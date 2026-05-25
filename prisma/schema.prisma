@@ -1,0 +1,429 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BRANCH (SCHOOL)
+// Each branch represents a physical school location managed under the SaaS
+// platform. All students, parents, teachers and configurations are scoped
+// to a branch. Migrated from legacy branch_id integer references.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Branch {
+  id          Int       @id @default(autoincrement())
+  name        String
+  code        String?   @unique // e.g. "MTGA", "DIV", "FSP"
+  address     String?   @db.Text
+  city        String?
+  state       String?
+  phone       String?
+  email       String?
+  logo        String?
+  adminName   String?
+  adminGender String?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime? @updatedAt
+
+  // Relations — every entity scoped to this branch
+  students               Student[]
+  parents                Parent[]
+  teachers               Teacher[]
+  teacherAllocations     TeacherAllocation[]
+  teacherNotes           TeacherNote[]
+  frontCmsTeachers       FrontCmsTeacher[]
+  onlineAdmissions       OnlineAdmission[]
+  frontCmsAdmissions     FrontCmsAdmission[]
+  onlineAdmissionFields  OnlineAdmissionField[]
+  studentAdmissionFields StudentAdmissionField[]
+  subscriptions          BranchSubscription[]
+
+  @@map("branches")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SAAS SUBSCRIPTION PLANS
+// Public marketing plans (Starter, Professional, Basic Plus, etc.)
+// Fused with legacy SaaS onboarding: plan name, duration, total cost.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SubscriptionPlan {
+  id              Int      @id @default(autoincrement())
+  slug            String   @unique
+  name            String
+  description     String?  @db.Text
+  priceMonthly    Decimal  @db.Decimal(18, 2)
+  durationMonths  Int      @default(3)
+  totalCost       Decimal  @db.Decimal(18, 2)
+  currency        String   @default("NGN")
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime? @updatedAt
+
+  subscriptions   BranchSubscription[]
+
+  @@map("subscription_plans")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BRANCH SUBSCRIPTION
+// Active or pending subscription for a school (branch) on the SaaS platform.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model BranchSubscription {
+  id            Int       @id @default(autoincrement())
+  startDate     DateTime
+  expiryDate    DateTime
+  totalCost     Decimal   @db.Decimal(18, 2)
+  paymentStatus String    @default("pending") // pending | paid | failed
+  message       String?   @db.Text
+  termsAccepted Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime? @updatedAt
+
+  branchId      Int
+  branch        Branch    @relation(fields: [branchId], references: [id])
+
+  planId        Int
+  plan          SubscriptionPlan @relation(fields: [planId], references: [id])
+
+  @@map("branch_subscriptions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH / CREDENTIALS
+// Mapped from legacy: login_credential
+// Role codes — VERIFIED against ugbekunc_Saas (2).sql data:
+//   1=Superadmin/Master (1 global user), 2=Branch Admin (per school), 3=Teacher,
+//   4=Accountant, 6=Parent, 7=Student, 8=Receptionist, 9=Proprietor,
+//   12=Librarian, 13=Other Staff
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           Int       @id // Preserve legacy login_credential.id
+  legacyUserId Int?      // login_credential.user_id — the profile ID in the domain
+  username     String    @unique
+  password     String    // Bcrypt-compatible hash — directly migrated
+  role         Int       // Legacy tinyint role code
+  active       Boolean   @default(true)
+  lastLogin    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime? @updatedAt
+
+  // Optional profile links based on role
+  student  Student? @relation("UserStudent")
+  parent   Parent?  @relation("UserParent")
+  teacher  Teacher? @relation("UserTeacher")
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARENT / GUARDIAN
+// Mapped from legacy: parent
+// Note: legacy active 0 = active, 1 = deactivated — inverted during ETL
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Parent {
+  id          Int       @id // Preserve legacy parent.id
+  name        String?
+  relation    String?
+  fatherName  String?
+  motherName  String?
+  occupation  String?
+  income      String?
+  education   String?
+  email       String?
+  mobileno    String?
+  address     String?   @db.Text
+  city        String?
+  state       String?
+  photo       String?
+  facebookUrl String?
+  linkedinUrl String?
+  twitterUrl  String?
+  active      Boolean   @default(true) // ETL: legacy 0→true, 1→false
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime?
+
+  branchId    Int?
+  branch      Branch?   @relation(fields: [branchId], references: [id])
+
+  students    Student[]
+
+  userId      Int?      @unique
+  user        User?     @relation("UserParent", fields: [userId], references: [id])
+
+  @@map("parents")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STUDENT
+// Mapped from legacy: student
+// Date fields stored as varchar in legacy — parsed to DateTime? during ETL
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Student {
+  id               Int       @id // Preserve legacy student.id
+  registerNo       String?   @unique
+  admissionDate    DateTime? // ETL: parse from varchar, null if invalid
+  firstName        String?
+  lastName         String?
+  gender           String?
+  birthday         DateTime? // ETL: parse from varchar, null if invalid
+  religion         String?
+  caste            String?
+  bloodGroup       String?
+  motherTongue     String?
+  currentAddress   String?   @db.Text
+  permanentAddress String?   @db.Text
+  city             String?
+  state            String?
+  mobileno         String?
+  categoryId       Int       @default(0)
+  email            String?
+  routeId          Int       @default(0)
+  stoppagePointId  Int?
+  vehicleId        Int?
+  hostelId         Int       @default(0)
+  roomId           Int       @default(0)
+  previousDetails  String?   @db.Text
+  photo            String?
+  active           Boolean   @default(true)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime?
+
+  parentId         Int?
+  parent           Parent?   @relation(fields: [parentId], references: [id])
+
+  branchId         Int?
+  branch           Branch?   @relation(fields: [branchId], references: [id])
+
+  userId           Int?      @unique
+  user             User?     @relation("UserStudent", fields: [userId], references: [id])
+
+  @@map("students")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEACHER
+// Synthesised from: login_credential (role=3) + teacher_allocation.teacher_id
+// The legacy system has no dedicated teacher profile table — Teacher records
+// are constructed from credential usernames and allocation data during ETL.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Teacher {
+  id          Int                 @id // legacy user_id for teacher credentials
+  name        String              // Derived from login_credential.username
+  email       String?
+  phone       String?
+  photo       String?
+  active      Boolean             @default(true)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime?
+
+  branchId    Int?
+  branch      Branch?             @relation(fields: [branchId], references: [id])
+
+  allocations TeacherAllocation[]
+  notes       TeacherNote[]
+  cmsPages    FrontCmsTeacher[]
+
+  userId      Int?                @unique
+  user        User?               @relation("UserTeacher", fields: [userId], references: [id])
+
+  @@map("teachers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEACHER ALLOCATION
+// Mapped from legacy: teacher_allocation
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TeacherAllocation {
+  id        Int     @id // Preserve legacy teacher_allocation.id
+  classId   Int
+  sectionId Int
+  sessionId Int
+
+  teacherId Int
+  teacher   Teacher @relation(fields: [teacherId], references: [id])
+
+  branchId  Int?
+  branch    Branch? @relation(fields: [branchId], references: [id])
+
+  @@map("teacher_allocations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEACHER NOTES
+// Mapped from legacy: teacher_note
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TeacherNote {
+  id          Int       @id // Preserve legacy teacher_note.id
+  title       String    @db.Text
+  description String    @db.Text
+  fileName    String    @db.Text
+  encName     String    @db.Text
+  typeId      Int
+  classId     String    @db.Text
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime?
+
+  teacherId   Int
+  teacher     Teacher   @relation(fields: [teacherId], references: [id])
+
+  branchId    Int
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  @@map("teacher_notes")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FRONT CMS — TEACHER PAGE CONFIG
+// Mapped from legacy: front_cms_teachers
+// One CMS config per branch for the Teachers landing page
+// ─────────────────────────────────────────────────────────────────────────────
+
+model FrontCmsTeacher {
+  id              Int      @id
+  pageTitle       String?
+  bannerImage     String?
+  metaDescription String   @db.Text @default("")
+  metaKeyword     String   @db.Text @default("")
+
+  // Which teacher is "featured" on this branch's CMS teacher page (optional)
+  teacherId       Int?
+  teacher         Teacher? @relation(fields: [teacherId], references: [id])
+
+  branchId        Int
+  branch          Branch   @relation(fields: [branchId], references: [id])
+
+  @@unique([branchId])    // One CMS teacher page per branch
+  @@map("front_cms_teachers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONLINE ADMISSIONS
+// Mapped from legacy: online_admission
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OnlineAdmission {
+  id                    Int       @id
+  referenceNo           String?
+  firstName             String
+  lastName              String?
+  gender                String?
+  birthday              DateTime? // ETL: parse varchar, null if invalid
+  religion              String?
+  caste                 String?
+  bloodGroup            String?
+  mobileNo              String?
+  motherTongue          String?
+  presentAddress        String?   @db.Text
+  permanentAddress      String?   @db.Text
+  admissionDate         DateTime? // ETL: parse varchar, null if invalid
+  city                  String?
+  state                 String?
+  studentPhoto          String?
+  categoryId            String?
+  email                 String?
+  previousSchoolDetails String?   @db.Text
+  guardianName          String?
+  guardianRelation      String?
+  fatherName            String?
+  motherName            String?
+  grdOccupation         String?
+  grdIncome             String?
+  grdEducation          String?
+  grdEmail              String?
+  grdMobileNo           String?
+  grdAddress            String?   @db.Text
+  grdCity               String?
+  grdState              String?
+  grdPhoto              String?
+  status                Int       @default(1)
+  paymentStatus         Int       @default(0)
+  paymentAmount         Decimal   @default(0) @db.Decimal(18, 2)
+  paymentDetails        String    @default("") @db.Text
+  classId               Int
+  sectionId             String?
+  applyDate             DateTime
+  doc                   String?
+  createdDate           DateTime?
+
+  branchId              Int
+  branch                Branch    @relation(fields: [branchId], references: [id])
+
+  @@map("online_admissions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FRONT CMS — ADMISSIONS PAGE CONFIG
+// Mapped from legacy: front_cms_admission
+// ─────────────────────────────────────────────────────────────────────────────
+
+model FrontCmsAdmission {
+  id                         Int     @id
+  title                      String?
+  description                String? @db.Text
+  pageTitle                  String?
+  termsConditionsTitle       String?
+  termsConditionsDescription String  @default("") @db.Text
+  feeElements                String? @db.Text
+  bannerImage                String?
+  metaDescription            String  @default("") @db.Text
+  metaKeyword                String  @default("") @db.Text
+  applicationFormName        String?
+  applicationFormFile        String?
+
+  branchId                   Int
+  branch                     Branch  @relation(fields: [branchId], references: [id])
+
+  @@unique([branchId])    // One CMS admission page per branch
+  @@map("front_cms_admissions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONLINE ADMISSION FORM FIELD CONFIG
+// Mapped from legacy: online_admission_fields
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OnlineAdmissionField {
+  id       Int     @id
+  fieldsId Int
+  status   Boolean @default(true)
+  required Boolean @default(false)
+  system   Boolean @default(true)
+
+  branchId Int
+  branch   Branch  @relation(fields: [branchId], references: [id])
+
+  @@map("online_admission_fields")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STUDENT ADMISSION FIELD CONFIG
+// Mapped from legacy: student_admission_fields
+// ─────────────────────────────────────────────────────────────────────────────
+
+model StudentAdmissionField {
+  id       Int     @id
+  fieldsId Int
+  status   Boolean @default(true)
+  required Boolean @default(false)
+  system   Boolean @default(true)
+
+  branchId Int
+  branch   Branch  @relation(fields: [branchId], references: [id])
+
+  @@map("student_admission_fields")
+}
