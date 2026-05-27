@@ -26,6 +26,11 @@ model Branch {
   phone       String?
   email       String?
   logo        String?
+  // Branding assets shown in tenant pages (admin requested)
+  systemLogo      String?
+  textLogo        String?
+  printingLogo    String?
+  reportCardLogo  String?
   adminName   String?
   adminGender String?
   active      Boolean   @default(true)

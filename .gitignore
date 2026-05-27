@@ -141,3 +141,32 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+node_modules
+# Keep environment variables out of version control
+.env
+
+/generated/prisma
+
+# Ignore log files
+logs
+*.log
+# Ignore build output
+dist
+build
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+migrate-login-credentials.js
+test-db.js
+ugbekunc_Saas (2).sql 
+ugbekunc_Saas.sql

@@ -1,10 +1,9 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const fs = require('fs');
-const path = require('path');
 const { PrismaClient } = require('@prisma/client');
 const { PrismaPg } = require('@prisma/adapter-pg');
 const { Pool } = require('pg');
+const { uploadBase64Image } = require('../lib/cloudinary')
 const {
   DEFAULT_PLANS,
   resolvePlanSlug,
@@ -17,8 +16,6 @@ const router = express.Router();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
-
-const UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'school-logos');
 
 async function ensurePlansSeeded() {
   for (const plan of DEFAULT_PLANS) {
@@ -59,30 +56,18 @@ function generateBranchCode(schoolName) {
 }
 
 async function saveLogoBase64(logoBase64, logoFileName) {
-  if (!logoBase64) return null;
-  const match = String(logoBase64).match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
-  const mime = match ? match[1] : 'image/png';
-  const data = match ? match[2] : logoBase64;
-  const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-  if (!allowed.includes(mime)) {
-    throw new Error('School logo must be a JPEG, PNG, WebP, or GIF image.');
-  }
-  const buffer = Buffer.from(data, 'base64');
-  if (buffer.length > 2 * 1024 * 1024) {
-    throw new Error('School logo must be smaller than 2MB.');
-  }
-  const extMap = {
-    'image/jpeg': '.jpg',
-    'image/png': '.png',
-    'image/webp': '.webp',
-    'image/gif': '.gif',
-  };
-  const ext = path.extname(logoFileName || '') || extMap[mime] || '.png';
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  const filename = `logo-${Date.now()}${ext}`;
-  const filepath = path.join(UPLOAD_DIR, filename);
-  fs.writeFileSync(filepath, buffer);
-  return `/uploads/school-logos/${filename}`;
+  if (!logoBase64) return null
+  const match = String(logoBase64).match(/^data:(image\/[a-z+]+);base64,(.+)$/i)
+  const mime = match ? match[1] : 'image/png'
+  const data = match ? match[2] : logoBase64
+
+  // Store the hosted Cloudinary URL in the `branches.logo` column
+  return await uploadBase64Image({
+    base64: data,
+    mime,
+    folder: 'ugbekun2/schools/logos',
+    tags: ['ugbekun2', 'school-logo'],
+  })
 }
 
 /**
