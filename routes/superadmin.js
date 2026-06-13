@@ -6,6 +6,9 @@ const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
 const { uploadBase64Image } = require('../lib/cloudinary')
+const { getBranchStatsMap } = require('../lib/branchStats')
+const { BRANCH_SELECT, branchesToCsv, buildBranchesPdf } = require('../lib/branchExport')
+const { deleteBranchCascade } = require('../lib/branchDelete')
 
 const {
   DEFAULT_PLANS,
@@ -95,6 +98,43 @@ function generateBranchCode(seed) {
   return `${initials || 'SCH'}${suffix}`
 }
 
+async function loadBranchesWithStats(branchId) {
+  const branches = await prisma.branch.findMany({
+    where: branchId ? { id: branchId } : undefined,
+    orderBy: { name: 'asc' },
+    select: BRANCH_SELECT,
+  })
+
+  if (branchId && !branches.length) return null
+
+  const statsByBranch = await getBranchStatsMap(prisma, branches)
+  return branches.map((branch) => {
+    const stats = statsByBranch.get(branch.id) || {
+      students: 0,
+      parents: 0,
+      teachers: 0,
+      staff: 0,
+    }
+
+    return {
+      ...branch,
+      students: stats.students,
+      parents: stats.parents,
+      teachers: stats.teachers,
+      staff: stats.staff,
+    }
+  })
+}
+
+function parseBranchId(req, res) {
+  const branchId = Number(req.params.id)
+  if (!Number.isInteger(branchId) || branchId <= 0) {
+    res.status(400).json({ success: false, message: 'Invalid branch id.' })
+    return null
+  }
+  return branchId
+}
+
 async function saveLogoBase64(logoBase64, logoFileName, folder) {
   if (!logoBase64) return null
 
@@ -109,6 +149,257 @@ async function saveLogoBase64(logoBase64, logoFileName, folder) {
     tags: ['ugbekun2', 'branch-logo'],
   })
 }
+
+/**
+ * GET /api/superadmin/stats
+ * Platform-wide counts for the superadmin dashboard.
+ */
+router.get('/stats', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const [branches, activeBranches, students, teachers, parents, users] = await Promise.all([
+      prisma.branch.count(),
+      prisma.branch.count({ where: { active: true } }),
+      prisma.student.count(),
+      prisma.teacher.count(),
+      prisma.parent.count(),
+      prisma.user.count(),
+    ])
+
+    return res.json({
+      success: true,
+      data: {
+        branches,
+        activeBranches,
+        students,
+        teachers,
+        parents,
+        users,
+      },
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] Stats error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to load platform stats.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/branches
+ * Returns all tenant school branches for the superadmin dashboard.
+ */
+router.get('/branches', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const data = await loadBranchesWithStats()
+    return res.json({ success: true, data })
+  } catch (error) {
+    console.error('[SUPERADMIN] Branch list error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to load branch list.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/branches/export.csv
+ * Export all branch details as CSV.
+ */
+router.get('/branches/export.csv', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const branches = await loadBranchesWithStats()
+    const csv = branchesToCsv(branches)
+    const filename = `ugbekun-branches-${new Date().toISOString().slice(0, 10)}.csv`
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    return res.send(`\uFEFF${csv}`)
+  } catch (error) {
+    console.error('[SUPERADMIN] Branch CSV export error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to export branches as CSV.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/branches/export.pdf
+ * Export all branch details as PDF.
+ */
+router.get('/branches/export.pdf', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const branches = await loadBranchesWithStats()
+    const pdf = await buildBranchesPdf(branches)
+    const filename = `ugbekun-branches-${new Date().toISOString().slice(0, 10)}.pdf`
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    return res.send(pdf)
+  } catch (error) {
+    console.error('[SUPERADMIN] Branch PDF export error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to export branches as PDF.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/branches/:id
+ * Fetch a single branch with live stats.
+ */
+router.get('/branches/:id', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  const branchId = parseBranchId(req, res)
+  if (!branchId) return
+
+  try {
+    const rows = await loadBranchesWithStats(branchId)
+    if (!rows?.length) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' })
+    }
+    return res.json({ success: true, data: rows[0] })
+  } catch (error) {
+    console.error('[SUPERADMIN] Branch detail error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to load branch details.',
+    })
+  }
+})
+
+/**
+ * PUT /api/superadmin/branches/:id
+ * Update branch details.
+ */
+router.put('/branches/:id', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  const branchId = parseBranchId(req, res)
+  if (!branchId) return
+
+  try {
+    const existing = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { id: true },
+    })
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' })
+    }
+
+    const body = req.body || {}
+    const name = (body.name || body.schoolName || '').trim()
+    const code = body.code != null ? String(body.code).trim() : undefined
+    const adminName = body.adminName != null ? String(body.adminName).trim() : undefined
+    const email = body.email != null ? String(body.email).trim().toLowerCase() : undefined
+    const phone = body.phone != null ? String(body.phone).trim() : undefined
+    const city = body.city != null ? String(body.city).trim() : undefined
+    const state = body.state != null ? String(body.state).trim() : undefined
+    const address = body.address != null ? String(body.address).trim() : undefined
+    const active = body.active != null ? Boolean(body.active) : undefined
+
+    if (!name) {
+      return res.status(400).json({ success: false, message: 'School name is required.' })
+    }
+
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email.' })
+    }
+
+    if (code) {
+      const codeConflict = await prisma.branch.findFirst({
+        where: { code, NOT: { id: branchId } },
+        select: { id: true },
+      })
+      if (codeConflict) {
+        return res.status(400).json({ success: false, message: 'Branch code already in use.' })
+      }
+    }
+
+    const updated = await prisma.branch.update({
+      where: { id: branchId },
+      data: {
+        name,
+        ...(code !== undefined ? { code: code || null } : {}),
+        ...(adminName !== undefined ? { adminName: adminName || null } : {}),
+        ...(email !== undefined ? { email: email || null } : {}),
+        ...(phone !== undefined ? { phone: phone || null } : {}),
+        ...(city !== undefined ? { city: city || null } : {}),
+        ...(state !== undefined ? { state: state || null } : {}),
+        ...(address !== undefined ? { address: address || null } : {}),
+        ...(active !== undefined ? { active } : {}),
+      },
+      select: BRANCH_SELECT,
+    })
+
+    const statsMap = await getBranchStatsMap(prisma, [updated])
+    const stats = statsMap.get(updated.id) || { students: 0, parents: 0, teachers: 0, staff: 0 }
+
+    return res.json({
+      success: true,
+      message: 'Branch updated successfully.',
+      data: { ...updated, ...stats },
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] Branch update error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to update branch.',
+    })
+  }
+})
+
+/**
+ * DELETE /api/superadmin/branches/:id
+ * Permanently remove a branch and its tenant-scoped records.
+ */
+router.delete('/branches/:id', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  const branchId = parseBranchId(req, res)
+  if (!branchId) return
+
+  try {
+    const existing = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { id: true, name: true },
+    })
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' })
+    }
+
+    await prisma.$transaction((tx) => deleteBranchCascade(tx, branchId))
+
+    return res.json({
+      success: true,
+      message: `Branch "${existing.name}" deleted successfully.`,
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] Branch delete error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to delete branch.',
+    })
+  }
+})
 
 /**
  * POST /api/superadmin/branches

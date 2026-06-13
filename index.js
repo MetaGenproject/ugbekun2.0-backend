@@ -38,9 +38,11 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const authRouter = require('./routes/auth');
 const onboardingRouter = require('./routes/onboarding');
 const superadminRouter = require('./routes/superadmin');
+const adminRouter = require('./routes/admin');
 app.use('/api/auth', authRouter);
 app.use('/api/onboarding', onboardingRouter);
 app.use('/api/superadmin', superadminRouter);
+app.use('/api/admin', adminRouter);
 
 // Health Check Endpoint
 app.get('/api/health', async (req, res) => {
