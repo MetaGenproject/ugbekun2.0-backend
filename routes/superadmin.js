@@ -563,5 +563,397 @@ router.post('/branches', async (req, res) => {
   }
 })
 
+/**
+ * GET /api/superadmin/sessions
+ * Fetch all academic sessions.
+ */
+router.get('/sessions', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const sessions = await prisma.schoolYear.findMany({
+      orderBy: { schoolYear: 'desc' },
+    })
+    // Also fetch currently active sessionId from global settings (if exists)
+    const settings = await prisma.globalSettings.findFirst({
+      select: { sessionId: true },
+    })
+    return res.json({
+      success: true,
+      data: {
+        sessions,
+        activeSessionId: settings ? settings.sessionId : null,
+      },
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] GET sessions error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to fetch academic sessions.',
+    })
+  }
+})
+
+/**
+ * POST /api/superadmin/sessions
+ * Create a new academic session.
+ */
+router.post('/sessions', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { schoolYear } = req.body || {}
+    if (!schoolYear || !/^\d{4}-\d{4}$/.test(schoolYear.trim())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Session name is required and must match YYYY-YYYY format.',
+      })
+    }
+
+    const normalizedYear = schoolYear.trim()
+
+    const existing = await prisma.schoolYear.findFirst({
+      where: { schoolYear: normalizedYear },
+    })
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: 'Academic session already exists.',
+      })
+    }
+
+    // Find max ID in schoolyear
+    const maxSession = await prisma.schoolYear.findFirst({ orderBy: { id: 'desc' } })
+    const nextId = maxSession ? maxSession.id + 1 : 1
+
+    const newSession = await prisma.schoolYear.create({
+      data: {
+        id: nextId,
+        schoolYear: normalizedYear,
+        createdBy: 1, // Superadmin legacy ID
+      },
+    })
+
+    return res.status(201).json({
+      success: true,
+      message: 'Academic session created successfully.',
+      data: newSession,
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] POST sessions error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to create academic session.',
+    })
+  }
+})
+
+/**
+ * PUT /api/superadmin/sessions/active
+ * Set globally active academic session.
+ */
+router.put('/sessions/active', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { sessionId } = req.body || {}
+    if (!sessionId) {
+      return res.status(400).json({ success: false, message: 'Session ID is required.' })
+    }
+
+    const id = Number(sessionId)
+    const sessionExists = await prisma.schoolYear.findUnique({
+      where: { id },
+    })
+    if (!sessionExists) {
+      return res.status(404).json({ success: false, message: 'Academic session not found.' })
+    }
+
+    // Check if global settings row exists
+    const settings = await prisma.globalSettings.findFirst()
+    if (settings) {
+      await prisma.globalSettings.update({
+        where: { id: settings.id },
+        data: { sessionId: id },
+      })
+    } else {
+      await prisma.globalSettings.create({
+        data: {
+          id: 1,
+          instituteName: 'Ugbekun School Management System',
+          sessionId: id,
+        },
+      })
+    }
+
+    return res.json({
+      success: true,
+      message: `Globally active session set to ${sessionExists.schoolYear}.`,
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] PUT active session error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to update active session.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/subscriptions
+ * Fetch subscription plan options and active subscription status per branch.
+ */
+router.get('/subscriptions', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    // Fetch all subscription plans
+    const plans = await prisma.subscriptionPlan.findMany({
+      where: { active: true },
+      orderBy: { id: 'asc' },
+    })
+
+    // Fetch all branches with their subscriptions
+    const branches = await prisma.branch.findMany({
+      select: {
+        id: true,
+        name: true,
+        code: true,
+        active: true,
+        subscriptions: {
+          orderBy: { id: 'desc' },
+          take: 1,
+          include: { plan: true },
+        },
+      },
+      orderBy: { name: 'asc' },
+    })
+
+    const subscriptions = branches.map((b) => {
+      const latestSub = b.subscriptions[0] || null
+      return {
+        branchId: b.id,
+        branchName: b.name,
+        branchCode: b.code,
+        branchActive: b.active,
+        latestSubscription: latestSub
+          ? {
+              id: latestSub.id,
+              startDate: latestSub.startDate,
+              expiryDate: latestSub.expiryDate,
+              totalCost: Number(latestSub.totalCost),
+              paymentStatus: latestSub.paymentStatus,
+              planName: latestSub.plan.name,
+              planSlug: latestSub.plan.slug,
+              planId: latestSub.plan.id,
+            }
+          : null,
+      }
+    })
+
+    return res.json({
+      success: true,
+      data: {
+        plans,
+        subscriptions,
+      },
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] GET subscriptions error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to load subscription status.',
+    })
+  }
+})
+
+/**
+ * POST /api/superadmin/branches/:id/renew-subscription
+ * Renew subscription for branch. If renewed before expiration, the duration appends directly to current expiration date.
+ */
+router.post('/branches/:id/renew-subscription', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  const branchId = parseBranchId(req, res)
+  if (!branchId) return
+
+  try {
+    const { planId, paymentStatus } = req.body || {}
+    if (!planId) {
+      return res.status(400).json({ success: false, message: 'Plan ID is required.' })
+    }
+
+    const plan = await prisma.subscriptionPlan.findUnique({
+      where: { id: Number(planId) },
+    })
+    if (!plan || !plan.active) {
+      return res.status(404).json({ success: false, message: 'Active plan not found.' })
+    }
+
+    // Get latest paid/active subscription to check expiration date
+    const latestSub = await prisma.branchSubscription.findFirst({
+      where: { branchId, paymentStatus: 'paid' },
+      orderBy: { expiryDate: 'desc' },
+    })
+
+    const now = new Date()
+    let startDate = now
+    // If latest subscription expiry date is in the future, append renewal directly to it
+    if (latestSub && latestSub.expiryDate > now) {
+      startDate = new Date(latestSub.expiryDate)
+    }
+
+    const expiryDate = addMonths(startDate, plan.durationMonths)
+    const statusPaid = paymentStatus === 'pending' ? 'pending' : 'paid'
+
+    const subscription = await prisma.$transaction(async (tx) => {
+      const sub = await tx.branchSubscription.create({
+        data: {
+          branchId,
+          planId: plan.id,
+          startDate,
+          expiryDate,
+          totalCost: plan.totalCost,
+          paymentStatus: statusPaid,
+          termsAccepted: true,
+        },
+        include: { plan: true },
+      })
+
+      // If immediately paid, activate the branch
+      if (statusPaid === 'paid') {
+        await tx.branch.update({
+          where: { id: branchId },
+          data: { active: true },
+        })
+        // Also active corresponding user credentials
+        await tx.user.updateMany({
+          where: { role: 2, legacyUserId: branchId },
+          data: { active: true },
+        })
+      }
+
+      return sub
+    })
+
+    return res.status(201).json({
+      success: true,
+      message: `Subscription renewed successfully under "${plan.name}" plan. Expiry: ${expiryDate.toISOString().slice(0, 10)}`,
+      data: subscription,
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] POST renew subscription error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to renew subscription.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/analytics
+ * Aggregated data for Recharts visualizations
+ */
+router.get('/analytics', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    // 1. Branch Enrollments: student count per branch
+    const branches = await prisma.branch.findMany({
+      select: {
+        id: true,
+        name: true,
+        students: {
+          where: { active: true },
+        },
+      },
+      orderBy: { name: 'asc' },
+    })
+
+    const branchEnrollments = branches.map((b) => ({
+      name: b.name.replace('School', '').replace('Academy', '').replace('Management System', '').trim(),
+      studentsCount: b.students.length,
+    }))
+
+    // 2. Subscription plans count & revenue
+    const plans = await prisma.subscriptionPlan.findMany({
+      include: {
+        subscriptions: {
+          where: { paymentStatus: 'paid' },
+        },
+      },
+    })
+
+    const planDistribution = plans.map((p) => {
+      const totalRev = p.subscriptions.reduce((sum, s) => sum + Number(s.totalCost), 0)
+      return {
+        name: p.name,
+        activeSubscriptions: p.subscriptions.length,
+        revenue: totalRev,
+      }
+    })
+
+    // 3. Subscriptions Expirations histogram
+    const allSubs = await prisma.branchSubscription.findMany({
+      where: { paymentStatus: 'paid' },
+      orderBy: { expiryDate: 'desc' },
+      distinct: ['branchId'],
+    })
+
+    const now = new Date()
+    const oneMonthFromNow = new Date()
+    oneMonthFromNow.setDate(now.getDate() + 30)
+    const threeMonthsFromNow = new Date()
+    threeMonthsFromNow.setDate(now.getDate() + 90)
+
+    let expired = 0
+    let critical = 0
+    let warning = 0
+    let healthy = 0
+
+    allSubs.forEach((sub) => {
+      const exp = new Date(sub.expiryDate)
+      if (exp < now) {
+        expired++
+      } else if (exp <= oneMonthFromNow) {
+        critical++
+      } else if (exp <= threeMonthsFromNow) {
+        warning++
+      } else {
+        healthy++
+      }
+    })
+
+    const expirationStats = [
+      { name: 'Expired', count: expired, color: '#ef4444' },
+      { name: 'Expiring 0-30d', count: critical, color: '#f97316' },
+      { name: 'Expiring 31-90d', count: warning, color: '#eab308' },
+      { name: 'Healthy (>90d)', count: healthy, color: '#10b981' },
+    ]
+
+    return res.json({
+      success: true,
+      data: {
+        branchEnrollments,
+        planDistribution,
+        expirationStats,
+      },
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] GET analytics error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to aggregate analytics statistics.',
+    })
+  }
+})
+
 module.exports = router
+
 

@@ -13,7 +13,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 // Middleware
 app.use(cors({
@@ -39,10 +39,32 @@ const authRouter = require('./routes/auth');
 const onboardingRouter = require('./routes/onboarding');
 const superadminRouter = require('./routes/superadmin');
 const adminRouter = require('./routes/admin');
+const teacherRouter = require('./routes/teacher');
+const studentRouter = require('./routes/student');
+const parentRouter = require('./routes/parent');
 app.use('/api/auth', authRouter);
 app.use('/api/onboarding', onboardingRouter);
 app.use('/api/superadmin', superadminRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/teacher', teacherRouter);
+app.use('/api/student', studentRouter);
+app.use('/api/parent', parentRouter);
+
+// Media Upload Endpoint
+const { uploadBase64File } = require('./lib/cloudinary');
+app.post('/api/upload', async (req, res) => {
+  try {
+    const { base64, mime, folder } = req.body;
+    if (!base64 || !mime) {
+      return res.status(400).json({ success: false, message: 'Missing base64 data or mime type.' });
+    }
+    const url = await uploadBase64File({ base64, mime, folder: folder || 'ugbekun_tasks' });
+    return res.json({ success: true, url });
+  } catch (err) {
+    console.error('[UPLOAD ERROR]', err);
+    return res.status(500).json({ success: false, message: err.message || 'Failed to upload media.' });
+  }
+});
 
 // Health Check Endpoint
 app.get('/api/health', async (req, res) => {

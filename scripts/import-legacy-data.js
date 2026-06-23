@@ -115,7 +115,11 @@ function parseCombinedDump(sql) {
     'id', 'class_id', 'section_id', 'teacher_id', 'session_id', 'branch_id',
   ])
 
-  return { legacyBranches, credentials, parents, students, allocations }
+  const staff = mapRows(sql, 'staff', [
+    'id', 'staff_id', 'name', 'department', 'qualification', 'experience_details', 'total_experience', 'designation', 'joining_date', 'birthday', 'sex', 'religion', 'blood_group', 'present_address', 'permanent_address', 'mobileno', 'email', 'salary_template_id', 'branch_id', 'photo', 'facebook_url', 'linkedin_url', 'twitter_url', 'created_at', 'updated_at'
+  ])
+
+  return { legacyBranches, credentials, parents, students, allocations, staff }
 }
 
 function parseSplitLegacyDumps() {
@@ -146,10 +150,10 @@ function parseSplitLegacyDumps() {
     'id', 'class_id', 'section_id', 'teacher_id', 'session_id', 'branch_id',
   ])
 
-  return { legacyBranches: null, credentials, parents, students, allocations }
+  return { legacyBranches: null, credentials, parents, students, allocations, staff: null }
 }
 
-function buildImportRows({ legacyBranches, credentials, parents, students, allocations }) {
+function buildImportRows({ legacyBranches, credentials, parents, students, allocations, staff }) {
   const credByRole = (role) => credentials.filter((c) => c.role === role)
   const branchAdmins = credByRole(2)
   const adminByBranchId = new Map(branchAdmins.map((a) => [a.user_id, a]))
@@ -338,18 +342,31 @@ function buildImportRows({ legacyBranches, credentials, parents, students, alloc
     }
   }
 
-  const teacherRows = credByRole(3).map((c) => ({
-    id: c.user_id,
-    name: c.username,
-    active: c.active === 1,
-    branchId: (() => {
-      const bid = teacherBranchById.get(c.user_id)
-      return bid && branchIds.has(bid) ? bid : null
-    })(),
-    userId: userRows.some((u) => u.id === c.id) ? c.id : null,
-    createdAt: parseDate(c.created_at) || new Date(),
-    updatedAt: parseDate(c.updated_at),
-  }))
+  const staffById = new Map()
+  if (staff) {
+    for (const s of staff) {
+      staffById.set(s.id, s)
+    }
+  }
+
+  const teacherRows = credByRole(3).map((c) => {
+    const s = staffById.get(c.user_id)
+    return {
+      id: c.user_id,
+      name: s?.name || c.username,
+      email: s?.email || null,
+      phone: s?.mobileno || null,
+      photo: s?.photo || null,
+      active: c.active === 1,
+      branchId: (() => {
+        const bid = s?.branch_id || teacherBranchById.get(c.user_id)
+        return bid && branchIds.has(bid) ? bid : null
+      })(),
+      userId: userRows.some((u) => u.id === c.id) ? c.id : null,
+      createdAt: parseDate(c.created_at) || new Date(),
+      updatedAt: parseDate(c.updated_at),
+    }
+  })
 
   return { branchRows, userRows, parentRows, studentRows, teacherRows }
 }

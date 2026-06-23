@@ -107,6 +107,41 @@ router.post('/login', async (req, res) => {
       data: { lastLogin: new Date() },
     });
 
+    // Fetch branch information for student, parent, or teacher
+    let branchInfo = null;
+    const roleId = user.role;
+    
+    try {
+      if (roleId === 7) { // Student
+        const student = await prisma.student.findFirst({
+          where: { userId: user.id },
+          include: { branch: { select: { id: true, name: true, logo: true, code: true } } },
+        });
+        if (student?.branch) {
+          branchInfo = student.branch;
+        }
+      } else if (roleId === 6) { // Parent
+        const parent = await prisma.parent.findFirst({
+          where: { userId: user.id },
+          include: { branch: { select: { id: true, name: true, logo: true, code: true } } },
+        });
+        if (parent?.branch) {
+          branchInfo = parent.branch;
+        }
+      } else if (roleId === 3) { // Teacher
+        const teacher = await prisma.teacher.findFirst({
+          where: { userId: user.id },
+          include: { branch: { select: { id: true, name: true, logo: true, code: true } } },
+        });
+        if (teacher?.branch) {
+          branchInfo = teacher.branch;
+        }
+      }
+    } catch (branchError) {
+      console.error('[AUTH] Error fetching branch info:', branchError);
+      // Continue without branch info if fetch fails
+    }
+
     // Sign JWT
     const secret = process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod';
     const expiresIn = process.env.JWT_EXPIRES_IN || '8h';
@@ -132,6 +167,7 @@ router.post('/login', async (req, res) => {
         roleName: ROLE_NAMES[user.role] || 'user',
         legacyUserId: user.legacyUserId,
         lastLogin: user.lastLogin,
+        branch: branchInfo,
       },
     });
   } catch (error) {

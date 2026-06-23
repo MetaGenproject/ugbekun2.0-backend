@@ -17,25 +17,25 @@ datasource db {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Branch {
-  id          Int       @id @default(autoincrement())
-  name        String
-  code        String?   @unique // e.g. "MTGA", "DIV", "FSP"
-  address     String?   @db.Text
-  city        String?
-  state       String?
-  phone       String?
-  email       String?
-  logo        String?
+  id             Int       @id @default(autoincrement())
+  name           String
+  code           String?   @unique // e.g. "MTGA", "DIV", "FSP"
+  address        String?   @db.Text
+  city           String?
+  state          String?
+  phone          String?
+  email          String?
+  logo           String?
   // Branding assets shown in tenant pages (admin requested)
-  systemLogo      String?
-  textLogo        String?
-  printingLogo    String?
-  reportCardLogo  String?
-  adminName   String?
-  adminGender String?
-  active      Boolean   @default(true)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime? @updatedAt
+  systemLogo     String?
+  textLogo       String?
+  printingLogo   String?
+  reportCardLogo String?
+  adminName      String?
+  adminGender    String?
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime? @updatedAt
 
   // Relations — every entity scoped to this branch
   students               Student[]
@@ -50,6 +50,10 @@ model Branch {
   studentAdmissionFields StudentAdmissionField[]
   subscriptions          BranchSubscription[]
 
+  classes  Class[]
+  sections Section[]
+  subjects Subject[]
+
   @@map("branches")
 }
 
@@ -60,19 +64,19 @@ model Branch {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model SubscriptionPlan {
-  id              Int      @id @default(autoincrement())
-  slug            String   @unique
-  name            String
-  description     String?  @db.Text
-  priceMonthly    Decimal  @db.Decimal(18, 2)
-  durationMonths  Int      @default(3)
-  totalCost       Decimal  @db.Decimal(18, 2)
-  currency        String   @default("NGN")
-  active          Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime? @updatedAt
+  id             Int       @id @default(autoincrement())
+  slug           String    @unique
+  name           String
+  description    String?   @db.Text
+  priceMonthly   Decimal   @db.Decimal(18, 2)
+  durationMonths Int       @default(3)
+  totalCost      Decimal   @db.Decimal(18, 2)
+  currency       String    @default("NGN")
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime? @updatedAt
 
-  subscriptions   BranchSubscription[]
+  subscriptions BranchSubscription[]
 
   @@map("subscription_plans")
 }
@@ -93,11 +97,11 @@ model BranchSubscription {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime? @updatedAt
 
-  branchId      Int
-  branch        Branch    @relation(fields: [branchId], references: [id])
+  branchId Int
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  planId        Int
-  plan          SubscriptionPlan @relation(fields: [planId], references: [id])
+  planId Int
+  plan   SubscriptionPlan @relation(fields: [planId], references: [id])
 
   @@map("branch_subscriptions")
 }
@@ -113,19 +117,19 @@ model BranchSubscription {
 
 model User {
   id           Int       @id // Preserve legacy login_credential.id
-  legacyUserId Int?      // login_credential.user_id — the profile ID in the domain
+  legacyUserId Int? // login_credential.user_id — the profile ID in the domain
   username     String    @unique
-  password     String    // Bcrypt-compatible hash — directly migrated
-  role         Int       // Legacy tinyint role code
+  password     String // Bcrypt-compatible hash — directly migrated
+  role         Int // Legacy tinyint role code
   active       Boolean   @default(true)
   lastLogin    DateTime?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime? @updatedAt
 
   // Optional profile links based on role
-  student  Student? @relation("UserStudent")
-  parent   Parent?  @relation("UserParent")
-  teacher  Teacher? @relation("UserTeacher")
+  student Student? @relation("UserStudent")
+  parent  Parent?  @relation("UserParent")
+  teacher Teacher? @relation("UserTeacher")
 
   @@map("users")
 }
@@ -158,13 +162,13 @@ model Parent {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime?
 
-  branchId    Int?
-  branch      Branch?   @relation(fields: [branchId], references: [id])
+  branchId Int?
+  branch   Branch? @relation(fields: [branchId], references: [id])
 
-  students    Student[]
+  students Student[]
 
-  userId      Int?      @unique
-  user        User?     @relation("UserParent", fields: [userId], references: [id])
+  userId Int?  @unique
+  user   User? @relation("UserParent", fields: [userId], references: [id])
 
   @@map("parents")
 }
@@ -205,14 +209,24 @@ model Student {
   createdAt        DateTime  @default(now())
   updatedAt        DateTime?
 
-  parentId         Int?
-  parent           Parent?   @relation(fields: [parentId], references: [id])
+  parentId Int?
+  parent   Parent? @relation(fields: [parentId], references: [id])
 
-  branchId         Int?
-  branch           Branch?   @relation(fields: [branchId], references: [id])
+  branchId Int?
+  branch   Branch? @relation(fields: [branchId], references: [id])
 
-  userId           Int?      @unique
-  user             User?     @relation("UserStudent", fields: [userId], references: [id])
+  userId Int?  @unique
+  user   User? @relation("UserStudent", fields: [userId], references: [id])
+
+  idCardToken  String?             @unique @map("id_card_token")
+  idCardStatus String              @default("active") @map("id_card_status")
+  enrolls      Enroll[]
+  marks        Mark[]
+  attendances  Attendance[]
+  commentaries StudentCommentary[]
+  onlineExamSubmissions OnlineExamSubmission[]
+  homeworkSubmissions HomeworkSubmission[]
+  montessoriAssessments MontessoriAssessment[]
 
   @@map("students")
 }
@@ -225,24 +239,25 @@ model Student {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Teacher {
-  id          Int                 @id // legacy user_id for teacher credentials
-  name        String              // Derived from login_credential.username
-  email       String?
-  phone       String?
-  photo       String?
-  active      Boolean             @default(true)
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime?
+  id        Int       @id // legacy user_id for teacher credentials
+  name      String // Derived from login_credential.username
+  email     String?
+  phone     String?
+  photo     String?
+  active    Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime?
 
-  branchId    Int?
-  branch      Branch?             @relation(fields: [branchId], references: [id])
+  branchId Int?
+  branch   Branch? @relation(fields: [branchId], references: [id])
 
-  allocations TeacherAllocation[]
-  notes       TeacherNote[]
-  cmsPages    FrontCmsTeacher[]
+  allocations    TeacherAllocation[]
+  notes          TeacherNote[]
+  cmsPages       FrontCmsTeacher[]
+  subjectAssigns SubjectAssign[]
 
-  userId      Int?                @unique
-  user        User?               @relation("UserTeacher", fields: [userId], references: [id])
+  userId Int?  @unique
+  user   User? @relation("UserTeacher", fields: [userId], references: [id])
 
   @@map("teachers")
 }
@@ -253,7 +268,7 @@ model Teacher {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model TeacherAllocation {
-  id        Int     @id // Preserve legacy teacher_allocation.id
+  id        Int @id // Preserve legacy teacher_allocation.id
   classId   Int
   sectionId Int
   sessionId Int
@@ -261,8 +276,11 @@ model TeacherAllocation {
   teacherId Int
   teacher   Teacher @relation(fields: [teacherId], references: [id])
 
-  branchId  Int?
-  branch    Branch? @relation(fields: [branchId], references: [id])
+  branchId Int?
+  branch   Branch? @relation(fields: [branchId], references: [id])
+
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
 
   @@map("teacher_allocations")
 }
@@ -283,11 +301,11 @@ model TeacherNote {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime?
 
-  teacherId   Int
-  teacher     Teacher   @relation(fields: [teacherId], references: [id])
+  teacherId Int
+  teacher   Teacher @relation(fields: [teacherId], references: [id])
 
-  branchId    Int
-  branch      Branch    @relation(fields: [branchId], references: [id])
+  branchId Int
+  branch   Branch @relation(fields: [branchId], references: [id])
 
   @@map("teacher_notes")
 }
@@ -299,20 +317,20 @@ model TeacherNote {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model FrontCmsTeacher {
-  id              Int      @id
+  id              Int     @id
   pageTitle       String?
   bannerImage     String?
-  metaDescription String   @db.Text @default("")
-  metaKeyword     String   @db.Text @default("")
+  metaDescription String  @default("") @db.Text
+  metaKeyword     String  @default("") @db.Text
 
   // Which teacher is "featured" on this branch's CMS teacher page (optional)
-  teacherId       Int?
-  teacher         Teacher? @relation(fields: [teacherId], references: [id])
+  teacherId Int?
+  teacher   Teacher? @relation(fields: [teacherId], references: [id])
 
-  branchId        Int
-  branch          Branch   @relation(fields: [branchId], references: [id])
+  branchId Int
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  @@unique([branchId])    // One CMS teacher page per branch
+  @@unique([branchId]) // One CMS teacher page per branch
   @@map("front_cms_teachers")
 }
 
@@ -365,8 +383,8 @@ model OnlineAdmission {
   doc                   String?
   createdDate           DateTime?
 
-  branchId              Int
-  branch                Branch    @relation(fields: [branchId], references: [id])
+  branchId Int
+  branch   Branch @relation(fields: [branchId], references: [id])
 
   @@map("online_admissions")
 }
@@ -390,10 +408,10 @@ model FrontCmsAdmission {
   applicationFormName        String?
   applicationFormFile        String?
 
-  branchId                   Int
-  branch                     Branch  @relation(fields: [branchId], references: [id])
+  branchId Int
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  @@unique([branchId])    // One CMS admission page per branch
+  @@unique([branchId]) // One CMS admission page per branch
   @@map("front_cms_admissions")
 }
 
@@ -410,7 +428,7 @@ model OnlineAdmissionField {
   system   Boolean @default(true)
 
   branchId Int
-  branch   Branch  @relation(fields: [branchId], references: [id])
+  branch   Branch @relation(fields: [branchId], references: [id])
 
   @@map("online_admission_fields")
 }
@@ -428,7 +446,374 @@ model StudentAdmissionField {
   system   Boolean @default(true)
 
   branchId Int
-  branch   Branch  @relation(fields: [branchId], references: [id])
+  branch   Branch @relation(fields: [branchId], references: [id])
 
   @@map("student_admission_fields")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHOOL YEAR / ACADEMIC SESSIONS
+// Mapped from legacy: schoolyear
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SchoolYear {
+  id         Int       @id @default(autoincrement())
+  schoolYear String    @map("school_year")
+  createdBy  Int       @map("created_by")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  @@map("schoolyear")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL SETTINGS
+// Mapped from legacy: global_settings
+// ─────────────────────────────────────────────────────────────────────────────
+
+model GlobalSettings {
+  id            Int      @id @default(autoincrement())
+  instituteName String   @map("institute_name")
+  sessionId     Int      @map("session_id") // Currently active session ID
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("global_settings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW ACADEMIC CONFIGURATION MODELS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Class {
+  id                 Int                  @id @default(autoincrement())
+  name               String
+  nameNumeric        String               @map("name_numeric")
+  isEcd              Boolean              @default(false) @map("is_ecd")
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime?            @updatedAt @map("updated_at")
+  branchId           Int?                 @map("branch_id")
+  branch             Branch?              @relation(fields: [branchId], references: [id])
+  enrolls            Enroll[]
+  sections           SectionsAllocation[]
+  subjects           SubjectAssign[]
+  marks              Mark[]
+  attendances        Attendance[]
+  teacherAllocations TeacherAllocation[]
+  onlineExams        OnlineExam[]
+  homeworks          Homework[]
+  montessoriAssessments MontessoriAssessment[]
+
+  @@index([branchId])
+  @@map("class")
+}
+
+model Section {
+  id                 Int                  @id @default(autoincrement())
+  name               String
+  capacity           String?
+  branchId           Int?                 @map("branch_id")
+  branch             Branch?              @relation(fields: [branchId], references: [id])
+  enrolls            Enroll[]
+  classes            SectionsAllocation[]
+  subjects           SubjectAssign[]
+  marks              Mark[]
+  attendances        Attendance[]
+  teacherAllocations TeacherAllocation[]
+  montessoriAssessments MontessoriAssessment[]
+
+  @@index([branchId])
+  @@map("section")
+}
+
+model SectionsAllocation {
+  id        Int     @id @default(autoincrement())
+  classId   Int     @map("class_id")
+  sectionId Int     @map("section_id")
+  class     Class   @relation(fields: [classId], references: [id])
+  section   Section @relation(fields: [sectionId], references: [id])
+
+  @@unique([classId, sectionId])
+  @@map("sections_allocation")
+}
+
+model Subject {
+  id            Int             @id @default(autoincrement())
+  name          String
+  subjectCode   String          @map("subject_code")
+  subjectType   String          @map("subject_type")
+  subjectAuthor String          @map("subject_author")
+  branchId      Int?            @map("branch_id")
+  branch        Branch?         @relation(fields: [branchId], references: [id])
+  assigns       SubjectAssign[]
+  marks         Mark[]
+  onlineExams   OnlineExam[]
+  homeworks     Homework[]
+
+  @@index([branchId])
+  @@map("subject")
+}
+
+model SubjectAssign {
+  id        Int       @id @default(autoincrement())
+  classId   Int       @map("class_id")
+  sectionId Int       @map("section_id")
+  subjectId Int       @map("subject_id")
+  teacherId Int       @map("teacher_id")
+  branchId  Int       @map("branch_id")
+  sessionId Int       @map("session_id")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+
+  @@index([branchId, sessionId])
+  @@index([classId, sectionId])
+  @@map("subject_assign")
+}
+
+model Enroll {
+  id           Int       @id @default(autoincrement())
+  studentId    Int       @map("student_id")
+  classId      Int       @map("class_id")
+  sectionId    Int       @map("section_id")
+  roll         Int       @default(0)
+  sessionId    Int       @map("session_id")
+  defaultLogin Int       @default(0) @map("default_login")
+  branchId     Int       @map("branch_id")
+  isAlumni     Int       @default(0) @map("is_alumni")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  student Student @relation(fields: [studentId], references: [id])
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
+
+  @@index([branchId, sessionId])
+  @@index([studentId])
+  @@map("enroll")
+}
+
+model Exam {
+  id               Int       @id @default(autoincrement())
+  name             String
+  termId           Int?      @map("term_id")
+  typeId           Int       @map("type_id")
+  sessionId        Int       @map("session_id")
+  branchId         Int?      @map("branch_id")
+  remark           String
+  markDistribution String    @map("mark_distribution")
+  status           Int       @default(1)
+  publishResult    Int       @default(1) @map("publish_result")
+  resumptionDate   DateTime? @map("resumption_date")
+  rankGenerated    Int       @default(0) @map("rank_generated")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
+  marks            Mark[]
+  montessoriAssessments MontessoriAssessment[]
+
+  @@index([branchId, sessionId])
+  @@map("exam")
+}
+
+model ExamMarkDistribution {
+  id       Int    @id @default(autoincrement())
+  name     String
+  branchId Int?   @map("branch_id")
+
+  @@index([branchId])
+  @@map("exam_mark_distribution")
+}
+
+model Mark {
+  id        Int     @id @default(autoincrement())
+  studentId Int     @map("student_id")
+  subjectId Int     @map("subject_id")
+  classId   Int     @map("class_id")
+  sectionId Int     @map("section_id")
+  examId    Int     @map("exam_id")
+  mark      String? @map("mark")
+  absent    String? @map("absent")
+  sessionId Int     @map("session_id")
+  branchId  Int?    @map("branch_id")
+
+  student Student @relation(fields: [studentId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
+  exam    Exam    @relation(fields: [examId], references: [id])
+
+  @@index([studentId, examId])
+  @@index([classId, sectionId, sessionId])
+  @@map("mark")
+}
+
+model PromotionHistory {
+  id            Int      @id @default(autoincrement())
+  studentId     Int      @map("student_id")
+  fromClassId   Int      @map("from_class_id")
+  fromSectionId Int      @map("from_section_id")
+  toClassId     Int      @map("to_class_id")
+  toSectionId   Int      @map("to_section_id")
+  promotedBy    Int      @map("promoted_by")
+  sessionId     Int      @map("session_id")
+  promotedAt    DateTime @default(now()) @map("promoted_at")
+
+  @@index([studentId])
+  @@map("promotion_history")
+}
+
+model Attendance {
+  id             Int       @id @default(autoincrement())
+  studentId      Int       @map("student_id")
+  classId        Int       @map("class_id")
+  sectionId      Int       @map("section_id")
+  attendanceDate DateTime  @map("attendance_date")
+  status         String    @map("status") // e.g. Present, Absent, Late
+  remark         String?   @map("remark")
+  sessionId      Int       @map("session_id")
+  branchId       Int       @map("branch_id")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  student Student @relation(fields: [studentId], references: [id])
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
+
+  @@index([classId, sectionId, attendanceDate])
+  @@map("attendance")
+}
+
+model StudentCommentary {
+  id        Int       @id @default(autoincrement())
+  studentId Int       @map("student_id")
+  classId   Int       @map("class_id")
+  sectionId Int       @map("section_id")
+  remark    String    @map("remark")
+  sessionId Int       @map("session_id")
+  branchId  Int       @map("branch_id")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  student Student @relation(fields: [studentId], references: [id])
+
+  @@unique([studentId, sessionId])
+  @@map("student_commentary")
+}
+
+model OnlineExam {
+  id          Int                    @id @default(autoincrement())
+  title       String
+  classId     Int                    @map("class_id")
+  subjectId   Int                    @map("subject_id")
+  passingMark Float                  @map("passing_mark") @default(0)
+  duration    Int?                   @map("duration") @default(0) // in minutes, 0 means untimed
+  branchId    Int                    @map("branch_id")
+  sessionId   Int                    @map("session_id")
+  questions   Json?                  @map("questions")
+  createdAt   DateTime               @default(now()) @map("created_at")
+  updatedAt   DateTime?              @updatedAt @map("updated_at")
+  submissions OnlineExamSubmission[]
+
+  class       Class                  @relation(fields: [classId], references: [id])
+  subject     Subject                @relation(fields: [subjectId], references: [id])
+
+  @@index([classId, subjectId])
+  @@map("online_exam")
+}
+
+model OnlineExamSubmission {
+  id           Int        @id @default(autoincrement())
+  studentId    Int        @map("student_id")
+  onlineExamId Int        @map("online_exam_id")
+  totalMark    Float?     @map("total_mark")
+  answers      Json?      @map("answers")
+  startedAt    DateTime?  @map("started_at")
+  submittedAt  DateTime?  @map("submitted_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime?  @updatedAt @map("updated_at")
+
+  student      Student    @relation(fields: [studentId], references: [id])
+  onlineExam   OnlineExam @relation(fields: [onlineExamId], references: [id])
+
+  @@index([studentId, onlineExamId])
+  @@map("online_exam_submission")
+}
+
+model Homework {
+  id          Int                  @id @default(autoincrement())
+  title       String
+  description String?              @db.Text
+  classId     Int                  @map("class_id")
+  subjectId   Int                  @map("subject_id")
+  dueDate     DateTime             @map("due_date")
+  branchId    Int                  @map("branch_id")
+  sessionId   Int                  @map("session_id")
+  questions   Json?                @map("questions")
+  createdAt   DateTime             @default(now()) @map("created_at")
+  updatedAt   DateTime?            @updatedAt @map("updated_at")
+
+  class       Class                @relation(fields: [classId], references: [id])
+  subject     Subject              @relation(fields: [subjectId], references: [id])
+  submissions HomeworkSubmission[]
+
+  @@index([classId, subjectId])
+  @@map("homework")
+}
+
+model HomeworkSubmission {
+  id          Int        @id @default(autoincrement())
+  homeworkId  Int        @map("homework_id")
+  studentId   Int        @map("student_id")
+  answers     Json       @map("answers")
+  score       Float?     @map("score")
+  feedback    String?    @db.Text @map("feedback")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime?  @updatedAt @map("updated_at")
+
+  homework    Homework   @relation(fields: [homeworkId], references: [id], onDelete: Cascade)
+  student     Student    @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId, homeworkId])
+  @@map("homework_submission")
+}
+
+model MontessoriAssessment {
+  id                         Int       @id @default(autoincrement())
+  studentId                  Int       @map("student_id")
+  classId                    Int       @map("class_id")
+  sectionId                  Int       @map("section_id")
+  sessionId                  Int       @map("session_id")
+  examId                     Int       @map("exam_id")
+  branchId                   Int       @map("branch_id")
+
+  // Psychomotor Domain Inputs
+  writingMastery             String?   @map("writing_mastery")
+  drawingCapability          String?   @map("drawing_capability")
+  physicalCoordination       String?   @map("physical_coordination")
+  motorSkillProgression      String?   @map("motor_skill_progression")
+
+  // Behavioral Domain Inputs
+  generalPunctuality         String?   @map("general_punctuality")
+  peerRespect                String?   @map("peer_respect")
+  aestheticNeatness          String?   @map("aesthetic_neatness")
+  activeGroupParticipation   String?   @map("active_group_participation")
+
+  // Narrative Feedback (Max 500 characters)
+  narrativeComment           String?   @db.Text @map("narrative_comment")
+
+  createdAt                  DateTime  @default(now()) @map("created_at")
+  updatedAt                  DateTime? @updatedAt @map("updated_at")
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
+  exam    Exam    @relation(fields: [examId], references: [id])
+
+  @@unique([studentId, examId, sessionId])
+  @@index([classId, sectionId])
+  @@map("montessori_assessments")
 }

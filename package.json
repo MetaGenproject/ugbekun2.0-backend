@@ -7,7 +7,9 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "import:legacy": "node scripts/import-legacy-data.js",
-    "import:legacy:dry": "node scripts/import-legacy-data.js --dry-run"
+    "import:legacy:dry": "node scripts/import-legacy-data.js --dry-run",
+    "repair:branch-admins": "node scripts/repair-branch-admin-legacy-userid.js",
+    "repair:branch-admins:dry": "node scripts/repair-branch-admin-legacy-userid.js --dry-run"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +24,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^9.0.1",
     "pdfkit": "^0.19.1",
     "pg": "^8.21.0",
     "redis": "^5.12.1"
