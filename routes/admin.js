@@ -2042,7 +2042,9 @@ router.post('/online-admissions/:id/status', async (req, res) => {
         where: {
           classId: finalClassId,
           sectionId: finalSectionId,
-          branchId: decoded.branchId,
+          class: {
+            branchId: decoded.branchId
+          }
         }
       })
       if (!allocation) {
@@ -2168,7 +2170,7 @@ router.post('/online-admissions/:id/status', async (req, res) => {
             gender: admission.gender || 'Male',
             birthday: admission.birthday,
             religion: admission.religion,
-            bloodgroup: admission.bloodGroup,
+            bloodGroup: admission.bloodGroup,
             mobileno: admission.mobileNo,
             email: admission.email,
             presentAddress: admission.presentAddress,
