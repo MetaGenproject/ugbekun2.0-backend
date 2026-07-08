@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken')
 const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
-const { getBranchStats, listStaffForBranch, staffMatchesBranch } = require('../lib/branchStats')
+const { getBranchStats, listStaffForBranch, staffMatchesBranch, STAFF_ROLE_LABELS, extractCodePrefix } = require('../lib/branchStats')
 const { generateRegistrationNumber, bindEvaluationMatrix, wipeEvaluationMatrix, generateSecurePassword } = require('../lib/studentService')
 const { sendOnboardingCredentials, sendTeacherOnboardingCredentials } = require('../lib/emailService')
 const { generateCredentialSlipPdf } = require('../lib/pdfService')
@@ -525,6 +525,67 @@ router.post('/subjects/assign', async (req, res) => {
 })
 
 /**
+ * POST /api/admin/subjects/assign-bulk
+ * Bulk link multiple subjects to a class, section, and teachers.
+ */
+router.post('/subjects/assign-bulk', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, assignments } = req.body
+    if (!classId || !sectionId || !Array.isArray(assignments)) {
+      return res.status(400).json({ success: false, message: 'Class, Section, and Assignments are required.' })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    await prisma.$transaction(async (tx) => {
+      for (const item of assignments) {
+        const { subjectId, teacherId } = item
+        if (!subjectId || !teacherId) continue
+
+        // Check if assignment already exists
+        const existing = await tx.subjectAssign.findFirst({
+          where: {
+            classId,
+            sectionId,
+            subjectId,
+            branchId: decoded.branchId,
+            sessionId,
+          },
+        })
+
+        if (existing) {
+          await tx.subjectAssign.update({
+            where: { id: existing.id },
+            data: { teacherId },
+          })
+        } else {
+          await tx.subjectAssign.create({
+            data: {
+              classId,
+              sectionId,
+              subjectId,
+              teacherId,
+              branchId: decoded.branchId,
+              sessionId,
+            },
+          })
+        }
+      }
+    })
+
+    return res.status(201).json({ success: true, message: 'Subjects bulk-assigned successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Bulk assign subjects error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to bulk-assign subjects.' })
+  }
+})
+
+
+/**
  * GET /api/admin/exams
  * Fetch branch exams and mark distributions.
  */
@@ -876,6 +937,294 @@ router.post('/students/onboard', async (req, res) => {
 })
 
 /**
+ * POST /api/admin/students/import-bulk
+ * Bulk onboarding of students via JSON payload parsed from CSV.
+ */
+router.post('/students/import-bulk', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { students } = req.body
+    if (!students || !Array.isArray(students) || students.length === 0) {
+      return res.status(400).json({ success: false, message: 'A non-empty list of students is required.' })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // Fetch branch info
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true, code: true },
+    })
+
+    // Fetch all classes, sections, and allocations in the branch for lookup and validation
+    const dbClasses = await prisma.class.findMany({
+      where: { branchId: decoded.branchId }
+    })
+    const dbSections = await prisma.section.findMany({
+      where: { branchId: decoded.branchId }
+    })
+    const dbAllocations = await prisma.sectionsAllocation.findMany({
+      include: {
+        class: true,
+        section: true
+      }
+    })
+
+    const validationErrors = []
+    
+    // Validate all rows first
+    for (let i = 0; i < students.length; i++) {
+      const row = students[i]
+      const rowNum = i + 1
+
+      if (!row.firstName || !row.firstName.trim()) {
+        validationErrors.push({ row: rowNum, error: 'Student first name is required.' })
+      }
+      if (!row.lastName || !row.lastName.trim()) {
+        validationErrors.push({ row: rowNum, error: 'Student last name is required.' })
+      }
+      if (!row.parentName || !row.parentName.trim()) {
+        validationErrors.push({ row: rowNum, error: 'Parent name is required.' })
+      }
+      if ((!row.parentEmail || !row.parentEmail.trim()) && (!row.parentPhone || !row.parentPhone.trim())) {
+        validationErrors.push({ row: rowNum, error: 'Parent must have either an email or mobile phone number.' })
+      }
+
+      // Check class existence
+      if (!row.className || !row.className.trim()) {
+        validationErrors.push({ row: rowNum, error: 'Class name is required.' })
+      } else {
+        const matchedClass = dbClasses.find(c => c.name.trim().toLowerCase() === row.className.trim().toLowerCase())
+        if (!matchedClass) {
+          validationErrors.push({ row: rowNum, error: `Class '${row.className}' not found in this branch.` })
+        } else {
+          // Check section existence
+          if (!row.sectionName || !row.sectionName.trim()) {
+            validationErrors.push({ row: rowNum, error: 'Section name is required.' })
+          } else {
+            const matchedSection = dbSections.find(s => s.name.trim().toLowerCase() === row.sectionName.trim().toLowerCase())
+            if (!matchedSection) {
+              validationErrors.push({ row: rowNum, error: `Section '${row.sectionName}' not found in this branch.` })
+            } else {
+              // Check allocation
+              const hasAllocation = dbAllocations.some(a => a.classId === matchedClass.id && a.sectionId === matchedSection.id)
+              if (!hasAllocation) {
+                validationErrors.push({ row: rowNum, error: `Section '${row.sectionName}' is not allocated to Class '${row.className}'.` })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ success: false, errors: validationErrors })
+    }
+
+    const results = []
+
+    // Execute bulk registration inside transaction
+    await prisma.$transaction(async (tx) => {
+      // Find initial ID baselines to increment sequentially in memory to prevent key collision
+      const maxUser = await tx.user.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      let nextUserId = maxUser ? maxUser.id + 1 : 1
+
+      const maxParent = await tx.parent.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      let nextParentId = maxParent ? maxParent.id + 1 : 1
+
+      const maxStudent = await tx.student.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      let nextStudentId = maxStudent ? maxStudent.id + 1 : 1
+
+      const maxEnroll = await tx.enroll.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      let nextEnrollId = maxEnroll ? maxEnroll.id + 1 : 1
+
+      for (let i = 0; i < students.length; i++) {
+        const row = students[i]
+        
+        // Resolve matching class/section (already validated)
+        const matchedClass = dbClasses.find(c => c.name.trim().toLowerCase() === row.className.trim().toLowerCase())
+        const matchedSection = dbSections.find(s => s.name.trim().toLowerCase() === row.sectionName.trim().toLowerCase())
+
+        const registerNo = await generateRegistrationNumber(tx, decoded.branchId)
+        const idCardToken = crypto.randomUUID()
+
+        const studentPlainPassword = generateSecurePassword()
+        const parentPlainPassword = generateSecurePassword()
+
+        let parentRecord = null
+        let parentUserId = null
+        let isExistingParent = false
+        let finalParentUsername = null
+
+        // Resolve or create Parent Profile
+        if (row.parentEmail) {
+          parentRecord = await tx.parent.findFirst({
+            where: { email: row.parentEmail, branchId: decoded.branchId },
+          })
+        }
+
+        if (!parentRecord && row.parentPhone) {
+          parentRecord = await tx.parent.findFirst({
+            where: { mobileno: row.parentPhone, branchId: decoded.branchId },
+          })
+        }
+
+        if (parentRecord) {
+          parentUserId = parentRecord.userId
+          isExistingParent = true
+        } else {
+          const baseUsername = row.parentEmail || row.parentPhone
+          const cleanUsername = `${baseUsername.split('@')[0]}_parent`
+
+          let uniqueUsername = cleanUsername
+          let counter = 1
+          while (true) {
+            const userCheck = await tx.user.findUnique({ where: { username: uniqueUsername }, select: { id: true } })
+            if (!userCheck) break
+            uniqueUsername = `${cleanUsername}_${counter++}`
+          }
+
+          finalParentUsername = uniqueUsername
+
+          const hashedParentPassword = await bcrypt.hash(parentPlainPassword, 10)
+          const parentUser = await tx.user.create({
+            data: {
+              id: nextUserId++,
+              username: uniqueUsername,
+              password: hashedParentPassword,
+              role: 6,
+              active: true,
+            },
+          })
+          parentUserId = parentUser.id
+
+          parentRecord = await tx.parent.create({
+            data: {
+              id: nextParentId++,
+              name: row.parentName,
+              relation: row.parentRelation || 'Father',
+              email: row.parentEmail || '',
+              mobileno: row.parentPhone || '',
+              active: true,
+              branchId: decoded.branchId,
+              userId: parentUserId,
+            },
+          })
+        }
+
+        // Create Student User
+        const studentUsername = `${row.firstName.toLowerCase()}.${row.lastName.toLowerCase()}`
+        let uniqueStudentUsername = studentUsername
+        let sCounter = 1
+        while (true) {
+          const userCheck = await tx.user.findUnique({ where: { username: uniqueStudentUsername }, select: { id: true } })
+          if (!userCheck) break
+          uniqueStudentUsername = `${studentUsername}_${sCounter++}`
+        }
+
+        const hashedStudentPassword = await bcrypt.hash(studentPlainPassword, 10)
+        const studentUser = await tx.user.create({
+          data: {
+            id: nextUserId++,
+            username: uniqueStudentUsername,
+            password: hashedStudentPassword,
+            role: 7,
+            active: true,
+          },
+        })
+
+        const studentRecord = await tx.student.create({
+          data: {
+            id: nextStudentId++,
+            registerNo,
+            firstName: row.firstName,
+            lastName: row.lastName,
+            gender: row.gender || 'Male',
+            birthday: row.birthday ? new Date(row.birthday) : null,
+            parentId: parentRecord.id,
+            branchId: decoded.branchId,
+            userId: studentUser.id,
+            idCardToken,
+            idCardStatus: 'active',
+            active: true,
+          },
+        })
+
+        // Create Enroll Record
+        await tx.enroll.create({
+          data: {
+            id: nextEnrollId++,
+            studentId: studentRecord.id,
+            classId: matchedClass.id,
+            sectionId: matchedSection.id,
+            roll: 0,
+            sessionId,
+            branchId: decoded.branchId,
+          },
+        })
+
+        // Bind CA/Exam Evaluation Matrix
+        await bindEvaluationMatrix(tx, {
+          studentId: studentRecord.id,
+          classId: matchedClass.id,
+          sectionId: matchedSection.id,
+          branchId: decoded.branchId,
+          sessionId,
+        })
+
+        results.push({
+          firstName: row.firstName,
+          lastName: row.lastName,
+          registerNo,
+          parentName: row.parentName,
+          parentEmail: row.parentEmail || null,
+          credentials: {
+            student: {
+              username: uniqueStudentUsername,
+              password: studentPlainPassword,
+            },
+            parent: isExistingParent ? null : {
+              username: finalParentUsername,
+              password: parentPlainPassword,
+            }
+          }
+        })
+      }
+    })
+
+    // Post-Transaction: Async email dispatch
+    for (const resItem of results) {
+      if (resItem.parentEmail) {
+        sendOnboardingCredentials({
+          parentEmail: resItem.parentEmail,
+          parentName: resItem.parentName,
+          studentName: `${resItem.firstName} ${resItem.lastName}`,
+          registerNo: resItem.registerNo,
+          studentUsername: resItem.credentials.student.username,
+          studentPassword: resItem.credentials.student.password,
+          parentUsername: resItem.credentials.parent ? resItem.credentials.parent.username : null,
+          parentPassword: resItem.credentials.parent ? resItem.credentials.parent.password : null,
+          isExistingParent: !resItem.credentials.parent,
+          schoolName: branch?.name || 'Your School',
+          branchCode: branch?.code || '',
+          loginUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
+        }).catch(err => {
+          console.warn('[ADMIN] Async bulk onboarding email failed:', err.message)
+        })
+      }
+    }
+
+    return res.status(201).json({ success: true, createdCount: results.length, data: results })
+  } catch (error) {
+    console.error('[ADMIN] Bulk student onboarding error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to complete bulk student onboarding.' })
+  }
+})
+
+/**
  * POST /api/admin/students/:id/promote
  * Student promotion event with historical archiving and matrix wiping.
  */
@@ -950,7 +1299,20 @@ router.post('/teachers/onboard', async (req, res) => {
   if (!decoded) return
 
   try {
-    const { name, email, phone } = req.body
+    const {
+      name,
+      email,
+      phone,
+      role = 3,
+      isClassTeacher,
+      classTeacherClassId,
+      classTeacherSectionId,
+      isSubjectTeacher,
+      subjectTeacherClassId,
+      subjectTeacherSectionId,
+      subjectTeacherSubjectId,
+    } = req.body
+
     if (!name || !email) {
       return res.status(400).json({ success: false, message: 'Name and email are required.' })
     }
@@ -958,6 +1320,11 @@ router.post('/teachers/onboard', async (req, res) => {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
     if (!emailRegex.test(email)) {
       return res.status(400).json({ success: false, message: 'Please enter a valid email address.' })
+    }
+
+    const selectedRole = Number(role) || 3
+    if (![3, 4, 8, 9, 12, 13].includes(selectedRole)) {
+      return res.status(400).json({ success: false, message: 'Invalid staff role.' })
     }
 
     // Fetch branch info for email/PDF context
@@ -973,7 +1340,15 @@ router.post('/teachers/onboard', async (req, res) => {
 
     const result = await prisma.$transaction(async (tx) => {
       // 1. Resolve a unique username
-      const baseUsername = email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '.')
+      const branchCode = branch?.code || ''
+      const prefix = extractCodePrefix(branchCode).toLowerCase()
+      const emailUser = email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '.')
+
+      let baseUsername = emailUser
+      if (selectedRole !== 3 && prefix) {
+        baseUsername = `${prefix}/${emailUser}`
+      }
+
       let uniqueUsername = baseUsername
       let counter = 1
       while (true) {
@@ -989,32 +1364,112 @@ router.post('/teachers/onboard', async (req, res) => {
       const nextUserId = maxUser ? maxUser.id + 1 : 1
       const hashedPassword = await bcrypt.hash(teacherPlainPassword, 10)
 
-      const maxTeacher = await tx.teacher.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
-      const nextTeacherId = maxTeacher ? maxTeacher.id + 1 : 1
-
       const user = await tx.user.create({
         data: {
           id: nextUserId,
           username: uniqueUsername,
           password: hashedPassword,
-          role: 3, // Teacher
-          legacyUserId: nextTeacherId,
+          role: selectedRole,
           active: true,
         },
       })
 
-      // 3. Create Teacher Profile
-      const teacher = await tx.teacher.create({
-        data: {
-          id: nextTeacherId,
-          name,
-          email,
-          phone: phone || null,
-          branchId: decoded.branchId,
-          userId: user.id,
-          active: true,
-        },
-      })
+      let teacher = null
+
+      if (selectedRole === 3) {
+        const maxTeacher = await tx.teacher.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+        const nextTeacherId = maxTeacher ? maxTeacher.id + 1 : 1
+
+        // Update user to link legacyUserId
+        await tx.user.update({
+          where: { id: user.id },
+          data: { legacyUserId: nextTeacherId }
+        })
+
+        // Create Teacher Profile
+        teacher = await tx.teacher.create({
+          data: {
+            id: nextTeacherId,
+            name,
+            email,
+            phone: phone || null,
+            branchId: decoded.branchId,
+            userId: user.id,
+            active: true,
+          },
+        })
+
+        const globalSetting = await tx.globalSettings.findFirst()
+        const sessionId = globalSetting?.sessionId || 5
+
+        // Allocate Form Class Teacher if specified
+        if (isClassTeacher && classTeacherClassId && classTeacherSectionId) {
+          const maxAlloc = await tx.teacherAllocation.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+          const nextAllocId = maxAlloc ? maxAlloc.id + 1 : 1
+
+          const existingClassAlloc = await tx.teacherAllocation.findFirst({
+            where: {
+              classId: Number(classTeacherClassId),
+              sectionId: Number(classTeacherSectionId),
+              sessionId: sessionId,
+              branchId: decoded.branchId,
+            }
+          })
+
+          if (existingClassAlloc) {
+            await tx.teacherAllocation.update({
+              where: { id: existingClassAlloc.id },
+              data: { teacherId: nextTeacherId }
+            })
+          } else {
+            await tx.teacherAllocation.create({
+              data: {
+                id: nextAllocId,
+                classId: Number(classTeacherClassId),
+                sectionId: Number(classTeacherSectionId),
+                sessionId: sessionId,
+                teacherId: nextTeacherId,
+                branchId: decoded.branchId,
+              }
+            })
+          }
+        }
+
+        // Assign Subject if specified
+        if (isSubjectTeacher && subjectTeacherClassId && subjectTeacherSectionId && subjectTeacherSubjectId) {
+          const maxAssign = await tx.subjectAssign.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+          const nextAssignId = maxAssign ? maxAssign.id + 1 : 1
+
+          const existingSubjectAssign = await tx.subjectAssign.findFirst({
+            where: {
+              classId: Number(subjectTeacherClassId),
+              sectionId: Number(subjectTeacherSectionId),
+              subjectId: Number(subjectTeacherSubjectId),
+              branchId: decoded.branchId,
+              sessionId: sessionId,
+            }
+          })
+
+          if (existingSubjectAssign) {
+            await tx.subjectAssign.update({
+              where: { id: existingSubjectAssign.id },
+              data: { teacherId: nextTeacherId }
+            })
+          } else {
+            await tx.subjectAssign.create({
+              data: {
+                id: nextAssignId,
+                classId: Number(subjectTeacherClassId),
+                sectionId: Number(subjectTeacherSectionId),
+                subjectId: Number(subjectTeacherSubjectId),
+                teacherId: nextTeacherId,
+                branchId: decoded.branchId,
+                sessionId: sessionId,
+              }
+            })
+          }
+        }
+      }
 
       return { teacher, user }
     })
@@ -1038,7 +1493,7 @@ router.post('/teachers/onboard', async (req, res) => {
         emailError = emailResult.error
       }
     } catch (err) {
-      console.error('[ADMIN] Teacher onboarding email dispatch error (non-blocking):', err.message)
+      console.error('[ADMIN] Teacher/Staff onboarding email dispatch error (non-blocking):', err.message)
       emailError = err.message
     }
 
@@ -1048,8 +1503,8 @@ router.post('/teachers/onboard', async (req, res) => {
       const pdfBuffer = await generateCredentialSlipPdf({
         schoolName: branch?.name || 'Ugbekun School',
         branchCode: branch?.code || '',
-        studentName: name, // For teacher slip, we put their name in the studentName slot
-        registerNo: 'TEACHER',
+        studentName: name, // For staff/teacher slip, we put their name in the studentName slot
+        registerNo: selectedRole === 3 ? 'TEACHER' : (STAFF_ROLE_LABELS[selectedRole] || 'STAFF').toUpperCase(),
         studentUsername: finalUsername,
         studentPassword: teacherPlainPassword,
         parentName: '',
@@ -1060,7 +1515,7 @@ router.post('/teachers/onboard', async (req, res) => {
       })
       pdfBase64 = pdfBuffer.toString('base64')
     } catch (pdfErr) {
-      console.error('[ADMIN] Failed to generate teacher credential PDF slip:', pdfErr)
+      console.error('[ADMIN] Failed to generate teacher/staff credential PDF slip:', pdfErr)
     }
 
     return res.status(201).json({
@@ -1075,8 +1530,8 @@ router.post('/teachers/onboard', async (req, res) => {
       pdfBase64,
     })
   } catch (error) {
-    console.error('[ADMIN] Teacher onboarding error:', error)
-    return res.status(500).json({ success: false, message: error.message || 'Failed to onboard teacher.' })
+    console.error('[ADMIN] Teacher/Staff onboarding error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to onboard teacher/staff.' })
   }
 })
 
@@ -1168,4 +1623,665 @@ router.delete('/teachers/:id', async (req, res) => {
   }
 })
 
+/**
+ * GET /api/admin/sibling-requests
+ * Fetch all sibling requests submitted by parents for review.
+ */
+router.get('/sibling-requests', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const requests = await prisma.parentSiblingRequest.findMany({
+      where: { branchId: decoded.branchId },
+      include: {
+        parent: { select: { name: true, email: true, mobileno: true } },
+        class: { select: { name: true } },
+        section: { select: { name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    const formatted = requests.map(r => ({
+      id: r.id,
+      parentId: r.parentId,
+      parentName: r.parent.name,
+      parentEmail: r.parent.email,
+      parentPhone: r.parent.mobileno,
+      firstName: r.firstName,
+      lastName: r.lastName,
+      gender: r.gender,
+      birthday: r.birthday,
+      status: r.status,
+      rejectionReason: r.rejectionReason,
+      className: r.class.name,
+      sectionName: r.section.name,
+      createdAt: r.createdAt,
+    }))
+
+    return res.json({ success: true, siblingRequests: formatted })
+  } catch (error) {
+    console.error('[ADMIN] Get sibling requests error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to load sibling requests.' })
+  }
+})
+
+/**
+ * POST /api/admin/sibling-requests/:id/approve
+ * Approve a sibling request, create the student user, student profile, enroll record,
+ * and bind evaluation matrix in an ACID transaction, then notify parent.
+ */
+router.post('/sibling-requests/:id/approve', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const requestId = parseInt(req.params.id, 10)
+    if (isNaN(requestId)) {
+      return res.status(400).json({ success: false, message: 'Invalid Request ID.' })
+    }
+
+    const request = await prisma.parentSiblingRequest.findFirst({
+      where: { id: requestId, branchId: decoded.branchId },
+      include: {
+        parent: true,
+        branch: true,
+      },
+    })
+
+    if (!request) {
+      return res.status(404).json({ success: false, message: 'Sibling request not found.' })
+    }
+
+    if (request.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Request is already ${request.status}.` })
+    }
+
+    const { firstName, lastName, gender, birthday, classId, sectionId, parentId } = request
+    const parentEmail = request.parent.email
+    const parentName = request.parent.name
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    const registerNo = await generateRegistrationNumber(prisma, decoded.branchId)
+    const idCardToken = crypto.randomUUID()
+    const studentPlainPassword = generateSecurePassword()
+
+    let finalStudentUsername = null
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Generate unique student username
+      const studentUsername = `${firstName.toLowerCase()}.${lastName.toLowerCase()}`
+      let uniqueStudentUsername = studentUsername
+      let sCounter = 1
+      while (true) {
+        const userCheck = await tx.user.findUnique({ where: { username: uniqueStudentUsername }, select: { id: true } })
+        if (!userCheck) break
+        uniqueStudentUsername = `${studentUsername}_${sCounter++}`
+      }
+      finalStudentUsername = uniqueStudentUsername
+
+      // 2. Create Student User
+      const maxUser = await tx.user.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      const nextStudentUserId = maxUser ? maxUser.id + 1 : 1
+      const hashedStudentPassword = await bcrypt.hash(studentPlainPassword, 10)
+
+      const studentUser = await tx.user.create({
+        data: {
+          id: nextStudentUserId,
+          username: finalStudentUsername,
+          password: hashedStudentPassword,
+          role: 7,
+          active: true,
+        },
+      })
+
+      // 3. Create Student Profile
+      const maxStudent = await tx.student.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      const nextStudentId = maxStudent ? maxStudent.id + 1 : 1
+
+      const studentRecord = await tx.student.create({
+        data: {
+          id: nextStudentId,
+          registerNo,
+          firstName,
+          lastName,
+          gender: gender || 'Male',
+          birthday,
+          parentId,
+          branchId: decoded.branchId,
+          userId: studentUser.id,
+          idCardToken,
+          idCardStatus: 'active',
+          active: true,
+        },
+      })
+
+      // 4. Create Enroll Record
+      const maxEnroll = await tx.enroll.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+      const nextEnrollId = maxEnroll ? maxEnroll.id + 1 : 1
+
+      await tx.enroll.create({
+        data: {
+          id: nextEnrollId,
+          studentId: studentRecord.id,
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          roll: 0,
+          sessionId,
+          branchId: decoded.branchId,
+        },
+      })
+
+      // 5. Bind CA/Exam Evaluation Matrix
+      await bindEvaluationMatrix(tx, {
+        studentId: studentRecord.id,
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        branchId: decoded.branchId,
+        sessionId,
+      })
+
+      // 6. Update Sibling Request status
+      await tx.parentSiblingRequest.update({
+        where: { id: requestId },
+        data: { status: 'approved' },
+      })
+    })
+
+    // ── Post-Transaction Email Dispatch ────────────────
+    let emailSent = false
+    if (parentEmail) {
+      try {
+        const emailResult = await sendOnboardingCredentials({
+          parentEmail,
+          parentName,
+          studentName: `${firstName} ${lastName}`,
+          registerNo,
+          studentUsername: finalStudentUsername,
+          studentPassword: studentPlainPassword,
+          parentUsername: null,
+          parentPassword: null,
+          isExistingParent: true,
+          schoolName: request.branch?.name || 'Your School',
+          branchCode: request.branch?.code || '',
+          loginUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
+        })
+        emailSent = emailResult.success
+      } catch (err) {
+        console.warn('[ADMIN] Sibling onboarding email failed:', err)
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: 'Sibling request approved and student registered successfully.',
+      emailSent,
+      credentials: {
+        student: {
+          username: finalStudentUsername,
+          password: studentPlainPassword,
+        },
+      },
+    })
+  } catch (error) {
+    console.error('[ADMIN] Approve sibling request error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to approve sibling request.' })
+  }
+})
+
+/**
+ * POST /api/admin/sibling-requests/:id/reject
+ * Reject a sibling request with a reason.
+ */
+router.post('/sibling-requests/:id/reject', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const requestId = parseInt(req.params.id, 10)
+    const { reason } = req.body || {}
+
+    if (isNaN(requestId)) {
+      return res.status(400).json({ success: false, message: 'Invalid Request ID.' })
+    }
+
+    const request = await prisma.parentSiblingRequest.findFirst({
+      where: { id: requestId, branchId: decoded.branchId },
+    })
+
+    if (!request) {
+      return res.status(404).json({ success: false, message: 'Sibling request not found.' })
+    }
+
+    if (request.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Request is already ${request.status}.` })
+    }
+
+    await prisma.parentSiblingRequest.update({
+      where: { id: requestId },
+      data: {
+        status: 'rejected',
+        rejectionReason: reason || 'Not specified',
+      },
+    })
+
+    return res.json({ success: true, message: 'Sibling request rejected successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Reject sibling request error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to reject sibling request.' })
+  }
+})
+
+/**
+ * GET /api/admin/classroom-students
+ * Fetch all students allocated to a specific classroom (class & section) for the current active session.
+ */
+router.get('/classroom-students', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId } = req.query
+    if (!classId || !sectionId) {
+      return res.json({
+        success: true,
+        students: [],
+        formTeacher: null,
+        stats: { total: 0, male: 0, female: 0 }
+      })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // Fetch enroll records for this classroom
+    const enrollments = await prisma.enroll.findMany({
+      where: {
+        branchId: decoded.branchId,
+        sessionId: sessionId,
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        isAlumni: 0,
+      },
+      include: {
+        student: {
+          include: {
+            parent: true,
+          },
+        },
+      },
+      orderBy: {
+        student: {
+          lastName: 'asc',
+        },
+      },
+    })
+
+    // Fetch Form Teacher Allocation
+    const formTeacherAllocation = await prisma.teacherAllocation.findFirst({
+      where: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId: sessionId,
+        branchId: decoded.branchId,
+      },
+      include: {
+        teacher: true,
+      },
+    })
+
+    const students = enrollments.map(e => ({
+      id: e.student.id,
+      registerNo: e.student.registerNo,
+      firstName: e.student.firstName,
+      lastName: e.student.lastName,
+      gender: e.student.gender,
+      mobileno: e.student.mobileno,
+      email: e.student.email,
+      parentName: e.student.parent?.name || null,
+      parentRelation: e.student.parent?.relation || null,
+      parentMobile: e.student.parent?.mobileno || null,
+      parentEmail: e.student.parent?.email || null,
+    }))
+
+    const total = students.length
+    const male = students.filter(s => s.gender?.toLowerCase() === 'male').length
+    const female = total - male
+
+    return res.json({
+      success: true,
+      students,
+      formTeacher: formTeacherAllocation?.teacher?.name || 'Unassigned',
+      stats: { total, male, female }
+    })
+  } catch (error) {
+    console.error('[ADMIN] Get classroom students error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to load classroom students.' })
+  }
+})
+
+/**
+ * GET /api/admin/online-admissions
+ * Fetch all online admissions for the branch, optional status filter.
+ */
+router.get('/online-admissions', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { status } = req.query
+    const where = { branchId: decoded.branchId }
+
+    if (status !== undefined && status !== '') {
+      where.status = parseInt(status, 10)
+    }
+
+    const admissions = await prisma.onlineAdmission.findMany({
+      where,
+      orderBy: {
+        applyDate: 'desc'
+      }
+    })
+
+    return res.json({ success: true, admissions })
+  } catch (error) {
+    console.error('[ADMIN] Get online admissions error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch online admissions.' })
+  }
+})
+
+/**
+ * POST /api/admin/online-admissions/:id/status
+ * Update the status of an online admission (Pending, Screening, Approved, Rejected).
+ * If approved, onboards the student and parent.
+ */
+router.post('/online-admissions/:id/status', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const admissionId = parseInt(req.params.id, 10)
+    if (isNaN(admissionId)) {
+      return res.status(400).json({ success: false, message: 'Invalid Admission ID.' })
+    }
+
+    const { status, rejectionReason, reviewNotes, classId, sectionId } = req.body
+    if (status === undefined) {
+      return res.status(400).json({ success: false, message: 'Status is required.' })
+    }
+
+    const admission = await prisma.onlineAdmission.findFirst({
+      where: { id: admissionId, branchId: decoded.branchId },
+      include: { branch: true }
+    })
+
+    if (!admission) {
+      return res.status(404).json({ success: false, message: 'Online admission record not found.' })
+    }
+
+    const targetStatus = parseInt(status, 10)
+
+    // If status is Approved (3)
+    if (targetStatus === 3) {
+      if (admission.status === 3) {
+        return res.status(400).json({ success: false, message: 'Admission has already been approved.' })
+      }
+
+      // Check if classId and sectionId are provided or use the ones from the request
+      const finalClassId = classId ? Number(classId) : admission.classId
+      const finalSectionId = sectionId ? Number(sectionId) : (admission.sectionId ? Number(admission.sectionId) : null)
+
+      if (!finalClassId || !finalSectionId) {
+        return res.status(400).json({ success: false, message: 'Class and section are required to approve admission.' })
+      }
+
+      // Verify class-section allocation exists
+      const allocation = await prisma.sectionsAllocation.findFirst({
+        where: {
+          classId: finalClassId,
+          sectionId: finalSectionId,
+          branchId: decoded.branchId,
+        }
+      })
+      if (!allocation) {
+        return res.status(400).json({ success: false, message: 'Selected Class and Section are not allocated together in this branch.' })
+      }
+
+      const globalSetting = await prisma.globalSettings.findFirst()
+      const sessionId = globalSetting?.sessionId || 5
+
+      const registerNo = await generateRegistrationNumber(prisma, decoded.branchId)
+      const idCardToken = crypto.randomUUID()
+      const studentPlainPassword = generateSecurePassword()
+      const parentPlainPassword = generateSecurePassword()
+
+      let isExistingParent = false
+      let finalParentUsername = null
+      let finalStudentUsername = null
+      let parentRecord = null
+
+      const parentEmail = admission.grdEmail
+      const parentPhone = admission.grdMobileNo
+      const parentName = admission.guardianName || `${admission.firstName}'s Guardian`
+      const parentRelation = admission.guardianRelation || 'Father'
+
+      await prisma.$transaction(async (tx) => {
+        // 1. Resolve or Create Parent
+        if (parentEmail) {
+          parentRecord = await tx.parent.findFirst({
+            where: { email: parentEmail, branchId: decoded.branchId },
+          })
+        }
+
+        if (!parentRecord && parentPhone) {
+          parentRecord = await tx.parent.findFirst({
+            where: { mobileno: parentPhone, branchId: decoded.branchId },
+          })
+        }
+
+        let parentUserId = null
+        if (parentRecord) {
+          parentUserId = parentRecord.userId
+          isExistingParent = true
+        } else {
+          const baseUsername = parentEmail || parentPhone || `${admission.firstName.toLowerCase()}.${admission.lastName?.toLowerCase() || 'parent'}`
+          const cleanUsername = `${baseUsername.split('@')[0]}_parent`
+
+          let uniqueUsername = cleanUsername
+          let counter = 1
+          while (true) {
+            const userCheck = await tx.user.findUnique({ where: { username: uniqueUsername }, select: { id: true } })
+            if (!userCheck) break
+            uniqueUsername = `${cleanUsername}_${counter++}`
+          }
+
+          finalParentUsername = uniqueUsername
+
+          const maxUser = await tx.user.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+          const nextUserId = maxUser ? maxUser.id + 1 : 1
+
+          const hashedParentPassword = await bcrypt.hash(parentPlainPassword, 10)
+          const parentUser = await tx.user.create({
+            data: {
+              id: nextUserId,
+              username: finalParentUsername,
+              password: hashedParentPassword,
+              role: 6,
+              active: true,
+            },
+          })
+
+          const maxParent = await tx.parent.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+          const nextParentId = maxParent ? maxParent.id + 1 : 1
+
+          parentRecord = await tx.parent.create({
+            data: {
+              id: nextParentId,
+              name: parentName,
+              relation: parentRelation,
+              email: parentEmail,
+              mobileno: parentPhone,
+              branchId: decoded.branchId,
+              userId: parentUser.id,
+            },
+          })
+        }
+
+        // 2. Generate Student Username
+        const studentUsername = `${admission.firstName.toLowerCase()}.${(admission.lastName || 'student').toLowerCase()}`
+        let uniqueStudentUsername = studentUsername
+        let sCounter = 1
+        while (true) {
+          const userCheck = await tx.user.findUnique({ where: { username: uniqueStudentUsername }, select: { id: true } })
+          if (!userCheck) break
+          uniqueStudentUsername = `${studentUsername}_${sCounter++}`
+        }
+        finalStudentUsername = uniqueStudentUsername
+
+        // 3. Create Student User
+        const maxUser = await tx.user.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+        const nextStudentUserId = maxUser ? maxUser.id + 1 : 1
+        const hashedStudentPassword = await bcrypt.hash(studentPlainPassword, 10)
+
+        const studentUser = await tx.user.create({
+          data: {
+            id: nextStudentUserId,
+            username: finalStudentUsername,
+            password: hashedStudentPassword,
+            role: 7,
+            active: true,
+          },
+        })
+
+        // 4. Create Student Profile
+        const maxStudent = await tx.student.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+        const nextStudentId = maxStudent ? maxStudent.id + 1 : 1
+
+        const studentRecord = await tx.student.create({
+          data: {
+            id: nextStudentId,
+            registerNo,
+            firstName: admission.firstName,
+            lastName: admission.lastName || '',
+            gender: admission.gender || 'Male',
+            birthday: admission.birthday,
+            religion: admission.religion,
+            bloodgroup: admission.bloodGroup,
+            mobileno: admission.mobileNo,
+            email: admission.email,
+            presentAddress: admission.presentAddress,
+            permanentAddress: admission.permanentAddress,
+            parentId: parentRecord.id,
+            branchId: decoded.branchId,
+            userId: studentUser.id,
+            idCardToken,
+            idCardStatus: 'active',
+            active: true,
+          },
+        })
+
+        // 5. Create Enroll Record
+        const maxEnroll = await tx.enroll.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+        const nextEnrollId = maxEnroll ? maxEnroll.id + 1 : 1
+
+        await tx.enroll.create({
+          data: {
+            id: nextEnrollId,
+            studentId: studentRecord.id,
+            classId: finalClassId,
+            sectionId: finalSectionId,
+            roll: 0,
+            sessionId,
+            branchId: decoded.branchId,
+          },
+        })
+
+        // 6. Bind CA/Exam Evaluation Matrix
+        await bindEvaluationMatrix(tx, {
+          studentId: studentRecord.id,
+          classId: finalClassId,
+          sectionId: finalSectionId,
+          branchId: decoded.branchId,
+          sessionId,
+        })
+
+        // 7. Update Online Admission Status
+        await tx.onlineAdmission.update({
+          where: { id: admissionId },
+          data: { status: 3 }
+        })
+      })
+
+      // Send Email Notification
+      let emailSent = false
+      if (parentEmail) {
+        try {
+          const emailResult = await sendOnboardingCredentials({
+            parentEmail,
+            parentName,
+            studentName: `${admission.firstName} ${admission.lastName || ''}`,
+            registerNo,
+            studentUsername: finalStudentUsername,
+            studentPassword: studentPlainPassword,
+            parentUsername: isExistingParent ? null : finalParentUsername,
+            parentPassword: isExistingParent ? null : parentPlainPassword,
+            isExistingParent,
+            schoolName: admission.branch?.name || 'Your School',
+            branchCode: admission.branch?.code || '',
+            loginUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
+          })
+          emailSent = emailResult.success
+        } catch (err) {
+          console.warn('[ADMIN] Online admission onboarding email failed:', err)
+        }
+      }
+
+      return res.json({
+        success: true,
+        message: 'Online admission approved and student registered successfully.',
+        emailSent,
+        credentials: {
+          student: {
+            username: finalStudentUsername,
+            password: studentPlainPassword,
+          },
+          parent: isExistingParent ? null : {
+            username: finalParentUsername,
+            password: parentPlainPassword,
+          }
+        }
+      })
+    }
+
+    // Otherwise, handle Rejected (0), Screening (2), or reset to Pending (1)
+    const updateData = { status: targetStatus }
+    if (targetStatus === 0) {
+      updateData.rejectionReason = rejectionReason || 'Application does not meet requirements.'
+    } else if (targetStatus === 2) {
+      if (reviewNotes !== undefined) {
+        updateData.reviewNotes = reviewNotes
+      }
+    }
+
+    await prisma.onlineAdmission.update({
+      where: { id: admissionId },
+      data: updateData
+    })
+
+    const statusNames = { 0: 'rejected', 1: 'pending', 2: 'screening' }
+
+    return res.json({
+      success: true,
+      message: `Online admission status updated to ${statusNames[targetStatus] || 'unknown'} successfully.`
+    })
+
+  } catch (error) {
+    console.error('[ADMIN] Update online admission status error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update online admission status.' })
+  }
+})
+
 module.exports = router
+

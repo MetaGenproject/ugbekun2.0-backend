@@ -853,4 +853,123 @@ router.get('/child/:studentId/export-pdf', assertChildLinked, async (req, res) =
   }
 })
 
+/**
+ * GET /api/parent/classes-sections
+ * Retrieve classes and sections for sibling enrollment form.
+ */
+router.get('/classes-sections', async (req, res) => {
+  try {
+    const classes = await prisma.class.findMany({
+      where: { branchId: req.branchId },
+      include: {
+        sections: {
+          include: {
+            section: true,
+          },
+        },
+      },
+      orderBy: { name: 'asc' },
+    })
+
+    return res.json({ success: true, classes })
+  } catch (error) {
+    console.error('[PARENT] Get classes-sections error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to load classes and sections.' })
+  }
+})
+
+/**
+ * GET /api/parent/sibling-requests
+ * Retrieve list of sibling requests submitted by this parent.
+ */
+router.get('/sibling-requests', async (req, res) => {
+  try {
+    const requests = await prisma.parentSiblingRequest.findMany({
+      where: { parentId: req.parentId, branchId: req.branchId },
+      include: {
+        class: { select: { name: true } },
+        section: { select: { name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    const formatted = requests.map(r => ({
+      id: r.id,
+      firstName: r.firstName,
+      lastName: r.lastName,
+      gender: r.gender,
+      birthday: r.birthday,
+      status: r.status,
+      rejectionReason: r.rejectionReason,
+      className: r.class.name,
+      sectionName: r.section.name,
+      createdAt: r.createdAt,
+    }))
+
+    return res.json({ success: true, siblingRequests: formatted })
+  } catch (error) {
+    console.error('[PARENT] Get sibling requests error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to load sibling requests.' })
+  }
+})
+
+/**
+ * POST /api/parent/sibling-requests
+ * Submit a new sibling request for approval.
+ */
+router.post('/sibling-requests', async (req, res) => {
+  try {
+    const { firstName, lastName, gender, birthday, classId, sectionId } = req.body || {}
+
+    if (!firstName || !lastName || !gender || !classId || !sectionId) {
+      return res.status(400).json({ success: false, message: 'First name, last name, gender, class, and section are required.' })
+    }
+
+    const cls = await prisma.class.findFirst({
+      where: { id: Number(classId), branchId: req.branchId },
+    })
+    const sec = await prisma.section.findFirst({
+      where: { id: Number(sectionId), branchId: req.branchId },
+    })
+
+    if (!cls || !sec) {
+      return res.status(400).json({ success: false, message: 'Invalid class or section selected.' })
+    }
+
+    const duplicate = await prisma.parentSiblingRequest.findFirst({
+      where: {
+        parentId: req.parentId,
+        branchId: req.branchId,
+        firstName: { equals: firstName.trim(), mode: 'insensitive' },
+        lastName: { equals: lastName.trim(), mode: 'insensitive' },
+        status: { in: ['pending', 'approved'] },
+      },
+    })
+
+    if (duplicate) {
+      return res.status(400).json({ success: false, message: 'A request for this child has already been submitted.' })
+    }
+
+    const siblingRequest = await prisma.parentSiblingRequest.create({
+      data: {
+        parentId: req.parentId,
+        branchId: req.branchId,
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
+        gender,
+        birthday: birthday ? new Date(birthday) : null,
+        status: 'pending',
+      },
+    })
+
+    return res.status(201).json({ success: true, message: 'Sibling request submitted successfully.', siblingRequest })
+  } catch (error) {
+    console.error('[PARENT] Create sibling request error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to submit sibling request.' })
+  }
+})
+
 module.exports = router
+

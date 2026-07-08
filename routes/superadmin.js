@@ -9,6 +9,7 @@ const { uploadBase64Image } = require('../lib/cloudinary')
 const { getBranchStatsMap } = require('../lib/branchStats')
 const { BRANCH_SELECT, branchesToCsv, buildBranchesPdf } = require('../lib/branchExport')
 const { deleteBranchCascade } = require('../lib/branchDelete')
+const { sendGracePeriodExtensionEmail } = require('../lib/emailService')
 
 const {
   DEFAULT_PLANS,
@@ -851,6 +852,135 @@ router.post('/branches/:id/renew-subscription', async (req, res) => {
     return res.status(500).json({
       success: false,
       message: error?.message || 'Failed to renew subscription.',
+    })
+  }
+})
+
+/**
+ * POST /api/superadmin/branches/:id/extend-subscription
+ * Extend branch subscription by a specified number of days (1 to 30) as a grace period.
+ */
+router.post('/branches/:id/extend-subscription', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  const branchId = parseBranchId(req, res)
+  if (!branchId) return
+
+  try {
+    const { days, reason } = req.body || {}
+    
+    // Validate days: Must be between 1 and 30
+    const extensionDays = parseInt(days, 10)
+    if (isNaN(extensionDays) || extensionDays < 1 || extensionDays > 30) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid extension days. Must be an integer between 1 and 30.',
+      })
+    }
+
+    // Verify branch exists and fetch details for email notification
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { id: true, name: true, email: true },
+    })
+
+    if (!branch) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' })
+    }
+
+    // Get latest paid subscription to check expiration date
+    const latestSub = await prisma.branchSubscription.findFirst({
+      where: { branchId, paymentStatus: 'paid' },
+      orderBy: { expiryDate: 'desc' },
+    })
+
+    const now = new Date()
+    let startDate = now
+    // If latest subscription expiry date is in the future, append extension directly to it
+    if (latestSub && latestSub.expiryDate > now) {
+      startDate = new Date(latestSub.expiryDate)
+    }
+
+    // Add specified number of days to the start date
+    const expiryDate = new Date(startDate)
+    expiryDate.setDate(expiryDate.getDate() + extensionDays)
+
+    // Resolve planId to copy from latest sub or find a default active plan
+    let planId = latestSub ? latestSub.planId : null
+    if (!planId) {
+      const defaultPlan = await prisma.subscriptionPlan.findFirst({
+        where: { active: true },
+        orderBy: { id: 'asc' },
+      })
+      if (!defaultPlan) {
+        return res.status(400).json({
+          success: false,
+          message: 'No active subscription plans found to link the extension.',
+        })
+      }
+      planId = defaultPlan.id
+    }
+
+    const subscription = await prisma.$transaction(async (tx) => {
+      const sub = await tx.branchSubscription.create({
+        data: {
+          branchId,
+          planId,
+          startDate,
+          expiryDate,
+          totalCost: 0.00, // Grace periods are free of charge
+          paymentStatus: 'paid', // Mark as paid to activate access
+          termsAccepted: true,
+          message: reason || `Grace period extension: ${extensionDays} day(s).`,
+        },
+        include: { plan: true },
+      })
+
+      // Always activate the branch
+      await tx.branch.update({
+        where: { id: branchId },
+        data: { active: true },
+      })
+
+      // Also active corresponding user credentials
+      await tx.user.updateMany({
+        where: { role: 2, legacyUserId: branchId },
+        data: { active: true },
+      })
+
+      return sub
+    })
+
+    // Post-transaction: Fire-and-forget email notification to branch admin
+    if (branch.email) {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+      const formattedExpiry = `${String(expiryDate.getDate()).padStart(2, '0')}-${months[expiryDate.getMonth()]}-${expiryDate.getFullYear()}`
+
+      const loginUrl = process.env.NEXT_PUBLIC_LOGIN_URL || 'http://localhost:3000/login'
+
+      sendGracePeriodExtensionEmail({
+        adminEmail: branch.email,
+        schoolName: branch.name,
+        days: extensionDays,
+        newExpiryDate: formattedExpiry,
+        reason: reason || 'Granted by super administrator.',
+        loginUrl,
+      }).catch((err) => {
+        console.error('[SUPERADMIN] Failed to send grace period extension email:', err)
+      })
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: `Subscription extended successfully by ${extensionDays} days. New Expiry: ${expiryDate.toISOString().slice(0, 10)}`,
+      data: subscription,
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] POST extend subscription error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to extend subscription.',
     })
   }
 })

@@ -53,6 +53,7 @@ model Branch {
   classes  Class[]
   sections Section[]
   subjects Subject[]
+  siblingRequests ParentSiblingRequest[]
 
   @@map("branches")
 }
@@ -169,6 +170,7 @@ model Parent {
 
   userId Int?  @unique
   user   User? @relation("UserParent", fields: [userId], references: [id])
+  siblingRequests ParentSiblingRequest[]
 
   @@map("parents")
 }
@@ -374,6 +376,8 @@ model OnlineAdmission {
   grdState              String?
   grdPhoto              String?
   status                Int       @default(1)
+  rejectionReason       String?   @db.Text
+  reviewNotes           String?   @db.Text
   paymentStatus         Int       @default(0)
   paymentAmount         Decimal   @default(0) @db.Decimal(18, 2)
   paymentDetails        String    @default("") @db.Text
@@ -503,6 +507,7 @@ model Class {
   onlineExams        OnlineExam[]
   homeworks          Homework[]
   montessoriAssessments MontessoriAssessment[]
+  siblingRequests ParentSiblingRequest[]
 
   @@index([branchId])
   @@map("class")
@@ -521,6 +526,7 @@ model Section {
   attendances        Attendance[]
   teacherAllocations TeacherAllocation[]
   montessoriAssessments MontessoriAssessment[]
+  siblingRequests ParentSiblingRequest[]
 
   @@index([branchId])
   @@map("section")
@@ -816,4 +822,29 @@ model MontessoriAssessment {
   @@unique([studentId, examId, sessionId])
   @@index([classId, sectionId])
   @@map("montessori_assessments")
+}
+
+model ParentSiblingRequest {
+  id              Int       @id @default(autoincrement())
+  parentId        Int       @map("parent_id")
+  branchId        Int       @map("branch_id")
+  classId         Int       @map("class_id")
+  sectionId       Int       @map("section_id")
+  firstName       String    @map("first_name")
+  lastName        String    @map("last_name")
+  gender          String
+  birthday        DateTime?
+  status          String    @default("pending") // "pending", "approved", "rejected"
+  rejectionReason String?   @map("rejection_reason") @db.Text
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  parent  Parent  @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id])
+  class   Class   @relation(fields: [classId], references: [id])
+  section Section @relation(fields: [sectionId], references: [id])
+
+  @@index([parentId])
+  @@index([branchId])
+  @@map("parent_sibling_requests")
 }
