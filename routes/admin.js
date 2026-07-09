@@ -6,7 +6,26 @@ const { Pool } = require('pg')
 const { getBranchStats, listStaffForBranch, staffMatchesBranch, STAFF_ROLE_LABELS, extractCodePrefix } = require('../lib/branchStats')
 const { generateRegistrationNumber, bindEvaluationMatrix, wipeEvaluationMatrix, generateSecurePassword } = require('../lib/studentService')
 const { sendOnboardingCredentials, sendTeacherOnboardingCredentials } = require('../lib/emailService')
-const { generateCredentialSlipPdf } = require('../lib/pdfService')
+const {
+  generateCredentialSlipPdf,
+  generateStudentIdCardPdf,
+  generateStaffIdCardPdf,
+  generateCertificatePdf
+} = require('../lib/pdfService')
+const {
+  provisionStudentIdCard,
+  provisionStaffIdCard,
+  provisionCertificate,
+  revokeIdCard,
+  batchProvisionStudentIdCards
+} = require('../lib/idCardService')
+const {
+  generateInvoice,
+  recordPayment,
+  getFinancialOverview,
+  exportFinancialReportCsv,
+  exportFinancialReportPdf
+} = require('../lib/accountingService')
 const bcrypt = require('bcryptjs')
 const crypto = require('crypto')
 
@@ -2285,5 +2304,782 @@ router.post('/online-admissions/:id/status', async (req, res) => {
   }
 })
 
-module.exports = router
+// ─────────────────────────────────────────────────────────────────────────────
+// CREDENTIAL GENERATION & PROVISIONING ENDPOINTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/admin/id-cards/provision/student/:studentId
+ */
+router.post('/id-cards/provision/student/:studentId', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const studentId = parseInt(req.params.studentId, 10);
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const card = await provisionStudentIdCard(prisma, {
+      studentId,
+      branchId: decoded.branchId,
+      sessionId
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Student ID card provisioned successfully.',
+      card
+    });
+  } catch (error) {
+    console.error('[ADMIN] Student ID provisioning error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to provision ID card.' });
+  }
+});
+
+/**
+ * POST /api/admin/id-cards/provision/staff/:userId
+ */
+router.post('/id-cards/provision/staff/:userId', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const userId = parseInt(req.params.userId, 10);
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const card = await provisionStaffIdCard(prisma, {
+      userId,
+      branchId: decoded.branchId,
+      sessionId
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Staff ID card provisioned successfully.',
+      card
+    });
+  } catch (error) {
+    console.error('[ADMIN] Staff ID provisioning error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to provision ID card.' });
+  }
+});
+
+/**
+ * POST /api/admin/id-cards/provision/batch
+ */
+router.post('/id-cards/provision/batch', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, sectionId } = req.body;
+    if (!classId || !sectionId) {
+      return res.status(400).json({ success: false, message: 'Class ID and Section ID are required.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const results = await batchProvisionStudentIdCards(prisma, {
+      classId: parseInt(classId, 10),
+      sectionId: parseInt(sectionId, 10),
+      branchId: decoded.branchId,
+      sessionId
+    });
+
+    const successCount = results.filter(r => r.success).length;
+
+    return res.status(201).json({
+      success: true,
+      message: `Batch ID provisioning completed: ${successCount} successful, ${results.length - successCount} failed.`,
+      results
+    });
+  } catch (error) {
+    console.error('[ADMIN] Batch ID provisioning error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to run batch ID provisioning.' });
+  }
+});
+
+/**
+ * GET /api/admin/id-cards
+ */
+router.get('/id-cards', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { entityType, status, page = 1, limit = 20, search } = req.query;
+    const p = parseInt(page, 10);
+    const l = parseInt(limit, 10);
+    const skip = (p - 1) * l;
+
+    const where = {
+      branchId: decoded.branchId
+    };
+
+    if (entityType) where.entityType = entityType;
+    if (status) where.status = status;
+
+    if (search) {
+      where.OR = [
+        { cardNumber: { contains: search, mode: 'insensitive' } },
+        {
+          student: {
+            OR: [
+              { firstName: { contains: search, mode: 'insensitive' } },
+              { lastName: { contains: search, mode: 'insensitive' } }
+            ]
+          }
+        },
+        {
+          user: {
+            username: { contains: search, mode: 'insensitive' }
+          }
+        }
+      ];
+    }
+
+    const [cards, total] = await Promise.all([
+      prisma.idCard.findMany({
+        where,
+        include: {
+          student: {
+            select: {
+              firstName: true,
+              lastName: true,
+              registerNo: true,
+              photo: true
+            }
+          },
+          user: {
+            select: {
+              username: true,
+              role: true
+            }
+          }
+        },
+        orderBy: { issuedAt: 'desc' },
+        skip,
+        take: l
+      }),
+      prisma.idCard.count({ where })
+    ]);
+
+    const mappedCards = cards.map(c => {
+      let name = 'Unknown';
+      let photo = null;
+      let role = 'Staff';
+
+      if (c.entityType === 'student' && c.student) {
+        name = `${c.student.firstName} ${c.student.lastName}`;
+        photo = c.student.photo;
+        role = 'Student';
+      } else if (c.entityType === 'staff' && c.user) {
+        name = c.user.username;
+        const roles = { 3: 'Teacher', 4: 'Accountant', 8: 'Receptionist', 9: 'Proprietor', 12: 'Librarian', 13: 'Staff' };
+        role = roles[c.user.role] || 'Staff';
+      }
+
+      return {
+        id: c.id,
+        entityType: c.entityType,
+        cardNumber: c.cardNumber,
+        verifyToken: c.verifyToken,
+        status: c.status,
+        issuedAt: c.issuedAt,
+        expiresAt: c.expiresAt,
+        revokedAt: c.revokedAt,
+        revokedReason: c.revokedReason,
+        name,
+        photo,
+        role
+      };
+    });
+
+    return res.json({
+      success: true,
+      data: mappedCards,
+      pagination: {
+        page: p,
+        limit: l,
+        total,
+        totalPages: Math.ceil(total / l)
+      }
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get ID cards error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve ID cards list.' });
+  }
+});
+
+/**
+ * PUT /api/admin/id-cards/:cardId/revoke
+ */
+router.put('/id-cards/:cardId/revoke', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const cardId = parseInt(req.params.cardId, 10);
+    const { reason } = req.body;
+
+    const card = await prisma.idCard.findFirst({
+      where: { id: cardId, branchId: decoded.branchId }
+    });
+
+    if (!card) {
+      return res.status(404).json({ success: false, message: 'ID card not found.' });
+    }
+
+    const updated = await revokeIdCard(prisma, cardId, reason || 'Administrative revocation');
+
+    return res.json({
+      success: true,
+      message: 'ID card has been successfully revoked.',
+      card: updated
+    });
+  } catch (error) {
+    console.error('[ADMIN] Revoke ID card error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to revoke ID card.' });
+  }
+});
+
+/**
+ * GET /api/admin/id-cards/:cardId/download
+ */
+router.get('/id-cards/:cardId/download', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const cardId = parseInt(req.params.cardId, 10);
+    const card = await prisma.idCard.findFirst({
+      where: { id: cardId, branchId: decoded.branchId },
+      include: {
+        student: {
+          include: {
+            enrolls: {
+              where: { active: true },
+              include: {
+                class: true,
+                section: true
+              }
+            }
+          }
+        },
+        user: true,
+        branch: true
+      }
+    });
+
+    if (!card) {
+      return res.status(404).json({ success: false, message: 'ID card not found.' });
+    }
+
+    const session = await prisma.schoolYear.findFirst({
+      where: { id: card.sessionId }
+    });
+
+    const sessionName = session?.session || 'Current';
+
+    const pdfParams = {
+      schoolName: card.branch.name,
+      branchName: card.branch.city || card.branch.name,
+      primaryColor: card.branch.idCardPrimaryColor || '#1b5e20',
+      secondaryColor: card.branch.idCardSecondaryColor || '#2e7d32',
+      verifyToken: card.verifyToken,
+      cardNumber: card.cardNumber
+    };
+
+    let pdfBuffer;
+    if (card.entityType === 'student' && card.student) {
+      const activeEnroll = card.student.enrolls[0];
+      pdfBuffer = await generateStudentIdCardPdf({
+        ...pdfParams,
+        studentName: `${card.student.firstName} ${card.student.lastName}`,
+        registerNo: card.student.registerNo,
+        className: activeEnroll?.class?.name || 'Unassigned',
+        sectionName: activeEnroll?.section?.name || 'Unassigned',
+        sessionName,
+        photoUrl: card.student.photo
+      });
+    } else if (card.entityType === 'staff' && card.user) {
+      const roles = { 3: 'Teacher', 4: 'Accountant', 8: 'Receptionist', 9: 'Proprietor', 12: 'Librarian', 13: 'Staff' };
+      pdfBuffer = await generateStaffIdCardPdf({
+        ...pdfParams,
+        staffName: card.user.username,
+        roleName: roles[card.user.role] || 'Staff',
+        username: card.user.username,
+        photoUrl: null
+      });
+    } else {
+      return res.status(400).json({ success: false, message: 'Entity profile missing on ID card.' });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=ID_Card_${card.cardNumber.replace(/\//g, '_')}.pdf`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN] Download ID PDF error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate ID card PDF document.' });
+  }
+});
+
+/**
+ * POST /api/admin/certificates/issue
+ */
+router.post('/certificates/issue', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { studentId, certificateType, title, description } = req.body;
+    if (!studentId || !certificateType || !title) {
+      return res.status(400).json({ success: false, message: 'Student ID, Type, and Title are required.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const cert = await provisionCertificate(prisma, {
+      studentId: parseInt(studentId, 10),
+      certificateType,
+      title,
+      description,
+      branchId: decoded.branchId,
+      sessionId
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Certificate issued successfully.',
+      certificate: cert
+    });
+  } catch (error) {
+    console.error('[ADMIN] Issue certificate error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to issue certificate.' });
+  }
+});
+
+/**
+ * GET /api/admin/certificates
+ */
+router.get('/certificates', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { certificateType, status, search, page = 1, limit = 20 } = req.query;
+    const p = parseInt(page, 10);
+    const l = parseInt(limit, 10);
+    const skip = (p - 1) * l;
+
+    const where = {
+      branchId: decoded.branchId
+    };
+
+    if (certificateType) where.certificateType = certificateType;
+    if (status) where.status = status;
+
+    if (search) {
+      where.OR = [
+        { certificateNo: { contains: search, mode: 'insensitive' } },
+        { title: { contains: search, mode: 'insensitive' } },
+        {
+          student: {
+            OR: [
+              { firstName: { contains: search, mode: 'insensitive' } },
+              { lastName: { contains: search, mode: 'insensitive' } }
+            ]
+          }
+        }
+      ];
+    }
+
+    const [certs, total] = await Promise.all([
+      prisma.certificate.findMany({
+        where,
+        include: {
+          student: {
+            select: {
+              firstName: true,
+              lastName: true,
+              registerNo: true
+            }
+          }
+        },
+        orderBy: { issuedAt: 'desc' },
+        skip,
+        take: l
+      }),
+      prisma.certificate.count({ where })
+    ]);
+
+    return res.json({
+      success: true,
+      data: certs,
+      pagination: {
+        page: p,
+        limit: l,
+        total,
+        totalPages: Math.ceil(total / l)
+      }
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get certificates error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve certificates list.' });
+  }
+});
+
+/**
+ * GET /api/admin/certificates/:certId/download
+ */
+router.get('/certificates/:certId/download', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const certId = parseInt(req.params.certId, 10);
+    const cert = await prisma.certificate.findFirst({
+      where: { id: certId, branchId: decoded.branchId },
+      include: {
+        student: true,
+        branch: true
+      }
+    });
+
+    if (!cert) {
+      return res.status(404).json({ success: false, message: 'Certificate not found.' });
+    }
+
+    const session = await prisma.schoolYear.findFirst({
+      where: { id: cert.sessionId }
+    });
+
+    const sessionName = session?.session || 'Current';
+
+    const pdfBuffer = await generateCertificatePdf({
+      schoolName: cert.branch.name,
+      branchName: cert.branch.city || cert.branch.name,
+      primaryColor: cert.branch.idCardPrimaryColor || '#1b5e20',
+      secondaryColor: cert.branch.idCardSecondaryColor || '#2e7d32',
+      studentName: `${cert.student.firstName} ${cert.student.lastName}`,
+      certificateType: cert.certificateType,
+      certificateNo: cert.certificateNo,
+      title: cert.title,
+      description: cert.description,
+      sessionName,
+      verifyToken: cert.verifyToken
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=Certificate_${cert.certificateNo.replace(/\//g, '_')}.pdf`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN] Download certificate PDF error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate certificate PDF document.' });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+// FINANCIAL & ACCOUNTING DASHBOARD ENDPOINTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/finances/overview
+ */
+router.get('/finances/overview', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const data = await getFinancialOverview(prisma, {
+      branchId: decoded.branchId,
+      sessionId
+    });
+
+    return res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    console.error('[ADMIN] Financial overview error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve financial overview data.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/fee-types
+ */
+router.get('/finances/fee-types', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const feeTypes = await prisma.feeType.findMany({
+      where: { branchId: decoded.branchId, active: true },
+      orderBy: { name: 'asc' }
+    });
+
+    return res.json({
+      success: true,
+      data: feeTypes
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get fee types error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve fee types.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/fee-types
+ */
+router.post('/finances/fee-types', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { name, code, amount, frequency = 'per_term' } = req.body;
+    if (!name || !code || !amount) {
+      return res.status(400).json({ success: false, message: 'Name, unique Code, and Amount are required.' });
+    }
+
+    const cleanCode = code.trim().toUpperCase();
+
+    // Check if code is already used in this branch
+    const existing = await prisma.feeType.findUnique({
+      where: {
+        branchId_code: {
+          branchId: decoded.branchId,
+          code: cleanCode
+        }
+      }
+    });
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: `Fee code '${cleanCode}' is already registered.` });
+    }
+
+    const feeType = await prisma.feeType.create({
+      data: {
+        name,
+        code: cleanCode,
+        amount: parseFloat(amount),
+        frequency,
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Fee type created successfully.',
+      data: feeType
+    });
+  } catch (error) {
+    console.error('[ADMIN] Create fee type error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to create fee type.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/invoices
+ */
+router.get('/finances/invoices', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { status, search, page = 1, limit = 20 } = req.query;
+    const p = parseInt(page, 10);
+    const l = parseInt(limit, 10);
+    const skip = (p - 1) * l;
+
+    const where = {
+      branchId: decoded.branchId
+    };
+
+    if (status) where.status = status;
+
+    if (search) {
+      where.OR = [
+        { invoiceNo: { contains: search, mode: 'insensitive' } },
+        {
+          student: {
+            OR: [
+              { firstName: { contains: search, mode: 'insensitive' } },
+              { lastName: { contains: search, mode: 'insensitive' } }
+            ]
+          }
+        }
+      ];
+    }
+
+    const [invoices, total] = await Promise.all([
+      prisma.invoice.findMany({
+        where,
+        include: {
+          student: {
+            select: {
+              firstName: true,
+              lastName: true,
+              registerNo: true
+            }
+          },
+          items: true,
+          payments: true
+        },
+        orderBy: { issuedAt: 'desc' },
+        skip,
+        take: l
+      }),
+      prisma.invoice.count({ where })
+    ]);
+
+    return res.json({
+      success: true,
+      data: invoices,
+      pagination: {
+        page: p,
+        limit: l,
+        total,
+        totalPages: Math.ceil(total / l)
+      }
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get invoices error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve invoices list.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/invoices
+ */
+router.post('/finances/invoices', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { studentId, termLabel, feeTypeIds, dueDate } = req.body;
+    if (!studentId || !Array.isArray(feeTypeIds) || feeTypeIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Student ID and at least one Fee Type selection are required.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const invoice = await generateInvoice(prisma, {
+      studentId: parseInt(studentId, 10),
+      termLabel: termLabel || 'First Term',
+      feeTypeIds: feeTypeIds.map(id => parseInt(id, 10)),
+      branchId: decoded.branchId,
+      sessionId,
+      dueDate
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Invoice generated successfully.',
+      invoice
+    });
+  } catch (error) {
+    console.error('[ADMIN] Generate invoice error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate invoice.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/payments
+ */
+router.post('/finances/payments', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { invoiceId, amount, method, reference, notes } = req.body;
+    if (!invoiceId || !amount || !method) {
+      return res.status(400).json({ success: false, message: 'Invoice ID, Payment Amount, and Payment Method are required.' });
+    }
+
+    const payment = await recordPayment(prisma, {
+      invoiceId: parseInt(invoiceId, 10),
+      amount: parseFloat(amount),
+      method,
+      reference: reference || null,
+      receivedBy: decoded.sub, // Admin User ID who recorded it
+      notes: notes || null,
+      branchId: decoded.branchId
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Payment recorded and invoice balance updated successfully.',
+      payment
+    });
+  } catch (error) {
+    console.error('[ADMIN] Record payment error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to record payment.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/export/csv
+ */
+router.get('/finances/export/csv', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const csvContent = await exportFinancialReportCsv(prisma, {
+      branchId: decoded.branchId,
+      sessionId
+    });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=financial_outstanding_report.csv');
+    return res.send(csvContent);
+  } catch (error) {
+    console.error('[ADMIN] Export CSV error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to export CSV report.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/export/pdf
+ */
+router.get('/finances/export/pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true }
+    });
+
+    const pdfBuffer = await exportFinancialReportPdf(prisma, {
+      branchId: decoded.branchId,
+      sessionId,
+      schoolName: branch?.name || 'Ugbekun School'
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename=financial_outstanding_report.pdf');
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN] Export PDF error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to export PDF report.' });
+  }
+});
+
+module.exports = router;
 

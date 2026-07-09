@@ -34,6 +34,9 @@ model Branch {
   adminName      String?
   adminGender    String?
   active         Boolean   @default(true)
+  idCardPrimaryColor   String?   @default("#1b5e20") @map("id_card_primary_color")
+  idCardSecondaryColor String?   @default("#2e7d32") @map("id_card_secondary_color")
+  idCardLayoutType     String    @default("classic") @map("id_card_layout_type")
   createdAt      DateTime  @default(now())
   updatedAt      DateTime? @updatedAt
 
@@ -49,6 +52,12 @@ model Branch {
   onlineAdmissionFields  OnlineAdmissionField[]
   studentAdmissionFields StudentAdmissionField[]
   subscriptions          BranchSubscription[]
+  idCards                IdCard[]
+  certificates           Certificate[]
+  feeTypes               FeeType[]
+  feeAssignments         FeeAssignment[]
+  invoices               Invoice[]
+  payments               Payment[]
 
   classes  Class[]
   sections Section[]
@@ -131,6 +140,7 @@ model User {
   student Student? @relation("UserStudent")
   parent  Parent?  @relation("UserParent")
   teacher Teacher? @relation("UserTeacher")
+  idCards IdCard[]
 
   @@map("users")
 }
@@ -229,6 +239,9 @@ model Student {
   onlineExamSubmissions OnlineExamSubmission[]
   homeworkSubmissions HomeworkSubmission[]
   montessoriAssessments MontessoriAssessment[]
+  idCards       IdCard[]
+  certificates  Certificate[]
+  invoices      Invoice[]
 
   @@map("students")
 }
@@ -508,6 +521,7 @@ model Class {
   homeworks          Homework[]
   montessoriAssessments MontessoriAssessment[]
   siblingRequests ParentSiblingRequest[]
+  feeAssignments FeeAssignment[]
 
   @@index([branchId])
   @@map("class")
@@ -847,4 +861,181 @@ model ParentSiblingRequest {
   @@index([parentId])
   @@index([branchId])
   @@map("parent_sibling_requests")
+}
+
+model IdCard {
+  id             Int       @id @default(autoincrement())
+  entityType     String    @map("entity_type")    // "student" | "staff"
+  cardNumber     String    @unique @map("card_number")  // e.g., IDC/MTGA/2026/0042
+  verifyToken    String    @unique @map("verify_token") // UUID for QR verification
+  status         String    @default("active") @map("status") // active | revoked | expired
+  issuedAt       DateTime  @default(now()) @map("issued_at")
+  expiresAt      DateTime? @map("expires_at")
+  revokedAt      DateTime? @map("revoked_at")
+  revokedReason  String?   @map("revoked_reason") @db.Text
+  metadata       Json?     @map("metadata")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  studentId      Int?      @map("student_id")
+  student        Student?  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  userId         Int?      @map("user_id")
+  user           User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  branchId       Int       @map("branch_id")
+  branch         Branch    @relation(fields: [branchId], references: [id])
+
+  sessionId      Int       @map("session_id")
+
+  @@index([studentId])
+  @@index([userId])
+  @@index([branchId, sessionId])
+  @@map("id_cards")
+}
+
+model Certificate {
+  id              Int       @id @default(autoincrement())
+  certificateType String    @map("certificate_type") // "completion" | "excellence" | "leaving"
+  verifyToken     String    @unique @map("verify_token")
+  certificateNo   String    @unique @map("certificate_no") // e.g., CERT/MTGA/2026/0001
+  title           String
+  description     String?   @db.Text
+  issuedAt        DateTime  @default(now()) @map("issued_at")
+  status          String    @default("active") @map("status") // active | revoked
+  metadata        Json?     @map("metadata")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  studentId       Int       @map("student_id")
+  student         Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  branchId        Int       @map("branch_id")
+  branch          Branch    @relation(fields: [branchId], references: [id])
+
+  sessionId       Int       @map("session_id")
+
+  @@index([studentId])
+  @@index([branchId, sessionId])
+  @@map("certificates")
+}
+
+model VerificationLog {
+  id          Int      @id @default(autoincrement())
+  token       String   @map("token")
+  entityType  String   @map("entity_type") // "id_card" | "certificate"
+  ipAddress   String?  @map("ip_address")
+  userAgent   String?  @map("user_agent") @db.Text
+  verifiedAt  DateTime @default(now()) @map("verified_at")
+
+  @@index([token])
+  @@map("verification_logs")
+}
+
+model FeeType {
+  id          Int       @id @default(autoincrement())
+  name        String
+  code        String    @map("code")
+  amount      Decimal   @db.Decimal(18, 2)
+  currency    String    @default("NGN")
+  frequency   String    @default("per_term")
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  branchId    Int       @map("branch_id")
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  assignments FeeAssignment[]
+  invoiceItems InvoiceItem[]
+
+  @@unique([branchId, code])
+  @@index([branchId])
+  @@map("fee_types")
+}
+
+model FeeAssignment {
+  id          Int       @id @default(autoincrement())
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  feeTypeId   Int       @map("fee_type_id")
+  feeType     FeeType   @relation(fields: [feeTypeId], references: [id])
+
+  branchId    Int       @map("branch_id")
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  classId     Int?      @map("class_id")
+  class       Class?    @relation(fields: [classId], references: [id])
+
+  sessionId   Int       @map("session_id")
+
+  @@index([branchId, sessionId])
+  @@map("fee_assignments")
+}
+
+model Invoice {
+  id              Int       @id @default(autoincrement())
+  invoiceNo       String    @unique @map("invoice_no")
+  termLabel       String?   @map("term_label")
+  totalAmount     Decimal   @db.Decimal(18, 2) @map("total_amount")
+  paidAmount      Decimal   @default(0) @db.Decimal(18, 2) @map("paid_amount")
+  balanceAmount   Decimal   @db.Decimal(18, 2) @map("balance_amount")
+  status          String    @default("unpaid") @map("status") // unpaid | partial | paid | waived
+  dueDate         DateTime? @map("due_date")
+  issuedAt        DateTime  @default(now()) @map("issued_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  studentId       Int       @map("student_id")
+  student         Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  branchId        Int       @map("branch_id")
+  branch          Branch    @relation(fields: [branchId], references: [id])
+
+  sessionId       Int       @map("session_id")
+
+  items           InvoiceItem[]
+  payments        Payment[]
+
+  @@index([studentId])
+  @@index([branchId, sessionId])
+  @@index([status])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id          Int       @id @default(autoincrement())
+  description String
+  amount      Decimal   @db.Decimal(18, 2)
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  invoiceId   Int       @map("invoice_id")
+  invoice     Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  feeTypeId   Int       @map("fee_type_id")
+  feeType     FeeType   @relation(fields: [feeTypeId], references: [id])
+
+  @@map("invoice_items")
+}
+
+model Payment {
+  id              Int       @id @default(autoincrement())
+  amount          Decimal   @db.Decimal(18, 2)
+  method          String    @map("method") // cash | bank_transfer | pos
+  reference       String?   @map("reference")
+  receivedBy      Int?      @map("received_by")
+  notes           String?   @db.Text
+  paidAt          DateTime  @default(now()) @map("paid_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  invoiceId       Int       @map("invoice_id")
+  invoice         Invoice   @relation(fields: [invoiceId], references: [id])
+
+  branchId        Int       @map("branch_id")
+  branch          Branch    @relation(fields: [branchId], references: [id])
+
+  @@index([invoiceId])
+  @@index([branchId, paidAt])
+  @@map("payments")
 }

@@ -42,6 +42,7 @@ const adminRouter = require('./routes/admin');
 const teacherRouter = require('./routes/teacher');
 const studentRouter = require('./routes/student');
 const parentRouter = require('./routes/parent');
+const verifyRouter = require('./routes/verify');
 app.use('/api/auth', authRouter);
 app.use('/api/onboarding', onboardingRouter);
 app.use('/api/superadmin', superadminRouter);
@@ -49,6 +50,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/teacher', teacherRouter);
 app.use('/api/student', studentRouter);
 app.use('/api/parent', parentRouter);
+app.use('/api/verify', verifyRouter);
 
 // Media Upload Endpoint
 const { uploadBase64File } = require('./lib/cloudinary');
