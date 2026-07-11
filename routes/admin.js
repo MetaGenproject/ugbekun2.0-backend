@@ -28,6 +28,16 @@ const {
 } = require('../lib/accountingService')
 const bcrypt = require('bcryptjs')
 const crypto = require('crypto')
+const multer = require('multer')
+const pdfParse = require('pdf-parse')
+const { OpenAI } = require('openai')
+
+let Tesseract
+try {
+  Tesseract = require('tesseract.js')
+} catch (e) {
+  console.warn('[ADMIN] Tesseract.js could not be loaded; OCR image parsing is disabled.')
+}
 
 const router = express.Router()
 
@@ -703,7 +713,7 @@ router.post('/students/onboard', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Student and Parent details are required.' })
     }
 
-    const { firstName, lastName, gender, birthday, classId, sectionId } = student
+    const { firstName, lastName, gender, birthday, classId, sectionId, currentAddress, permanentAddress, previousDetails } = student
     const { name: parentName, email: parentEmail, mobileno: parentPhone, relation: parentRelation } = parent
 
     if (!firstName || !lastName || !classId || !sectionId) {
@@ -839,6 +849,9 @@ router.post('/students/onboard', async (req, res) => {
           lastName,
           gender: gender || 'Male',
           birthday: birthday ? new Date(birthday) : null,
+          currentAddress: currentAddress || null,
+          permanentAddress: permanentAddress || null,
+          previousDetails: previousDetails || null,
           parentId: parentRecord.id,
           branchId: decoded.branchId,
           userId: studentUser.id,
@@ -3080,6 +3093,190 @@ router.get('/finances/export/pdf', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Failed to export PDF report.' });
   }
 });
+
+const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } })
+
+const openai = new OpenAI({
+  apiKey: process.env.DEEPSEEK_API_KEY,
+  baseURL: 'https://api.deepseek.com',
+})
+
+/**
+ * POST /api/admin/students/parse-document
+ * Upload a document (PDF or image) and extract student onboarding details using Deepseek.
+ */
+router.post('/students/parse-document', upload.single('file'), async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'No document file uploaded.' })
+  }
+
+  try {
+    let rawText = ''
+    const fileMimetype = req.file.mimetype
+
+    if (fileMimetype === 'application/pdf') {
+      const pdfBuffer = req.file.buffer
+      const data = await pdfParse(pdfBuffer)
+      rawText = data.text
+    } else if (fileMimetype.startsWith('image/')) {
+      if (!Tesseract) {
+        return res.status(400).json({
+          success: false,
+          message: 'Image processing (OCR) is currently disabled on this server. Please upload a digital PDF instead.'
+        })
+      }
+      const result = await Tesseract.recognize(req.file.buffer, 'eng')
+      rawText = result.data.text
+    } else {
+      return res.status(400).json({ success: false, message: 'Unsupported file format. Please upload a PDF or an Image.' })
+    }
+
+    if (!rawText || rawText.trim().length < 5) {
+      return res.status(400).json({ success: false, message: 'Could not extract text from the document. Please ensure it is legible.' })
+    }
+
+    const prompt = `
+      You are an expert administrative assistant for Ugbekun Academy.
+      Your task is to analyze the following raw text extracted from a school admission form, birth certificate, or previous academic transcript.
+      Extract information to populate our student registration schema.
+
+      Raw Document Text:
+      """
+      ${rawText}
+      """
+
+      Rules for extraction:
+      1. Map the extracted values strictly to the JSON schema specified below.
+      2. If a value is missing or cannot be inferred, set it to null or empty string.
+      3. Format Date of Birth (birthday) as "YYYY-MM-DD".
+      4. For "historicalPerformance", summarize previous school names, grades, key marks, and academic standing into a clean, readable text description.
+      5. Output ONLY the raw JSON block. No markdown wrappers (like \`\`\`json), no additional introductory text.
+
+      Required JSON Output Format:
+      {
+        "firstName": "Extract student's first name",
+        "lastName": "Extract student's last name (surname)",
+        "gender": "Extract Male/Female. Default to 'Male' if not found",
+        "birthday": "YYYY-MM-DD",
+        "homeAddress": "Extract complete home address",
+        "historicalPerformance": "Summary of previous schools, report cards, grades, or transcripts",
+        "parentName": "Extract guardian or parent's name",
+        "parentRelation": "Extract relation (Father/Mother/Guardian)",
+        "parentEmail": "Extract parent's email address",
+        "parentPhone": "Extract parent's phone number"
+      }
+    `
+
+    const completion = await openai.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a precise JSON extractor. Output valid, parsed JSON based on the user\'s guidelines without any explanations or formatting wrappers.'
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 0.1,
+      response_format: { type: 'json_object' }
+    })
+
+    const extractedData = JSON.parse(completion.choices[0].message.content.trim())
+
+    return res.json({
+      success: true,
+      extractedData
+    })
+
+  } catch (error) {
+    console.error('[ADMIN] Document parsing error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to process document. ' + error.message })
+  }
+})
+
+/**
+ * GET /api/admin/commentary/pending
+ * Retrieve all student commentaries in the branch for review.
+ */
+router.get('/commentary/pending', assertBranchAdmin, async (req, res) => {
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    const commentaries = await prisma.studentCommentary.findMany({
+      where: {
+        branchId: req.branchId,
+        sessionId,
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+          }
+        }
+      },
+      orderBy: {
+        updatedAt: 'desc'
+      }
+    })
+
+    res.json({ success: true, commentaries })
+  } catch (error) {
+    console.error('[ADMIN] Fetch pending commentaries error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch commentaries.' })
+  }
+})
+
+/**
+ * POST /api/admin/commentary/review
+ * Principal / Branch Admin reviews and signs off or rejects student report commentary.
+ */
+router.post('/commentary/review', assertBranchAdmin, async (req, res) => {
+  const { commentaryId, status, reviewNotes } = req.body
+  if (!commentaryId || !status) {
+    return res.status(400).json({ success: false, message: 'commentaryId and status are required.' })
+  }
+
+  if (!['PRINCIPAL_SIGNED_OFF', 'REJECTED'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid status. Must be PRINCIPAL_SIGNED_OFF or REJECTED.' })
+  }
+
+  try {
+    const existing = await prisma.studentCommentary.findUnique({
+      where: { id: Number(commentaryId) }
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Commentary record not found.' })
+    }
+
+    if (existing.branchId !== req.branchId) {
+      return res.status(403).json({ success: false, message: 'Access denied: commentary belongs to another branch.' })
+    }
+
+    await prisma.studentCommentary.update({
+      where: { id: existing.id },
+      data: {
+        status,
+        reviewerId: req.adminId || null,
+        reviewNotes: reviewNotes || null
+      }
+    })
+
+    res.json({ success: true, message: `Commentary successfully marked as ${status}.` })
+  } catch (error) {
+    console.error('[ADMIN] Commentary review error:', error)
+    res.status(500).json({ success: false, message: 'Failed to record commentary review.' })
+  }
+})
 
 module.exports = router;
 

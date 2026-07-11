@@ -5,6 +5,23 @@ const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
 const { isSubjectTeacher, isFormTeacher, hasClassAccess } = require('../lib/teacherAccess')
 const { generateReportCardPdf, generateMontessoriReportCardPdf } = require('../lib/pdfService')
+const { OpenAI } = require('openai')
+const multer = require('multer')
+const { uploadBase64Image } = require('../lib/cloudinary')
+
+let Tesseract
+try {
+  Tesseract = require('tesseract.js')
+} catch (err) {
+  console.warn('[TEACHER] Tesseract.js could not be loaded; OCR image parsing is disabled.')
+}
+
+const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } })
+
+const openai = new OpenAI({
+  apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
+  baseURL: 'https://api.deepseek.com'
+})
 
 const router = express.Router()
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
@@ -174,7 +191,14 @@ router.get('/students', async (req, res) => {
             gender: true,
             commentaries: {
               where: { sessionId },
-              select: { remark: true }
+              select: {
+                remark: true,
+                originalAiRemark: true,
+                isAiGenerated: true,
+                isEditedByHuman: true,
+                status: true,
+                reviewNotes: true
+              }
             }
           }
         }
@@ -186,14 +210,22 @@ router.get('/students', async (req, res) => {
       }
     })
 
-    const students = enrolls.map(e => ({
-      id: e.student.id,
-      firstName: e.student.firstName,
-      lastName: e.student.lastName,
-      registerNo: e.student.registerNo,
-      gender: e.student.gender,
-      remark: e.student.commentaries[0]?.remark || ''
-    }))
+    const students = enrolls.map(e => {
+      const comm = e.student.commentaries[0]
+      return {
+        id: e.student.id,
+        firstName: e.student.firstName,
+        lastName: e.student.lastName,
+        registerNo: e.student.registerNo,
+        gender: e.student.gender,
+        remark: comm?.remark || '',
+        originalAiRemark: comm?.originalAiRemark || null,
+        isAiGenerated: comm?.isAiGenerated || false,
+        isEditedByHuman: comm?.isEditedByHuman || false,
+        status: comm?.status || 'DRAFT',
+        reviewNotes: comm?.reviewNotes || null
+      }
+    })
 
     res.json({ success: true, students })
   } catch (error) {
@@ -458,7 +490,7 @@ router.get('/attendance', async (req, res) => {
  * Write holistic card comments/remarks (Confined exclusively to Form / Class Teacher).
  */
 router.post('/commentary', async (req, res) => {
-  const { classId, sectionId, studentId, remark } = req.body
+  const { classId, sectionId, studentId, remark, originalAiRemark, isAiGenerated } = req.body
   if (!classId || !sectionId || !studentId || remark === undefined) {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
@@ -474,6 +506,7 @@ router.post('/commentary', async (req, res) => {
   try {
     const globalSetting = await prisma.globalSettings.findFirst()
     const sessionId = globalSetting?.sessionId || 5
+    const isEditedByHuman = isAiGenerated ? (remark !== originalAiRemark) : false
 
     const existing = await prisma.studentCommentary.findUnique({
       where: {
@@ -488,7 +521,13 @@ router.post('/commentary', async (req, res) => {
     if (existing) {
       await prisma.studentCommentary.update({
         where: { id: existing.id },
-        data: { remark }
+        data: {
+          remark,
+          originalAiRemark: originalAiRemark || null,
+          isAiGenerated: !!isAiGenerated,
+          isEditedByHuman,
+          status: 'TEACHER_APPROVED'
+        }
       })
     } else {
       await prisma.studentCommentary.create({
@@ -497,6 +536,10 @@ router.post('/commentary', async (req, res) => {
           classId: Number(classId),
           sectionId: Number(sectionId),
           remark,
+          originalAiRemark: originalAiRemark || null,
+          isAiGenerated: !!isAiGenerated,
+          isEditedByHuman,
+          status: 'TEACHER_APPROVED',
           sessionId,
           branchId: req.branchId
         }
@@ -507,6 +550,192 @@ router.post('/commentary', async (req, res) => {
   } catch (error) {
     console.error('[TEACHER] Commentary save error:', error)
     res.status(500).json({ success: false, message: 'Failed to save holistic remarks.' })
+  }
+})
+
+/**
+ * POST /api/teacher/commentary/generate-ai
+ * Generates an AI-driven qualitative remark using Deepseek AI based on term performance.
+ */
+router.post('/commentary/generate-ai', async (req, res) => {
+  const { classId, sectionId, studentId, behavioralTags = [] } = req.body
+  if (!classId || !sectionId || !studentId) {
+    return res.status(400).json({ success: false, message: 'classId, sectionId, and studentId are required.' })
+  }
+
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  if (!isForm) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Only the designated Form Teacher can generate card remarks.'
+    })
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // 1. Fetch Student details
+    const student = await prisma.student.findUnique({
+      where: { id: Number(studentId) },
+      select: { firstName: true, lastName: true }
+    })
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student not found.' })
+    }
+
+    // 2. Fetch all marks in this session
+    const marks = await prisma.mark.findMany({
+      where: {
+        studentId: Number(studentId),
+        sessionId,
+      },
+      include: {
+        subject: { select: { name: true } }
+      }
+    })
+
+    const grades = {}
+    const subjectScores = {}
+    for (const m of marks) {
+      if (!m.mark || m.absent === '1') continue
+      const score = parseFloat(m.mark)
+      if (isNaN(score)) continue
+      const subjName = m.subject.name
+      if (!subjectScores[subjName]) {
+        subjectScores[subjName] = []
+      }
+      subjectScores[subjName].push(score)
+    }
+
+    for (const [subj, list] of Object.entries(subjectScores)) {
+      const avg = list.reduce((a, b) => a + b, 0) / list.length
+      grades[subj] = Math.round(avg * 10) / 10
+    }
+
+    // 3. Fetch online submissions
+    const onlineSubmissions = await prisma.onlineExamSubmission.findMany({
+      where: {
+        studentId: Number(studentId),
+        onlineExam: {
+          sessionId,
+        }
+      },
+      include: {
+        onlineExam: {
+          include: {
+            subject: { select: { name: true } }
+          }
+        }
+      }
+    })
+
+    const onlineScoresBySubject = {}
+    for (const sub of onlineSubmissions) {
+      if (sub.totalMark === null || sub.totalMark === undefined) continue
+      const subjName = sub.onlineExam.subject.name
+      if (!onlineScoresBySubject[subjName]) {
+        onlineScoresBySubject[subjName] = []
+      }
+      onlineScoresBySubject[subjName].push(sub.totalMark)
+    }
+
+    // Merge manual and online marks
+    const mergedGrades = {}
+    const allSubjects = new Set([...Object.keys(grades), ...Object.keys(onlineScoresBySubject)])
+    for (const subj of allSubjects) {
+      const list = [
+        ...(grades[subj] !== undefined ? [grades[subj]] : []),
+        ...(onlineScoresBySubject[subj] || []),
+      ]
+      if (list.length > 0) {
+        const avg = list.reduce((a, b) => a + b, 0) / list.length
+        mergedGrades[subj] = Math.round(avg * 10) / 10
+      }
+    }
+
+    // 4. Fetch current term attendance logs
+    const attendanceRecords = await prisma.attendance.findMany({
+      where: {
+        studentId: Number(studentId),
+        sessionId,
+      }
+    })
+    const totalDays = attendanceRecords.length
+    const presentDays = attendanceRecords.filter(a => {
+      const statusLower = String(a.status || '').toLowerCase()
+      return statusLower === 'present' || statusLower === 'late'
+    }).length
+    const attendanceRate = totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 100
+
+    // 5. Fetch historical term performance averages
+    const historicalMarks = await prisma.mark.findMany({
+      where: {
+        studentId: Number(studentId),
+        sessionId: { not: sessionId }
+      }
+    })
+    const historicalBySession = {}
+    for (const m of historicalMarks) {
+      if (!m.mark || m.absent === '1') continue
+      const score = parseFloat(m.mark)
+      if (isNaN(score)) continue
+      if (!historicalBySession[m.sessionId]) {
+        historicalBySession[m.sessionId] = []
+      }
+      historicalBySession[m.sessionId].push(score)
+    }
+    const historicalAverages = Object.entries(historicalBySession).map(([sessId, list]) => {
+      const avg = list.reduce((a, b) => a + b, 0) / list.length
+      return `Session ${sessId}: ${Math.round(avg * 10) / 10}%`
+    }).join(', ')
+
+    // 6. Call Deepseek AI
+    if (!process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY === 'your_deepseek_api_key_here') {
+      return res.status(400).json({
+        success: false,
+        message: 'Deepseek API Key is not configured. Please contact the administrator.'
+      })
+    }
+
+    const systemPrompt = `You are an expert child development assessor. Create a personalized, constructive report card narrative (max 100 words) for a student.`
+    const userPrompt = `
+      Write a single paragraph report card remark for student: ${student.firstName} ${student.lastName}.
+      
+      Performance Context:
+      - Subject Grades: ${JSON.stringify(mergedGrades)}
+      - Attendance: Attended ${presentDays} of ${totalDays} classes (${attendanceRate}% attendance)
+      - Historical Performance (Past Averages): ${historicalAverages || 'No past terms recorded'}
+      - Qualitative Behavioral Attributes Selected by Teacher: ${behavioralTags.join(', ') || 'General behavior'}
+      
+      Instructions:
+      1. Mention specific academic strengths (grades >= 70%) and subjects requiring improvement (grades < 50% or the lowest scoring subjects).
+      2. Constructively comment on attendance if it is below 85%.
+      3. Integrate the qualitative behavioral attributes smoothly.
+      4. Suggest a clear growth action.
+      5. The output MUST be a clean JSON object in this format:
+      {"commentary": "Your generated commentary goes here."}
+    `
+
+    const response = await openai.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.15,
+      response_format: { type: 'json_object' }
+    })
+
+    const result = JSON.parse(response.choices[0].message.content)
+    res.json({
+      success: true,
+      draft: result.commentary
+    })
+
+  } catch (error) {
+    console.error('[TEACHER] AI Commentary Generation Error:', error)
+    res.status(500).json({ success: false, message: 'AI failed to generate narrative commentary.' })
   }
 })
 
@@ -1134,7 +1363,8 @@ router.get('/report-cards/export-pdf', async (req, res) => {
     const commentaryRecord = await prisma.studentCommentary.findFirst({
       where: {
         studentId: parsedStudentId,
-        sessionId
+        sessionId,
+        status: 'PRINCIPAL_SIGNED_OFF'
       },
       select: { remark: true }
     })
@@ -1575,6 +1805,781 @@ router.post('/online-exams/submissions/:id/grade', async (req, res) => {
   } catch (error) {
     console.error('[TEACHER] Grade online-exam submission error:', error)
     res.status(500).json({ success: false, message: 'Failed to save grade.' })
+  }
+})
+
+// Levenshtein & matching helpers
+function levenshteinDistance(s1, s2) {
+  s1 = s1.toLowerCase().trim();
+  s2 = s2.toLowerCase().trim();
+  if (s1 === s2) return 0;
+  if (s1.length === 0) return s2.length;
+  if (s2.length === 0) return s1.length;
+
+  const matrix = [];
+  for (let i = 0; i <= s2.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= s1.length; j++) {
+    matrix[0][j] = j;
+  }
+  for (let i = 1; i <= s2.length; i++) {
+    for (let j = 1; j <= s1.length; j++) {
+      if (s2.charAt(i - 1) === s1.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1, // substitution
+          matrix[i][j - 1] + 1,     // insertion
+          matrix[i - 1][j] + 1      // deletion
+        );
+      }
+    }
+  }
+  return matrix[s2.length][s1.length];
+}
+
+function computeSimilarity(s1, s2) {
+  const distance = levenshteinDistance(s1, s2);
+  const maxLength = Math.max(s1.length, s2.length);
+  if (maxLength === 0) return 1.0;
+  return 1.0 - distance / maxLength;
+}
+
+// POST /api/teacher/grades/scan
+router.post('/grades/scan', upload.single('file'), async (req, res) => {
+  const decoded = await assertTeacher(req, res)
+  if (!decoded) return
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'No image file uploaded.' })
+  }
+
+  const { classId, sectionId, examId, subjectId } = req.body
+  if (!classId || !sectionId || !examId || !subjectId) {
+    return res.status(400).json({ success: false, message: 'Missing required parameters (classId, sectionId, examId, subjectId).' })
+  }
+
+  const parsedClassId = parseInt(classId, 10)
+  const parsedSectionId = parseInt(sectionId, 10)
+  const parsedExamId = parseInt(examId, 10)
+  const parsedSubjectId = parseInt(subjectId, 10)
+
+  try {
+    // 1. OCR processing using Tesseract.js
+    if (!Tesseract) {
+      return res.status(400).json({
+        success: false,
+        message: 'OCR Engine is not initialized. Please try again later.'
+      })
+    }
+    const ocrResult = await Tesseract.recognize(req.file.buffer, 'eng')
+    const rawText = ocrResult.data.text
+
+    if (!rawText || rawText.trim().length < 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'No text could be extracted from the image. Please verify image clarity.'
+      })
+    }
+
+    // 2. Upload image to Cloudinary
+    const fileBase64 = req.file.buffer.toString('base64')
+    const fileUrl = await uploadBase64Image({
+      base64: fileBase64,
+      mime: req.file.mimetype,
+      folder: 'score_sheets'
+    })
+
+    // 3. Request JSON parsing from Deepseek
+    const prompt = `
+      You are a high-precision data entry engine for school gradebooks.
+      Analyze the provided raw text parsed from a student score sheet. The text contains names or admission numbers alongside numeric scores.
+
+      Extract all rows into a JSON array matching the structure:
+      {
+        "extractedRows": [
+          {
+            "identifier": "Admission/Registration number or name string written on the row",
+            "rawName": "Name string written on the row (or null if only ID is present)",
+            "score": number or null (if unmarked/absent/unreadable)
+          }
+        ]
+      }
+
+      Raw OCR Text:
+      """
+      ${rawText}
+      """
+
+      Rules:
+      1. Strictly extract only what is written in the text. Do not invent any numbers.
+      2. If a score is unreadable or empty, set it to null.
+      3. Output ONLY valid, parsable JSON. No conversational markdown block, no introductory text.
+    `
+
+    const completion = await openai.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [
+        { role: 'system', content: 'You extract scores from OCR text and output pure JSON.' },
+        { role: 'user', content: prompt }
+      ],
+      response_format: { type: 'json_object' }
+    })
+
+    const responseText = completion.choices[0].message.content
+    let extractedRows = []
+    try {
+      const cleaned = responseText.replace(/```json/g, '').replace(/```/g, '').trim()
+      const data = JSON.parse(cleaned)
+      extractedRows = data.extractedRows || []
+    } catch (e) {
+      console.error('Deepseek JSON Parse Error:', e, responseText)
+      return res.status(500).json({ success: false, message: 'Failed to structure the OCR output. Please retry.' })
+    }
+
+    // 4. Fetch Active Registry and align names
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    const enrolls = await prisma.enroll.findMany({
+      where: {
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
+        sessionId,
+        branchId: decoded.branchId || null
+      },
+      include: {
+        student: true
+      }
+    })
+
+    // Prepare parsed list
+    const alignedRows = []
+    let rowId = 1
+
+    for (const row of extractedRows) {
+      const identifierStr = String(row.identifier || '').trim()
+      const rawNameStr = String(row.rawName || '').trim()
+      
+      let matchedStudent = null
+      let bestScore = 0
+
+      // Exact match on RegNo
+      if (identifierStr) {
+        matchedStudent = enrolls.find(e => e.student.registerNo.toLowerCase() === identifierStr.toLowerCase())?.student || null
+      }
+
+      // Fuzzy match on names if not matched
+      if (!matchedStudent) {
+        for (const enroll of enrolls) {
+          const student = enroll.student
+          const studentFullName = `${student.firstName} ${student.lastName}`
+          const studentFullNameRev = `${student.lastName} ${student.firstName}`
+          
+          let score1 = computeSimilarity(rawNameStr, studentFullName)
+          let score2 = computeSimilarity(rawNameStr, studentFullNameRev)
+          let score3 = identifierStr ? computeSimilarity(identifierStr, studentFullName) : 0
+          let score4 = identifierStr ? computeSimilarity(identifierStr, studentFullNameRev) : 0
+
+          const maxScore = Math.max(score1, score2, score3, score4)
+          if (maxScore > bestScore) {
+            bestScore = maxScore
+            matchedStudent = student
+          }
+        }
+      } else {
+        bestScore = 1.0 // Exact match
+      }
+
+      // If matched student similarity is too low, reject match
+      if (bestScore < 0.65) {
+        matchedStudent = null
+        bestScore = 0
+      }
+
+      // Determine anomalies
+      let hasAnomaly = false
+      let anomalyReason = null
+
+      if (!matchedStudent) {
+        hasAnomaly = true
+        anomalyReason = 'Student not found in registry.'
+      }
+
+      const scoreNum = row.score !== null ? parseFloat(row.score) : NaN
+      if (row.score !== null && (isNaN(scoreNum) || scoreNum < 0 || scoreNum > 100)) {
+        hasAnomaly = true
+        anomalyReason = anomalyReason ? anomalyReason + ' Score out of bounds (0-100).' : 'Score out of bounds (0-100).'
+      }
+
+      // Low confidence matches
+      const lowConfidence = matchedStudent && bestScore < 0.85
+
+      alignedRows.push({
+        rowId: rowId++,
+        inputIdentifier: identifierStr,
+        inputName: rawNameStr || identifierStr,
+        matchedStudentId: matchedStudent ? matchedStudent.id : null,
+        matchedStudentName: matchedStudent ? `${matchedStudent.lastName}, ${matchedStudent.firstName}` : 'Unmatched',
+        matchedRegNo: matchedStudent ? matchedStudent.registerNo : 'N/A',
+        matchConfidence: Number(bestScore.toFixed(2)),
+        extractedMark: isNaN(scoreNum) ? null : scoreNum,
+        hasAnomaly: !!hasAnomaly,
+        anomalyReason,
+        lowConfidence: !!lowConfidence
+      })
+    }
+
+    // Check for duplicate student mappings
+    const studentCount = {}
+    alignedRows.forEach(r => {
+      if (r.matchedStudentId) {
+        studentCount[r.matchedStudentId] = (studentCount[r.matchedStudentId] || 0) + 1
+      }
+    })
+    alignedRows.forEach(r => {
+      if (r.matchedStudentId && studentCount[r.matchedStudentId] > 1) {
+        r.hasAnomaly = true
+        r.anomalyReason = r.anomalyReason ? r.anomalyReason + ' Duplicate student mapping.' : 'Duplicate student mapping.'
+      }
+    })
+
+    // Save scan staging record
+    const stagingRecord = await prisma.scoreSheetScan.create({
+      data: {
+        fileName: req.file.originalname,
+        fileUrl,
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
+        examId: parsedExamId,
+        subjectId: parsedSubjectId,
+        parsedData: alignedRows,
+        status: 'PENDING_VALIDATION',
+        teacherId: decoded.sub,
+        branchId: decoded.branchId || 0
+      }
+    })
+
+    res.json({
+      success: true,
+      scanId: stagingRecord.id,
+      fileUrl,
+      parsedData: alignedRows,
+      message: 'Score sheet parsed successfully.'
+    })
+  } catch (error) {
+    console.error('[TEACHER] Score sheet scan error:', error)
+    res.status(500).json({ success: false, message: 'Internal server error while processing scan.' })
+  }
+})
+
+// GET /api/teacher/grades/scan/:id
+router.get('/grades/scan/:id', async (req, res) => {
+  const decoded = await assertTeacher(req, res)
+  if (!decoded) return
+
+  const { id } = req.params
+
+  try {
+    const scan = await prisma.scoreSheetScan.findFirst({
+      where: {
+        id: Number(id),
+        teacherId: decoded.sub
+      }
+    })
+
+    if (!scan) {
+      return res.status(404).json({ success: false, message: 'Scanned sheet record not found.' })
+    }
+
+    res.json({ success: true, scan })
+  } catch (error) {
+    console.error('[TEACHER] Get scan record error:', error)
+    res.status(500).json({ success: false, message: 'Failed to retrieve scan record.' })
+  }
+})
+
+// POST /api/teacher/grades/scan/:id/commit
+router.post('/grades/scan/:id/commit', async (req, res) => {
+  const decoded = await assertTeacher(req, res)
+  if (!decoded) return
+
+  const { id } = req.params
+  const { verifiedData } = req.body
+
+  if (!verifiedData || !Array.isArray(verifiedData)) {
+    return res.status(400).json({ success: false, message: 'Invalid or missing verifiedData grid.' })
+  }
+
+  try {
+    const scan = await prisma.scoreSheetScan.findFirst({
+      where: {
+        id: Number(id),
+        teacherId: decoded.sub,
+        status: 'PENDING_VALIDATION'
+      }
+    })
+
+    if (!scan) {
+      return res.status(404).json({ success: false, message: 'Staged scan record not found or already committed.' })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // Run transaction
+    await prisma.$transaction(async (tx) => {
+      for (const row of verifiedData) {
+        if (!row.matchedStudentId) continue
+
+        const scoreVal = row.extractedMark !== null && row.extractedMark !== undefined ? String(row.extractedMark) : null
+
+        const existingMark = await tx.mark.findFirst({
+          where: {
+            studentId: Number(row.matchedStudentId),
+            subjectId: scan.subjectId,
+            classId: scan.classId,
+            sectionId: scan.sectionId,
+            examId: scan.examId,
+            sessionId
+          }
+        })
+
+        if (existingMark) {
+          await tx.mark.update({
+            where: { id: existingMark.id },
+            data: {
+              mark: scoreVal,
+              absent: scoreVal === null ? 'true' : 'false'
+            }
+          })
+        } else {
+          await tx.mark.create({
+            data: {
+              studentId: Number(row.matchedStudentId),
+              subjectId: scan.subjectId,
+              classId: scan.classId,
+              sectionId: scan.sectionId,
+              examId: scan.examId,
+              mark: scoreVal,
+              absent: scoreVal === null ? 'true' : 'false',
+              sessionId,
+              branchId: scan.branchId
+            }
+          })
+        }
+      }
+
+      // Update staging status
+      await tx.scoreSheetScan.update({
+        where: { id: scan.id },
+        data: {
+          status: 'COMMITTED',
+          parsedData: verifiedData
+        }
+      })
+    })
+
+    res.json({ success: true, message: 'Scores successfully committed to the production gradebook.' })
+  } catch (error) {
+    console.error('[TEACHER] Commit scan error:', error)
+    res.status(500).json({ success: false, message: 'Transaction failed: Could not commit marks.' })
+  }
+})
+
+// =============================================================================
+// AI LESSON PLANNER, MANAGED MEDIA LIBRARY, & VIRTUAL CLASSROOMS
+// =============================================================================
+const fs = require('fs')
+const path = require('path')
+
+// Helper to save file locally
+async function saveMediaFile(file) {
+  const uploadDir = path.join(__dirname, '../uploads')
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true })
+  }
+  const filename = Date.now() + '_' + file.originalname.replace(/\s+/g, '_')
+  const filepath = path.join(uploadDir, filename)
+  fs.writeFileSync(filepath, file.buffer)
+  return `/uploads/${filename}`
+}
+
+// Helper to generate Jitsi room token
+function generateJitsiToken({ roomName, user, isModerator }) {
+  const appId = process.env.JITSI_APP_ID || 'vpaas-magic-cookie-ugbekun';
+  const appSecret = process.env.JITSI_APP_SECRET || 'jitsi_dummy_secret_key';
+  
+  const payload = {
+    aud: 'jitsi',
+    iss: appId,
+    sub: appId,
+    room: roomName,
+    moderator: isModerator,
+    context: {
+      user: {
+        id: String(user.id),
+        name: user.name || user.username || 'Ugbekun User',
+        email: user.email || '',
+        avatar: user.photo || ''
+      },
+      features: {
+        recording: true,
+        livestreaming: true,
+        'screen-sharing': true
+      }
+    }
+  }
+  return jwt.sign(payload, appSecret, { algorithm: 'HS256', expiresIn: '2h' })
+}
+
+// --- 1. Managed Media Library ---
+
+// GET /api/teacher/media
+router.get('/media', assertTeacher, async (req, res) => {
+  try {
+    const { classTier, topic } = req.query
+    const where = {}
+    if (classTier) where.classTier = classTier
+    if (topic) where.topic = topic
+
+    const items = await prisma.mediaItem.findMany({
+      where,
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, items })
+  } catch (error) {
+    console.error('[TEACHER] Fetch media error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch media library items.' })
+  }
+})
+
+// POST /api/teacher/media
+router.post('/media', assertTeacher, upload.single('file'), async (req, res) => {
+  const { title, description, classTier, topic, accessType, price } = req.body
+  if (!title || !classTier || !topic || !req.file) {
+    return res.status(400).json({ success: false, message: 'Required fields missing.' })
+  }
+
+  try {
+    const fileUrl = await saveMediaFile(req.file)
+    const mediaItem = await prisma.mediaItem.create({
+      data: {
+        title,
+        description: description || null,
+        fileUrl,
+        fileSize: req.file.size,
+        mimeType: req.file.mimetype,
+        classTier,
+        topic,
+        accessType: accessType === 'PREMIUM' ? 'PREMIUM' : 'FREE',
+        price: accessType === 'PREMIUM' && price ? parseFloat(price) : null,
+        uploadedBy: req.teacherId
+      }
+    })
+    res.json({ success: true, message: 'Media item uploaded successfully.', item: mediaItem })
+  } catch (error) {
+    console.error('[TEACHER] Media upload error:', error)
+    res.status(500).json({ success: false, message: 'Failed to upload media item.' })
+  }
+})
+
+// DELETE /api/teacher/media/:id
+router.delete('/media/:id', assertTeacher, async (req, res) => {
+  try {
+    const item = await prisma.mediaItem.findUnique({
+      where: { id: Number(req.params.id) }
+    })
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Media item not found.' })
+    }
+    await prisma.mediaItem.delete({
+      where: { id: item.id }
+    })
+    const filepath = path.join(__dirname, '..', item.fileUrl)
+    if (fs.existsSync(filepath)) {
+      try {
+        fs.unlinkSync(filepath)
+      } catch (e) {
+        console.warn('Could not delete physical file:', filepath)
+      }
+    }
+    res.json({ success: true, message: 'Media item deleted successfully.' })
+  } catch (error) {
+    console.error('[TEACHER] Delete media error:', error)
+    res.status(500).json({ success: false, message: 'Failed to delete media item.' })
+  }
+})
+
+// --- 2. AI Lesson Planner ---
+
+// POST /api/teacher/lesson-plan/generate
+router.post('/lesson-plan/generate', assertTeacher, async (req, res) => {
+  const { classId, subjectId, coreTopic } = req.body
+  if (!classId || !subjectId || !coreTopic) {
+    return res.status(400).json({ success: false, message: 'classId, subjectId, and coreTopic are required.' })
+  }
+
+  try {
+    const classObj = await prisma.class.findUnique({
+      where: { id: Number(classId) },
+      select: { name: true }
+    })
+    const subjectObj = await prisma.subject.findUnique({
+      where: { id: Number(subjectId) },
+      select: { name: true }
+    })
+
+    if (!classObj || !subjectObj) {
+      return res.status(404).json({ success: false, message: 'Class or Subject not found.' })
+    }
+
+    let result
+    if (!process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY === 'your_deepseek_api_key_here' || process.env.DEEPSEEK_API_KEY === 'dummy-key') {
+      console.log('[TEACHER] Deepseek API key not set, using mock generation fallback')
+      result = {
+        objectives: `1. Understand the core concepts of ${coreTopic} in the context of ${subjectObj.name} for ${classObj.name}.\n2. Solve foundational practice problems step-by-step.`,
+        materials: `1. Textbook: Modern ${subjectObj.name} (Chapter 4).\n2. Handouts, whiteboards, and markers.`,
+        teachingGuide: `0-15m: Direct instruction introducing ${coreTopic}.\n15-30m: Guided group exercises.\n30-45m: Independent student practice.`,
+        assessments: `Students will be evaluated based on class participation (30%), interactive notebook work (30%), and the short end-of-lesson quiz (40%).`,
+        assignments: `Complete Page 54, exercises 1 through 10 from the textbook.`
+      }
+    } else {
+      try {
+        const systemPrompt = "You are an expert curriculum designer. Return a detailed, professional lesson plan in JSON format."
+        const userPrompt = `
+          Create a detailed lesson plan template for:
+          - Class Level: ${classObj.name}
+          - Subject: ${subjectObj.name}
+          - Core Topic: ${coreTopic}
+
+          The output MUST be a JSON object with these EXACT keys:
+          {
+            "objectives": "Measurable lesson objectives.",
+            "materials": "Required classroom tools/materials.",
+            "teachingGuide": "Step-by-step timeline of classroom activities.",
+            "assessments": "Rubrics/criteria for student evaluation.",
+            "assignments": "Suggested homework tasks."
+          }
+          Do not include markdown headers or extra text. Return ONLY the JSON object.
+        `
+
+        const response = await openai.chat.completions.create({
+          model: 'deepseek-chat',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ],
+          temperature: 0.3,
+          response_format: { type: 'json_object' }
+        })
+
+        result = JSON.parse(response.choices[0].message.content)
+      } catch (apiErr) {
+        console.warn('[TEACHER] OpenAI API failed, falling back to mock curriculum generation:', apiErr)
+        result = {
+          objectives: `1. Understand the core concepts of ${coreTopic} in the context of ${subjectObj.name} for ${classObj.name}.\n2. Solve foundational practice problems step-by-step.`,
+          materials: `1. Textbook: Modern ${subjectObj.name} (Chapter 4).\n2. Handouts, whiteboards, and markers.`,
+          teachingGuide: `0-15m: Direct instruction introducing ${coreTopic}.\n15-30m: Guided group exercises.\n30-45m: Independent student practice.`,
+          assessments: `Students will be evaluated based on class participation (30%), interactive notebook work (30%), and the short end-of-lesson quiz (40%).`,
+          assignments: `Complete Page 54, exercises 1 through 10 from the textbook.`
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      draft: result
+    })
+  } catch (error) {
+    console.error('[TEACHER] AI Lesson Plan Generation Error:', error)
+    res.status(500).json({ success: false, message: 'Failed to generate AI lesson plan draft.' })
+  }
+})
+
+// GET /api/teacher/lesson-plan
+router.get('/lesson-plan', assertTeacher, async (req, res) => {
+  try {
+    const plans = await prisma.lessonPlan.findMany({
+      where: { teacherId: req.teacherId },
+      include: {
+        class: { select: { name: true } },
+        subject: { select: { name: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, plans })
+  } catch (error) {
+    console.error('[TEACHER] Fetch lesson plans error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch lesson plans.' })
+  }
+})
+
+// POST /api/teacher/lesson-plan
+router.post('/lesson-plan', assertTeacher, async (req, res) => {
+  const { classId, subjectId, coreTopic, objectives, materials, teachingGuide, assessments, assignments, status } = req.body
+  if (!classId || !subjectId || !coreTopic) {
+    return res.status(400).json({ success: false, message: 'Required fields missing.' })
+  }
+
+  try {
+    const plan = await prisma.lessonPlan.create({
+      data: {
+        teacherId: req.teacherId,
+        classId: Number(classId),
+        subjectId: Number(subjectId),
+        coreTopic,
+        educationalObjectives: objectives || null,
+        materialLists: materials || null,
+        teachingGuide: teachingGuide || null,
+        assessmentCriteria: assessments || null,
+        classAssignments: assignments || null,
+        status: status === 'PUBLISHED' ? 'PUBLISHED' : 'DRAFT'
+      }
+    })
+    res.json({ success: true, message: 'Lesson plan saved successfully.', plan })
+  } catch (error) {
+    console.error('[TEACHER] Save lesson plan error:', error)
+    res.status(500).json({ success: false, message: 'Failed to save lesson plan.' })
+  }
+})
+
+// PUT /api/teacher/lesson-plan/:id
+router.put('/lesson-plan/:id', assertTeacher, async (req, res) => {
+  const { objectives, materials, teachingGuide, assessments, assignments, status, coreTopic } = req.body
+  try {
+    const plan = await prisma.lessonPlan.findUnique({
+      where: { id: Number(req.params.id) }
+    })
+    if (!plan || plan.teacherId !== req.teacherId) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found or access denied.' })
+    }
+
+    const updated = await prisma.lessonPlan.update({
+      where: { id: plan.id },
+      data: {
+        coreTopic: coreTopic !== undefined ? coreTopic : plan.coreTopic,
+        educationalObjectives: objectives !== undefined ? objectives : plan.educationalObjectives,
+        materialLists: materials !== undefined ? materials : plan.materialLists,
+        teachingGuide: teachingGuide !== undefined ? teachingGuide : plan.teachingGuide,
+        assessmentCriteria: assessments !== undefined ? assessments : plan.assessmentCriteria,
+        classAssignments: assignments !== undefined ? assignments : plan.classAssignments,
+        status: status === 'PUBLISHED' ? 'PUBLISHED' : (status === 'DRAFT' ? 'DRAFT' : plan.status)
+      }
+    })
+    res.json({ success: true, message: 'Lesson plan updated successfully.', plan: updated })
+  } catch (error) {
+    console.error('[TEACHER] Update lesson plan error:', error)
+    res.status(500).json({ success: false, message: 'Failed to update lesson plan.' })
+  }
+})
+
+// DELETE /api/teacher/lesson-plan/:id
+router.delete('/lesson-plan/:id', assertTeacher, async (req, res) => {
+  try {
+    const plan = await prisma.lessonPlan.findUnique({
+      where: { id: Number(req.params.id) }
+    })
+    if (!plan || plan.teacherId !== req.teacherId) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found or access denied.' })
+    }
+    await prisma.lessonPlan.delete({
+      where: { id: plan.id }
+    })
+    res.json({ success: true, message: 'Lesson plan deleted successfully.' })
+  } catch (error) {
+    console.error('[TEACHER] Delete lesson plan error:', error)
+    res.status(500).json({ success: false, message: 'Failed to delete lesson plan.' })
+  }
+})
+
+// --- 3. Communication Hub (Jitsi / WebRTC Live Rooms) ---
+
+// POST /api/teacher/live-rooms
+router.post('/live-rooms', assertTeacher, async (req, res) => {
+  const { title, roomName, type, classId, sectionId, scheduledAt, durationMins } = req.body
+  if (!title || !roomName || !type || !scheduledAt) {
+    return res.status(400).json({ success: false, message: 'Required fields missing.' })
+  }
+
+  try {
+    const liveRoom = await prisma.liveRoom.create({
+      data: {
+        title,
+        roomName: roomName.trim().toLowerCase().replace(/\s+/g, '-'),
+        type: type === 'STAFF_ALIGNMENT' ? 'STAFF_ALIGNMENT' : 'STUDENT_CLASSROOM',
+        hostId: req.teacherId,
+        classId: classId ? Number(classId) : null,
+        sectionId: sectionId ? Number(sectionId) : null,
+        scheduledAt: new Date(scheduledAt),
+        durationMins: durationMins ? Number(durationMins) : 45,
+        isLive: false
+      }
+    })
+    res.json({ success: true, message: 'Live room created successfully.', room: liveRoom })
+  } catch (error) {
+    console.error('[TEACHER] Create live room error:', error)
+    res.status(500).json({ success: false, message: 'Failed to create live room.' })
+  }
+})
+
+// GET /api/teacher/live-rooms
+router.get('/live-rooms', assertTeacher, async (req, res) => {
+  try {
+    const rooms = await prisma.liveRoom.findMany({
+      where: {
+        OR: [
+          { hostId: req.teacherId },
+          { type: 'STAFF_ALIGNMENT' }
+        ]
+      },
+      orderBy: { scheduledAt: 'desc' }
+    })
+    res.json({ success: true, rooms })
+  } catch (error) {
+    console.error('[TEACHER] Fetch live rooms error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch live rooms.' })
+  }
+})
+
+// GET /api/teacher/live-rooms/:roomName/token
+router.get('/live-rooms/:roomName/token', assertTeacher, async (req, res) => {
+  const { roomName } = req.params
+  try {
+    const room = await prisma.liveRoom.findUnique({
+      where: { roomName }
+    })
+    if (!room) {
+      return res.status(404).json({ success: false, message: 'Room not found.' })
+    }
+
+    const teacher = await prisma.teacher.findUnique({
+      where: { id: req.teacherId }
+    })
+
+    const token = generateJitsiToken({
+      roomName,
+      user: {
+        id: teacher.id,
+        name: teacher.name,
+        email: teacher.email,
+        photo: teacher.photo
+      },
+      isModerator: room.hostId === req.teacherId
+    })
+
+    if (room.hostId === req.teacherId && !room.isLive) {
+      await prisma.liveRoom.update({
+        where: { id: room.id },
+        data: { isLive: true }
+      })
+    }
+
+    res.json({ success: true, token, roomName })
+  } catch (error) {
+    console.error('[TEACHER] Live token error:', error)
+    res.status(500).json({ success: false, message: 'Failed to generate live room token.' })
   }
 })
 

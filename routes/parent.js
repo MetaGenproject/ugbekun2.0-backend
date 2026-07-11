@@ -429,7 +429,8 @@ router.get('/child/:studentId/grades', assertChildLinked, async (req, res) => {
     const commentary = await prisma.studentCommentary.findFirst({
       where: {
         studentId: req.studentId,
-        sessionId: req.childSessionId
+        sessionId: req.childSessionId,
+        status: 'PRINCIPAL_SIGNED_OFF'
       },
       select: { remark: true }
     })
@@ -814,7 +815,8 @@ router.get('/child/:studentId/export-pdf', assertChildLinked, async (req, res) =
     const commentaryRecord = await prisma.studentCommentary.findFirst({
       where: {
         studentId: req.studentId,
-        sessionId: req.childSessionId
+        sessionId: req.childSessionId,
+        status: 'PRINCIPAL_SIGNED_OFF'
       },
       select: { remark: true }
     })

@@ -270,6 +270,7 @@ model Teacher {
   notes          TeacherNote[]
   cmsPages       FrontCmsTeacher[]
   subjectAssigns SubjectAssign[]
+  lessonPlans    LessonPlan[]
 
   userId Int?  @unique
   user   User? @relation("UserTeacher", fields: [userId], references: [id])
@@ -522,6 +523,7 @@ model Class {
   montessoriAssessments MontessoriAssessment[]
   siblingRequests ParentSiblingRequest[]
   feeAssignments FeeAssignment[]
+  lessonPlans    LessonPlan[]
 
   @@index([branchId])
   @@map("class")
@@ -569,6 +571,7 @@ model Subject {
   marks         Mark[]
   onlineExams   OnlineExam[]
   homeworks     Homework[]
+  lessonPlans   LessonPlan[]
 
   @@index([branchId])
   @@map("subject")
@@ -708,20 +711,44 @@ model Attendance {
 }
 
 model StudentCommentary {
-  id        Int       @id @default(autoincrement())
-  studentId Int       @map("student_id")
-  classId   Int       @map("class_id")
-  sectionId Int       @map("section_id")
-  remark    String    @map("remark")
-  sessionId Int       @map("session_id")
-  branchId  Int       @map("branch_id")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime? @updatedAt @map("updated_at")
+  id               Int       @id @default(autoincrement())
+  studentId        Int       @map("student_id")
+  classId          Int       @map("class_id")
+  sectionId        Int       @map("section_id")
+  remark           String    @map("remark")
+  originalAiRemark String?   @map("original_ai_remark")
+  isAiGenerated    Boolean   @default(false) @map("is_ai_generated")
+  isEditedByHuman  Boolean   @default(false) @map("is_edited_by_human")
+  status           String    @default("DRAFT") @map("status")
+  reviewerId       Int?      @map("reviewer_id")
+  reviewNotes      String?   @map("review_notes")
+  sessionId        Int       @map("session_id")
+  branchId         Int       @map("branch_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
 
   student Student @relation(fields: [studentId], references: [id])
 
   @@unique([studentId, sessionId])
   @@map("student_commentary")
+}
+
+model ScoreSheetScan {
+  id           Int       @id @default(autoincrement())
+  fileName     String    @map("file_name")
+  fileUrl      String    @map("file_url")
+  classId      Int       @map("class_id")
+  sectionId    Int       @map("section_id")
+  examId       Int       @map("exam_id")
+  subjectId    Int       @map("subject_id")
+  parsedData   Json      @map("parsed_data")
+  status       String    @default("PENDING_VALIDATION") @map("status")
+  teacherId    Int       @map("teacher_id")
+  branchId     Int       @map("branch_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  @@map("score_sheet_scan")
 }
 
 model OnlineExam {
@@ -1039,3 +1066,80 @@ model Payment {
   @@index([branchId, paidAt])
   @@map("payments")
 }
+
+enum MediaAccessType {
+  FREE
+  PREMIUM
+}
+
+model MediaItem {
+  id           Int             @id @default(autoincrement())
+  title        String
+  description  String?         @db.Text
+  fileUrl      String          @map("file_url")
+  fileSize     Int?            @map("file_size")
+  mimeType     String?         @map("mime_type")
+  classTier    String          @map("class_tier")
+  topic        String          @map("topic")
+  accessType   MediaAccessType @default(FREE) @map("access_type")
+  price        Decimal?        @db.Decimal(10, 2)
+  uploadedBy   Int             @map("uploaded_by")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime?       @updatedAt @map("updated_at")
+
+  @@index([classTier, topic])
+  @@map("media_items")
+}
+
+enum LessonPlanStatus {
+  DRAFT
+  PUBLISHED
+}
+
+model LessonPlan {
+  id                 Int              @id @default(autoincrement())
+  teacherId          Int              @map("teacher_id")
+  classId            Int              @map("class_id")
+  subjectId          Int              @map("subject_id")
+  coreTopic          String           @map("core_topic")
+  educationalObjectives String?       @map("educational_objectives") @db.Text
+  materialLists         String?       @map("material_lists") @db.Text
+  teachingGuide         String?       @map("teaching_guide") @db.Text
+  assessmentCriteria    String?       @map("assessment_criteria") @db.Text
+  classAssignments      String?       @map("class_assignments") @db.Text
+  status             LessonPlanStatus @default(DRAFT)
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime?        @updatedAt @map("updated_at")
+
+  teacher            Teacher          @relation(fields: [teacherId], references: [id])
+  class              Class            @relation(fields: [classId], references: [id])
+  subject            Subject          @relation(fields: [subjectId], references: [id])
+
+  @@index([teacherId, classId, subjectId])
+  @@map("lesson_plans")
+}
+
+enum LiveRoomType {
+  STAFF_ALIGNMENT
+  STUDENT_CLASSROOM
+}
+
+model LiveRoom {
+  id           Int          @id @default(autoincrement())
+  title        String
+  roomName     String       @unique @map("room_name")
+  type         LiveRoomType @map("room_type")
+  hostId       Int          @map("host_id")
+  classId      Int?         @map("class_id")
+  sectionId    Int?         @map("section_id")
+  scheduledAt  DateTime     @map("scheduled_at")
+  durationMins Int          @default(45) @map("duration_mins")
+  isLive       Boolean      @default(false) @map("is_live")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime?    @updatedAt @map("updated_at")
+
+  @@index([hostId])
+  @@index([classId, sectionId])
+  @@map("live_rooms")
+}
+
