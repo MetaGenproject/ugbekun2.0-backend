@@ -9,7 +9,9 @@
     "import:legacy": "node scripts/import-legacy-data.js",
     "import:legacy:dry": "node scripts/import-legacy-data.js --dry-run",
     "repair:branch-admins": "node scripts/repair-branch-admin-legacy-userid.js",
-    "repair:branch-admins:dry": "node scripts/repair-branch-admin-legacy-userid.js --dry-run"
+    "repair:branch-admins:dry": "node scripts/repair-branch-admin-legacy-userid.js --dry-run",
+    "cron:attendance": "node scripts/evaluateWeeklyAttendance.js",
+    "cron:attrition": "node scripts/evaluateWeeklyAttrition.js"
   },
   "keywords": [],
   "author": "",
@@ -25,6 +27,7 @@
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.2.0",
+    "node-cron": "^4.6.0",
     "nodemailer": "^9.0.1",
     "openai": "^6.46.0",
     "pdf-parse": "^2.4.5",

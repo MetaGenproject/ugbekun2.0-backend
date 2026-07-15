@@ -1,5 +1,6 @@
 const express = require('express')
 const jwt = require('jsonwebtoken')
+const gamificationService = require('../lib/gamificationService')
 const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
@@ -3271,6 +3272,10 @@ router.post('/commentary/review', assertBranchAdmin, async (req, res) => {
       }
     })
 
+    // Trigger gamification review check asynchronously
+    gamificationService.checkStudentCommentaryApproval(prisma, existing.id, status, req.branchId)
+      .catch(err => console.error('[Gamification] Error in commentary review trigger:', err.message))
+
     res.json({ success: true, message: `Commentary successfully marked as ${status}.` })
   } catch (error) {
     console.error('[ADMIN] Commentary review error:', error)
@@ -3278,5 +3283,56 @@ router.post('/commentary/review', assertBranchAdmin, async (req, res) => {
   }
 })
 
-module.exports = router;
+// GET /api/admin/gamification/config
+router.get('/gamification/config', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    let config = await prisma.gamificationConfig.findUnique({
+      where: { branchId: decoded.branchId }
+    });
+
+    if (!config) {
+      config = {
+        weeklyMintLimit: 5000,
+        termStartDate: null
+      };
+    }
+
+    res.json({ success: true, config });
+  } catch (error) {
+    console.error('[ADMIN] Get gamification config error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve gamification config.' });
+  }
+});
+
+// POST /api/admin/gamification/config
+router.post('/gamification/config', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const { weeklyMintLimit, termStartDate } = req.body;
+  try {
+    const config = await prisma.gamificationConfig.upsert({
+      where: { branchId: decoded.branchId },
+      update: {
+        weeklyMintLimit: Number(weeklyMintLimit),
+        termStartDate: termStartDate ? new Date(termStartDate) : null
+      },
+      create: {
+        branchId: decoded.branchId,
+        weeklyMintLimit: Number(weeklyMintLimit),
+        termStartDate: termStartDate ? new Date(termStartDate) : null
+      }
+    });
+
+    res.json({ success: true, message: 'Gamification config successfully saved.', config });
+  } catch (error) {
+    console.error('[ADMIN] Save gamification config error:', error);
+    res.status(500).json({ success: false, message: 'Failed to save gamification config.' });
+  }
+});
+
+module.exports = router; // reload nodemon
 

@@ -4,6 +4,9 @@ const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
 const { generateReportCardPdf, generateMontessoriReportCardPdf } = require('../lib/pdfService')
+const gamificationService = require('../lib/gamificationService')
+const companionService = require('../lib/companionService')
+const walletService = require('../lib/walletService')
 
 const router = express.Router()
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
@@ -908,6 +911,10 @@ router.post('/homeworks/:id/submit', async (req, res) => {
       }
     })
 
+    // Trigger gamification early homework submission check
+    gamificationService.checkHomeworkSubmissionEarly(prisma, req.studentId, submission.id, req.branchId)
+      .catch(err => console.error('[Gamification] Error in early homework submission check:', err.message))
+
     res.json({ success: true, submission, message: 'Homework submitted successfully.' })
   } catch (error) {
     console.error('[STUDENT] Homework submission error:', error)
@@ -1056,6 +1063,10 @@ router.post('/online-exams/:id/submit', async (req, res) => {
       }
     })
 
+    // Trigger gamification online exam check
+    gamificationService.checkOnlineExamPerformance(prisma, req.studentId, submission.id, req.branchId)
+      .catch(err => console.error('[Gamification] Error in exam performance check:', err.message))
+
     res.json({ success: true, submission, message: 'Online exam submitted successfully.' })
   } catch (error) {
     console.error('[STUDENT] Online exam submission error:', error)
@@ -1182,5 +1193,334 @@ router.get('/live-rooms/:roomName/token', async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to generate live classroom token.' })
   }
 })
+
+// =============================================================================
+// INTERNAL TRIVIA STREAM ENGINE
+// =============================================================================
+
+// GET /api/student/trivia/active
+router.get('/trivia/active', assertStudent, async (req, res) => {
+  try {
+    // Fetch all active questions (global pool — no branch filter on TriviaQuestion)
+    const questions = await prisma.triviaQuestion.findMany({
+      where: { active: true },
+      orderBy: { id: 'desc' }
+    });
+
+    // Fetch student's own submissions
+    const submissions = await prisma.triviaSubmission.findMany({
+      where: { studentId: req.studentId }
+    });
+
+    const answeredMap = {};
+    submissions.forEach(s => {
+      answeredMap[s.triviaQuestionId] = {
+        isCorrect: s.isCorrect,
+        selectedOption: s.selectedOption
+      };
+    });
+
+    const mappedQuestions = questions.map(q => {
+      const submission = answeredMap[q.id];
+      return {
+        id: q.id,
+        questionText: q.questionText,
+        options: q.options,
+        timeLimitSeconds: q.timeLimitSeconds,
+        points: q.points,
+        difficulty: q.difficulty,
+        answered: !!submission,
+        isCorrect: submission ? submission.isCorrect : null,
+        selectedOption: submission ? submission.selectedOption : null
+      };
+    });
+
+    const streakRecord = await prisma.studentTriviaStreak.findFirst({
+      where: { studentId: req.studentId }
+    });
+
+    res.json({
+      success: true,
+      questions: mappedQuestions,
+      streak: streakRecord ? {
+        currentStreak: streakRecord.currentStreak,
+        highestStreak: streakRecord.highestStreak
+      } : { currentStreak: 0, highestStreak: 0 }
+    });
+  } catch (error) {
+    console.error('[STUDENT] Active trivia error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve active trivia.' });
+  }
+});
+
+// POST /api/student/trivia/submit
+router.post('/trivia/submit', assertStudent, async (req, res) => {
+  const { triviaQuestionId, selectedOption, timeTakenMs } = req.body;
+  if (triviaQuestionId === undefined || selectedOption === undefined || timeTakenMs === undefined) {
+    return res.status(400).json({ success: false, message: 'triviaQuestionId, selectedOption, and timeTakenMs are required.' });
+  }
+
+  try {
+    const question = await prisma.triviaQuestion.findUnique({
+      where: { id: Number(triviaQuestionId) }
+    });
+
+    if (!question) {
+      return res.status(404).json({ success: false, message: 'Trivia question not found.' });
+    }
+
+    // Check if already answered
+    const existing = await prisma.triviaSubmission.findFirst({
+      where: {
+        triviaQuestionId: question.id,
+        studentId: req.studentId
+      }
+    });
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: 'You have already answered this question.' });
+    }
+
+    // Anti-cheat checks
+    if (timeTakenMs < 500) {
+      return res.status(400).json({ success: false, message: 'Submission rejected: Answered suspiciously fast.' });
+    }
+
+    const timeLimitMs = (question.timeLimitSeconds + 3) * 1000; // 3-second buffer for network latency
+    if (timeTakenMs > timeLimitMs) {
+      return res.status(400).json({ success: false, message: 'Submission rejected: Time limit exceeded.' });
+    }
+
+    const isCorrect = (Number(selectedOption) === question.correctOption);
+
+    // Save submission
+    await prisma.triviaSubmission.create({
+      data: {
+        studentId: req.studentId,
+        triviaQuestionId: question.id,
+        selectedOption: Number(selectedOption),
+        isCorrect,
+        timeTakenMs
+      }
+    });
+
+    let currentStreak = 0;
+    let streakBonus = 0;
+    let pointsAwarded = 0;
+
+    if (isCorrect) {
+      // Manage streak
+      const streakRecord = await prisma.studentTriviaStreak.findFirst({
+        where: { studentId: req.studentId }
+      });
+
+      const now = new Date();
+      if (!streakRecord) {
+        currentStreak = 1;
+        await prisma.studentTriviaStreak.create({
+          data: {
+            studentId: req.studentId,
+            currentStreak: 1,
+            highestStreak: 1,
+            lastActiveDate: now
+          }
+        });
+      } else {
+        const lastDate = new Date(streakRecord.lastActiveDate);
+        // Compare dates ignoring time
+        const todayZero = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const lastZero = new Date(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate());
+        const diffTime = Math.abs(todayZero - lastZero);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        if (diffDays === 1) {
+          currentStreak = streakRecord.currentStreak + 1;
+          await prisma.studentTriviaStreak.update({
+            where: { id: streakRecord.id },
+            data: {
+              currentStreak,
+              highestStreak: Math.max(streakRecord.highestStreak, currentStreak),
+              lastActiveDate: now
+            }
+          });
+        } else if (diffDays === 0) {
+          currentStreak = streakRecord.currentStreak;
+          await prisma.studentTriviaStreak.update({
+            where: { id: streakRecord.id },
+            data: { lastActiveDate: now }
+          });
+        } else {
+          // Streak broken, start fresh
+          currentStreak = 1;
+          await prisma.studentTriviaStreak.update({
+            where: { id: streakRecord.id },
+            data: {
+              currentStreak: 1,
+              lastActiveDate: now
+            }
+          });
+        }
+      }
+
+      // Streak bonus: 5 XP per streak count (capped at 50 XP bonus)
+      streakBonus = Math.min(currentStreak * 5, 50);
+      pointsAwarded = question.points + streakBonus;
+
+      // Award Points
+      await gamificationService.awardPoints(prisma, {
+        actorType: 'STUDENT',
+        actorId: req.studentId,
+        points: pointsAwarded,
+        actionType: 'TRIVIA_CORRECT',
+        referenceEntity: 'TriviaQuestion',
+        referenceId: question.id,
+        branchId: req.branchId,
+        metadata: { selectedOption, streakBonus, currentStreak }
+      });
+    } else {
+      // Incorrect answer: reset streak to 0
+      const streakRecord = await prisma.studentTriviaStreak.findFirst({
+        where: { studentId: req.studentId }
+      });
+      if (streakRecord) {
+        await prisma.studentTriviaStreak.update({
+          where: { id: streakRecord.id },
+          data: {
+            currentStreak: 0,
+            lastActiveDate: new Date()
+          }
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      isCorrect,
+      correctOption: question.correctOption,
+      pointsAwarded,
+      currentStreak
+    });
+  } catch (error) {
+    console.error('[STUDENT] Trivia submission error:', error);
+    res.status(500).json({ success: false, message: 'Failed to process trivia submission.' });
+  }
+});
+
+// GET /api/student/gamification/profile
+router.get('/gamification/profile', assertStudent, async (req, res) => {
+  try {
+    const student = await prisma.student.findUnique({
+      where: { id: req.studentId },
+      select: { xp: true, firstName: true, lastName: true }
+    });
+
+    const streak = await prisma.studentTriviaStreak.findFirst({
+      where: { studentId: req.studentId }
+    });
+
+    const badges = await prisma.studentBadge.findMany({
+      where: { studentId: req.studentId },
+      include: { badge: true }
+    });
+
+    const recentLedger = await prisma.gamificationLedger.findMany({
+      where: { actorType: 'STUDENT', actorId: req.studentId },
+      orderBy: { createdAt: 'desc' },
+      take: 10
+    });
+
+    // Get rank info from LeaderboardCache
+    const periods = await gamificationService.getPeriodKeys(prisma);
+    const weeklyPeriodKey = `WEEKLY_${periods.WEEKLY}`;
+    const alltimePeriodKey = `ALL_TIME_${periods.ALL_TIME}`;
+
+    // Get weekly rank
+    const weeklyCache = await prisma.leaderboardCache.findUnique({
+      where: {
+        entityType_entityId_period_branchId: {
+          entityType: 'STUDENT',
+          entityId: req.studentId,
+          period: weeklyPeriodKey,
+          branchId: req.branchId
+        }
+      }
+    });
+
+    // Get all time rank
+    const alltimeCache = await prisma.leaderboardCache.findUnique({
+      where: {
+        entityType_entityId_period_branchId: {
+          entityType: 'STUDENT',
+          entityId: req.studentId,
+          period: alltimePeriodKey,
+          branchId: req.branchId
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      xp: student?.xp || 0,
+      streak: streak ? { currentStreak: streak.currentStreak, highestStreak: streak.highestStreak } : { currentStreak: 0, highestStreak: 0 },
+      badges: badges.map(sb => sb.badge),
+      recentLedger,
+      weeklyRank: weeklyCache?.rank || '-',
+      alltimeRank: alltimeCache?.rank || '-'
+    });
+  } catch (error) {
+    console.error('[STUDENT] Get gamification profile error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve gamification profile.' });
+  }
+});
+
+// GET /api/student/gamification/leaderboard
+router.get('/gamification/leaderboard', assertStudent, async (req, res) => {
+  const { periodType = 'WEEKLY' } = req.query;
+  try {
+    const periods = await gamificationService.getPeriodKeys(prisma);
+    let periodKey = '';
+    if (periodType === 'WEEKLY') {
+      periodKey = `WEEKLY_${periods.WEEKLY}`;
+    } else {
+      periodKey = `ALL_TIME_${periods.ALL_TIME}`;
+    }
+
+    const cacheEntries = await prisma.leaderboardCache.findMany({
+      where: {
+        entityType: 'STUDENT',
+        period: periodKey,
+        branchId: req.branchId
+      },
+      orderBy: { points: 'desc' },
+      take: 10
+    });
+
+    const studentIds = cacheEntries.map(e => e.entityId);
+    const students = await prisma.student.findMany({
+      where: { id: { in: studentIds } },
+      select: { id: true, firstName: true, lastName: true }
+    });
+
+    const studentMap = {};
+    students.forEach(s => {
+      studentMap[s.id] = `${s.firstName} ${s.lastName}`;
+    });
+
+    const leaderboard = cacheEntries.map((entry, index) => ({
+      rank: index + 1,
+      studentId: entry.entityId,
+      studentName: studentMap[entry.entityId] || `Student #${entry.entityId}`,
+      points: entry.points
+    }));
+
+    res.json({
+      success: true,
+      leaderboard
+    });
+  } catch (error) {
+    console.error('[STUDENT] Get leaderboard error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve leaderboard.' });
+  }
+});
 
 module.exports = router

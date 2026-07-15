@@ -8,6 +8,7 @@ const { generateReportCardPdf, generateMontessoriReportCardPdf } = require('../l
 const { OpenAI } = require('openai')
 const multer = require('multer')
 const { uploadBase64Image } = require('../lib/cloudinary')
+const gamificationService = require('../lib/gamificationService')
 
 let Tesseract
 try {
@@ -426,6 +427,10 @@ router.post('/attendance', async (req, res) => {
         })
       }
     })
+
+    // Trigger gamification check asynchronously
+    gamificationService.checkAttendanceTimeliness(prisma, req.teacherId, classId, sectionId, targetDate, req.branchId)
+      .catch(err => console.error('[Gamification] Error in attendance trigger:', err.message))
 
     res.json({ success: true, message: 'Attendance register submitted successfully.' })
   } catch (error) {
@@ -1712,6 +1717,10 @@ router.post('/homeworks/submissions/:id/grade', async (req, res) => {
         feedback: feedback || null
       }
     })
+    // Trigger gamification check asynchronously
+    gamificationService.checkHomeworkGradingTimeliness(prisma, req.teacherId, submission.homeworkId, req.branchId)
+      .catch(err => console.error('[Gamification] Error in homework grading trigger:', err.message))
+
     res.json({ success: true, submission, message: 'Submission graded successfully.' })
   } catch (error) {
     console.error('[TEACHER] Grade homework submission error:', error)
@@ -2438,6 +2447,12 @@ router.post('/lesson-plan', assertTeacher, async (req, res) => {
         status: status === 'PUBLISHED' ? 'PUBLISHED' : 'DRAFT'
       }
     })
+
+    if (plan.status === 'PUBLISHED') {
+      gamificationService.checkLessonPlanEarly(prisma, req.teacherId, plan.id, req.branchId)
+        .catch(err => console.error('[Gamification] Error in lesson plan trigger:', err.message))
+    }
+
     res.json({ success: true, message: 'Lesson plan saved successfully.', plan })
   } catch (error) {
     console.error('[TEACHER] Save lesson plan error:', error)
@@ -2468,6 +2483,12 @@ router.put('/lesson-plan/:id', assertTeacher, async (req, res) => {
         status: status === 'PUBLISHED' ? 'PUBLISHED' : (status === 'DRAFT' ? 'DRAFT' : plan.status)
       }
     })
+
+    if (updated.status === 'PUBLISHED') {
+      gamificationService.checkLessonPlanEarly(prisma, req.teacherId, updated.id, req.branchId)
+        .catch(err => console.error('[Gamification] Error in lesson plan trigger:', err.message))
+    }
+
     res.json({ success: true, message: 'Lesson plan updated successfully.', plan: updated })
   } catch (error) {
     console.error('[TEACHER] Update lesson plan error:', error)
@@ -2583,4 +2604,281 @@ router.get('/live-rooms/:roomName/token', assertTeacher, async (req, res) => {
   }
 })
 
+// GET /api/teacher/gamification/profile
+router.get('/gamification/profile', assertTeacher, async (req, res) => {
+  try {
+    const teacher = await prisma.teacher.findUnique({
+      where: { id: req.teacherId },
+      select: { points: true, name: true }
+    });
+
+    const recentLedger = await prisma.gamificationLedger.findMany({
+      where: { actorType: 'TEACHER', actorId: req.teacherId },
+      orderBy: { createdAt: 'desc' },
+      take: 10
+    });
+
+    // Get rank info from LeaderboardCache
+    const periods = await gamificationService.getPeriodKeys(prisma);
+    const weeklyPeriodKey = `WEEKLY_${periods.WEEKLY}`;
+    const alltimePeriodKey = `ALL_TIME_${periods.ALL_TIME}`;
+
+    // Get weekly rank
+    const weeklyCache = await prisma.leaderboardCache.findUnique({
+      where: {
+        entityType_entityId_period_branchId: {
+          entityType: 'TEACHER',
+          entityId: req.teacherId,
+          period: weeklyPeriodKey,
+          branchId: req.branchId
+        }
+      }
+    });
+
+    // Get all time rank
+    const alltimeCache = await prisma.leaderboardCache.findUnique({
+      where: {
+        entityType_entityId_period_branchId: {
+          entityType: 'TEACHER',
+          entityId: req.teacherId,
+          period: alltimePeriodKey,
+          branchId: req.branchId
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      points: teacher?.points || 0,
+      recentLedger,
+      weeklyRank: weeklyCache?.rank || '-',
+      alltimeRank: alltimeCache?.rank || '-'
+    });
+  } catch (error) {
+    console.error('[TEACHER] Get gamification profile error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve gamification profile.' });
+  }
+});
+
+// GET /api/teacher/gamification/leaderboard
+router.get('/gamification/leaderboard', assertTeacher, async (req, res) => {
+  const { periodType = 'WEEKLY' } = req.query;
+  try {
+    const periods = await gamificationService.getPeriodKeys(prisma);
+    let periodKey = '';
+    if (periodType === 'WEEKLY') {
+      periodKey = `WEEKLY_${periods.WEEKLY}`;
+    } else {
+      periodKey = `ALL_TIME_${periods.ALL_TIME}`;
+    }
+
+    const cacheEntries = await prisma.leaderboardCache.findMany({
+      where: {
+        entityType: 'TEACHER',
+        period: periodKey,
+        branchId: req.branchId
+      },
+      orderBy: { points: 'desc' },
+      take: 10
+    });
+
+    const teacherIds = cacheEntries.map(e => e.entityId);
+    const teachers = await prisma.teacher.findMany({
+      where: { id: { in: teacherIds } },
+      select: { id: true, name: true }
+    });
+
+    const teacherMap = {};
+    teachers.forEach(t => {
+      teacherMap[t.id] = t.name;
+    });
+
+    const leaderboard = cacheEntries.map((entry, index) => ({
+      rank: entry.rank,
+      points: entry.points,
+      name: teacherMap[entry.entityId] || `Teacher #${entry.entityId}`
+    }));
+
+    res.json({
+      success: true,
+      leaderboard
+    });
+  } catch (error) {
+    console.error('[TEACHER] Get gamification leaderboard error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve gamification leaderboard.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREDICTIVE ATTRITION RADAR & INTERVENTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/teacher/attrition/dashboard
+ * Fetch students in the Form Teacher's classroom flagged with high/medium attrition risk.
+ */
+router.get('/attrition/dashboard', async (req, res) => {
+  try {
+    const allocations = await prisma.teacherAllocation.findMany({
+      where: { teacherId: req.teacherId },
+      select: { classId: true, sectionId: true }
+    });
+
+    if (allocations.length === 0) {
+      return res.json({ success: true, alerts: [] });
+    }
+
+    // Map allocations into list of conditions
+    const orConditions = allocations.map(a => ({
+      classId: a.classId,
+      sectionId: a.sectionId
+    }));
+
+    const enrolledStudents = await prisma.enroll.findMany({
+      where: {
+        OR: orConditions,
+        isAlumni: 0
+      },
+      select: { studentId: true }
+    });
+
+    const studentIds = enrolledStudents.map(e => e.studentId);
+
+    const alerts = await prisma.interventionAlert.findMany({
+      where: {
+        teacherId: req.teacherId,
+        risk: {
+          studentId: { in: studentIds }
+        }
+      },
+      include: {
+        risk: {
+          include: {
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true
+              }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json({ success: true, alerts });
+  } catch (error) {
+    console.error('[TEACHER] Attrition dashboard fetch error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch attrition alerts.' });
+  }
+});
+
+/**
+ * GET /api/teacher/attrition/detail/:studentId
+ * Fetch the detailed component metrics and pre-drafted parent plan.
+ */
+router.get('/attrition/detail/:studentId', async (req, res) => {
+  try {
+    const studentId = Number(req.params.studentId);
+
+    // Verify enrollment
+    const enroll = await prisma.enroll.findFirst({
+      where: { studentId, isAlumni: 0 },
+      select: { classId: true, sectionId: true }
+    });
+
+    if (!enroll) {
+      return res.status(404).json({ success: false, message: 'Student enrollment not found.' });
+    }
+
+    // Verify Form Teacher allocation
+    const isAllocated = await prisma.teacherAllocation.findFirst({
+      where: {
+        teacherId: req.teacherId,
+        classId: enroll.classId,
+        sectionId: enroll.sectionId
+      }
+    });
+
+    if (!isAllocated) {
+      return res.status(403).json({ success: false, message: 'Access denied: You are not the Form Teacher for this student.' });
+    }
+
+    const risk = await prisma.studentAttritionRisk.findUnique({
+      where: { studentId },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true
+          }
+        },
+        alerts: {
+          where: { teacherId: req.teacherId },
+          orderBy: { createdAt: 'desc' }
+        }
+      }
+    });
+
+    if (!risk) {
+      return res.status(404).json({ success: false, message: 'No attrition risk profile generated for this student yet.' });
+    }
+
+    res.json({ success: true, risk });
+  } catch (error) {
+    console.error('[TEACHER] Attrition detail fetch error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch attrition detail.' });
+  }
+});
+
+/**
+ * POST /api/teacher/attrition/action/:alertId
+ * Form Teacher updates status of the intervention alert.
+ */
+router.post('/attrition/action/:alertId', async (req, res) => {
+  try {
+    const alertId = Number(req.params.alertId);
+    const { status } = req.body;
+
+    if (!['PENDING', 'ACTIVE', 'RESOLVED', 'DISMISSED'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid intervention alert status.' });
+    }
+
+    const alert = await prisma.interventionAlert.findUnique({
+      where: { id: alertId }
+    });
+
+    if (!alert) {
+      return res.status(404).json({ success: false, message: 'Intervention alert not found.' });
+    }
+
+    if (alert.teacherId !== req.teacherId) {
+      return res.status(403).json({ success: false, message: 'Access denied: You are not authorized to update this alert.' });
+    }
+
+    const updatedAlert = await prisma.interventionAlert.update({
+      where: { id: alertId },
+      data: { status }
+    });
+
+    // Release isolation if status is set to RESOLVED
+    if (status === 'RESOLVED') {
+      await prisma.studentAttritionRisk.update({
+        where: { id: alert.riskId },
+        data: { isIsolated: false }
+      });
+    }
+
+    res.json({ success: true, alert: updatedAlert });
+  } catch (error) {
+    console.error('[TEACHER] Attrition alert action update error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update attrition alert status.' });
+  }
+});
+
 module.exports = router
+

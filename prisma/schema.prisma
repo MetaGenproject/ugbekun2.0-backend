@@ -17,28 +17,28 @@ datasource db {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Branch {
-  id             Int       @id @default(autoincrement())
-  name           String
-  code           String?   @unique // e.g. "MTGA", "DIV", "FSP"
-  address        String?   @db.Text
-  city           String?
-  state          String?
-  phone          String?
-  email          String?
-  logo           String?
+  id                   Int       @id @default(autoincrement())
+  name                 String
+  code                 String?   @unique // e.g. "MTGA", "DIV", "FSP"
+  address              String?   @db.Text
+  city                 String?
+  state                String?
+  phone                String?
+  email                String?
+  logo                 String?
   // Branding assets shown in tenant pages (admin requested)
-  systemLogo     String?
-  textLogo       String?
-  printingLogo   String?
-  reportCardLogo String?
-  adminName      String?
-  adminGender    String?
-  active         Boolean   @default(true)
+  systemLogo           String?
+  textLogo             String?
+  printingLogo         String?
+  reportCardLogo       String?
+  adminName            String?
+  adminGender          String?
+  active               Boolean   @default(true)
   idCardPrimaryColor   String?   @default("#1b5e20") @map("id_card_primary_color")
   idCardSecondaryColor String?   @default("#2e7d32") @map("id_card_secondary_color")
   idCardLayoutType     String    @default("classic") @map("id_card_layout_type")
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime? @updatedAt
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime? @updatedAt
 
   // Relations — every entity scoped to this branch
   students               Student[]
@@ -58,11 +58,13 @@ model Branch {
   feeAssignments         FeeAssignment[]
   invoices               Invoice[]
   payments               Payment[]
+  gamificationConfig     GamificationConfig?
 
-  classes  Class[]
-  sections Section[]
-  subjects Subject[]
+  classes         Class[]
+  sections        Section[]
+  subjects        Subject[]
   siblingRequests ParentSiblingRequest[]
+  triviaArenas    TriviaArena[]
 
   @@map("branches")
 }
@@ -178,8 +180,8 @@ model Parent {
 
   students Student[]
 
-  userId Int?  @unique
-  user   User? @relation("UserParent", fields: [userId], references: [id])
+  userId          Int?                   @unique
+  user            User?                  @relation("UserParent", fields: [userId], references: [id])
   siblingRequests ParentSiblingRequest[]
 
   @@map("parents")
@@ -230,18 +232,26 @@ model Student {
   userId Int?  @unique
   user   User? @relation("UserStudent", fields: [userId], references: [id])
 
-  idCardToken  String?             @unique @map("id_card_token")
-  idCardStatus String              @default("active") @map("id_card_status")
-  enrolls      Enroll[]
-  marks        Mark[]
-  attendances  Attendance[]
-  commentaries StudentCommentary[]
+  idCardToken           String?                @unique @map("id_card_token")
+  idCardStatus          String                 @default("active") @map("id_card_status")
+  enrolls               Enroll[]
+  marks                 Mark[]
+  attendances           Attendance[]
+  commentaries          StudentCommentary[]
   onlineExamSubmissions OnlineExamSubmission[]
-  homeworkSubmissions HomeworkSubmission[]
+  homeworkSubmissions   HomeworkSubmission[]
   montessoriAssessments MontessoriAssessment[]
-  idCards       IdCard[]
-  certificates  Certificate[]
-  invoices      Invoice[]
+  idCards               IdCard[]
+  certificates          Certificate[]
+  invoices              Invoice[]
+  xp                    Int                    @default(0) @map("xp")
+  triviaStreak          StudentTriviaStreak?
+  triviaSubmissions     TriviaSubmission[]
+  badges                StudentBadge[]
+  attritionRisk         StudentAttritionRisk?
+  wallet                StudentWallet?
+  arenaParticipants     TriviaArenaParticipant[]
+  aiSessions            AiCompanionSession[]
 
   @@map("students")
 }
@@ -271,9 +281,12 @@ model Teacher {
   cmsPages       FrontCmsTeacher[]
   subjectAssigns SubjectAssign[]
   lessonPlans    LessonPlan[]
+  points         Int                 @default(0) @map("points")
 
   userId Int?  @unique
   user   User? @relation("UserTeacher", fields: [userId], references: [id])
+  
+  interventionAlerts InterventionAlert[]
 
   @@map("teachers")
 }
@@ -504,45 +517,45 @@ model GlobalSettings {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Class {
-  id                 Int                  @id @default(autoincrement())
-  name               String
-  nameNumeric        String               @map("name_numeric")
-  isEcd              Boolean              @default(false) @map("is_ecd")
-  createdAt          DateTime             @default(now()) @map("created_at")
-  updatedAt          DateTime?            @updatedAt @map("updated_at")
-  branchId           Int?                 @map("branch_id")
-  branch             Branch?              @relation(fields: [branchId], references: [id])
-  enrolls            Enroll[]
-  sections           SectionsAllocation[]
-  subjects           SubjectAssign[]
-  marks              Mark[]
-  attendances        Attendance[]
-  teacherAllocations TeacherAllocation[]
-  onlineExams        OnlineExam[]
-  homeworks          Homework[]
+  id                    Int                    @id @default(autoincrement())
+  name                  String
+  nameNumeric           String                 @map("name_numeric")
+  isEcd                 Boolean                @default(false) @map("is_ecd")
+  createdAt             DateTime               @default(now()) @map("created_at")
+  updatedAt             DateTime?              @updatedAt @map("updated_at")
+  branchId              Int?                   @map("branch_id")
+  branch                Branch?                @relation(fields: [branchId], references: [id])
+  enrolls               Enroll[]
+  sections              SectionsAllocation[]
+  subjects              SubjectAssign[]
+  marks                 Mark[]
+  attendances           Attendance[]
+  teacherAllocations    TeacherAllocation[]
+  onlineExams           OnlineExam[]
+  homeworks             Homework[]
   montessoriAssessments MontessoriAssessment[]
-  siblingRequests ParentSiblingRequest[]
-  feeAssignments FeeAssignment[]
-  lessonPlans    LessonPlan[]
+  siblingRequests       ParentSiblingRequest[]
+  feeAssignments        FeeAssignment[]
+  lessonPlans           LessonPlan[]
 
   @@index([branchId])
   @@map("class")
 }
 
 model Section {
-  id                 Int                  @id @default(autoincrement())
-  name               String
-  capacity           String?
-  branchId           Int?                 @map("branch_id")
-  branch             Branch?              @relation(fields: [branchId], references: [id])
-  enrolls            Enroll[]
-  classes            SectionsAllocation[]
-  subjects           SubjectAssign[]
-  marks              Mark[]
-  attendances        Attendance[]
-  teacherAllocations TeacherAllocation[]
+  id                    Int                    @id @default(autoincrement())
+  name                  String
+  capacity              String?
+  branchId              Int?                   @map("branch_id")
+  branch                Branch?                @relation(fields: [branchId], references: [id])
+  enrolls               Enroll[]
+  classes               SectionsAllocation[]
+  subjects              SubjectAssign[]
+  marks                 Mark[]
+  attendances           Attendance[]
+  teacherAllocations    TeacherAllocation[]
   montessoriAssessments MontessoriAssessment[]
-  siblingRequests ParentSiblingRequest[]
+  siblingRequests       ParentSiblingRequest[]
 
   @@index([branchId])
   @@map("section")
@@ -621,21 +634,21 @@ model Enroll {
 }
 
 model Exam {
-  id               Int       @id @default(autoincrement())
-  name             String
-  termId           Int?      @map("term_id")
-  typeId           Int       @map("type_id")
-  sessionId        Int       @map("session_id")
-  branchId         Int?      @map("branch_id")
-  remark           String
-  markDistribution String    @map("mark_distribution")
-  status           Int       @default(1)
-  publishResult    Int       @default(1) @map("publish_result")
-  resumptionDate   DateTime? @map("resumption_date")
-  rankGenerated    Int       @default(0) @map("rank_generated")
-  createdAt        DateTime  @default(now()) @map("created_at")
-  updatedAt        DateTime? @updatedAt @map("updated_at")
-  marks            Mark[]
+  id                    Int                    @id @default(autoincrement())
+  name                  String
+  termId                Int?                   @map("term_id")
+  typeId                Int                    @map("type_id")
+  sessionId             Int                    @map("session_id")
+  branchId              Int?                   @map("branch_id")
+  remark                String
+  markDistribution      String                 @map("mark_distribution")
+  status                Int                    @default(1)
+  publishResult         Int                    @default(1) @map("publish_result")
+  resumptionDate        DateTime?              @map("resumption_date")
+  rankGenerated         Int                    @default(0) @map("rank_generated")
+  createdAt             DateTime               @default(now()) @map("created_at")
+  updatedAt             DateTime?              @updatedAt @map("updated_at")
+  marks                 Mark[]
   montessoriAssessments MontessoriAssessment[]
 
   @@index([branchId, sessionId])
@@ -722,6 +735,7 @@ model StudentCommentary {
   status           String    @default("DRAFT") @map("status")
   reviewerId       Int?      @map("reviewer_id")
   reviewNotes      String?   @map("review_notes")
+  rejectionCount   Int       @default(0) @map("rejection_count")
   sessionId        Int       @map("session_id")
   branchId         Int       @map("branch_id")
   createdAt        DateTime  @default(now()) @map("created_at")
@@ -734,19 +748,19 @@ model StudentCommentary {
 }
 
 model ScoreSheetScan {
-  id           Int       @id @default(autoincrement())
-  fileName     String    @map("file_name")
-  fileUrl      String    @map("file_url")
-  classId      Int       @map("class_id")
-  sectionId    Int       @map("section_id")
-  examId       Int       @map("exam_id")
-  subjectId    Int       @map("subject_id")
-  parsedData   Json      @map("parsed_data")
-  status       String    @default("PENDING_VALIDATION") @map("status")
-  teacherId    Int       @map("teacher_id")
-  branchId     Int       @map("branch_id")
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime? @updatedAt @map("updated_at")
+  id         Int       @id @default(autoincrement())
+  fileName   String    @map("file_name")
+  fileUrl    String    @map("file_url")
+  classId    Int       @map("class_id")
+  sectionId  Int       @map("section_id")
+  examId     Int       @map("exam_id")
+  subjectId  Int       @map("subject_id")
+  parsedData Json      @map("parsed_data")
+  status     String    @default("PENDING_VALIDATION") @map("status")
+  teacherId  Int       @map("teacher_id")
+  branchId   Int       @map("branch_id")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
 
   @@map("score_sheet_scan")
 }
@@ -756,8 +770,8 @@ model OnlineExam {
   title       String
   classId     Int                    @map("class_id")
   subjectId   Int                    @map("subject_id")
-  passingMark Float                  @map("passing_mark") @default(0)
-  duration    Int?                   @map("duration") @default(0) // in minutes, 0 means untimed
+  passingMark Float                  @default(0) @map("passing_mark")
+  duration    Int?                   @default(0) @map("duration") // in minutes, 0 means untimed
   branchId    Int                    @map("branch_id")
   sessionId   Int                    @map("session_id")
   questions   Json?                  @map("questions")
@@ -765,43 +779,43 @@ model OnlineExam {
   updatedAt   DateTime?              @updatedAt @map("updated_at")
   submissions OnlineExamSubmission[]
 
-  class       Class                  @relation(fields: [classId], references: [id])
-  subject     Subject                @relation(fields: [subjectId], references: [id])
+  class   Class   @relation(fields: [classId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
 
   @@index([classId, subjectId])
   @@map("online_exam")
 }
 
 model OnlineExamSubmission {
-  id           Int        @id @default(autoincrement())
-  studentId    Int        @map("student_id")
-  onlineExamId Int        @map("online_exam_id")
-  totalMark    Float?     @map("total_mark")
-  answers      Json?      @map("answers")
-  startedAt    DateTime?  @map("started_at")
-  submittedAt  DateTime?  @map("submitted_at")
-  createdAt    DateTime   @default(now()) @map("created_at")
-  updatedAt    DateTime?  @updatedAt @map("updated_at")
+  id           Int       @id @default(autoincrement())
+  studentId    Int       @map("student_id")
+  onlineExamId Int       @map("online_exam_id")
+  totalMark    Float?    @map("total_mark")
+  answers      Json?     @map("answers")
+  startedAt    DateTime? @map("started_at")
+  submittedAt  DateTime? @map("submitted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
 
-  student      Student    @relation(fields: [studentId], references: [id])
-  onlineExam   OnlineExam @relation(fields: [onlineExamId], references: [id])
+  student    Student    @relation(fields: [studentId], references: [id])
+  onlineExam OnlineExam @relation(fields: [onlineExamId], references: [id])
 
   @@index([studentId, onlineExamId])
   @@map("online_exam_submission")
 }
 
 model Homework {
-  id          Int                  @id @default(autoincrement())
+  id          Int       @id @default(autoincrement())
   title       String
-  description String?              @db.Text
-  classId     Int                  @map("class_id")
-  subjectId   Int                  @map("subject_id")
-  dueDate     DateTime             @map("due_date")
-  branchId    Int                  @map("branch_id")
-  sessionId   Int                  @map("session_id")
-  questions   Json?                @map("questions")
-  createdAt   DateTime             @default(now()) @map("created_at")
-  updatedAt   DateTime?            @updatedAt @map("updated_at")
+  description String?   @db.Text
+  classId     Int       @map("class_id")
+  subjectId   Int       @map("subject_id")
+  dueDate     DateTime  @map("due_date")
+  branchId    Int       @map("branch_id")
+  sessionId   Int       @map("session_id")
+  questions   Json?     @map("questions")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
 
   class       Class                @relation(fields: [classId], references: [id])
   subject     Subject              @relation(fields: [subjectId], references: [id])
@@ -812,48 +826,48 @@ model Homework {
 }
 
 model HomeworkSubmission {
-  id          Int        @id @default(autoincrement())
-  homeworkId  Int        @map("homework_id")
-  studentId   Int        @map("student_id")
-  answers     Json       @map("answers")
-  score       Float?     @map("score")
-  feedback    String?    @db.Text @map("feedback")
-  createdAt   DateTime   @default(now()) @map("created_at")
-  updatedAt   DateTime?  @updatedAt @map("updated_at")
+  id         Int       @id @default(autoincrement())
+  homeworkId Int       @map("homework_id")
+  studentId  Int       @map("student_id")
+  answers    Json      @map("answers")
+  score      Float?    @map("score")
+  feedback   String?   @map("feedback") @db.Text
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
 
-  homework    Homework   @relation(fields: [homeworkId], references: [id], onDelete: Cascade)
-  student     Student    @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  homework Homework @relation(fields: [homeworkId], references: [id], onDelete: Cascade)
+  student  Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
   @@index([studentId, homeworkId])
   @@map("homework_submission")
 }
 
 model MontessoriAssessment {
-  id                         Int       @id @default(autoincrement())
-  studentId                  Int       @map("student_id")
-  classId                    Int       @map("class_id")
-  sectionId                  Int       @map("section_id")
-  sessionId                  Int       @map("session_id")
-  examId                     Int       @map("exam_id")
-  branchId                   Int       @map("branch_id")
+  id        Int @id @default(autoincrement())
+  studentId Int @map("student_id")
+  classId   Int @map("class_id")
+  sectionId Int @map("section_id")
+  sessionId Int @map("session_id")
+  examId    Int @map("exam_id")
+  branchId  Int @map("branch_id")
 
   // Psychomotor Domain Inputs
-  writingMastery             String?   @map("writing_mastery")
-  drawingCapability          String?   @map("drawing_capability")
-  physicalCoordination       String?   @map("physical_coordination")
-  motorSkillProgression      String?   @map("motor_skill_progression")
+  writingMastery        String? @map("writing_mastery")
+  drawingCapability     String? @map("drawing_capability")
+  physicalCoordination  String? @map("physical_coordination")
+  motorSkillProgression String? @map("motor_skill_progression")
 
   // Behavioral Domain Inputs
-  generalPunctuality         String?   @map("general_punctuality")
-  peerRespect                String?   @map("peer_respect")
-  aestheticNeatness          String?   @map("aesthetic_neatness")
-  activeGroupParticipation   String?   @map("active_group_participation")
+  generalPunctuality       String? @map("general_punctuality")
+  peerRespect              String? @map("peer_respect")
+  aestheticNeatness        String? @map("aesthetic_neatness")
+  activeGroupParticipation String? @map("active_group_participation")
 
   // Narrative Feedback (Max 500 characters)
-  narrativeComment           String?   @db.Text @map("narrative_comment")
+  narrativeComment String? @map("narrative_comment") @db.Text
 
-  createdAt                  DateTime  @default(now()) @map("created_at")
-  updatedAt                  DateTime? @updatedAt @map("updated_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
 
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
   class   Class   @relation(fields: [classId], references: [id])
@@ -891,29 +905,29 @@ model ParentSiblingRequest {
 }
 
 model IdCard {
-  id             Int       @id @default(autoincrement())
-  entityType     String    @map("entity_type")    // "student" | "staff"
-  cardNumber     String    @unique @map("card_number")  // e.g., IDC/MTGA/2026/0042
-  verifyToken    String    @unique @map("verify_token") // UUID for QR verification
-  status         String    @default("active") @map("status") // active | revoked | expired
-  issuedAt       DateTime  @default(now()) @map("issued_at")
-  expiresAt      DateTime? @map("expires_at")
-  revokedAt      DateTime? @map("revoked_at")
-  revokedReason  String?   @map("revoked_reason") @db.Text
-  metadata       Json?     @map("metadata")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime? @updatedAt @map("updated_at")
+  id            Int       @id @default(autoincrement())
+  entityType    String    @map("entity_type") // "student" | "staff"
+  cardNumber    String    @unique @map("card_number") // e.g., IDC/MTGA/2026/0042
+  verifyToken   String    @unique @map("verify_token") // UUID for QR verification
+  status        String    @default("active") @map("status") // active | revoked | expired
+  issuedAt      DateTime  @default(now()) @map("issued_at")
+  expiresAt     DateTime? @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  revokedReason String?   @map("revoked_reason") @db.Text
+  metadata      Json?     @map("metadata")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
 
-  studentId      Int?      @map("student_id")
-  student        Student?  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId Int?     @map("student_id")
+  student   Student? @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
-  userId         Int?      @map("user_id")
-  user           User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId Int?  @map("user_id")
+  user   User? @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  branchId       Int       @map("branch_id")
-  branch         Branch    @relation(fields: [branchId], references: [id])
+  branchId Int    @map("branch_id")
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  sessionId      Int       @map("session_id")
+  sessionId Int @map("session_id")
 
   @@index([studentId])
   @@index([userId])
@@ -931,16 +945,16 @@ model Certificate {
   issuedAt        DateTime  @default(now()) @map("issued_at")
   status          String    @default("active") @map("status") // active | revoked
   metadata        Json?     @map("metadata")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime? @updatedAt @map("updated_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
 
-  studentId       Int       @map("student_id")
-  student         Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId Int     @map("student_id")
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
-  branchId        Int       @map("branch_id")
-  branch          Branch    @relation(fields: [branchId], references: [id])
+  branchId Int    @map("branch_id")
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  sessionId       Int       @map("session_id")
+  sessionId Int @map("session_id")
 
   @@index([studentId])
   @@index([branchId, sessionId])
@@ -948,32 +962,32 @@ model Certificate {
 }
 
 model VerificationLog {
-  id          Int      @id @default(autoincrement())
-  token       String   @map("token")
-  entityType  String   @map("entity_type") // "id_card" | "certificate"
-  ipAddress   String?  @map("ip_address")
-  userAgent   String?  @map("user_agent") @db.Text
-  verifiedAt  DateTime @default(now()) @map("verified_at")
+  id         Int      @id @default(autoincrement())
+  token      String   @map("token")
+  entityType String   @map("entity_type") // "id_card" | "certificate"
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent") @db.Text
+  verifiedAt DateTime @default(now()) @map("verified_at")
 
   @@index([token])
   @@map("verification_logs")
 }
 
 model FeeType {
-  id          Int       @id @default(autoincrement())
-  name        String
-  code        String    @map("code")
-  amount      Decimal   @db.Decimal(18, 2)
-  currency    String    @default("NGN")
-  frequency   String    @default("per_term")
-  active      Boolean   @default(true)
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime? @updatedAt @map("updated_at")
+  id        Int       @id @default(autoincrement())
+  name      String
+  code      String    @map("code")
+  amount    Decimal   @db.Decimal(18, 2)
+  currency  String    @default("NGN")
+  frequency String    @default("per_term")
+  active    Boolean   @default(true)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
 
-  branchId    Int       @map("branch_id")
-  branch      Branch    @relation(fields: [branchId], references: [id])
+  branchId Int    @map("branch_id")
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  assignments FeeAssignment[]
+  assignments  FeeAssignment[]
   invoiceItems InvoiceItem[]
 
   @@unique([branchId, code])
@@ -982,48 +996,48 @@ model FeeType {
 }
 
 model FeeAssignment {
-  id          Int       @id @default(autoincrement())
-  active      Boolean   @default(true)
-  createdAt   DateTime  @default(now()) @map("created_at")
+  id        Int      @id @default(autoincrement())
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
 
-  feeTypeId   Int       @map("fee_type_id")
-  feeType     FeeType   @relation(fields: [feeTypeId], references: [id])
+  feeTypeId Int     @map("fee_type_id")
+  feeType   FeeType @relation(fields: [feeTypeId], references: [id])
 
-  branchId    Int       @map("branch_id")
-  branch      Branch    @relation(fields: [branchId], references: [id])
+  branchId Int    @map("branch_id")
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  classId     Int?      @map("class_id")
-  class       Class?    @relation(fields: [classId], references: [id])
+  classId Int?   @map("class_id")
+  class   Class? @relation(fields: [classId], references: [id])
 
-  sessionId   Int       @map("session_id")
+  sessionId Int @map("session_id")
 
   @@index([branchId, sessionId])
   @@map("fee_assignments")
 }
 
 model Invoice {
-  id              Int       @id @default(autoincrement())
-  invoiceNo       String    @unique @map("invoice_no")
-  termLabel       String?   @map("term_label")
-  totalAmount     Decimal   @db.Decimal(18, 2) @map("total_amount")
-  paidAmount      Decimal   @default(0) @db.Decimal(18, 2) @map("paid_amount")
-  balanceAmount   Decimal   @db.Decimal(18, 2) @map("balance_amount")
-  status          String    @default("unpaid") @map("status") // unpaid | partial | paid | waived
-  dueDate         DateTime? @map("due_date")
-  issuedAt        DateTime  @default(now()) @map("issued_at")
-  createdAt       DateTime  @default(now()) @map("created_at")
-  updatedAt       DateTime? @updatedAt @map("updated_at")
+  id            Int       @id @default(autoincrement())
+  invoiceNo     String    @unique @map("invoice_no")
+  termLabel     String?   @map("term_label")
+  totalAmount   Decimal   @map("total_amount") @db.Decimal(18, 2)
+  paidAmount    Decimal   @default(0) @map("paid_amount") @db.Decimal(18, 2)
+  balanceAmount Decimal   @map("balance_amount") @db.Decimal(18, 2)
+  status        String    @default("unpaid") @map("status") // unpaid | partial | paid | waived
+  dueDate       DateTime? @map("due_date")
+  issuedAt      DateTime  @default(now()) @map("issued_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
 
-  studentId       Int       @map("student_id")
-  student         Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId Int     @map("student_id")
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
-  branchId        Int       @map("branch_id")
-  branch          Branch    @relation(fields: [branchId], references: [id])
+  branchId Int    @map("branch_id")
+  branch   Branch @relation(fields: [branchId], references: [id])
 
-  sessionId       Int       @map("session_id")
+  sessionId Int @map("session_id")
 
-  items           InvoiceItem[]
-  payments        Payment[]
+  items    InvoiceItem[]
+  payments Payment[]
 
   @@index([studentId])
   @@index([branchId, sessionId])
@@ -1032,35 +1046,35 @@ model Invoice {
 }
 
 model InvoiceItem {
-  id          Int       @id @default(autoincrement())
+  id          Int      @id @default(autoincrement())
   description String
-  amount      Decimal   @db.Decimal(18, 2)
-  createdAt   DateTime  @default(now()) @map("created_at")
+  amount      Decimal  @db.Decimal(18, 2)
+  createdAt   DateTime @default(now()) @map("created_at")
 
-  invoiceId   Int       @map("invoice_id")
-  invoice     Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoiceId Int     @map("invoice_id")
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
-  feeTypeId   Int       @map("fee_type_id")
-  feeType     FeeType   @relation(fields: [feeTypeId], references: [id])
+  feeTypeId Int     @map("fee_type_id")
+  feeType   FeeType @relation(fields: [feeTypeId], references: [id])
 
   @@map("invoice_items")
 }
 
 model Payment {
-  id              Int       @id @default(autoincrement())
-  amount          Decimal   @db.Decimal(18, 2)
-  method          String    @map("method") // cash | bank_transfer | pos
-  reference       String?   @map("reference")
-  receivedBy      Int?      @map("received_by")
-  notes           String?   @db.Text
-  paidAt          DateTime  @default(now()) @map("paid_at")
-  createdAt       DateTime  @default(now()) @map("created_at")
+  id         Int      @id @default(autoincrement())
+  amount     Decimal  @db.Decimal(18, 2)
+  method     String   @map("method") // cash | bank_transfer | pos
+  reference  String?  @map("reference")
+  receivedBy Int?     @map("received_by")
+  notes      String?  @db.Text
+  paidAt     DateTime @default(now()) @map("paid_at")
+  createdAt  DateTime @default(now()) @map("created_at")
 
-  invoiceId       Int       @map("invoice_id")
-  invoice         Invoice   @relation(fields: [invoiceId], references: [id])
+  invoiceId Int     @map("invoice_id")
+  invoice   Invoice @relation(fields: [invoiceId], references: [id])
 
-  branchId        Int       @map("branch_id")
-  branch          Branch    @relation(fields: [branchId], references: [id])
+  branchId Int    @map("branch_id")
+  branch   Branch @relation(fields: [branchId], references: [id])
 
   @@index([invoiceId])
   @@index([branchId, paidAt])
@@ -1073,19 +1087,19 @@ enum MediaAccessType {
 }
 
 model MediaItem {
-  id           Int             @id @default(autoincrement())
-  title        String
-  description  String?         @db.Text
-  fileUrl      String          @map("file_url")
-  fileSize     Int?            @map("file_size")
-  mimeType     String?         @map("mime_type")
-  classTier    String          @map("class_tier")
-  topic        String          @map("topic")
-  accessType   MediaAccessType @default(FREE) @map("access_type")
-  price        Decimal?        @db.Decimal(10, 2)
-  uploadedBy   Int             @map("uploaded_by")
-  createdAt    DateTime        @default(now()) @map("created_at")
-  updatedAt    DateTime?       @updatedAt @map("updated_at")
+  id          Int             @id @default(autoincrement())
+  title       String
+  description String?         @db.Text
+  fileUrl     String          @map("file_url")
+  fileSize    Int?            @map("file_size")
+  mimeType    String?         @map("mime_type")
+  classTier   String          @map("class_tier")
+  topic       String          @map("topic")
+  accessType  MediaAccessType @default(FREE) @map("access_type")
+  price       Decimal?        @db.Decimal(10, 2)
+  uploadedBy  Int             @map("uploaded_by")
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime?       @updatedAt @map("updated_at")
 
   @@index([classTier, topic])
   @@map("media_items")
@@ -1097,23 +1111,23 @@ enum LessonPlanStatus {
 }
 
 model LessonPlan {
-  id                 Int              @id @default(autoincrement())
-  teacherId          Int              @map("teacher_id")
-  classId            Int              @map("class_id")
-  subjectId          Int              @map("subject_id")
-  coreTopic          String           @map("core_topic")
-  educationalObjectives String?       @map("educational_objectives") @db.Text
-  materialLists         String?       @map("material_lists") @db.Text
-  teachingGuide         String?       @map("teaching_guide") @db.Text
-  assessmentCriteria    String?       @map("assessment_criteria") @db.Text
-  classAssignments      String?       @map("class_assignments") @db.Text
-  status             LessonPlanStatus @default(DRAFT)
-  createdAt          DateTime         @default(now()) @map("created_at")
-  updatedAt          DateTime?        @updatedAt @map("updated_at")
+  id                    Int              @id @default(autoincrement())
+  teacherId             Int              @map("teacher_id")
+  classId               Int              @map("class_id")
+  subjectId             Int              @map("subject_id")
+  coreTopic             String           @map("core_topic")
+  educationalObjectives String?          @map("educational_objectives") @db.Text
+  materialLists         String?          @map("material_lists") @db.Text
+  teachingGuide         String?          @map("teaching_guide") @db.Text
+  assessmentCriteria    String?          @map("assessment_criteria") @db.Text
+  classAssignments      String?          @map("class_assignments") @db.Text
+  status                LessonPlanStatus @default(DRAFT)
+  createdAt             DateTime         @default(now()) @map("created_at")
+  updatedAt             DateTime?        @updatedAt @map("updated_at")
 
-  teacher            Teacher          @relation(fields: [teacherId], references: [id])
-  class              Class            @relation(fields: [classId], references: [id])
-  subject            Subject          @relation(fields: [subjectId], references: [id])
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+  class   Class   @relation(fields: [classId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
 
   @@index([teacherId, classId, subjectId])
   @@map("lesson_plans")
@@ -1143,3 +1157,264 @@ model LiveRoom {
   @@map("live_rooms")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GAMIFICATION CONFIG & CONFIGURATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+model GamificationConfig {
+  id              Int       @id @default(autoincrement())
+  branchId        Int       @unique @map("branch_id")
+  weeklyMintLimit Int       @default(5000) @map("weekly_mint_limit") // Branch-specific weekly point cap
+  termStartDate   DateTime? @map("term_start_date")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@map("gamification_configs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GAMIFICATION ENGINE LEDGER & LEADERBOARD
+// ─────────────────────────────────────────────────────────────────────────────
+
+model GamificationLedger {
+  id              Int      @id @default(autoincrement())
+  actorType       String   @map("actor_type") // "TEACHER" | "STUDENT"
+  actorId         Int      @map("actor_id") // ID referencing Teacher or Student
+  points          Int // Positive for credit (+XP), negative for debit/correction
+  actionType      String   @map("action_type") // e.g. "ATTENDANCE_9AM", "LESSON_PLAN_EARLY"
+  referenceEntity String?  @map("reference_entity") // e.g. "Attendance", "HomeworkSubmission"
+  referenceId     Int?     @map("reference_id") // ID of the trigger record
+  idempotencyKey  String   @unique @map("idempotency_key") // Unique hash: SHA256(actorType+actorId+actionType+referenceId)
+  createdAt       DateTime @default(now()) @map("created_at")
+  metadata        Json?    @map("metadata") // Stores context: submission delay, timestamps, streak number
+
+  @@index([actorType, actorId])
+  @@index([createdAt])
+  @@map("gamification_ledger")
+}
+
+model LeaderboardCache {
+  id         Int      @id @default(autoincrement())
+  entityType String   @map("entity_type") // "TEACHER" | "STUDENT"
+  entityId   Int      @map("entity_id") // Teacher.id or Student.id
+  points     Int      @default(0)
+  rank       Int      @default(0)
+  period     String // "DAILY" | "WEEKLY" | "MONTHLY" | "TERMLY" | "ALL_TIME"
+  branchId   Int      @map("branch_id")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([entityType, entityId, period, branchId])
+  @@index([entityType, period, points(sort: Desc)])
+  @@map("leaderboard_caches")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERNAL TRIVIA & ACHIEVEMENTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TriviaQuestion {
+  id              Int                @id @default(autoincrement())
+  questionText    String             @map("question_text") @db.Text
+  options         Json               // Array of choices: e.g., ["A", "B", "C", "D"]
+  correctOption   Int                @map("correct_option")   // Correct index: 0 to 3
+  timeLimitSeconds Int               @default(15) @map("time_limit_seconds")
+  points          Int                @default(10)             // Base XP awarded for correct answer
+  difficulty      String             @default("MEDIUM")       // EASY | MEDIUM | HARD
+  subjectId       Int?               @map("subject_id")       // Optional: link to curriculum subject
+  classId         Int?               @map("class_id")         // Optional: target difficulty tier
+  active          Boolean            @default(true)
+  createdAt       DateTime           @default(now()) @map("created_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+  submissions     TriviaSubmission[]
+
+  @@index([active])
+  @@map("trivia_questions")
+}
+
+model TriviaSubmission {
+  id               Int             @id @default(autoincrement())
+  studentId        Int             @map("student_id")
+  triviaQuestionId Int             @map("trivia_question_id")
+  selectedOption   Int             @map("selected_option")
+  isCorrect        Boolean         @map("is_correct")
+  timeTakenMs      Int             @map("time_taken_ms")  // Evaluated for speed-cheating validation
+  createdAt        DateTime        @default(now()) @map("created_at")
+
+  student  Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  question TriviaQuestion @relation(fields: [triviaQuestionId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, triviaQuestionId])
+  @@map("trivia_submissions")
+}
+
+model StudentTriviaStreak {
+  id             Int      @id @default(autoincrement())
+  studentId      Int      @unique @map("student_id")
+  currentStreak  Int      @default(0)  @map("current_streak")
+  highestStreak  Int      @default(0)  @map("highest_streak")
+  lastActiveDate DateTime @map("last_active_date")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@map("student_trivia_streaks")
+}
+
+model Badge {
+  id            Int            @id @default(autoincrement())
+  name          String         @unique
+  description   String         @db.Text
+  iconUrl       String         @map("icon_url")
+  criteria      Json // Rule specifications: e.g. { "type": "TRIVIA_STREAK", "minVal": 5 }
+  createdAt     DateTime       @default(now()) @map("created_at")
+  studentAwards StudentBadge[]
+
+  @@map("badges")
+}
+
+model StudentBadge {
+  id        Int      @id @default(autoincrement())
+  studentId Int      @map("student_id")
+  badgeId   Int      @map("badge_id")
+  awardedAt DateTime @default(now()) @map("awarded_at")
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  badge   Badge   @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, badgeId])
+  @@map("student_badges")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREDICTIVE ATTRITION RADER & INTERVENTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model StudentAttritionRisk {
+  id               Int      @id @default(autoincrement())
+  studentId        Int      @unique @map("student_id")
+  student          Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  
+  attendanceScore  Float    @map("attendance_score") // 0.0 to 1.0 (Higher is riskier)
+  academicScore    Float    @map("academic_score")    // 0.0 to 1.0 (Decline velocity)
+  financialScore   Float    @map("financial_score")   // 0.0 to 1.0 (Outstanding balance backlog)
+  sentimentScore   Float    @map("sentiment_score")   // 0.0 to 1.0 (Narrative negative spike)
+  compositeDrift   Float    @map("composite_drift")   // 0.0 to 1.0 (Weighted sum)
+  
+  riskLevel        String   @map("risk_level")        // "LOW" (drift < 0.4), "MEDIUM" (0.4 <= drift < 0.7), "HIGH" (drift >= 0.7)
+  isIsolated       Boolean  @default(false) @map("is_isolated")
+  
+  lastEvaluatedAt  DateTime @default(now()) @map("last_evaluated_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  
+  alerts           InterventionAlert[]
+
+  @@index([riskLevel])
+  @@map("student_attrition_risks")
+}
+
+model InterventionAlert {
+  id               Int                  @id @default(autoincrement())
+  riskId           Int                  @map("risk_id")
+  risk             StudentAttritionRisk @relation(fields: [riskId], references: [id], onDelete: Cascade)
+  
+  teacherId        Int                  @map("teacher_id")
+  teacher          Teacher              @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  
+  status           String               @default("PENDING") @map("status") // PENDING, ACTIVE, RESOLVED, DISMISSED
+  parentPlan       String?              @db.Text @map("parent_plan")       // AI Pre-drafted remediation roadmap
+  remediationSteps Json?                @map("remediation_steps")          // Dynamic list of action items
+  
+  createdAt        DateTime             @default(now()) @map("created_at")
+  updatedAt        DateTime             @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@map("intervention_alerts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STUDENT INTERNAL WALLET (Coin Economy — separate from XP Gamification)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model StudentWallet {
+  id           Int                  @id @default(autoincrement())
+  studentId    Int                  @unique @map("student_id")
+  student      Student              @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  balance      Int                  @default(0)
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+  transactions WalletTransaction[]
+
+  @@map("student_wallets")
+}
+
+model WalletTransaction {
+  id          Int           @id @default(autoincrement())
+  walletId    Int           @map("wallet_id")
+  wallet      StudentWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  amount      Int
+  type        String
+  referenceId Int?          @map("reference_id")
+  note        String?       @db.Text
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  @@index([walletId])
+  @@map("wallet_transactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRIVIA ARENA (Live Competitive Session Engine)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TriviaArena {
+  id            Int                      @id @default(autoincrement())
+  code          String                   @unique
+  status        String                   @default("WAITING")
+  hostId        Int?                     @map("host_id")
+  branchId      Int                      @map("branch_id")
+  branch        Branch                   @relation(fields: [branchId], references: [id])
+  maxPlayers    Int                      @default(20) @map("max_players")
+  timeLimitSecs Int                      @default(15) @map("time_limit_secs")
+  createdAt     DateTime                 @default(now()) @map("created_at")
+  updatedAt     DateTime                 @updatedAt @map("updated_at")
+  participants  TriviaArenaParticipant[]
+
+  @@index([status])
+  @@index([branchId])
+  @@map("trivia_arenas")
+}
+
+model TriviaArenaParticipant {
+  id        Int         @id @default(autoincrement())
+  arenaId   Int         @map("arena_id")
+  arena     TriviaArena @relation(fields: [arenaId], references: [id], onDelete: Cascade)
+  studentId Int         @map("student_id")
+  student   Student     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  score     Int         @default(0)
+  rank      Int?
+  joinedAt  DateTime    @default(now()) @map("joined_at")
+
+  @@unique([arenaId, studentId])
+  @@index([arenaId])
+  @@map("trivia_arena_participants")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI LEARNING COMPANION SESSIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AiCompanionSession {
+  id        Int      @id @default(autoincrement())
+  studentId Int      @map("student_id")
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  title     String?
+  messages  Json
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([studentId])
+  @@map("ai_companion_sessions")
+}

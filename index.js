@@ -6,6 +6,7 @@ const { PrismaClient } = require('@prisma/client');
 const { PrismaPg } = require('@prisma/adapter-pg');
 const { Pool } = require('pg');
 const redisClient = require('./config/redis');
+const cron = require('node-cron');
 
 const app = express();
 
@@ -75,13 +76,20 @@ app.get('/api/health', async (req, res) => {
     await prisma.$queryRaw`SELECT 1`;
     
     // Check Redis Connection
-    const ping = await redisClient.ping();
+    let redisStatus = 'disconnected';
+    try {
+      const ping = await redisClient.ping();
+      redisStatus = ping === 'PONG' ? 'connected' : 'disconnected';
+    } catch (redisError) {
+      console.warn('[HEALTH] Redis health check failed:', redisError.message);
+      redisStatus = redisError.message.includes('NOAUTH') ? 'auth_required' : 'error';
+    }
 
     res.status(200).json({
       status: 'ok',
       message: 'Server is healthy',
       database: 'connected',
-      redis: ping === 'PONG' ? 'connected' : 'disconnected'
+      redis: redisStatus
     });
   } catch (error) {
     console.error('Health check failed:', error);
@@ -97,6 +105,43 @@ app.get('/api/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.send('Welcome to Ugbekun 2.0 Backend API');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHEDULED CRON JOBS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 1. Weekly Attendance Gamification Evaluator
+//    Runs every Monday at 06:00 AM server time
+cron.schedule('0 6 * * 1', () => {
+  console.log('[CRON] Running weekly attendance gamification evaluation...');
+  const { execFile } = require('child_process');
+  execFile('node', ['scripts/evaluateWeeklyAttendance.js'], { cwd: __dirname }, (err, stdout, stderr) => {
+    if (err) {
+      console.error('[CRON] Weekly attendance evaluation failed:', err.message);
+    } else {
+      if (stdout) process.stdout.write(stdout);
+      if (stderr) process.stderr.write(stderr);
+    }
+  });
+}, { scheduled: true, timezone: 'Africa/Lagos' });
+
+// 2. Weekly Attrition Radar Evaluator
+//    Runs every Monday at 06:30 AM server time
+cron.schedule('30 6 * * 1', () => {
+  console.log('[CRON] Running weekly AI predictive attrition radar...');
+  const { execFile } = require('child_process');
+  execFile('node', ['scripts/evaluateWeeklyAttrition.js'], { cwd: __dirname }, (err, stdout, stderr) => {
+    if (err) {
+      console.error('[CRON] Weekly attrition radar failed:', err.message);
+    } else {
+      if (stdout) process.stdout.write(stdout);
+      if (stderr) process.stderr.write(stderr);
+    }
+  });
+}, { scheduled: true, timezone: 'Africa/Lagos' });
+
+console.log('[CRON] Scheduled jobs registered: Weekly Attendance (Mon 06:00) + Attrition Radar (Mon 06:30) [Africa/Lagos]');
+
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
