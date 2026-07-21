@@ -537,6 +537,7 @@ model Class {
   siblingRequests       ParentSiblingRequest[]
   feeAssignments        FeeAssignment[]
   lessonPlans           LessonPlan[]
+  questionBankItems     QuestionBank[]
 
   @@index([branchId])
   @@map("class")
@@ -580,11 +581,12 @@ model Subject {
   subjectAuthor String          @map("subject_author")
   branchId      Int?            @map("branch_id")
   branch        Branch?         @relation(fields: [branchId], references: [id])
-  assigns       SubjectAssign[]
-  marks         Mark[]
-  onlineExams   OnlineExam[]
-  homeworks     Homework[]
-  lessonPlans   LessonPlan[]
+  assigns           SubjectAssign[]
+  marks             Mark[]
+  onlineExams       OnlineExam[]
+  homeworks         Homework[]
+  lessonPlans       LessonPlan[]
+  questionBankItems QuestionBank[]
 
   @@index([branchId])
   @@map("subject")
@@ -1417,4 +1419,24 @@ model AiCompanionSession {
 
   @@index([studentId])
   @@map("ai_companion_sessions")
+}
+
+model QuestionBank {
+  id             Int       @id @default(autoincrement())
+  questionText   String    @map("question_text") @db.Text
+  questionType   String    @default("mcq") @map("question_type") // mcq | theory
+  options        Json?     @map("options") // Array of options, e.g. ["Option A", "Option B", ...]
+  correctOption  String?   @map("correct_option") // E.g. "A", "B", etc. or index/text
+  marks          Float     @default(1.0) @map("marks")
+  subjectId      Int       @map("subject_id")
+  classId        Int?      @map("class_id") // Optional target class reference
+  branchId       Int       @map("branch_id")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  subject        Subject   @relation(fields: [subjectId], references: [id])
+  class          Class?    @relation(fields: [classId], references: [id])
+
+  @@index([subjectId, branchId])
+  @@map("question_bank")
 }

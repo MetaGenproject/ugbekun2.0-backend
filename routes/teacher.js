@@ -3,7 +3,58 @@ const jwt = require('jsonwebtoken')
 const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
-const { isSubjectTeacher, isFormTeacher, hasClassAccess } = require('../lib/teacherAccess')
+const {
+  isSubjectTeacher: originalIsSubjectTeacher,
+  isFormTeacher: originalIsFormTeacher,
+  hasClassAccess: originalHasClassAccess
+} = require('../lib/teacherAccess')
+const { staffMatchesBranch } = require('../lib/branchStats')
+
+// Wrapper bypasses verification if request has been marked as admin-authorized (req.isAdmin)
+async function isSubjectTeacher(prisma, teacherId, classId, sectionId, subjectId, req) {
+  if (req && req.isAdmin) return true
+  return originalIsSubjectTeacher(prisma, teacherId, classId, sectionId, subjectId)
+}
+
+async function isFormTeacher(prisma, teacherId, classId, sectionId, req) {
+  if (req && req.isAdmin) return true
+  return originalIsFormTeacher(prisma, teacherId, classId, sectionId)
+}
+
+async function hasClassAccess(prisma, teacherId, classId, sectionId, req) {
+  if (req && req.isAdmin) return true
+  return originalHasClassAccess(prisma, teacherId, classId, sectionId)
+}
+
+async function resolveBranchForAdmin(decoded) {
+  const requestedBranchId = decoded.legacyUserId ? Number(decoded.legacyUserId) : null
+  if (requestedBranchId) {
+    const branch = await prisma.branch.findUnique({
+      where: { id: requestedBranchId },
+      select: { id: true },
+    })
+    if (branch) {
+      return branch.id
+    }
+  }
+
+  if (!decoded.username) {
+    return null
+  }
+
+  const branches = await prisma.branch.findMany({
+    where: { active: true },
+    select: { id: true, name: true, code: true },
+  })
+
+  const matched = branches.find((branch) => staffMatchesBranch(decoded.username, branch))
+  if (matched) {
+    return matched.id
+  }
+
+  return null
+}
+
 const { generateReportCardPdf, generateMontessoriReportCardPdf } = require('../lib/pdfService')
 const { OpenAI } = require('openai')
 const multer = require('multer')
@@ -38,7 +89,7 @@ function getBearerToken(req) {
   return authHeader.slice('Bearer '.length)
 }
 
-// Authentication guard specifically for Teachers
+// Authentication guard specifically for Teachers (and Branch Admins acting as teachers)
 async function assertTeacher(req, res, next) {
   const token = getBearerToken(req)
   if (!token) {
@@ -47,8 +98,41 @@ async function assertTeacher(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET)
-    if (!decoded || decoded.role !== 3) {
-      return res.status(403).json({ success: false, message: 'Access denied: Requires Teacher role.' })
+    if (!decoded || (decoded.role !== 3 && decoded.role !== 2)) {
+      return res.status(403).json({ success: false, message: 'Access denied: Requires Teacher or Admin role.' })
+    }
+
+    if (decoded.role === 2) {
+      const branchId = await resolveBranchForAdmin(decoded)
+      if (!branchId) {
+        return res.status(403).json({ success: false, message: 'Branch admin account is not linked to a school branch.' })
+      }
+      req.branchId = branchId
+      req.isAdmin = true
+
+      const teacherId = Number(req.headers['x-admin-teacher-id'] || req.query.teacherId || req.body.teacherId || 0)
+      if (teacherId) {
+        const tProfile = await prisma.teacher.findFirst({
+          where: { id: teacherId, branchId }
+        })
+        if (!tProfile) {
+          return res.status(403).json({ success: false, message: 'Access denied: Selected teacher does not belong to your branch.' })
+        }
+        req.teacherId = teacherId
+      } else {
+        const tProfile = await prisma.teacher.findFirst({
+          where: { branchId }
+        })
+        if (tProfile) {
+          req.teacherId = tProfile.id
+        } else {
+          return res.status(403).json({ success: false, message: 'No teachers found in your branch to impersonate.' })
+        }
+      }
+      if (typeof next === 'function') {
+        return next()
+      }
+      return decoded
     }
 
     const teacher = await prisma.teacher.findFirst({
@@ -66,7 +150,10 @@ async function assertTeacher(req, res, next) {
 
     req.teacherId = teacher.id
     req.branchId = teacher.branchId
-    next()
+    if (typeof next === 'function') {
+      return next()
+    }
+    return decoded
   } catch (error) {
     return res.status(401).json({ success: false, message: 'Token is invalid or expired.' })
   }
@@ -163,7 +250,7 @@ router.get('/students', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' })
   }
 
-  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId)
+  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId, req)
   if (!hasAccess) {
     return res.status(403).json({
       success: false,
@@ -245,7 +332,7 @@ router.get('/scores', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId, sectionId, subjectId, and examId are required.' })
   }
 
-  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId)
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req)
   if (!isAssigned) {
     return res.status(403).json({
       success: false,
@@ -291,7 +378,7 @@ router.post('/scores', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
 
-  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId)
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req)
   if (!isAssigned) {
     return res.status(403).json({
       success: false,
@@ -370,7 +457,7 @@ router.post('/attendance', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -449,7 +536,7 @@ router.get('/attendance', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId, sectionId, and attendanceDate are required.' })
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -500,7 +587,7 @@ router.post('/commentary', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -568,7 +655,7 @@ router.post('/commentary/generate-ai', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId, sectionId, and studentId are required.' })
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -754,7 +841,7 @@ router.get('/report-cards', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' })
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -798,7 +885,7 @@ router.get('/gradebook/sheet', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId, sectionId, subjectId, and examId are required.' })
   }
 
-  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId)
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req)
   if (!isAssigned) {
     return res.status(403).json({
       success: false,
@@ -923,7 +1010,7 @@ router.post('/gradebook/save-single', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
 
-  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId)
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req)
   if (!isAssigned) {
     return res.status(403).json({
       success: false,
@@ -992,7 +1079,7 @@ router.post('/gradebook/csv-upload', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
 
-  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId)
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req)
   if (!isAssigned) {
     return res.status(403).json({
       success: false,
@@ -1105,7 +1192,7 @@ router.get('/report-cards/export-pdf', async (req, res) => {
     return res.status(400).json({ success: false, message: 'classId, sectionId, and studentId are required.' })
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId)
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -1434,7 +1521,7 @@ router.get('/montessori/sheet', async (req, res) => {
       return res.status(400).json({ success: false, message: 'This class is not configured for Montessori evaluations.' })
     }
 
-    const access = await hasClassAccess(prisma, req.teacherId, cid, sid)
+    const access = await hasClassAccess(prisma, req.teacherId, cid, sid, req)
     if (!access) {
       return res.status(403).json({
         success: false,
@@ -1554,7 +1641,7 @@ router.post('/montessori/save-single', async (req, res) => {
       return res.status(400).json({ success: false, message: 'This class is not configured for Montessori evaluations.' })
     }
 
-    const access = await hasClassAccess(prisma, req.teacherId, cid, sid)
+    const access = await hasClassAccess(prisma, req.teacherId, cid, sid, req)
     if (!access) {
       return res.status(403).json({
         success: false,
@@ -1778,6 +1865,163 @@ router.post('/online-exams', async (req, res) => {
   } catch (error) {
     console.error('[TEACHER] Create online exam error:', error)
     res.status(500).json({ success: false, message: 'Failed to publish online exam.' })
+  }
+})
+
+// GET /api/teacher/question-bank
+router.get('/question-bank', async (req, res) => {
+  const { subjectId, classId } = req.query
+  try {
+    const whereClause = {
+      branchId: req.branchId
+    }
+    if (subjectId) {
+      whereClause.subjectId = Number(subjectId)
+    }
+    if (classId) {
+      whereClause.classId = Number(classId)
+    }
+
+    const items = await prisma.questionBank.findMany({
+      where: whereClause,
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        class: { select: { id: true, name: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, items })
+  } catch (error) {
+    console.error('[TEACHER] Get question-bank error:', error)
+    res.status(500).json({ success: false, message: 'Failed to retrieve Question Bank items.' })
+  }
+})
+
+// POST /api/teacher/question-bank
+router.post('/question-bank', async (req, res) => {
+  const { questionText, questionType, options, correctOption, marks, subjectId, classId } = req.body
+  if (!questionText || !subjectId) {
+    return res.status(400).json({ success: false, message: 'Question text and Subject are required.' })
+  }
+  try {
+    const item = await prisma.questionBank.create({
+      data: {
+        questionText,
+        questionType: questionType || 'mcq',
+        options: options || null,
+        correctOption: correctOption || null,
+        marks: marks !== undefined ? Number(marks) : 1.0,
+        subjectId: Number(subjectId),
+        classId: classId ? Number(classId) : null,
+        branchId: req.branchId
+      }
+    })
+    res.json({ success: true, item, message: 'Question saved to Question Bank successfully.' })
+  } catch (error) {
+    console.error('[TEACHER] Create question-bank item error:', error)
+    res.status(500).json({ success: false, message: 'Failed to save question to bank.' })
+  }
+})
+
+// PUT /api/teacher/question-bank/:id
+router.put('/question-bank/:id', async (req, res) => {
+  const { id } = req.params
+  const { questionText, questionType, options, correctOption, marks, subjectId, classId } = req.body
+  try {
+    const item = await prisma.questionBank.update({
+      where: { id: Number(id) },
+      data: {
+        questionText,
+        questionType,
+        options,
+        correctOption,
+        marks: marks !== undefined ? Number(marks) : undefined,
+        subjectId: subjectId ? Number(subjectId) : undefined,
+        classId: classId ? Number(classId) : null,
+      }
+    })
+    res.json({ success: true, item, message: 'Question updated successfully.' })
+  } catch (error) {
+    console.error('[TEACHER] Update question-bank item error:', error)
+    res.status(500).json({ success: false, message: 'Failed to update question.' })
+  }
+})
+
+// DELETE /api/teacher/question-bank/:id
+router.delete('/question-bank/:id', async (req, res) => {
+  const { id } = req.params
+  try {
+    await prisma.questionBank.delete({
+      where: { id: Number(id) }
+    })
+    res.json({ success: true, message: 'Question removed from bank.' })
+  } catch (error) {
+    console.error('[TEACHER] Delete question-bank item error:', error)
+    res.status(500).json({ success: false, message: 'Failed to delete question.' })
+  }
+})
+
+// POST /api/teacher/online-exams/distribute
+router.post('/online-exams/distribute', async (req, res) => {
+  const { examId, title, subjectId, passingMark, duration, questions, classIds } = req.body
+  if (!classIds || !Array.isArray(classIds) || classIds.length === 0) {
+    return res.status(400).json({ success: false, message: 'At least one target class is required.' })
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    let finalTitle = title
+    let finalSubjectId = Number(subjectId)
+    let finalPassingMark = passingMark !== undefined ? Number(passingMark) : 0
+    let finalDuration = duration !== undefined ? Number(duration) : 0
+    let finalQuestions = questions || []
+
+    if (examId) {
+      const existingExam = await prisma.onlineExam.findUnique({
+        where: { id: Number(examId) }
+      })
+      if (!existingExam) {
+        return res.status(404).json({ success: false, message: 'Source exam not found.' })
+      }
+      finalTitle = existingExam.title
+      finalSubjectId = existingExam.subjectId
+      finalPassingMark = existingExam.passingMark
+      finalDuration = existingExam.duration
+      finalQuestions = existingExam.questions
+    }
+
+    if (!finalTitle || !finalSubjectId) {
+      return res.status(400).json({ success: false, message: 'Exam title and Subject are required.' })
+    }
+
+    // Create online exam for each class
+    const createdExams = []
+    for (const cid of classIds) {
+      const created = await prisma.onlineExam.create({
+        data: {
+          title: finalTitle,
+          classId: Number(cid),
+          subjectId: finalSubjectId,
+          passingMark: finalPassingMark,
+          duration: finalDuration,
+          questions: finalQuestions,
+          branchId: req.branchId,
+          sessionId
+        }
+      })
+      createdExams.push(created)
+    }
+
+    res.json({
+      success: true,
+      message: `Exam successfully distributed to ${classIds.length} classes.`,
+      examsCount: createdExams.length
+    })
+  } catch (error) {
+    console.error('[TEACHER] Distribute exam error:', error)
+    res.status(500).json({ success: false, message: 'Failed to distribute exam.' })
   }
 })
 

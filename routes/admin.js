@@ -150,13 +150,12 @@ router.get('/students-parents', async (req, res) => {
   if (!decoded) return
 
   try {
-    const where = { branchId: decoded.branchId, active: true }
     const globalSetting = await prisma.globalSettings.findFirst()
     const sessionId = globalSetting?.sessionId || 5
 
     const [students, parents] = await Promise.all([
       prisma.student.findMany({
-        where,
+        where: { branchId: decoded.branchId },
         orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
         select: {
           id: true,
@@ -167,6 +166,7 @@ router.get('/students-parents', async (req, res) => {
           mobileno: true,
           email: true,
           parentId: true,
+          active: true,
           parent: { select: { name: true } },
           enrolls: {
             where: { sessionId },
@@ -177,7 +177,7 @@ router.get('/students-parents', async (req, res) => {
         },
       }),
       prisma.parent.findMany({
-        where,
+        where: { branchId: decoded.branchId },
         orderBy: { name: 'asc' },
         select: {
           id: true,
@@ -187,6 +187,7 @@ router.get('/students-parents', async (req, res) => {
           mobileno: true,
           city: true,
           state: true,
+          active: true,
           _count: { select: { students: true } },
         },
       }),
@@ -203,6 +204,7 @@ router.get('/students-parents', async (req, res) => {
           gender: student.gender,
           mobileno: student.mobileno,
           email: student.email,
+          active: student.active,
           parentName: student.parent?.name || null,
           className: student.enrolls[0]?.class?.name || 'Unassigned',
         })),
@@ -214,6 +216,7 @@ router.get('/students-parents', async (req, res) => {
           mobileno: parent.mobileno,
           city: parent.city,
           state: parent.state,
+          active: parent.active,
           studentCount: parent._count.students,
         })),
       },
@@ -238,13 +241,14 @@ router.get('/teachers-staff', async (req, res) => {
   try {
     const [teachers, staff] = await Promise.all([
       prisma.teacher.findMany({
-        where: { branchId: decoded.branchId, active: true },
+        where: { branchId: decoded.branchId },
         orderBy: { name: 'asc' },
         select: {
           id: true,
           name: true,
           email: true,
           phone: true,
+          active: true,
           _count: { select: { allocations: true } },
         },
       }),
@@ -259,6 +263,7 @@ router.get('/teachers-staff', async (req, res) => {
           name: teacher.name,
           email: teacher.email,
           phone: teacher.phone,
+          active: teacher.active,
           classCount: teacher._count.allocations,
         })),
         staff,
@@ -1973,6 +1978,7 @@ router.get('/classroom-students', async (req, res) => {
       gender: e.student.gender,
       mobileno: e.student.mobileno,
       email: e.student.email,
+      active: e.student.active,
       parentName: e.student.parent?.name || null,
       parentRelation: e.student.parent?.relation || null,
       parentMobile: e.student.parent?.mobileno || null,
@@ -3333,6 +3339,377 @@ router.post('/gamification/config', async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to save gamification config.' });
   }
 });
+
+/**
+ * POST /api/admin/teachers/:id/toggle-status
+ * Toggle active status of a teacher (and their associated login User account).
+ */
+router.post('/teachers/:id/toggle-status', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const teacherId = Number(req.params.id)
+  try {
+    const teacher = await prisma.teacher.findFirst({
+      where: { id: teacherId, branchId: decoded.branchId },
+    })
+
+    if (!teacher) {
+      return res.status(404).json({ success: false, message: 'Teacher not found or unauthorized.' })
+    }
+
+    const newStatus = !teacher.active
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Toggle Teacher profile active status
+      await tx.teacher.update({
+        where: { id: teacherId },
+        data: { active: newStatus },
+      })
+
+      // 2. Toggle linked User account active status
+      if (teacher.userId) {
+        await tx.user.update({
+          where: { id: teacher.userId },
+          data: { active: newStatus },
+        })
+      }
+    })
+
+    return res.json({ success: true, active: newStatus, message: `Teacher status updated to ${newStatus ? 'active' : 'suspended'}.` })
+  } catch (error) {
+    console.error('[ADMIN] Toggle teacher status error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to toggle status.' })
+  }
+})
+
+/**
+ * POST /api/admin/students/:id/toggle-status
+ * Toggle active status of a student (and their associated login User account).
+ */
+router.post('/students/:id/toggle-status', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const studentId = Number(req.params.id)
+  try {
+    const student = await prisma.student.findFirst({
+      where: { id: studentId, branchId: decoded.branchId },
+    })
+
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student not found or unauthorized.' })
+    }
+
+    const newStatus = !student.active
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Toggle Student profile active status
+      await tx.student.update({
+        where: { id: studentId },
+        data: { active: newStatus },
+      })
+
+      // 2. Toggle linked User account active status
+      if (student.userId) {
+        await tx.user.update({
+          where: { id: student.userId },
+          data: { active: newStatus },
+        })
+      }
+    })
+
+    return res.json({ success: true, active: newStatus, message: `Student status updated to ${newStatus ? 'active' : 'suspended'}.` })
+  } catch (error) {
+    console.error('[ADMIN] Toggle student status error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to toggle status.' })
+  }
+})
+
+/**
+ * POST /api/admin/staff/:id/toggle-status
+ * Toggle active status of a staff member User account.
+ */
+router.post('/staff/:id/toggle-status', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const staffId = Number(req.params.id)
+  try {
+    // Make sure they belong to this branch by checking branch matches via helper
+    const user = await prisma.user.findUnique({
+      where: { id: staffId }
+    })
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Staff member not found.' })
+    }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId }
+    })
+
+    if (!branch || !staffMatchesBranch(user.username, branch)) {
+      return res.status(403).json({ success: false, message: 'Unauthorized branch access.' })
+    }
+
+    const newStatus = !user.active
+
+    await prisma.user.update({
+      where: { id: staffId },
+      data: { active: newStatus }
+    })
+
+    return res.json({ success: true, active: newStatus, message: `Staff status updated to ${newStatus ? 'active' : 'suspended'}.` })
+  } catch (error) {
+    console.error('[ADMIN] Toggle staff status error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to toggle status.' })
+  }
+})
+
+/**
+ * GET /api/admin/reports/staff-activities
+ * Fetches recent administrative and instructional activities carried out by staff and teachers in this branch.
+ */
+router.get('/reports/staff-activities', assertBranchAdmin, async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const branchId = decoded.branchId
+
+  try {
+    const activities = []
+
+    // 1. Fetch Lesson Plans (up to 30)
+    const lessonPlans = await prisma.lessonPlan.findMany({
+      where: {
+        teacher: { branchId }
+      },
+      take: 30,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        teacher: { select: { firstName: true, lastName: true } },
+        class: { select: { name: true } },
+        subject: { select: { name: true } }
+      }
+    })
+
+    for (const lp of lessonPlans) {
+      activities.push({
+        id: `lp-${lp.id}`,
+        type: 'LESSON_PLAN',
+        category: 'Instructional',
+        description: `Lesson plan created for Class ${lp.class.name} - ${lp.subject.name} on "${lp.coreTopic}"`,
+        staffName: `${lp.teacher.firstName} ${lp.teacher.lastName}`,
+        staffRole: 'Teacher',
+        timestamp: lp.createdAt
+      })
+    }
+
+    // 2. Fetch Student Commentaries (up to 30)
+    const commentaries = await prisma.studentCommentary.findMany({
+      where: { branchId },
+      take: 30,
+      orderBy: { updatedAt: 'desc' },
+      include: {
+        student: { select: { firstName: true, lastName: true } }
+      }
+    })
+
+    for (const comm of commentaries) {
+      activities.push({
+        id: `comm-${comm.id}`,
+        type: 'COMMENTARY',
+        category: 'Academic Remarks',
+        description: `Holistic report card commentary updated for ${comm.student.firstName} ${comm.student.lastName} (Status: ${comm.status})`,
+        staffName: 'Form Teacher',
+        staffRole: 'Teacher',
+        timestamp: comm.updatedAt || comm.createdAt
+      })
+    }
+
+    // 3. Fetch ID Cards (up to 30)
+    const idCards = await prisma.idCard.findMany({
+      where: { branchId },
+      take: 30,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        student: { select: { firstName: true, lastName: true } },
+        user: { select: { username: true } }
+      }
+    })
+
+    for (const card of idCards) {
+      const recipient = card.entityType === 'student' && card.student
+        ? `${card.student.firstName} ${card.student.lastName}`
+        : card.user
+        ? card.user.username
+        : 'Staff'
+
+      activities.push({
+        id: `idcard-${card.id}`,
+        type: 'IDCARD',
+        category: 'Administration',
+        description: `Identity card provisioned (Card No: ${card.cardNumber}, Recipient: ${recipient}, Status: ${card.status})`,
+        staffName: 'Admin Desk',
+        staffRole: 'Branch Admin/Staff',
+        timestamp: card.createdAt
+      })
+    }
+
+    // 4. Fetch Certificates (up to 30)
+    const certs = await prisma.certificate.findMany({
+      where: { branchId },
+      take: 30,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        student: { select: { firstName: true, lastName: true } }
+      }
+    })
+
+    for (const cert of certs) {
+      activities.push({
+        id: `cert-${cert.id}`,
+        type: 'CERTIFICATE',
+        category: 'Administration',
+        description: `Academic Certificate issued (${cert.title} to ${cert.student.firstName} ${cert.student.lastName})`,
+        staffName: 'Admin Desk',
+        staffRole: 'Branch Admin/Staff',
+        timestamp: cert.createdAt
+      })
+    }
+
+    // 5. Fetch Invoices (up to 30)
+    const invoices = await prisma.invoice.findMany({
+      where: { branchId },
+      take: 30,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        student: { select: { firstName: true, lastName: true } }
+      }
+    })
+
+    for (const inv of invoices) {
+      activities.push({
+        id: `invoice-${inv.id}`,
+        type: 'INVOICE',
+        category: 'Finance',
+        description: `Invoice ${inv.invoiceNo} raised for ${inv.student.firstName} ${inv.student.lastName} (Amount: ₦${inv.totalAmount}, Status: ${inv.status})`,
+        staffName: 'Accountant Desk',
+        staffRole: 'Accountant/Staff',
+        timestamp: inv.createdAt
+      })
+    }
+
+    // 6. Fetch Payments (up to 30)
+    const payments = await prisma.payment.findMany({
+      where: { branchId },
+      take: 30,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        invoice: {
+          include: {
+            student: { select: { firstName: true, lastName: true } }
+          }
+        }
+      }
+    })
+
+    for (const pay of payments) {
+      let collectorName = 'Accountant Desk'
+      if (pay.receivedBy) {
+        const user = await prisma.user.findUnique({
+          where: { id: pay.receivedBy },
+          select: { username: true }
+        })
+        if (user) {
+          collectorName = user.username
+        }
+      }
+
+      const payer = pay.invoice && pay.invoice.student
+        ? `${pay.invoice.student.firstName} ${pay.invoice.student.lastName}`
+        : 'Student'
+
+      activities.push({
+        id: `payment-${pay.id}`,
+        type: 'PAYMENT',
+        category: 'Finance',
+        description: `Payment of ₦${pay.amount} received via ${pay.method} for ${payer} (Ref: ${pay.reference || 'N/A'})`,
+        staffName: collectorName,
+        staffRole: 'Finance Collector',
+        timestamp: pay.createdAt
+      })
+    }
+
+    // 7. Fetch Attendance Records Grouped (up to 30)
+    const attendanceRecords = await prisma.attendance.findMany({
+      where: { branchId },
+      take: 50,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        class: { select: { name: true } },
+        section: { select: { name: true } }
+      }
+    })
+
+    const seenAttendance = new Set()
+    for (const att of attendanceRecords) {
+      const dateStr = new Date(att.attendanceDate).toISOString().split('T')[0]
+      const key = `${att.classId}-${att.sectionId}-${dateStr}`
+      if (!seenAttendance.has(key)) {
+        seenAttendance.add(key)
+        activities.push({
+          id: `att-${att.id}`,
+          type: 'ATTENDANCE',
+          category: 'Instructional',
+          description: `Attendance register submitted for Class ${att.class.name} Section ${att.section.name} on date ${dateStr}`,
+          staffName: 'Form Teacher',
+          staffRole: 'Teacher',
+          timestamp: att.createdAt
+        })
+      }
+    }
+
+    // 8. Fetch Marks Entered/Updated Grouped (up to 30)
+    const marksRecords = await prisma.mark.findMany({
+      where: { branchId },
+      take: 100,
+      orderBy: { id: 'desc' },
+      include: {
+        class: { select: { name: true } },
+        section: { select: { name: true } },
+        subject: { select: { name: true } },
+        exam: { select: { name: true } }
+      }
+    })
+
+    const seenMarks = new Set()
+    for (const m of marksRecords) {
+      const key = `${m.classId}-${m.sectionId}-${m.subjectId}-${m.examId}`
+      if (!seenMarks.has(key)) {
+        seenMarks.add(key)
+        activities.push({
+          id: `mark-${m.id}`,
+          type: 'MARKS',
+          category: 'Academic Grading',
+          description: `Student grades entered/updated for ${m.class.name} Section ${m.section.name} in "${m.subject.name}" (${m.exam.name})`,
+          staffName: 'Subject Teacher',
+          staffRole: 'Teacher',
+          timestamp: new Date()
+        })
+      }
+    }
+
+    // Sort all activities chronologically descending
+    activities.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+
+    return res.json({ success: true, activities: activities.slice(0, 50) })
+  } catch (error) {
+    console.error('[ADMIN] Staff activity report error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to compile staff activity report.' })
+  }
+})
 
 module.exports = router; // reload nodemon
 

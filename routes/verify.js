@@ -20,8 +20,14 @@ router.get('/:token', async (req, res) => {
     const userAgent = req.headers['user-agent'] || 'unknown';
 
     // 1. Try to find a matching ID Card
-    const idCard = await prisma.idCard.findUnique({
-      where: { verifyToken: token },
+    const idCard = await prisma.idCard.findFirst({
+      where: {
+        OR: [
+          { verifyToken: token },
+          { cardNumber: token },
+          { cardNumber: decodeURIComponent(token) }
+        ]
+      },
       include: {
         student: {
           select: {
@@ -92,8 +98,14 @@ router.get('/:token', async (req, res) => {
     }
 
     // 2. Try to find a matching Certificate
-    const certificate = await prisma.certificate.findUnique({
-      where: { verifyToken: token },
+    const certificate = await prisma.certificate.findFirst({
+      where: {
+        OR: [
+          { verifyToken: token },
+          { certificateNo: token },
+          { certificateNo: decodeURIComponent(token) }
+        ]
+      },
       include: {
         student: {
           select: {
