@@ -777,6 +777,7 @@ model OnlineExam {
   branchId    Int                    @map("branch_id")
   sessionId   Int                    @map("session_id")
   questions   Json?                  @map("questions")
+  examDate    DateTime?              @map("exam_date")
   createdAt   DateTime               @default(now()) @map("created_at")
   updatedAt   DateTime?              @updatedAt @map("updated_at")
   submissions OnlineExamSubmission[]

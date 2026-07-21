@@ -1841,7 +1841,7 @@ router.get('/online-exams', async (req, res) => {
 
 // POST /api/teacher/online-exams
 router.post('/online-exams', async (req, res) => {
-  const { title, classId, subjectId, passingMark, questions, duration } = req.body
+  const { title, classId, subjectId, passingMark, questions, duration, examDate } = req.body
   if (!title || !classId || !subjectId) {
     return res.status(400).json({ success: false, message: 'Title, Class, and Subject are required.' })
   }
@@ -1857,6 +1857,7 @@ router.post('/online-exams', async (req, res) => {
         passingMark: passingMark !== undefined ? Number(passingMark) : 0,
         duration: duration !== undefined ? Number(duration) : 0,
         questions: questions || [],
+        examDate: examDate ? new Date(examDate) : null,
         branchId: req.branchId,
         sessionId
       }
@@ -1963,7 +1964,7 @@ router.delete('/question-bank/:id', async (req, res) => {
 
 // POST /api/teacher/online-exams/distribute
 router.post('/online-exams/distribute', async (req, res) => {
-  const { examId, title, subjectId, passingMark, duration, questions, classIds } = req.body
+  const { examId, title, subjectId, passingMark, duration, questions, classIds, examDate } = req.body
   if (!classIds || !Array.isArray(classIds) || classIds.length === 0) {
     return res.status(400).json({ success: false, message: 'At least one target class is required.' })
   }
@@ -1977,6 +1978,7 @@ router.post('/online-exams/distribute', async (req, res) => {
     let finalPassingMark = passingMark !== undefined ? Number(passingMark) : 0
     let finalDuration = duration !== undefined ? Number(duration) : 0
     let finalQuestions = questions || []
+    let finalExamDate = examDate ? new Date(examDate) : null
 
     if (examId) {
       const existingExam = await prisma.onlineExam.findUnique({
@@ -1990,6 +1992,7 @@ router.post('/online-exams/distribute', async (req, res) => {
       finalPassingMark = existingExam.passingMark
       finalDuration = existingExam.duration
       finalQuestions = existingExam.questions
+      finalExamDate = examDate ? new Date(examDate) : existingExam.examDate
     }
 
     if (!finalTitle || !finalSubjectId) {
@@ -2007,6 +2010,7 @@ router.post('/online-exams/distribute', async (req, res) => {
           passingMark: finalPassingMark,
           duration: finalDuration,
           questions: finalQuestions,
+          examDate: finalExamDate,
           branchId: req.branchId,
           sessionId
         }
@@ -2058,6 +2062,44 @@ router.post('/online-exams/submissions/:id/grade', async (req, res) => {
   } catch (error) {
     console.error('[TEACHER] Grade online-exam submission error:', error)
     res.status(500).json({ success: false, message: 'Failed to save grade.' })
+  }
+})
+
+// PUT /api/teacher/online-exams/:id
+router.put('/online-exams/:id', async (req, res) => {
+  const { id } = req.params
+  const { title, passingMark, duration, examDate } = req.body
+  try {
+    const exam = await prisma.onlineExam.update({
+      where: { id: Number(id) },
+      data: {
+        title,
+        passingMark: passingMark !== undefined ? Number(passingMark) : undefined,
+        duration: duration !== undefined ? Number(duration) : undefined,
+        examDate: examDate ? new Date(examDate) : null
+      }
+    })
+    res.json({ success: true, exam, message: 'Online exam updated successfully.' })
+  } catch (error) {
+    console.error('[TEACHER] Update online exam error:', error)
+    res.status(500).json({ success: false, message: 'Failed to update online exam.' })
+  }
+})
+
+// DELETE /api/teacher/online-exams/:id
+router.delete('/online-exams/:id', async (req, res) => {
+  const { id } = req.params
+  try {
+    await prisma.onlineExamSubmission.deleteMany({
+      where: { onlineExamId: Number(id) }
+    })
+    await prisma.onlineExam.delete({
+      where: { id: Number(id) }
+    })
+    res.json({ success: true, message: 'Online exam deleted successfully.' })
+  } catch (error) {
+    console.error('[TEACHER] Delete online exam error:', error)
+    res.status(500).json({ success: false, message: 'Failed to delete online exam.' })
   }
 })
 

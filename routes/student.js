@@ -296,6 +296,7 @@ router.get('/tasks', async (req, res) => {
           answers: submission ? submission.answers : null,
           startedAt: submission ? submission.startedAt : null,
           submittedAt: submission ? submission.submittedAt : null,
+          examDate: ex.examDate,
           createdAt: ex.createdAt
         }
       }),
@@ -931,6 +932,10 @@ router.post('/online-exams/:id/start', async (req, res) => {
     })
     if (!exam) {
       return res.status(404).json({ success: false, message: 'Online exam not found.' })
+    }
+
+    if (exam.examDate && new Date(exam.examDate).getTime() > Date.now()) {
+      return res.status(400).json({ success: false, message: 'This scheduled CBT exam has not started yet.' })
     }
 
     // Check for existing attempt/submission
