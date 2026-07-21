@@ -406,12 +406,12 @@ router.get('/grades', async (req, res) => {
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 }
       }
-      if (m.mark && m.mark !== '{}' && m.mark !== '') {
-        const val = parseFloat(m.mark)
-        if (!isNaN(val)) {
-          classAverageMap[key].sum += val
-          classAverageMap[key].count += 1
-        }
+      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0
+      const examVal = m.mark ? parseFloat(m.mark) : 0
+      const totalVal = testVal + examVal
+      if (m.cbtMark !== null || m.mark !== null) {
+        classAverageMap[key].sum += totalVal
+        classAverageMap[key].count += 1
       }
     })
 
@@ -430,14 +430,15 @@ router.get('/grades', async (req, res) => {
     let marksCount = 0
 
     const reportCard = studentMarks.map(m => {
+      const testScore = m.cbtMark !== null ? parseFloat(m.cbtMark) : 0
+      const examScore = m.mark !== null ? parseFloat(m.mark) : 0
+      const totalScore = testScore + examScore
+
       let markValue = null
       let studentScore = NaN
-      if (m.mark && m.mark !== '{}' && m.mark !== '') {
-        const parsed = parseFloat(m.mark)
-        if (!isNaN(parsed)) {
-          studentScore = parsed
-          markValue = String(parsed)
-        }
+      if (m.cbtMark !== null || m.mark !== null) {
+        studentScore = totalScore
+        markValue = String(totalScore)
       }
 
       if (!isNaN(studentScore)) {
@@ -456,6 +457,8 @@ router.get('/grades', async (req, res) => {
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
+        cbtMark: m.cbtMark !== null ? String(testScore) : null,
+        theoryMark: m.mark !== null ? String(examScore) : null,
         mark: markValue,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage
@@ -703,18 +706,19 @@ router.get('/grades/export-pdf', async (req, res) => {
       }
     })
 
+    // Calculate averages helper map
     const classAverageMap = {}
     classMarks.forEach(m => {
       const key = `${m.examId}-${m.subjectId}`
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 }
       }
-      if (m.mark && m.mark !== '{}' && m.mark !== '') {
-        const val = parseFloat(m.mark)
-        if (!isNaN(val)) {
-          classAverageMap[key].sum += val
-          classAverageMap[key].count += 1
-        }
+      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0
+      const examVal = m.mark ? parseFloat(m.mark) : 0
+      const totalVal = testVal + examVal
+      if (m.cbtMark !== null || m.mark !== null) {
+        classAverageMap[key].sum += totalVal
+        classAverageMap[key].count += 1
       }
     })
 
@@ -723,14 +727,15 @@ router.get('/grades/export-pdf', async (req, res) => {
     let marksCount = 0
 
     const reportCard = studentMarks.map(m => {
+      const testScore = m.cbtMark !== null ? parseFloat(m.cbtMark) : 0
+      const examScore = m.mark !== null ? parseFloat(m.mark) : 0
+      const totalScore = testScore + examScore
+
       let markValue = null
       let studentScore = NaN
-      if (m.mark && m.mark !== '{}' && m.mark !== '') {
-        const parsed = parseFloat(m.mark)
-        if (!isNaN(parsed)) {
-          studentScore = parsed
-          markValue = String(parsed)
-        }
+      if (m.cbtMark !== null || m.mark !== null) {
+        studentScore = totalScore
+        markValue = String(totalScore)
       }
 
       if (!isNaN(studentScore)) {
@@ -749,6 +754,8 @@ router.get('/grades/export-pdf', async (req, res) => {
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
+        cbtMark: m.cbtMark !== null ? String(testScore) : null,
+        theoryMark: m.mark !== null ? String(examScore) : null,
         mark: markValue,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage
@@ -781,7 +788,7 @@ router.get('/grades/export-pdf', async (req, res) => {
             sessionId: req.sessionId,
             branchId: req.branchId
           },
-          select: { studentId: true, mark: true }
+          select: { studentId: true, mark: true, cbtMark: true }
         })
 
         const studentAggregates = {}
@@ -790,12 +797,12 @@ router.get('/grades/export-pdf', async (req, res) => {
         })
 
         allMarks.forEach(m => {
-          if (m.mark && m.mark !== '{}' && m.mark !== '') {
-            const val = parseFloat(m.mark)
-            if (!isNaN(val)) {
-              studentAggregates[m.studentId].sum += val
-              studentAggregates[m.studentId].count += 1
-            }
+          const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0
+          const examVal = m.mark ? parseFloat(m.mark) : 0
+          const totalVal = testVal + examVal
+          if (m.cbtMark !== null || m.mark !== null) {
+            studentAggregates[m.studentId].sum += totalVal
+            studentAggregates[m.studentId].count += 1
           }
         })
 
@@ -1527,5 +1534,35 @@ router.get('/gamification/leaderboard', assertStudent, async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to retrieve leaderboard.' });
   }
 });
+
+/**
+ * GET /api/student/events
+ * Fetch all events for the current branch.
+ */
+router.get('/events', async (req, res) => {
+  const branchId = req.branchId
+
+  try {
+    const globalSetting = await prisma.globalSetting.findFirst({
+      where: { branchId }
+    })
+    const sessionId = globalSetting?.sessionId || 5
+
+    const events = await prisma.event.findMany({
+      where: {
+        branchId,
+        sessionId
+      },
+      orderBy: {
+        startDate: 'asc'
+      }
+    })
+
+    return res.json({ success: true, events })
+  } catch (error) {
+    console.error('[STUDENT] Get events error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch events.' })
+  }
+})
 
 module.exports = router

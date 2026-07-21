@@ -674,6 +674,7 @@ model Mark {
   sectionId Int     @map("section_id")
   examId    Int     @map("exam_id")
   mark      String? @map("mark")
+  cbtMark   String? @map("cbt_mark")
   absent    String? @map("absent")
   sessionId Int     @map("session_id")
   branchId  Int?    @map("branch_id")
@@ -1440,4 +1441,19 @@ model QuestionBank {
 
   @@index([subjectId, branchId])
   @@map("question_bank")
+}
+
+model Event {
+  id          Int       @id @default(autoincrement())
+  title       String
+  description String?   @db.Text
+  startDate   DateTime  @map("start_date")
+  endDate     DateTime? @map("end_date")
+  branchId    Int?      @map("branch_id")
+  sessionId   Int?      @map("session_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  @@index([branchId, sessionId])
+  @@map("event")
 }

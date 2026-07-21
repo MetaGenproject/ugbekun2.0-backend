@@ -937,6 +937,7 @@ router.get('/gradebook/sheet', async (req, res) => {
         id: true,
         studentId: true,
         mark: true,
+        cbtMark: true,
         absent: true
       }
     })
@@ -979,6 +980,7 @@ router.get('/gradebook/sheet', async (req, res) => {
       const markRec = markMap.get(student.id)
       const objectiveScore = onlineSubMap.get(student.id) || 0
       const theoryMark = markRec?.mark ? Number(markRec.mark) : null
+      const savedCbtMark = markRec?.cbtMark ? Number(markRec.cbtMark) : null
       const absent = markRec?.absent === '1'
 
       return {
@@ -988,7 +990,7 @@ router.get('/gradebook/sheet', async (req, res) => {
         lastName: student.lastName,
         gender: student.gender,
         theoryMark: absent ? null : theoryMark,
-        objectiveMark: objectiveScore,
+        objectiveMark: savedCbtMark !== null ? savedCbtMark : objectiveScore,
         absent
       }
     })
@@ -1005,7 +1007,7 @@ router.get('/gradebook/sheet', async (req, res) => {
  * Upserts a single student's manual theory score.
  */
 router.post('/gradebook/save-single', async (req, res) => {
-  const { classId, sectionId, subjectId, examId, studentId, theoryMark, absent } = req.body
+  const { classId, sectionId, subjectId, examId, studentId, theoryMark, objectiveMark, absent } = req.body
   if (!classId || !sectionId || !subjectId || !examId || !studentId) {
     return res.status(400).json({ success: false, message: 'Required fields missing.' })
   }
@@ -1032,19 +1034,24 @@ router.post('/gradebook/save-single', async (req, res) => {
         sessionId,
         branchId: req.branchId
       },
-      select: { id: true }
+      select: { id: true, cbtMark: true }
     })
 
     const markValue = theoryMark !== undefined && theoryMark !== null && theoryMark !== '' ? String(theoryMark) : null
     const absentValue = absent ? '1' : null
+    const passedCbtMark = objectiveMark !== undefined && objectiveMark !== null && objectiveMark !== '' ? String(objectiveMark) : null
 
     if (existing) {
+      const updateData = {
+        mark: markValue,
+        absent: absentValue
+      }
+      if (req.isAdmin) {
+        updateData.cbtMark = passedCbtMark
+      }
       await prisma.mark.update({
         where: { id: existing.id },
-        data: {
-          mark: markValue,
-          absent: absentValue
-        }
+        data: updateData
       })
     } else {
       await prisma.mark.create({
@@ -1055,6 +1062,7 @@ router.post('/gradebook/save-single', async (req, res) => {
           sectionId: Number(sectionId),
           examId: Number(examId),
           mark: markValue,
+          cbtMark: passedCbtMark,
           absent: absentValue,
           sessionId,
           branchId: req.branchId
@@ -1348,12 +1356,12 @@ router.get('/report-cards/export-pdf', async (req, res) => {
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 }
       }
-      if (m.mark && m.mark !== '{}' && m.mark !== '') {
-        const val = parseFloat(m.mark)
-        if (!isNaN(val)) {
-          classAverageMap[key].sum += val
-          classAverageMap[key].count += 1
-        }
+      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0
+      const examVal = m.mark ? parseFloat(m.mark) : 0
+      const totalVal = testVal + examVal
+      if (m.cbtMark !== null || m.mark !== null) {
+        classAverageMap[key].sum += totalVal
+        classAverageMap[key].count += 1
       }
     })
 
@@ -1362,14 +1370,15 @@ router.get('/report-cards/export-pdf', async (req, res) => {
     let marksCount = 0
 
     const reportCard = studentMarks.map(m => {
+      const testScore = m.cbtMark !== null ? parseFloat(m.cbtMark) : 0
+      const examScore = m.mark !== null ? parseFloat(m.mark) : 0
+      const totalScore = testScore + examScore
+
       let markValue = null
       let studentScore = NaN
-      if (m.mark && m.mark !== '{}' && m.mark !== '') {
-        const parsed = parseFloat(m.mark)
-        if (!isNaN(parsed)) {
-          studentScore = parsed
-          markValue = String(parsed)
-        }
+      if (m.cbtMark !== null || m.mark !== null) {
+        studentScore = totalScore
+        markValue = String(totalScore)
       }
 
       if (!isNaN(studentScore)) {
@@ -1388,6 +1397,8 @@ router.get('/report-cards/export-pdf', async (req, res) => {
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
+        cbtMark: m.cbtMark !== null ? String(testScore) : null,
+        theoryMark: m.mark !== null ? String(examScore) : null,
         mark: markValue,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage
@@ -1419,7 +1430,7 @@ router.get('/report-cards/export-pdf', async (req, res) => {
           sessionId,
           branchId: req.branchId
         },
-        select: { studentId: true, mark: true }
+        select: { studentId: true, mark: true, cbtMark: true }
       })
 
       const studentAggregates = {}
@@ -1428,12 +1439,12 @@ router.get('/report-cards/export-pdf', async (req, res) => {
       })
 
       allMarks.forEach(m => {
-        if (m.mark && m.mark !== '{}' && m.mark !== '') {
-          const val = parseFloat(m.mark)
-          if (!isNaN(val)) {
-            studentAggregates[m.studentId].sum += val
-            studentAggregates[m.studentId].count += 1
-          }
+        const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0
+        const examVal = m.mark ? parseFloat(m.mark) : 0
+        const totalVal = testVal + examVal
+        if (m.cbtMark !== null || m.mark !== null) {
+          studentAggregates[m.studentId].sum += totalVal
+          studentAggregates[m.studentId].count += 1
         }
       })
 
@@ -3164,7 +3175,37 @@ router.post('/attrition/action/:alertId', async (req, res) => {
     console.error('[TEACHER] Attrition alert action update error:', error);
     res.status(500).json({ success: false, message: 'Failed to update attrition alert status.' });
   }
-});
+})
+
+/**
+ * GET /api/teacher/events
+ * Fetch all events for the current branch and session.
+ */
+router.get('/events', assertTeacher, async (req, res) => {
+  const branchId = req.branchId
+
+  try {
+    const globalSetting = await prisma.globalSetting.findFirst({
+      where: { branchId }
+    })
+    const sessionId = globalSetting?.sessionId || 5
+
+    const events = await prisma.event.findMany({
+      where: {
+        branchId,
+        sessionId
+      },
+      orderBy: {
+        startDate: 'asc'
+      }
+    })
+
+    return res.json({ success: true, events })
+  } catch (error) {
+    console.error('[TEACHER] Get events error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch events.' })
+  }
+})
 
 module.exports = router
 

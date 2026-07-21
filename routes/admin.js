@@ -3711,5 +3711,269 @@ router.get('/reports/staff-activities', assertBranchAdmin, async (req, res) => {
   }
 })
 
+/**
+ * GET /api/admin/events
+ * Fetch all events for the current branch and session.
+ */
+router.get('/events', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const globalSetting = await prisma.globalSetting.findFirst({
+      where: { branchId: decoded.branchId }
+    })
+    const sessionId = globalSetting?.sessionId || 5
+
+    const events = await prisma.event.findMany({
+      where: {
+        branchId: decoded.branchId,
+        sessionId: sessionId
+      },
+      orderBy: {
+        startDate: 'asc'
+      }
+    })
+
+    return res.json({ success: true, events })
+  } catch (error) {
+    console.error('[ADMIN] Get events error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch events.' })
+  }
+})
+
+/**
+ * POST /api/admin/events
+ * Create a new event.
+ */
+router.post('/events', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const { title, description, startDate, endDate } = req.body
+
+  if (!title || !startDate) {
+    return res.status(400).json({ success: false, message: 'Title and Start Date are required.' })
+  }
+
+  try {
+    const globalSetting = await prisma.globalSetting.findFirst({
+      where: { branchId: decoded.branchId }
+    })
+    const sessionId = globalSetting?.sessionId || 5
+
+    const newEvent = await prisma.event.create({
+      data: {
+        title,
+        description,
+        startDate: new Date(startDate),
+        endDate: endDate ? new Date(endDate) : null,
+        branchId: decoded.branchId,
+        sessionId: sessionId
+      }
+    })
+
+    return res.json({ success: true, event: newEvent, message: 'Event created successfully!' })
+  } catch (error) {
+    console.error('[ADMIN] Create event error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create event.' })
+  }
+})
+
+/**
+ * PUT /api/admin/events/:id
+ * Update an existing event.
+ */
+router.put('/events/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const eventId = Number(req.params.id)
+  const { title, description, startDate, endDate } = req.body
+
+  try {
+    const existing = await prisma.event.findFirst({
+      where: {
+        id: eventId,
+        branchId: decoded.branchId
+      }
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Event not found or unauthorized.' })
+    }
+
+    const updated = await prisma.event.update({
+      where: { id: eventId },
+      data: {
+        title: title !== undefined ? title : existing.title,
+        description: description !== undefined ? description : existing.description,
+        startDate: startDate ? new Date(startDate) : existing.startDate,
+        endDate: endDate !== undefined ? (endDate ? new Date(endDate) : null) : existing.endDate
+      }
+    })
+
+    return res.json({ success: true, event: updated, message: 'Event updated successfully!' })
+  } catch (error) {
+    console.error('[ADMIN] Update event error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update event.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/events/:id
+ * Delete an event.
+ */
+router.delete('/events/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const eventId = Number(req.params.id)
+
+  try {
+    const existing = await prisma.event.findFirst({
+      where: {
+        id: eventId,
+        branchId: decoded.branchId
+      }
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Event not found or unauthorized.' })
+    }
+
+    await prisma.event.delete({
+      where: { id: eventId }
+    })
+
+    return res.json({ success: true, message: 'Event deleted successfully!' })
+  } catch (error) {
+    console.error('[ADMIN] Delete event error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete event.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/sync
+ * Syncs student CBT online exam scores into the Mark model (cbtMark field) for a target academic Exam.
+ */
+router.post('/cbt/sync', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const { examId, onlineExamIds } = req.body
+  if (!examId) {
+    return res.status(400).json({ success: false, message: 'Academic examId is required for mapping.' })
+  }
+
+  try {
+    const targetExam = await prisma.exam.findFirst({
+      where: {
+        id: Number(examId),
+        branchId: decoded.branchId
+      }
+    })
+
+    if (!targetExam) {
+      return res.status(404).json({ success: false, message: 'Target academic exam not found.' })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // Build query for online exam submissions
+    const submissionFilter = {
+      onlineExam: {
+        branchId: decoded.branchId,
+        sessionId: sessionId
+      }
+    }
+
+    if (onlineExamIds && Array.isArray(onlineExamIds) && onlineExamIds.length > 0) {
+      submissionFilter.onlineExamId = { in: onlineExamIds.map(Number) }
+    }
+
+    const submissions = await prisma.onlineExamSubmission.findMany({
+      where: submissionFilter,
+      include: {
+        onlineExam: true
+      }
+    })
+
+    let updatedCount = 0
+    let createdCount = 0
+    let skippedCount = 0
+
+    for (const sub of submissions) {
+      if (sub.totalMark === null || sub.totalMark === undefined) {
+        skippedCount++
+        continue
+      }
+
+      const { studentId, totalMark, onlineExam } = sub
+      const { classId, subjectId } = onlineExam
+
+      // Find enrollment to resolve sectionId
+      const enroll = await prisma.enroll.findFirst({
+        where: {
+          studentId,
+          sessionId,
+          branchId: decoded.branchId
+        },
+        select: { sectionId: true }
+      })
+
+      if (!enroll) {
+        skippedCount++
+        continue
+      }
+
+      // Check if Mark record already exists for this student, subject, class, academic exam, session
+      const existingMark = await prisma.mark.findFirst({
+        where: {
+          studentId,
+          subjectId,
+          classId,
+          examId: Number(examId),
+          sessionId,
+          branchId: decoded.branchId
+        }
+      })
+
+      if (existingMark) {
+        await prisma.mark.update({
+          where: { id: existingMark.id },
+          data: {
+            cbtMark: String(totalMark)
+          }
+        })
+        updatedCount++
+      } else {
+        await prisma.mark.create({
+          data: {
+            studentId,
+            subjectId,
+            classId,
+            sectionId: enroll.sectionId,
+            examId: Number(examId),
+            cbtMark: String(totalMark),
+            sessionId,
+            branchId: decoded.branchId
+          }
+        })
+        createdCount++
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: `Sync completed successfully. Updated: ${updatedCount}, Created: ${createdCount}, Skipped: ${skippedCount}`
+    })
+  } catch (error) {
+    console.error('[ADMIN] CBT marks sync error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to sync CBT marks.' })
+  }
+})
+
 module.exports = router; // reload nodemon
 
