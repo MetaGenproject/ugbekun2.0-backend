@@ -987,9 +987,7 @@ router.get('/events', async (req, res) => {
   const branchId = req.branchId
 
   try {
-    const globalSetting = await prisma.globalSetting.findFirst({
-      where: { branchId }
-    })
+    const globalSetting = await prisma.globalSettings.findFirst()
     const sessionId = globalSetting?.sessionId || 5
 
     const events = await prisma.event.findMany({

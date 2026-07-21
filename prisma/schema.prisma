@@ -1002,6 +1002,7 @@ model FeeType {
 model FeeAssignment {
   id        Int      @id @default(autoincrement())
   active    Boolean  @default(true)
+  isOptional Boolean  @default(false) @map("is_optional")
   createdAt DateTime @default(now()) @map("created_at")
 
   feeTypeId Int     @map("fee_type_id")

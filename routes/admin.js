@@ -171,7 +171,7 @@ router.get('/students-parents', async (req, res) => {
           enrolls: {
             where: { sessionId },
             select: {
-              class: { select: { name: true } },
+              class: { select: { id: true, name: true } },
             },
           },
         },
@@ -2906,6 +2906,261 @@ router.post('/finances/fee-types', async (req, res) => {
 });
 
 /**
+ * POST /api/admin/finances/fee-types/bulk
+ * Batch creates multiple fee categories at once.
+ */
+router.post('/finances/fee-types/bulk', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { feeTypes } = req.body;
+    if (!feeTypes || !Array.isArray(feeTypes) || feeTypes.length === 0) {
+      return res.status(400).json({ success: false, message: 'Fee categories array is required.' });
+    }
+
+    const created = [];
+    const skipped = [];
+
+    for (const item of feeTypes) {
+      const { name, code, amount, frequency = 'per_term' } = item;
+      if (!name || !code || amount === undefined) {
+        skipped.push({ name: name || 'Unknown', reason: 'Missing name, code, or amount' });
+        continue;
+      }
+
+      const cleanCode = code.trim().toUpperCase();
+
+      const existing = await prisma.feeType.findUnique({
+        where: {
+          branchId_code: {
+            branchId: decoded.branchId,
+            code: cleanCode
+          }
+        }
+      });
+
+      if (existing) {
+        skipped.push({ name, code: cleanCode, reason: 'Duplicate unique code' });
+        continue;
+      }
+
+      const newFee = await prisma.feeType.create({
+        data: {
+          name,
+          code: cleanCode,
+          amount: parseFloat(amount),
+          frequency,
+          branchId: decoded.branchId
+        }
+      });
+      created.push(newFee);
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: `Batch complete. Created: ${created.length}, Skipped: ${skipped.length}`,
+      created,
+      skipped
+    });
+  } catch (error) {
+    console.error('[ADMIN] Bulk create fee types error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to create fee categories.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/fee-assignments
+ * Retrieves all fee allocations for the current branch.
+ */
+router.get('/finances/fee-assignments', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const assignments = await prisma.feeAssignment.findMany({
+      where: {
+        branchId: decoded.branchId,
+        sessionId
+      },
+      include: {
+        feeType: true,
+        class: { select: { id: true, name: true } }
+      }
+    });
+
+    return res.json({
+      success: true,
+      data: assignments
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get fee assignments error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve fee allocations.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/fee-assignments
+ * Allocates fee types to a specific class.
+ */
+router.post('/finances/fee-assignments', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, allocations } = req.body;
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    }
+
+    const parsedClassId = parseInt(classId, 10);
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete existing assignments for this class
+      await tx.feeAssignment.deleteMany({
+        where: {
+          branchId: decoded.branchId,
+          classId: parsedClassId,
+          sessionId
+        }
+      });
+
+      // 2. Create new allocations
+      if (allocations && Array.isArray(allocations)) {
+        const createData = allocations.map(alloc => ({
+          feeTypeId: parseInt(alloc.feeTypeId, 10),
+          isOptional: !!alloc.isOptional,
+          classId: parsedClassId,
+          branchId: decoded.branchId,
+          sessionId
+        }));
+
+        if (createData.length > 0) {
+          await tx.feeAssignment.createMany({
+            data: createData
+          });
+        }
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: 'Class fee allocations updated successfully.'
+    });
+  } catch (error) {
+    console.error('[ADMIN] Save fee assignments error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save fee allocations.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/invoices/bulk
+ * Bulk generates invoices for all students in a class based on mandatory fee allocations.
+ */
+router.post('/finances/invoices/bulk', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, termLabel, dueDate } = req.body;
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    }
+
+    const parsedClassId = parseInt(classId, 10);
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    // 1. Fetch mandatory fee allocations for the class
+    const allocations = await prisma.feeAssignment.findMany({
+      where: {
+        branchId: decoded.branchId,
+        classId: parsedClassId,
+        sessionId,
+        isOptional: false,
+        active: true
+      },
+      select: { feeTypeId: true }
+    });
+
+    if (allocations.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No mandatory fee allocations found for this class. Please assign fees first.'
+      });
+    }
+
+    const feeTypeIds = allocations.map(a => a.feeTypeId);
+
+    // 2. Fetch all students enrolled in this class for the current session
+    const enrollments = await prisma.enroll.findMany({
+      where: {
+        classId: parsedClassId,
+        sessionId,
+        branchId: decoded.branchId
+      },
+      select: { studentId: true }
+    });
+
+    if (enrollments.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No students enrolled in this class for the current session.'
+      });
+    }
+
+    let successCount = 0;
+    let errorCount = 0;
+
+    for (const enroll of enrollments) {
+      try {
+        // Check if student already has an invoice for this term to prevent duplicate billing
+        const existingInvoice = await prisma.invoice.findFirst({
+          where: {
+            studentId: enroll.studentId,
+            termLabel: termLabel || 'First Term',
+            sessionId,
+            branchId: decoded.branchId
+          }
+        });
+
+        if (existingInvoice) {
+          // Skip if already billed for this term
+          continue;
+        }
+
+        await generateInvoice(prisma, {
+          studentId: enroll.studentId,
+          termLabel: termLabel || 'First Term',
+          feeTypeIds,
+          branchId: decoded.branchId,
+          sessionId,
+          dueDate: dueDate || null
+        });
+
+        successCount++;
+      } catch (err) {
+        console.error(`[ADMIN] Bulk invoice fail for student ${enroll.studentId}:`, err);
+        errorCount++;
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: `Bulk invoicing complete. Invoices generated: ${successCount}. Skipped or failed: ${errorCount}`
+    });
+  } catch (error) {
+    console.error('[ADMIN] Bulk generate invoices error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to bulk generate invoices.' });
+  }
+});
+
+/**
  * GET /api/admin/finances/invoices
  */
 router.get('/finances/invoices', async (req, res) => {
@@ -3720,9 +3975,7 @@ router.get('/events', async (req, res) => {
   if (!decoded) return
 
   try {
-    const globalSetting = await prisma.globalSetting.findFirst({
-      where: { branchId: decoded.branchId }
-    })
+    const globalSetting = await prisma.globalSettings.findFirst()
     const sessionId = globalSetting?.sessionId || 5
 
     const events = await prisma.event.findMany({
@@ -3757,9 +4010,7 @@ router.post('/events', async (req, res) => {
   }
 
   try {
-    const globalSetting = await prisma.globalSetting.findFirst({
-      where: { branchId: decoded.branchId }
-    })
+    const globalSetting = await prisma.globalSettings.findFirst()
     const sessionId = globalSetting?.sessionId || 5
 
     const newEvent = await prisma.event.create({
