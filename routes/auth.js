@@ -63,7 +63,7 @@ router.post('/login', async (req, res) => {
     const user = await prisma.user.findFirst({
       where: {
         username: {
-          equals: username,
+          equals: trimmedUsername,
           mode: 'insensitive',
         },
       },
