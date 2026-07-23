@@ -115,7 +115,7 @@ router.post('/login', async (req, res) => {
       if (roleId === 7) { // Student
         const student = await prisma.student.findFirst({
           where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, logo: true, code: true } } },
+          include: { branch: { select: { id: true, name: true, code: true } } },
         });
         if (student?.branch) {
           branchInfo = student.branch;
@@ -123,7 +123,7 @@ router.post('/login', async (req, res) => {
       } else if (roleId === 6) { // Parent
         const parent = await prisma.parent.findFirst({
           where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, logo: true, code: true } } },
+          include: { branch: { select: { id: true, name: true, code: true } } },
         });
         if (parent?.branch) {
           branchInfo = parent.branch;
@@ -131,17 +131,11 @@ router.post('/login', async (req, res) => {
       } else if (roleId === 3) { // Teacher
         const teacher = await prisma.teacher.findFirst({
           where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, logo: true, code: true } } },
+          include: { branch: { select: { id: true, name: true, code: true } } },
         });
         if (teacher?.branch) {
           branchInfo = teacher.branch;
         }
-      }
-
-      // Sanitize branchInfo logo if it's a massive Base64 string to keep auth session payload lightweight (<1KB)
-      if (branchInfo && branchInfo.logo && (branchInfo.logo.startsWith('data:') || branchInfo.logo.length > 500)) {
-        const { logo, ...restBranch } = branchInfo;
-        branchInfo = restBranch;
       }
     } catch (branchError) {
       console.error('[AUTH] Error fetching branch info:', branchError);
