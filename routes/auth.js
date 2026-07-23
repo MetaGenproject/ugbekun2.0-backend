@@ -137,6 +137,12 @@ router.post('/login', async (req, res) => {
           branchInfo = teacher.branch;
         }
       }
+
+      // Sanitize branchInfo logo if it's a massive Base64 string to keep auth session payload lightweight (<1KB)
+      if (branchInfo && branchInfo.logo && (branchInfo.logo.startsWith('data:') || branchInfo.logo.length > 500)) {
+        const { logo, ...restBranch } = branchInfo;
+        branchInfo = restBranch;
+      }
     } catch (branchError) {
       console.error('[AUTH] Error fetching branch info:', branchError);
       // Continue without branch info if fetch fails
