@@ -1329,6 +1329,271 @@ router.post('/students/:id/promote', async (req, res) => {
 })
 
 /**
+ * GET /api/admin/students/:id
+ * Fetch single student details for editing
+ */
+router.get('/students/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const studentId = Number(req.params.id)
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        parent: true,
+        enrolls: {
+          where: { sessionId },
+          include: {
+            class: true,
+            section: true,
+          },
+        },
+      },
+    })
+
+    if (!student || student.branchId !== decoded.branchId) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' })
+    }
+
+    const currentEnroll = student.enrolls[0] || null
+
+    return res.json({
+      success: true,
+      student: {
+        id: student.id,
+        registerNo: student.registerNo || '',
+        firstName: student.firstName || '',
+        lastName: student.lastName || '',
+        gender: student.gender || '',
+        birthday: student.birthday ? student.birthday.toISOString().split('T')[0] : '',
+        religion: student.religion || '',
+        caste: student.caste || '',
+        bloodGroup: student.bloodGroup || '',
+        motherTongue: student.motherTongue || '',
+        currentAddress: student.currentAddress || '',
+        permanentAddress: student.permanentAddress || '',
+        city: student.city || '',
+        state: student.state || '',
+        mobileno: student.mobileno || '',
+        email: student.email || '',
+        previousDetails: student.previousDetails || '',
+        photo: student.photo || '',
+        active: student.active,
+        classId: currentEnroll?.classId || '',
+        sectionId: currentEnroll?.sectionId || '',
+        className: currentEnroll?.class?.name || '',
+        sectionName: currentEnroll?.section?.name || '',
+        parent: student.parent ? {
+          id: student.parent.id,
+          name: student.parent.name || '',
+          email: student.parent.email || '',
+          mobileno: student.parent.mobileno || '',
+          relation: student.parent.relation || '',
+        } : null,
+      },
+    })
+  } catch (error) {
+    console.error('[ADMIN] Get student details error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch student details.' })
+  }
+})
+
+/**
+ * PUT /api/admin/students/:id
+ * Update full student profile, enrollment class/section, and parent details.
+ */
+router.put('/students/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const studentId = Number(req.params.id)
+  try {
+    const {
+      firstName,
+      lastName,
+      gender,
+      birthday,
+      registerNo,
+      religion,
+      caste,
+      bloodGroup,
+      motherTongue,
+      currentAddress,
+      permanentAddress,
+      city,
+      state,
+      mobileno,
+      email,
+      previousDetails,
+      photo,
+      active,
+      classId,
+      sectionId,
+      parentName,
+      parentEmail,
+      parentPhone,
+      parentRelation,
+    } = req.body
+
+    const existingStudent = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: { parent: true },
+    })
+
+    if (!existingStudent || existingStudent.branchId !== decoded.branchId) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Update Student record
+      const updateData = {}
+      if (firstName !== undefined) updateData.firstName = firstName
+      if (lastName !== undefined) updateData.lastName = lastName
+      if (gender !== undefined) updateData.gender = gender
+      if (birthday !== undefined) updateData.birthday = birthday ? new Date(birthday) : null
+      if (registerNo !== undefined) updateData.registerNo = registerNo
+      if (religion !== undefined) updateData.religion = religion
+      if (caste !== undefined) updateData.caste = caste
+      if (bloodGroup !== undefined) updateData.bloodGroup = bloodGroup
+      if (motherTongue !== undefined) updateData.motherTongue = motherTongue
+      if (currentAddress !== undefined) updateData.currentAddress = currentAddress
+      if (permanentAddress !== undefined) updateData.permanentAddress = permanentAddress
+      if (city !== undefined) updateData.city = city
+      if (state !== undefined) updateData.state = state
+      if (mobileno !== undefined) updateData.mobileno = mobileno
+      if (email !== undefined) updateData.email = email
+      if (previousDetails !== undefined) updateData.previousDetails = previousDetails
+      if (photo !== undefined) updateData.photo = photo
+      if (active !== undefined) updateData.active = Boolean(active)
+      updateData.updatedAt = new Date()
+
+      await tx.student.update({
+        where: { id: studentId },
+        data: updateData,
+      })
+
+      // 2. Update Associated User if present
+      if (existingStudent.userId && (firstName || lastName || email)) {
+        const userUpdate = {}
+        if (firstName || lastName) {
+          userUpdate.name = `${firstName || existingStudent.firstName || ''} ${lastName || existingStudent.lastName || ''}`.trim()
+        }
+        if (email) userUpdate.email = email
+        await tx.user.update({
+          where: { id: existingStudent.userId },
+          data: userUpdate,
+        })
+      }
+
+      // 3. Update or Upsert Enroll record for active session
+      if (classId && sectionId) {
+        const numClassId = Number(classId)
+        const numSectionId = Number(sectionId)
+
+        const existingEnroll = await tx.enroll.findFirst({
+          where: { studentId, sessionId, branchId: decoded.branchId },
+        })
+
+        if (existingEnroll) {
+          if (existingEnroll.classId !== numClassId || existingEnroll.sectionId !== numSectionId) {
+            await tx.enroll.update({
+              where: { id: existingEnroll.id },
+              data: {
+                classId: numClassId,
+                sectionId: numSectionId,
+                updatedAt: new Date(),
+              },
+            })
+          }
+        } else {
+          // Create missing enrollment
+          const maxEnroll = await tx.enroll.findFirst({ orderBy: { id: 'desc' }, select: { id: true } })
+          await tx.enroll.create({
+            data: {
+              id: maxEnroll ? maxEnroll.id + 1 : 1,
+              studentId,
+              classId: numClassId,
+              sectionId: numSectionId,
+              sessionId,
+              branchId: decoded.branchId,
+              isAlumni: 0,
+            },
+          })
+        }
+      }
+
+      // 4. Update Parent record if provided and linked
+      if (existingStudent.parentId && (parentName || parentEmail || parentPhone || parentRelation)) {
+        const parentUpdate = {}
+        if (parentName) parentUpdate.name = parentName
+        if (parentEmail) parentUpdate.email = parentEmail
+        if (parentPhone) parentUpdate.mobileno = parentPhone
+        if (parentRelation) parentUpdate.relation = parentRelation
+        parentUpdate.updatedAt = new Date()
+
+        await tx.parent.update({
+          where: { id: existingStudent.parentId },
+          data: parentUpdate,
+        })
+
+        // Also update parent User record if name or email changed
+        if (existingStudent.parent?.userId && (parentName || parentEmail)) {
+          const parentUserUpdate = {}
+          if (parentName) parentUserUpdate.name = parentName
+          if (parentEmail) parentUserUpdate.email = parentEmail
+          await tx.user.update({
+            where: { id: existingStudent.parent.userId },
+            data: parentUserUpdate,
+          })
+        }
+      }
+    })
+
+    return res.json({ success: true, message: 'Student information updated successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Update student error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update student information.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/students/:id
+ * Delete or deactivate student record.
+ */
+router.delete('/students/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const studentId = Number(req.params.id)
+  try {
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+    })
+
+    if (!student || student.branchId !== decoded.branchId) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' })
+    }
+
+    await prisma.student.update({
+      where: { id: studentId },
+      data: { active: false, updatedAt: new Date() },
+    })
+
+    return res.json({ success: true, message: 'Student record deactivated successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete student error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to deactivate student.' })
+  }
+})
+
+/**
  * POST /api/admin/teachers/onboard
  * Onboard a teacher with email credential delivery.
  */

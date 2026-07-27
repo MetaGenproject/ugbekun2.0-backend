@@ -37,18 +37,13 @@ router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
+    const trimmedUsername = String(username || '').trim().replace(/\s+/g, '');
+    const trimmedPassword = String(password || '').trim();
+
+    if (!trimmedUsername || !trimmedPassword) {
       return res.status(400).json({
         success: false,
         message: 'Username and password are required.',
-      });
-    }
-
-    const trimmedUsername = username.trim();
-    if (!trimmedUsername) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username cannot be blank.',
       });
     }
 
@@ -88,10 +83,10 @@ router.post('/login', async (req, res) => {
     const isBcryptHash = user.password.startsWith('$2');
 
     if (isBcryptHash) {
-      passwordMatch = await bcrypt.compare(password, user.password);
+      passwordMatch = await bcrypt.compare(trimmedPassword, user.password);
     } else {
       // Legacy plain-text comparison (for migrated accounts not yet re-hashed)
-      passwordMatch = user.password === password;
+      passwordMatch = user.password === trimmedPassword;
     }
 
     if (!passwordMatch) {

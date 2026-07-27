@@ -58,7 +58,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-teacher-id', 'X-Requested-With']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-teacher-id', 'X-Requested-With', 'Cache-Control', 'cache-control', 'Pragma', 'pragma', 'Expires', 'expires']
 }));
 // Allow larger JSON payloads for base64-encoded logos
 app.use(express.json({ limit: '25mb' }));
