@@ -267,9 +267,15 @@ model Teacher {
   id        Int       @id // legacy user_id for teacher credentials
   name      String // Derived from login_credential.username
   email     String?
-  phone     String?
-  photo     String?
-  active    Boolean   @default(true)
+  phone          String?
+  photo          String?
+  qualifications String?   @db.Text
+  houseAddress   String?   @db.Text
+  department     String?
+  bankName       String?
+  accountNumber  String?
+  accountName    String?
+  active         Boolean   @default(true)
   createdAt DateTime  @default(now())
   updatedAt DateTime?
 

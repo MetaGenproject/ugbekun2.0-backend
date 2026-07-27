@@ -248,6 +248,12 @@ router.get('/teachers-staff', async (req, res) => {
           name: true,
           email: true,
           phone: true,
+          qualifications: true,
+          houseAddress: true,
+          department: true,
+          bankName: true,
+          accountNumber: true,
+          accountName: true,
           active: true,
           _count: { select: { allocations: true } },
         },
@@ -263,6 +269,12 @@ router.get('/teachers-staff', async (req, res) => {
           name: teacher.name,
           email: teacher.email,
           phone: teacher.phone,
+          qualifications: teacher.qualifications || null,
+          houseAddress: teacher.houseAddress || null,
+          department: teacher.department || null,
+          bankName: teacher.bankName || null,
+          accountNumber: teacher.accountNumber || null,
+          accountName: teacher.accountName || null,
           active: teacher.active,
           classCount: teacher._count.allocations,
         })),
@@ -1606,6 +1618,12 @@ router.post('/teachers/onboard', async (req, res) => {
       name,
       email,
       phone,
+      qualifications,
+      houseAddress,
+      department,
+      bankName,
+      accountNumber,
+      accountName,
       role = 3,
       isClassTeacher,
       classTeacherClassId,
@@ -1696,6 +1714,12 @@ router.post('/teachers/onboard', async (req, res) => {
             name,
             email,
             phone: phone || null,
+            qualifications: qualifications || null,
+            houseAddress: houseAddress || null,
+            department: department || null,
+            bankName: bankName || null,
+            accountNumber: accountNumber || null,
+            accountName: accountName || null,
             branchId: decoded.branchId,
             userId: user.id,
             active: true,
@@ -1848,7 +1872,7 @@ router.put('/teachers/:id', async (req, res) => {
 
   const teacherId = Number(req.params.id)
   try {
-    const { name, email, phone } = req.body
+    const { name, email, phone, qualifications, houseAddress, department, bankName, accountNumber, accountName } = req.body
     if (!name || !email) {
       return res.status(400).json({ success: false, message: 'Name and email are required.' })
     }
@@ -1864,14 +1888,22 @@ router.put('/teachers/:id', async (req, res) => {
 
     const updated = await prisma.$transaction(async (tx) => {
       // Update Teacher profile
+      const updateData = {
+        name,
+        email,
+        phone: phone || null,
+        updatedAt: new Date(),
+      }
+      if (qualifications !== undefined) updateData.qualifications = qualifications || null
+      if (houseAddress !== undefined) updateData.houseAddress = houseAddress || null
+      if (department !== undefined) updateData.department = department || null
+      if (bankName !== undefined) updateData.bankName = bankName || null
+      if (accountNumber !== undefined) updateData.accountNumber = accountNumber || null
+      if (accountName !== undefined) updateData.accountName = accountName || null
+
       const t = await tx.teacher.update({
         where: { id: teacherId },
-        data: {
-          name,
-          email,
-          phone: phone || null,
-          updatedAt: new Date(),
-        },
+        data: updateData,
       })
 
       return t
