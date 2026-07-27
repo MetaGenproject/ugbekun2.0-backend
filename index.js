@@ -31,8 +31,8 @@ app.use(cors({
     }
 
     const allowedOrigins = [
-      process.env.FRONTEND_URL || 'http://localhost:3000',
-      'http://127.0.0.1:3000',
+      process.env.FRONTEND_URL || 'http://localhost:3001',
+      'http://127.0.0.1:3001',
       'http://localhost:3000',
       'http://localhost:3001',
       'http://127.0.0.1:3001',
@@ -63,7 +63,22 @@ app.use(cors({
 // Allow larger JSON payloads for base64-encoded logos
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Global Cache-Control middleware for API endpoints to prevent stale response caching
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+  next();
+});
+
+// Static uploads with revalidation cache control
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+  }
+}));
 
 // Routes
 const authRouter = require('./routes/auth');
@@ -104,7 +119,7 @@ app.get('/api/health', async (req, res) => {
   try {
     // Check DB Connection
     await prisma.$queryRaw`SELECT 1`;
-    
+
     // Check Redis Connection
     let redisStatus = 'disconnected';
     try {
