@@ -324,6 +324,2240 @@ router.get('/classes-sections', async (req, res) => {
 })
 
 /**
+ * GET /api/admin/roles
+ * Fetch all staff roles (standard system roles + branch-custom roles) with active staff counts.
+ */
+router.get('/roles', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const DEFAULT_SYSTEM_ROLES = [
+      { roleCode: 3, name: 'Teacher', description: 'Form teacher or subject instructor', isSystem: true },
+      { roleCode: 4, name: 'Accountant', description: 'Finance, fees, and payroll manager', isSystem: true },
+      { roleCode: 8, name: 'Receptionist', description: 'Front desk and visitor management', isSystem: true },
+      { roleCode: 9, name: 'Proprietor', description: 'School owner and executive oversight', isSystem: true },
+      { roleCode: 12, name: 'Librarian', description: 'Library asset and book catalog manager', isSystem: true },
+      { roleCode: 13, name: 'Staff', description: 'General administrative & support staff', isSystem: true },
+    ]
+
+    // Fetch custom roles created for this branch
+    const customRoles = await prisma.staffRole.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { name: 'asc' },
+    })
+
+    // Combine system and custom roles
+    const allRolesMap = new Map()
+
+    DEFAULT_SYSTEM_ROLES.forEach((r) => {
+      allRolesMap.set(r.roleCode, { ...r, id: `sys-${r.roleCode}` })
+    })
+
+    customRoles.forEach((r) => {
+      allRolesMap.set(r.roleCode, {
+        id: r.id,
+        roleCode: r.roleCode,
+        name: r.name,
+        description: r.description || null,
+        isSystem: false,
+        createdAt: r.createdAt,
+      })
+    })
+
+    const roleList = Array.from(allRolesMap.values())
+
+    // Fetch active user count per role
+    const userRoleCounts = await prisma.user.groupBy({
+      by: ['role'],
+      where: { active: true },
+      _count: { role: true },
+    })
+
+    const countMap = new Map()
+    userRoleCounts.forEach((c) => {
+      countMap.set(c.role, c._count.role)
+    })
+
+    const rolesWithCounts = roleList.map((r) => ({
+      ...r,
+      staffCount: countMap.get(r.roleCode) || 0,
+    }))
+
+    return res.json({ success: true, roles: rolesWithCounts })
+  } catch (error) {
+    console.error('[ADMIN] Fetch roles error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch staff roles.' })
+  }
+})
+
+/**
+ * POST /api/admin/roles
+ * Create a new custom staff role for the branch.
+ */
+router.post('/roles', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { name, description } = req.body
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Role name is required.' })
+    }
+
+    const trimmedName = name.trim()
+
+    // Check if role name already exists for this branch
+    const existing = await prisma.staffRole.findFirst({
+      where: {
+        branchId: decoded.branchId,
+        name: { equals: trimmedName, mode: 'insensitive' },
+      },
+    })
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: 'A staff role with this name already exists.' })
+    }
+
+    // Resolve next custom roleCode starting from 101
+    const maxCustomRole = await prisma.staffRole.findFirst({
+      orderBy: { roleCode: 'desc' },
+      select: { roleCode: true },
+    })
+
+    const nextRoleCode = maxCustomRole && maxCustomRole.roleCode >= 101 ? maxCustomRole.roleCode + 1 : 101
+
+    const newRole = await prisma.staffRole.create({
+      data: {
+        name: trimmedName,
+        roleCode: nextRoleCode,
+        description: description ? description.trim() : null,
+        isSystem: false,
+        branchId: decoded.branchId,
+      },
+    })
+
+    return res.json({ success: true, role: { ...newRole, staffCount: 0 } })
+  } catch (error) {
+    console.error('[ADMIN] Create role error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create role.' })
+  }
+})
+
+/**
+ * PUT /api/admin/roles/:id
+ * Update custom role details.
+ */
+router.put('/roles/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const roleId = Number(req.params.id)
+  if (isNaN(roleId)) {
+    return res.status(400).json({ success: false, message: 'System default roles cannot be edited.' })
+  }
+
+  try {
+    const { name, description } = req.body
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Role name is required.' })
+    }
+
+    const role = await prisma.staffRole.findFirst({
+      where: { id: roleId, branchId: decoded.branchId },
+    })
+
+    if (!role || role.isSystem) {
+      return res.status(404).json({ success: false, message: 'Custom role not found or non-editable system role.' })
+    }
+
+    const updated = await prisma.staffRole.update({
+      where: { id: roleId },
+      data: {
+        name: name.trim(),
+        description: description ? description.trim() : null,
+      },
+    })
+
+    return res.json({ success: true, role: updated })
+  } catch (error) {
+    console.error('[ADMIN] Update role error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update role.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/roles/:id
+ * Delete a custom staff role.
+ */
+router.delete('/roles/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  const roleId = Number(req.params.id)
+  if (isNaN(roleId)) {
+    return res.status(400).json({ success: false, message: 'System default roles cannot be deleted.' })
+  }
+
+  try {
+    const role = await prisma.staffRole.findFirst({
+      where: { id: roleId, branchId: decoded.branchId },
+    })
+
+    if (!role || role.isSystem) {
+      return res.status(404).json({ success: false, message: 'Custom role not found or system role.' })
+    }
+
+    // Check if any active user is assigned to this roleCode
+    const assignedUserCount = await prisma.user.count({
+      where: { role: role.roleCode, active: true },
+    })
+
+    if (assignedUserCount > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete role '${role.name}' because ${assignedUserCount} active staff member(s) are assigned to it.`,
+      })
+    }
+
+    await prisma.staffRole.delete({
+      where: { id: roleId },
+    })
+
+    return res.json({ success: true, message: 'Staff role deleted successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete role error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete staff role.' })
+  }
+})
+
+/**
+ * GET /api/admin/timetable
+ * Fetch timetable slots for a class & section or teacher.
+ */
+router.get('/timetable', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, teacherId } = req.query
+
+    const where = { branchId: decoded.branchId }
+    if (classId) where.classId = Number(classId)
+    if (sectionId) where.sectionId = Number(sectionId)
+    if (teacherId) where.teacherId = Number(teacherId)
+
+    const slots = await prisma.timetableSlot.findMany({
+      where,
+      include: {
+        class: { select: { id: true, name: true, nameNumeric: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        teacher: { select: { id: true, name: true, phone: true } },
+      },
+      orderBy: [{ startTime: 'asc' }],
+    })
+
+    // Group by day of week
+    const DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY']
+    const grouped = {}
+    DAYS.forEach((d) => { grouped[d] = [] })
+
+    slots.forEach((s) => {
+      if (grouped[s.dayOfWeek]) {
+        grouped[s.dayOfWeek].push(s)
+      } else {
+        grouped[s.dayOfWeek] = [s]
+      }
+    })
+
+    return res.json({ success: true, slots, grouped })
+  } catch (error) {
+    console.error('[ADMIN] Fetch timetable error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch timetable.' })
+  }
+})
+
+/**
+ * POST /api/admin/timetable/slot
+ * Create or update a timetable slot (Assembly, Break, or Subject).
+ */
+router.post('/timetable/slot', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const {
+      id,
+      classId,
+      sectionId,
+      dayOfWeek,
+      startTime,
+      endTime,
+      type, // 'SUBJECT', 'ASSEMBLY', 'BREAK'
+      title,
+      subjectId,
+      teacherId,
+    } = req.body
+
+    if (!classId || !dayOfWeek || !startTime || !endTime || !type) {
+      return res.status(400).json({
+        success: false,
+        message: 'Class, Day of Week, Start Time, End Time, and Slot Type are required.',
+      })
+    }
+
+    const validDays = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY']
+    if (!validDays.includes(dayOfWeek.toUpperCase())) {
+      return res.status(400).json({ success: false, message: 'Invalid day of week.' })
+    }
+
+    const slotType = type.toUpperCase()
+    if (!['SUBJECT', 'ASSEMBLY', 'BREAK'].includes(slotType)) {
+      return res.status(400).json({ success: false, message: 'Invalid slot type. Must be SUBJECT, ASSEMBLY, or BREAK.' })
+    }
+
+    if (slotType === 'SUBJECT' && !subjectId) {
+      return res.status(400).json({ success: false, message: 'Subject is required for Subject Time slots.' })
+    }
+
+    // Teacher Collision Check: check if teacher is assigned to another class at same day/time
+    if (slotType === 'SUBJECT' && teacherId) {
+      const conflict = await prisma.timetableSlot.findFirst({
+        where: {
+          branchId: decoded.branchId,
+          teacherId: Number(teacherId),
+          dayOfWeek: dayOfWeek.toUpperCase(),
+          ...(id ? { id: { not: Number(id) } } : {}),
+          OR: [
+            { startTime: { lte: startTime }, endTime: { gt: startTime } },
+            { startTime: { lt: endTime }, endTime: { gte: endTime } },
+            { startTime: { gte: startTime }, endTime: { lte: endTime } },
+          ],
+        },
+        include: {
+          class: { select: { name: true } },
+          section: { select: { name: true } },
+          subject: { select: { name: true } },
+        },
+      })
+
+      if (conflict) {
+        return res.status(400).json({
+          success: false,
+          message: `Teacher Collision Warning: Teacher is already scheduled for ${conflict.subject?.name || 'Class'} in ${conflict.class?.name || ''} ${conflict.section?.name ? `(${conflict.section.name})` : ''} on ${dayOfWeek} between ${conflict.startTime} - ${conflict.endTime}.`,
+        })
+      }
+    }
+
+    let defaultTitle = title
+    if (!defaultTitle) {
+      if (slotType === 'ASSEMBLY') defaultTitle = 'Morning Assembly'
+      if (slotType === 'BREAK') defaultTitle = 'Break Time'
+    }
+
+    let slot
+    if (id) {
+      slot = await prisma.timetableSlot.update({
+        where: { id: Number(id) },
+        data: {
+          dayOfWeek: dayOfWeek.toUpperCase(),
+          startTime,
+          endTime,
+          type: slotType,
+          title: defaultTitle || null,
+          subjectId: subjectId ? Number(subjectId) : null,
+          teacherId: teacherId ? Number(teacherId) : null,
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true } },
+          teacher: { select: { id: true, name: true } },
+        },
+      })
+    } else {
+      slot = await prisma.timetableSlot.create({
+        data: {
+          branchId: decoded.branchId,
+          classId: Number(classId),
+          sectionId: sectionId ? Number(sectionId) : null,
+          dayOfWeek: dayOfWeek.toUpperCase(),
+          startTime,
+          endTime,
+          type: slotType,
+          title: defaultTitle || null,
+          subjectId: subjectId ? Number(subjectId) : null,
+          teacherId: teacherId ? Number(teacherId) : null,
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true } },
+          teacher: { select: { id: true, name: true } },
+        },
+      })
+    }
+
+    return res.json({ success: true, slot })
+  } catch (error) {
+    console.error('[ADMIN] Save timetable slot error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save timetable slot.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/timetable/slot/:id
+ */
+router.delete('/timetable/slot/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const slotId = Number(req.params.id)
+    await prisma.timetableSlot.delete({
+      where: { id: slotId },
+    })
+
+    return res.json({ success: true, message: 'Timetable slot removed.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete timetable slot error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to remove timetable slot.' })
+  }
+})
+
+/**
+ * POST /api/admin/timetable/clear
+ */
+router.post('/timetable/clear', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId } = req.body
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' })
+    }
+
+    const where = { branchId: decoded.branchId, classId: Number(classId) }
+    if (sectionId) where.sectionId = Number(sectionId)
+
+    await prisma.timetableSlot.deleteMany({ where })
+
+    return res.json({ success: true, message: 'Timetable cleared for this class/section.' })
+  } catch (error) {
+    console.error('[ADMIN] Clear timetable error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to clear timetable.' })
+  }
+})
+
+/**
+ * POST /api/admin/timetable/ai-generate
+ * AI-Assisted Timetable Generator.
+ * Automatically schedules Assembly Time, Break Time, and Subject slots across Mon-Fri.
+ */
+router.post('/timetable/ai-generate', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const {
+      classId,
+      sectionId,
+      assemblyStartTime = '08:00',
+      assemblyEndTime = '08:30',
+      breakStartTime = '11:00',
+      breakEndTime = '11:30',
+    } = req.body
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' })
+    }
+
+    const numClassId = Number(classId)
+    const numSectionId = sectionId ? Number(sectionId) : null
+
+    // Fetch subjects assigned to this class/section via SubjectAssign
+    const assignedSubjects = await prisma.subjectAssign.findMany({
+      where: {
+        branchId: decoded.branchId,
+        classId: numClassId,
+        ...(numSectionId ? { sectionId: numSectionId } : {}),
+      },
+      include: {
+        subject: { select: { id: true, name: true } },
+        teacher: { select: { id: true, name: true } },
+      },
+    })
+
+    // If no specific SubjectAssign records, fallback to all subjects for this branch
+    let subjectTeacherPairs = assignedSubjects.map((sa) => ({
+      subjectId: sa.subjectId,
+      subjectName: sa.subject.name,
+      teacherId: sa.teacherId,
+      teacherName: sa.teacher.name,
+    }))
+
+    if (subjectTeacherPairs.length === 0) {
+      const allBranchSubjects = await prisma.subject.findMany({
+        where: { branchId: decoded.branchId },
+        take: 8,
+      })
+      subjectTeacherPairs = allBranchSubjects.map((sub) => ({
+        subjectId: sub.id,
+        subjectName: sub.name,
+        teacherId: null,
+        teacherName: null,
+      }))
+    }
+
+    if (subjectTeacherPairs.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No subjects found for this class. Please assign subjects in Curriculum setup first.',
+      })
+    }
+
+    const DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY']
+
+    const subjectTimeSlots = [
+      { startTime: '08:30', endTime: '09:15' },
+      { startTime: '09:15', endTime: '10:00' },
+      { startTime: '10:00', endTime: '10:45' },
+      { startTime: '11:30', endTime: '12:15' },
+      { startTime: '12:15', endTime: '13:00' },
+      { startTime: '13:00', endTime: '13:45' },
+    ]
+
+    const newSlotsToCreate = []
+
+    DAYS.forEach((day) => {
+      // 1. Assembly Time
+      newSlotsToCreate.push({
+        branchId: decoded.branchId,
+        classId: numClassId,
+        sectionId: numSectionId,
+        dayOfWeek: day,
+        startTime: assemblyStartTime,
+        endTime: assemblyEndTime,
+        type: 'ASSEMBLY',
+        title: 'Morning Assembly & Devotion',
+        subjectId: null,
+        teacherId: null,
+      })
+
+      // 2. Break Time
+      newSlotsToCreate.push({
+        branchId: decoded.branchId,
+        classId: numClassId,
+        sectionId: numSectionId,
+        dayOfWeek: day,
+        startTime: breakStartTime,
+        endTime: breakEndTime,
+        type: 'BREAK',
+        title: 'Mid-Morning Recess & Break',
+        subjectId: null,
+        teacherId: null,
+      })
+
+      // 3. Subject Periods Distribution
+      subjectTimeSlots.forEach((tSlot, pIdx) => {
+        const pairIndex = (DAYS.indexOf(day) * subjectTimeSlots.length + pIdx) % subjectTeacherPairs.length
+        const pair = subjectTeacherPairs[pairIndex]
+
+        newSlotsToCreate.push({
+          branchId: decoded.branchId,
+          classId: numClassId,
+          sectionId: numSectionId,
+          dayOfWeek: day,
+          startTime: tSlot.startTime,
+          endTime: tSlot.endTime,
+          type: 'SUBJECT',
+          title: pair.subjectName,
+          subjectId: pair.subjectId,
+          teacherId: pair.teacherId,
+        })
+      })
+    })
+
+    // Execute in transaction: clear old slots and insert new AI-generated slots
+    await prisma.$transaction(async (tx) => {
+      await tx.timetableSlot.deleteMany({
+        where: {
+          branchId: decoded.branchId,
+          classId: numClassId,
+          ...(numSectionId ? { sectionId: numSectionId } : {}),
+        },
+      })
+
+      await tx.timetableSlot.createMany({
+        data: newSlotsToCreate,
+      })
+    })
+
+    const generatedSlots = await prisma.timetableSlot.findMany({
+      where: {
+        branchId: decoded.branchId,
+        classId: numClassId,
+        ...(numSectionId ? { sectionId: numSectionId } : {}),
+      },
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true } },
+        teacher: { select: { id: true, name: true } },
+      },
+      orderBy: [{ startTime: 'asc' }],
+    })
+
+    return res.json({
+      success: true,
+      message: `AI Timetable generated successfully with ${newSlotsToCreate.length} slots.`,
+      slots: generatedSlots,
+    })
+  } catch (error) {
+    console.error('[ADMIN] AI Timetable generation error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate AI timetable.' })
+  }
+})
+
+/**
+ * GET /api/admin/evaluation-matrices
+ * Fetch mark distribution matrices for the branch with default seed matrices.
+ */
+router.get('/evaluation-matrices', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    let matrices = await prisma.evaluationMatrix.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+    })
+
+    // Seed initial matrices if none exist for this branch
+    if (matrices.length === 0) {
+      const defaultSeeds = [
+        {
+          branchId: decoded.branchId,
+          name: 'Standard 40/60 Assessment Matrix',
+          code: 'EVAL-4060',
+          description: 'Standard Secondary School matrix: CA1 (15%), CA2 (25%), and Terminal Exam (60%).',
+          totalMarks: 100,
+          isDefault: true,
+          components: [
+            { name: 'Continuous Assessment 1', code: 'CA1', maxMarks: 15, passMarks: 6 },
+            { name: 'Continuous Assessment 2', code: 'CA2', maxMarks: 25, passMarks: 10 },
+            { name: 'Terminal Examination', code: 'EXAM', maxMarks: 60, passMarks: 24 },
+          ],
+        },
+        {
+          branchId: decoded.branchId,
+          name: 'Primary School 30/70 Scheme',
+          code: 'EVAL-3070',
+          description: 'Primary Level matrix: Classwork/Attendance (10%), Mid-Term (20%), End of Term Exam (70%).',
+          totalMarks: 100,
+          isDefault: false,
+          components: [
+            { name: 'Classwork & Attendance', code: 'CA1', maxMarks: 10, passMarks: 4 },
+            { name: 'Mid-Term Test', code: 'CA2', maxMarks: 20, passMarks: 8 },
+            { name: 'Terminal Examination', code: 'EXAM', maxMarks: 70, passMarks: 28 },
+          ],
+        },
+        {
+          branchId: decoded.branchId,
+          name: 'ECD / Nursery Competency Matrix',
+          code: 'EVAL-ECD50',
+          description: 'Early Childhood Development matrix: Practical Assessment (50%) & Terminal Evaluation (50%).',
+          totalMarks: 100,
+          isDefault: false,
+          components: [
+            { name: 'Practical & Behavioral CA', code: 'CA1', maxMarks: 50, passMarks: 25 },
+            { name: 'Terminal Evaluation', code: 'EXAM', maxMarks: 50, passMarks: 25 },
+          ],
+        },
+      ]
+
+      for (const seed of defaultSeeds) {
+        await prisma.evaluationMatrix.create({
+          data: seed,
+        })
+      }
+
+      matrices = await prisma.evaluationMatrix.findMany({
+        where: { branchId: decoded.branchId },
+        orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+      })
+    }
+
+    return res.json({ success: true, matrices })
+  } catch (error) {
+    console.error('[ADMIN] Fetch evaluation matrices error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch evaluation matrices.' })
+  }
+})
+
+/**
+ * POST /api/admin/evaluation-matrices
+ * Create a new mark distribution matrix.
+ */
+router.post('/evaluation-matrices', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { name, code, description, totalMarks, isDefault, components } = req.body
+
+    if (!name || !code) {
+      return res.status(400).json({ success: false, message: 'Matrix Name and Matrix Code are required.' })
+    }
+
+    if (!Array.isArray(components) || components.length === 0) {
+      return res.status(400).json({ success: false, message: 'At least one assessment component is required.' })
+    }
+
+    if (isDefault) {
+      await prisma.evaluationMatrix.updateMany({
+        where: { branchId: decoded.branchId },
+        data: { isDefault: false },
+      })
+    }
+
+    const matrix = await prisma.evaluationMatrix.create({
+      data: {
+        branchId: decoded.branchId,
+        name: name.trim(),
+        code: code.trim().toUpperCase(),
+        description: description ? description.trim() : null,
+        totalMarks: totalMarks ? Number(totalMarks) : 100,
+        isDefault: Boolean(isDefault),
+        components: components,
+      },
+    })
+
+    return res.json({ success: true, matrix, message: 'Evaluation Matrix created successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Create evaluation matrix error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create evaluation matrix.' })
+  }
+})
+
+/**
+ * PUT /api/admin/evaluation-matrices/:id
+ * Update an existing mark distribution matrix (editable even after creation).
+ */
+router.put('/evaluation-matrices/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const matrixId = Number(req.params.id)
+    const { name, code, description, totalMarks, isDefault, components } = req.body
+
+    const existing = await prisma.evaluationMatrix.findFirst({
+      where: { id: matrixId, branchId: decoded.branchId },
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Evaluation Matrix not found.' })
+    }
+
+    if (isDefault && !existing.isDefault) {
+      await prisma.evaluationMatrix.updateMany({
+        where: { branchId: decoded.branchId },
+        data: { isDefault: false },
+      })
+    }
+
+    const updated = await prisma.evaluationMatrix.update({
+      where: { id: matrixId },
+      data: {
+        name: name ? name.trim() : existing.name,
+        code: code ? code.trim().toUpperCase() : existing.code,
+        description: description !== undefined ? (description ? description.trim() : null) : existing.description,
+        totalMarks: totalMarks !== undefined ? Number(totalMarks) : existing.totalMarks,
+        isDefault: isDefault !== undefined ? Boolean(isDefault) : existing.isDefault,
+        components: components !== undefined ? components : existing.components,
+      },
+    })
+
+    return res.json({ success: true, matrix: updated, message: 'Evaluation Matrix updated successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Update evaluation matrix error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update evaluation matrix.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/evaluation-matrices/:id
+ * Delete a mark distribution matrix.
+ */
+router.delete('/evaluation-matrices/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const matrixId = Number(req.params.id)
+
+    const existing = await prisma.evaluationMatrix.findFirst({
+      where: { id: matrixId, branchId: decoded.branchId },
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Evaluation Matrix not found.' })
+    }
+
+    await prisma.evaluationMatrix.delete({
+      where: { id: matrixId },
+    })
+
+    return res.json({ success: true, message: 'Evaluation Matrix deleted successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete evaluation matrix error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to delete evaluation matrix.' })
+  }
+})
+
+/**
+ * POST /api/admin/evaluation-matrices/:id/set-default
+ * Set a matrix as default.
+ */
+router.post('/evaluation-matrices/:id/set-default', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const matrixId = Number(req.params.id)
+
+    await prisma.$transaction([
+      prisma.evaluationMatrix.updateMany({
+        where: { branchId: decoded.branchId },
+        data: { isDefault: false },
+      }),
+      prisma.evaluationMatrix.update({
+        where: { id: matrixId },
+        data: { isDefault: true },
+      }),
+    ])
+
+    return res.json({ success: true, message: 'Default evaluation matrix updated.' })
+  } catch (error) {
+    console.error('[ADMIN] Set default matrix error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to update default evaluation matrix.' })
+  }
+})
+
+/**
+ * GET /api/admin/exam-halls
+ * Fetch exam halls for the branch with default seed venues.
+ */
+router.get('/exam-halls', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    let halls = await prisma.examHall.findMany({
+      where: { branchId: decoded.branchId },
+      include: {
+        invigilator: { select: { id: true, name: true, email: true, phone: true } },
+      },
+      orderBy: [{ createdAt: 'asc' }],
+    })
+
+    // Seed default exam halls if none exist for this branch
+    if (halls.length === 0) {
+      const defaultSeeds = [
+        {
+          branchId: decoded.branchId,
+          name: 'Main Examination Hall Alpha',
+          code: 'HALL-01',
+          capacity: 120,
+          location: 'Block A, Ground Floor',
+          facilities: 'Air Conditioned, High Capacity Desk Seating, Public Address System',
+          status: 'ACTIVE',
+        },
+        {
+          branchId: decoded.branchId,
+          name: 'CBT Centre Lab 1',
+          code: 'CBT-LAB-1',
+          capacity: 60,
+          location: 'Innovation Building, 2nd Floor',
+          facilities: '60 Computer Workstations, High-Speed LAN, UPS Power Backup, CCTV Monitored',
+          status: 'ACTIVE',
+        },
+        {
+          branchId: decoded.branchId,
+          name: 'Multipurpose Auditorium',
+          code: 'AUD-01',
+          capacity: 200,
+          location: 'Main Campus Center',
+          facilities: 'Spacious Examination Layout, Audio System, Stage Invigilator Desk',
+          status: 'ACTIVE',
+        },
+      ]
+
+      for (const seed of defaultSeeds) {
+        await prisma.examHall.create({
+          data: seed,
+        })
+      }
+
+      halls = await prisma.examHall.findMany({
+        where: { branchId: decoded.branchId },
+        include: {
+          invigilator: { select: { id: true, name: true, email: true, phone: true } },
+        },
+        orderBy: [{ createdAt: 'asc' }],
+      })
+    }
+
+    return res.json({ success: true, halls })
+  } catch (error) {
+    console.error('[ADMIN] Fetch exam halls error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch exam halls.' })
+  }
+})
+
+/**
+ * POST /api/admin/exam-halls
+ * Create a new exam hall.
+ */
+router.post('/exam-halls', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { name, code, capacity, location, facilities, invigilatorId, status } = req.body
+
+    if (!name || !code) {
+      return res.status(400).json({ success: false, message: 'Hall Name and Hall Code are required.' })
+    }
+
+    const hall = await prisma.examHall.create({
+      data: {
+        branchId: decoded.branchId,
+        name: name.trim(),
+        code: code.trim().toUpperCase(),
+        capacity: capacity ? Number(capacity) : 50,
+        location: location ? location.trim() : null,
+        facilities: facilities ? facilities.trim() : null,
+        status: status ? status.toUpperCase() : 'ACTIVE',
+        invigilatorId: invigilatorId ? Number(invigilatorId) : null,
+      },
+      include: {
+        invigilator: { select: { id: true, name: true, email: true, phone: true } },
+      },
+    })
+
+    return res.json({ success: true, hall, message: 'Exam Hall created successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Create exam hall error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create exam hall.' })
+  }
+})
+
+/**
+ * PUT /api/admin/exam-halls/:id
+ * Update an existing exam hall.
+ */
+router.put('/exam-halls/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const hallId = Number(req.params.id)
+    const { name, code, capacity, location, facilities, invigilatorId, status } = req.body
+
+    const existing = await prisma.examHall.findFirst({
+      where: { id: hallId, branchId: decoded.branchId },
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Exam Hall not found.' })
+    }
+
+    const updated = await prisma.examHall.update({
+      where: { id: hallId },
+      data: {
+        name: name ? name.trim() : existing.name,
+        code: code ? code.trim().toUpperCase() : existing.code,
+        capacity: capacity !== undefined ? Number(capacity) : existing.capacity,
+        location: location !== undefined ? (location ? location.trim() : null) : existing.location,
+        facilities: facilities !== undefined ? (facilities ? facilities.trim() : null) : existing.facilities,
+        status: status ? status.toUpperCase() : existing.status,
+        invigilatorId: invigilatorId !== undefined ? (invigilatorId ? Number(invigilatorId) : null) : existing.invigilatorId,
+      },
+      include: {
+        invigilator: { select: { id: true, name: true, email: true, phone: true } },
+      },
+    })
+
+    return res.json({ success: true, hall: updated, message: 'Exam Hall updated successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Update exam hall error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update exam hall.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/exam-halls/:id
+ * Delete an exam hall.
+ */
+router.delete('/exam-halls/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const hallId = Number(req.params.id)
+
+    const existing = await prisma.examHall.findFirst({
+      where: { id: hallId, branchId: decoded.branchId },
+    })
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Exam Hall not found.' })
+    }
+
+    await prisma.examHall.delete({
+      where: { id: hallId },
+    })
+
+    return res.json({ success: true, message: 'Exam Hall deleted successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete exam hall error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to delete exam hall.' })
+  }
+})
+
+/**
+ * GET /api/admin/exam-schedule
+ * Fetch exam schedule slots for a class & section or hall.
+ */
+router.get('/exam-schedule', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, hallId } = req.query
+
+    const where = { branchId: decoded.branchId }
+    if (classId) where.classId = Number(classId)
+    if (sectionId) where.sectionId = Number(sectionId)
+    if (hallId) where.hallId = Number(hallId)
+
+    const slots = await prisma.examScheduleSlot.findMany({
+      where,
+      include: {
+        class: { select: { id: true, name: true, nameNumeric: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        hall: { select: { id: true, name: true, code: true, capacity: true, location: true } },
+        invigilator: { select: { id: true, name: true, email: true, phone: true } },
+      },
+      orderBy: [{ examDate: 'asc' }, { startTime: 'asc' }],
+    })
+
+    return res.json({ success: true, slots })
+  } catch (error) {
+    console.error('[ADMIN] Fetch exam schedule error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch exam schedule.' })
+  }
+})
+
+/**
+ * POST /api/admin/exam-schedule/slot
+ * Create or update an exam schedule slot.
+ */
+router.post('/exam-schedule/slot', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const {
+      id,
+      classId,
+      sectionId,
+      subjectId,
+      examDate,
+      startTime,
+      endTime,
+      hallId,
+      invigilatorId,
+      instructions,
+      isPublished = true,
+    } = req.body
+
+    if (!classId || !subjectId || !examDate || !startTime || !endTime) {
+      return res.status(400).json({
+        success: false,
+        message: 'Class, Subject, Exam Date, Start Time, and End Time are required.',
+      })
+    }
+
+    const parsedDate = new Date(examDate)
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid exam date format.' })
+    }
+
+    // 1. Hall Double-Booking Collision Check
+    if (hallId) {
+      const hallConflict = await prisma.examScheduleSlot.findFirst({
+        where: {
+          branchId: decoded.branchId,
+          hallId: Number(hallId),
+          examDate: parsedDate,
+          ...(id ? { id: { not: Number(id) } } : {}),
+          OR: [
+            { startTime: { lte: startTime }, endTime: { gt: startTime } },
+            { startTime: { lt: endTime }, endTime: { gte: endTime } },
+            { startTime: { gte: startTime }, endTime: { lte: endTime } },
+          ],
+        },
+        include: {
+          class: { select: { name: true } },
+          subject: { select: { name: true } },
+          hall: { select: { name: true } },
+        },
+      })
+
+      if (hallConflict) {
+        return res.status(400).json({
+          success: false,
+          message: `Venue Collision Warning: ${hallConflict.hall?.name || 'Exam Hall'} is already booked for ${hallConflict.subject?.name || 'an exam'} (${hallConflict.class?.name || 'Class'}) on ${examDate} between ${hallConflict.startTime} - ${hallConflict.endTime}.`,
+        })
+      }
+    }
+
+    // 2. Invigilator Double-Booking Collision Check
+    if (invigilatorId) {
+      const invigilatorConflict = await prisma.examScheduleSlot.findFirst({
+        where: {
+          branchId: decoded.branchId,
+          invigilatorId: Number(invigilatorId),
+          examDate: parsedDate,
+          ...(id ? { id: { not: Number(id) } } : {}),
+          OR: [
+            { startTime: { lte: startTime }, endTime: { gt: startTime } },
+            { startTime: { lt: endTime }, endTime: { gte: endTime } },
+            { startTime: { gte: startTime }, endTime: { lte: endTime } },
+          ],
+        },
+        include: {
+          class: { select: { name: true } },
+          subject: { select: { name: true } },
+          invigilator: { select: { name: true } },
+        },
+      })
+
+      if (invigilatorConflict) {
+        return res.status(400).json({
+          success: false,
+          message: `Invigilator Collision Warning: Supervisor ${invigilatorConflict.invigilator?.name || ''} is already assigned to ${invigilatorConflict.subject?.name || 'an exam'} in ${invigilatorConflict.class?.name || 'another class'} on ${examDate} between ${invigilatorConflict.startTime} - ${invigilatorConflict.endTime}.`,
+        })
+      }
+    }
+
+    let slot
+    if (id) {
+      slot = await prisma.examScheduleSlot.update({
+        where: { id: Number(id) },
+        data: {
+          classId: Number(classId),
+          sectionId: sectionId ? Number(sectionId) : null,
+          subjectId: Number(subjectId),
+          examDate: parsedDate,
+          startTime,
+          endTime,
+          hallId: hallId ? Number(hallId) : null,
+          invigilatorId: invigilatorId ? Number(invigilatorId) : null,
+          instructions: instructions ? instructions.trim() : null,
+          isPublished: Boolean(isPublished),
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true } },
+          hall: { select: { id: true, name: true, code: true } },
+          invigilator: { select: { id: true, name: true } },
+        },
+      })
+    } else {
+      slot = await prisma.examScheduleSlot.create({
+        data: {
+          branchId: decoded.branchId,
+          classId: Number(classId),
+          sectionId: sectionId ? Number(sectionId) : null,
+          subjectId: Number(subjectId),
+          examDate: parsedDate,
+          startTime,
+          endTime,
+          hallId: hallId ? Number(hallId) : null,
+          invigilatorId: invigilatorId ? Number(invigilatorId) : null,
+          instructions: instructions ? instructions.trim() : null,
+          isPublished: Boolean(isPublished),
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true } },
+          hall: { select: { id: true, name: true, code: true } },
+          invigilator: { select: { id: true, name: true } },
+        },
+      })
+    }
+
+    return res.json({ success: true, slot, message: 'Exam timetable slot saved.' })
+  } catch (error) {
+    console.error('[ADMIN] Save exam schedule slot error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save exam schedule slot.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/exam-schedule/slot/:id
+ */
+router.delete('/exam-schedule/slot/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const slotId = Number(req.params.id)
+
+    await prisma.examScheduleSlot.delete({
+      where: { id: slotId },
+    })
+
+    return res.json({ success: true, message: 'Exam timetable slot removed.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete exam schedule slot error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to remove exam schedule slot.' })
+  }
+})
+
+/**
+ * POST /api/admin/exam-schedule/publish
+ * Distribute / Publish exam timetable to target class & section.
+ */
+router.post('/exam-schedule/publish', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, isPublished = true } = req.body
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' })
+    }
+
+    const where = { branchId: decoded.branchId, classId: Number(classId) }
+    if (sectionId) where.sectionId = Number(sectionId)
+
+    await prisma.examScheduleSlot.updateMany({
+      where,
+      data: { isPublished: Boolean(isPublished) },
+    })
+
+    return res.json({
+      success: true,
+      message: isPublished
+        ? 'Exam schedule published and distributed to class successfully.'
+        : 'Exam schedule set to draft for class.',
+    })
+  } catch (error) {
+    console.error('[ADMIN] Publish exam schedule error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to publish exam schedule.' })
+  }
+})
+
+/**
+ * POST /api/admin/exam-schedule/clear
+ */
+router.post('/exam-schedule/clear', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId } = req.body
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' })
+    }
+
+    const where = { branchId: decoded.branchId, classId: Number(classId) }
+    if (sectionId) where.sectionId = Number(sectionId)
+
+    await prisma.examScheduleSlot.deleteMany({ where })
+
+    return res.json({ success: true, message: 'Exam schedule cleared for this class.' })
+  } catch (error) {
+    console.error('[ADMIN] Clear exam schedule error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to clear exam schedule.' })
+  }
+})
+
+/**
+ * POST /api/admin/evaluation-matrices/assign-class
+ * Assign an Evaluation Matrix to a specific Class.
+ */
+router.post('/evaluation-matrices/assign-class', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, evaluationMatrixId } = req.body
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' })
+    }
+
+    const updatedClass = await prisma.class.update({
+      where: { id: Number(classId) },
+      data: {
+        evaluationMatrixId: evaluationMatrixId ? Number(evaluationMatrixId) : null,
+      },
+      include: {
+        evaluationMatrix: true,
+      },
+    })
+
+    return res.json({
+      success: true,
+      class: updatedClass,
+      message: 'Evaluation Matrix assigned to class successfully.',
+    })
+  } catch (error) {
+    console.error('[ADMIN] Assign evaluation matrix to class error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to assign evaluation matrix to class.' })
+  }
+})
+
+/**
+ * GET /api/admin/marks-entry
+ * Fetch class roster, assigned matrix, and existing marks for a class & subject.
+ */
+router.get('/marks-entry', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, subjectId, sessionId } = req.query
+
+    if (!classId || !subjectId) {
+      return res.status(400).json({ success: false, message: 'classId and subjectId are required.' })
+    }
+
+    const cId = Number(classId)
+    const subId = Number(subjectId)
+    const secId = sectionId ? Number(sectionId) : undefined
+
+    // 1. Fetch Class with assigned Evaluation Matrix
+    const classData = await prisma.class.findFirst({
+      where: { id: cId, branchId: decoded.branchId },
+      include: { evaluationMatrix: true },
+    })
+
+    if (!classData) {
+      return res.status(404).json({ success: false, message: 'Class not found.' })
+    }
+
+    // Fallback to default branch matrix if class has no assigned matrix
+    let matrix = classData.evaluationMatrix
+    if (!matrix) {
+      matrix = await prisma.evaluationMatrix.findFirst({
+        where: { branchId: decoded.branchId, isDefault: true },
+      })
+    }
+    if (!matrix) {
+      matrix = await prisma.evaluationMatrix.findFirst({
+        where: { branchId: decoded.branchId },
+      })
+    }
+
+    // 2. Fetch Students enrolled in this Class & Section
+    const enrollWhere = { classId: cId }
+    if (secId) enrollWhere.sectionId = secId
+
+    const enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }],
+    })
+
+    const students = enrolls.map((e) => ({
+      id: e.student.id,
+      name: [e.student.firstName, e.student.lastName].filter(Boolean).join(' ') || `Student #${e.student.id}`,
+      roll: e.roll ? String(e.roll) : null,
+      registerNo: e.student.registerNo,
+      sectionName: e.section?.name,
+    }))
+
+    // 3. Fetch existing Marks
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1
+
+    const existingMarks = await prisma.mark.findMany({
+      where: {
+        branchId: decoded.branchId,
+        classId: cId,
+        subjectId: subId,
+        sessionId: activeSession,
+        ...(secId ? { sectionId: secId } : {}),
+      },
+    })
+
+    const marksMap = {}
+    existingMarks.forEach((m) => {
+      let parsedComponents = {}
+      try {
+        if (m.mark && m.mark.startsWith('{')) {
+          parsedComponents = JSON.parse(m.mark)
+        }
+      } catch (err) {
+        // fallback plain string score
+      }
+
+      marksMap[m.studentId] = {
+        id: m.id,
+        mark: m.mark,
+        cbtMark: m.cbtMark,
+        absent: m.absent === '1' || m.absent === 'true',
+        components: parsedComponents,
+      }
+    })
+
+    return res.json({
+      success: true,
+      matrix,
+      students,
+      marksMap,
+      classData: { id: classData.id, name: classData.name, evaluationMatrixId: classData.evaluationMatrixId },
+    })
+  } catch (error) {
+    console.error('[ADMIN] Fetch marks entry error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch marks entry data.' })
+  }
+})
+
+/**
+ * POST /api/admin/marks-entry/batch-save
+ * Batch save student assessment marks (supports offline sync payloads).
+ */
+router.post('/marks-entry/batch-save', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, subjectId, sessionId, examId, marks } = req.body
+
+    if (!classId || !subjectId || !Array.isArray(marks)) {
+      return res.status(400).json({ success: false, message: 'Invalid batch save payload.' })
+    }
+
+    const cId = Number(classId)
+    const subId = Number(subjectId)
+    const secId = sectionId ? Number(sectionId) : 1
+    const exId = examId ? Number(examId) : 1
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1
+
+    let savedCount = 0
+
+    for (const item of marks) {
+      if (!item.studentId) continue
+
+      const sId = Number(item.studentId)
+      const isAbsentStr = item.absent ? '1' : '0'
+
+      // Store components breakdown as JSON in mark column, or raw total mark string
+      const markValue = item.components ? JSON.stringify(item.components) : String(item.mark || '0')
+
+      const existing = await prisma.mark.findFirst({
+        where: {
+          branchId: decoded.branchId,
+          classId: cId,
+          subjectId: subId,
+          studentId: sId,
+          sessionId: activeSession,
+        },
+      })
+
+      if (existing) {
+        await prisma.mark.update({
+          where: { id: existing.id },
+          data: {
+            mark: markValue,
+            absent: isAbsentStr,
+          },
+        })
+      } else {
+        await prisma.mark.create({
+          data: {
+            branchId: decoded.branchId,
+            classId: cId,
+            sectionId: secId,
+            subjectId: subId,
+            studentId: sId,
+            examId: exId,
+            sessionId: activeSession,
+            mark: markValue,
+            absent: isAbsentStr,
+          },
+        })
+      }
+      savedCount++
+    }
+
+    return res.json({
+      success: true,
+      savedCount,
+      message: `Batch marks save completed (${savedCount} student records updated).`,
+    })
+  } catch (error) {
+    console.error('[ADMIN] Batch save marks error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to batch save marks.' })
+  }
+})
+
+/**
+ * POST /api/admin/marks-entry/ai-distribute
+ * AI Score Distribution Assistant based on Evaluation Matrix.
+ */
+router.post('/marks-entry/ai-distribute', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, matrixComponents, studentTotals, distributionMode = 'PROPORTIONAL' } = req.body
+
+    if (!Array.isArray(matrixComponents) || matrixComponents.length === 0) {
+      return res.status(400).json({ success: false, message: 'Matrix components are required.' })
+    }
+
+    if (!Array.isArray(studentTotals) || studentTotals.length === 0) {
+      return res.status(400).json({ success: false, message: 'Student totals array is required.' })
+    }
+
+    // Calculate sum of max marks in matrix
+    const matrixTotalMax = matrixComponents.reduce((sum, c) => sum + (Number(c.maxMarks) || 0), 0) || 100
+
+    const distributedMarksMap = {}
+
+    studentTotals.forEach((st) => {
+      const studentId = st.studentId
+      const totalScore = Math.min(Math.max(Number(st.totalScore) || 0, 0), matrixTotalMax)
+
+      const components = {}
+      let allocatedSum = 0
+
+      // Distribute proportionally across matrix components
+      matrixComponents.forEach((comp, idx) => {
+        const compMax = Number(comp.maxMarks) || 0
+        const isLast = idx === matrixComponents.length - 1
+
+        if (isLast) {
+          // Last component absorbs remaining score rounding to equal exactly totalScore
+          const remaining = Math.max(0, totalScore - allocatedSum)
+          components[comp.code || comp.name] = Math.min(remaining, compMax)
+        } else {
+          const ratio = compMax / matrixTotalMax
+          const calculated = Math.round(totalScore * ratio)
+          const compScore = Math.min(calculated, compMax)
+          components[comp.code || comp.name] = compScore
+          allocatedSum += compScore
+        }
+      })
+
+      distributedMarksMap[studentId] = {
+        totalScore,
+        components,
+      }
+    })
+
+    return res.json({
+      success: true,
+      distributedMarksMap,
+      message: 'AI score distribution completed based on Evaluation Matrix.',
+    })
+  } catch (error) {
+    console.error('[ADMIN] AI distribute marks error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to generate AI score distribution.' })
+  }
+})
+
+/**
+ * GET /api/admin/cbt/groups
+ * Fetch Question Groups for branch with auto-seeding.
+ */
+router.get('/cbt/groups', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { subjectId } = req.query
+    const where = { branchId: decoded.branchId }
+    if (subjectId) where.subjectId = Number(subjectId)
+
+    let groups = await prisma.questionGroup.findMany({
+      where,
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+      },
+      orderBy: [{ createdAt: 'desc' }],
+    })
+
+    // Seed default question group if empty
+    if (groups.length === 0) {
+      const firstSubject = await prisma.subject.findFirst({
+        where: { branchId: decoded.branchId },
+      })
+
+      if (firstSubject) {
+        await prisma.questionGroup.create({
+          data: {
+            branchId: decoded.branchId,
+            subjectId: firstSubject.id,
+            title: `${firstSubject.name} General Practice Pack`,
+            groupCode: `${firstSubject.subjectCode || 'SUB'}-GRP-01`,
+            description: 'Standard practice question bundle for classroom test distribution.',
+            questionIds: [],
+          },
+        })
+
+        groups = await prisma.questionGroup.findMany({
+          where,
+          include: {
+            subject: { select: { id: true, name: true, subjectCode: true } },
+          },
+          orderBy: [{ createdAt: 'desc' }],
+        })
+      }
+    }
+
+    return res.json({ success: true, groups })
+  } catch (error) {
+    console.error('[ADMIN] Fetch CBT question groups error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch question groups.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/groups
+ * Create or update a Question Group.
+ */
+router.post('/cbt/groups', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { id, title, description, groupCode, subjectId, questionIds = [] } = req.body
+
+    if (!title || !subjectId) {
+      return res.status(400).json({ success: false, message: 'Group Title and Subject are required.' })
+    }
+
+    let group
+    if (id) {
+      group = await prisma.questionGroup.update({
+        where: { id: Number(id) },
+        data: {
+          title: title.trim(),
+          description: description ? description.trim() : null,
+          groupCode: groupCode ? groupCode.trim().toUpperCase() : 'GRP-01',
+          subjectId: Number(subjectId),
+          questionIds: Array.isArray(questionIds) ? questionIds : [],
+        },
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+        },
+      })
+    } else {
+      group = await prisma.questionGroup.create({
+        data: {
+          branchId: decoded.branchId,
+          title: title.trim(),
+          description: description ? description.trim() : null,
+          groupCode: groupCode ? groupCode.trim().toUpperCase() : `GRP-${Date.now().toString().slice(-4)}`,
+          subjectId: Number(subjectId),
+          questionIds: Array.isArray(questionIds) ? questionIds : [],
+        },
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+        },
+      })
+    }
+
+    return res.json({ success: true, group, message: 'Question group saved successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Save question group error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to save question group.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/cbt/groups/:id
+ */
+router.delete('/cbt/groups/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const groupId = Number(req.params.id)
+    await prisma.questionGroup.delete({ where: { id: groupId } })
+    return res.json({ success: true, message: 'Question group deleted.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete question group error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to delete question group.' })
+  }
+})
+
+/**
+ * GET /api/admin/cbt/distributions
+ * List CBT distributions for class & section.
+ */
+router.get('/cbt/distributions', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, subjectId } = req.query
+    const where = { branchId: decoded.branchId }
+    if (classId) where.classId = Number(classId)
+    if (sectionId) where.sectionId = Number(sectionId)
+    if (subjectId) where.subjectId = Number(subjectId)
+
+    const distributions = await prisma.cbtDistribution.findMany({
+      where,
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
+      },
+      orderBy: [{ createdAt: 'desc' }],
+    })
+
+    return res.json({ success: true, distributions })
+  } catch (error) {
+    console.error('[ADMIN] Fetch CBT distributions error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch CBT distributions.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/distributions
+ * Distribute a CBT test / Question Group to a target class.
+ */
+router.post('/cbt/distributions', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const {
+      id,
+      title,
+      instructions,
+      duration = 30,
+      passingMark = 50.0,
+      isPublished = true,
+      shuffleQuestions = true,
+      showResults = true,
+      groupId,
+      classId,
+      sectionId,
+      subjectId,
+      startDate,
+      endDate,
+    } = req.body
+
+    if (!title || !classId || !subjectId) {
+      return res.status(400).json({ success: false, message: 'Title, Class, and Subject are required.' })
+    }
+
+    let dist
+    if (id) {
+      dist = await prisma.cbtDistribution.update({
+        where: { id: Number(id) },
+        data: {
+          title: title.trim(),
+          instructions: instructions ? instructions.trim() : null,
+          duration: Number(duration) || 30,
+          passingMark: Number(passingMark) || 50.0,
+          isPublished: Boolean(isPublished),
+          shuffleQuestions: Boolean(shuffleQuestions),
+          showResults: Boolean(showResults),
+          groupId: groupId ? Number(groupId) : null,
+          classId: Number(classId),
+          sectionId: sectionId ? Number(sectionId) : null,
+          subjectId: Number(subjectId),
+          startDate: startDate ? new Date(startDate) : null,
+          endDate: endDate ? new Date(endDate) : null,
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          group: { select: { id: true, title: true, groupCode: true } },
+        },
+      })
+    } else {
+      dist = await prisma.cbtDistribution.create({
+        data: {
+          branchId: decoded.branchId,
+          title: title.trim(),
+          instructions: instructions ? instructions.trim() : null,
+          duration: Number(duration) || 30,
+          passingMark: Number(passingMark) || 50.0,
+          isPublished: Boolean(isPublished),
+          shuffleQuestions: Boolean(shuffleQuestions),
+          showResults: Boolean(showResults),
+          groupId: groupId ? Number(groupId) : null,
+          classId: Number(classId),
+          sectionId: sectionId ? Number(sectionId) : null,
+          subjectId: Number(subjectId),
+          startDate: startDate ? new Date(startDate) : null,
+          endDate: endDate ? new Date(endDate) : null,
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          group: { select: { id: true, title: true, groupCode: true } },
+        },
+      })
+    }
+
+    return res.json({ success: true, distribution: dist, message: 'CBT Test distributed to class successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Create CBT distribution error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to distribute CBT test.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/distributions/:id/toggle-publish
+ */
+router.post('/cbt/distributions/:id/toggle-publish', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const distId = Number(req.params.id)
+    const { isPublished } = req.body
+
+    const updated = await prisma.cbtDistribution.update({
+      where: { id: distId },
+      data: { isPublished: Boolean(isPublished) },
+    })
+
+    return res.json({
+      success: true,
+      distribution: updated,
+      message: isPublished ? 'CBT test published live for students.' : 'CBT test unpublished (Draft Mode).',
+    })
+  } catch (error) {
+    console.error('[ADMIN] Toggle CBT publish error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to toggle CBT publication status.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/cbt/distributions/:id
+ */
+router.delete('/cbt/distributions/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const distId = Number(req.params.id)
+    await prisma.cbtDistribution.delete({ where: { id: distId } })
+    return res.json({ success: true, message: 'CBT distribution deleted.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete CBT distribution error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to delete CBT distribution.' })
+  }
+})
+
+/**
+ * GET /api/admin/attendance/students
+ * Fetch student attendance roster & summary for a class & date.
+ */
+router.get('/attendance/students', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, date } = req.query
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' })
+    }
+
+    const cId = Number(classId)
+    const secId = sectionId ? Number(sectionId) : undefined
+
+    // Parse date as LOCAL midnight to avoid UTC off-by-one timezone issue
+    let targetDate
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const [y, m, d] = date.split('-').map(Number)
+      targetDate = new Date(y, m - 1, d, 0, 0, 0, 0)
+    } else {
+      targetDate = new Date()
+      targetDate.setHours(0, 0, 0, 0)
+    }
+
+    const nextDate = new Date(targetDate)
+    nextDate.setDate(nextDate.getDate() + 1)
+
+    // 1. Fetch Enrolled Students
+    const enrollWhere = { classId: cId }
+    if (secId) enrollWhere.sectionId = secId
+
+    const enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }],
+    })
+
+    const students = enrolls.map((e) => ({
+      id: e.student.id,
+      name: [e.student.firstName, e.student.lastName].filter(Boolean).join(' ') || `Student #${e.student.id}`,
+      roll: e.roll ? String(e.roll) : null,
+      registerNo: e.student.registerNo,
+      sectionName: e.section?.name,
+    }))
+
+    // 2. Fetch Attendance Records for this Date
+    const attendanceRecords = await prisma.attendance.findMany({
+      where: {
+        branchId: decoded.branchId,
+        classId: cId,
+        ...(secId ? { sectionId: secId } : {}),
+        attendanceDate: {
+          gte: targetDate,
+          lt: nextDate,
+        },
+      },
+    })
+
+    const attendanceMap = {}
+    let presentCount = 0
+    let absentCount = 0
+    let lateCount = 0
+    let excusedCount = 0
+
+    attendanceRecords.forEach((att) => {
+      attendanceMap[att.studentId] = {
+        id: att.id,
+        status: att.status ? att.status.toUpperCase() : 'PRESENT',
+        remark: att.remark,
+      }
+
+      const st = (att.status || '').toUpperCase()
+      if (st === 'PRESENT' || st === 'H' || st === '1') presentCount++
+      else if (st === 'ABSENT' || st === 'A') absentCount++
+      else if (st === 'LATE' || st === 'L') lateCount++
+      else if (st === 'EXCUSED' || st === 'E') excusedCount++
+      else presentCount++
+    })
+
+    const totalEnrolled = students.length
+    const attendanceRate = totalEnrolled > 0 ? Math.round(((presentCount + lateCount) / totalEnrolled) * 100) : 0
+
+    return res.json({
+      success: true,
+      students,
+      attendanceMap,
+      metrics: {
+        totalEnrolled,
+        presentCount,
+        absentCount,
+        lateCount,
+        excusedCount,
+        attendanceRate,
+      },
+    })
+  } catch (error) {
+    console.error('[ADMIN] Fetch student attendance error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch student attendance.' })
+  }
+})
+
+/**
+ * POST /api/admin/attendance/students/batch-save
+ * Batch save student attendance for a class & date.
+ */
+router.post('/attendance/students/batch-save', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { classId, sectionId, date, attendance } = req.body
+
+    if (!classId || !date || !Array.isArray(attendance)) {
+      return res.status(400).json({ success: false, message: 'Invalid payload.' })
+    }
+
+    const cId = Number(classId)
+    const secId = sectionId ? Number(sectionId) : null
+
+    // Parse date as LOCAL midnight to avoid UTC off-by-one timezone issue
+    let targetDate
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const [y, m, d] = date.split('-').map(Number)
+      targetDate = new Date(y, m - 1, d, 0, 0, 0, 0)
+    } else {
+      targetDate = new Date()
+      targetDate.setHours(0, 0, 0, 0)
+    }
+
+    const nextDate = new Date(targetDate)
+    nextDate.setDate(nextDate.getDate() + 1)
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const activeSession = globalSetting?.sessionId || 1
+
+    let savedCount = 0
+
+    for (const item of attendance) {
+      if (!item.studentId) continue
+      const sId = Number(item.studentId)
+      const statusStr = item.status ? String(item.status).toUpperCase() : 'PRESENT'
+      const remarkStr = item.remark ? String(item.remark).trim() : null
+
+      const existing = await prisma.attendance.findFirst({
+        where: {
+          branchId: decoded.branchId,
+          classId: cId,
+          studentId: sId,
+          attendanceDate: {
+            gte: targetDate,
+            lt: nextDate,
+          },
+        },
+      })
+
+      if (existing) {
+        await prisma.attendance.update({
+          where: { id: existing.id },
+          data: {
+            status: statusStr,
+            remark: remarkStr,
+          },
+        })
+      } else {
+        await prisma.attendance.create({
+          data: {
+            branchId: decoded.branchId,
+            classId: cId,
+            ...(secId ? { sectionId: secId } : {}),
+            studentId: sId,
+            attendanceDate: targetDate,
+            status: statusStr,
+            remark: remarkStr,
+            sessionId: activeSession,
+          },
+        })
+      }
+      savedCount++
+    }
+
+    return res.json({
+      success: true,
+      savedCount,
+      message: `Student attendance saved successfully (${savedCount} records).`,
+    })
+  } catch (error) {
+    console.error('[ADMIN] Batch save student attendance error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to save student attendance.' })
+  }
+})
+
+/**
+ * GET /api/admin/attendance/staff
+ * Fetch staff attendance roster & summary for a date.
+ */
+router.get('/attendance/staff', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { date } = req.query
+    // Parse date as LOCAL midnight to avoid UTC off-by-one timezone issue
+    let targetDate
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const [y, m, d] = date.split('-').map(Number)
+      targetDate = new Date(y, m - 1, d, 0, 0, 0, 0)
+    } else {
+      targetDate = new Date()
+      targetDate.setHours(0, 0, 0, 0)
+    }
+
+    const nextDate = new Date(targetDate)
+    nextDate.setDate(nextDate.getDate() + 1)
+
+    // 1. Fetch Staff List
+    const teachers = await prisma.teacher.findMany({
+      where: { branchId: decoded.branchId },
+      select: { id: true, name: true, email: true, phone: true, department: true },
+      orderBy: [{ name: 'asc' }],
+    })
+
+    // 2. Fetch Staff Attendance Records
+    const attendanceRecords = await prisma.staffAttendance.findMany({
+      where: {
+        branchId: decoded.branchId,
+        attendanceDate: {
+          gte: targetDate,
+          lt: nextDate,
+        },
+      },
+    })
+
+    const attendanceMap = {}
+    let presentCount = 0
+    let absentCount = 0
+    let lateCount = 0
+    let halfDayCount = 0
+    let onLeaveCount = 0
+
+    attendanceRecords.forEach((att) => {
+      attendanceMap[att.teacherId] = {
+        id: att.id,
+        status: att.status ? att.status.toUpperCase() : 'PRESENT',
+        clockIn: att.clockIn || '',
+        clockOut: att.clockOut || '',
+        remark: att.remark || '',
+      }
+
+      const st = (att.status || '').toUpperCase()
+      if (st === 'PRESENT') presentCount++
+      else if (st === 'ABSENT') absentCount++
+      else if (st === 'LATE') lateCount++
+      else if (st === 'HALF_DAY') halfDayCount++
+      else if (st === 'ON_LEAVE') onLeaveCount++
+      else presentCount++
+    })
+
+    const totalStaff = teachers.length
+    const attendanceRate = totalStaff > 0 ? Math.round(((presentCount + lateCount + halfDayCount) / totalStaff) * 100) : 0
+
+    return res.json({
+      success: true,
+      teachers,
+      attendanceMap,
+      metrics: {
+        totalStaff,
+        presentCount,
+        absentCount,
+        lateCount,
+        halfDayCount,
+        onLeaveCount,
+        attendanceRate,
+      },
+    })
+  } catch (error) {
+    console.error('[ADMIN] Fetch staff attendance error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch staff attendance.' })
+  }
+})
+
+/**
+ * POST /api/admin/attendance/staff/batch-save
+ * Batch save staff attendance for a date.
+ */
+router.post('/attendance/staff/batch-save', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { date, attendance } = req.body
+
+    if (!date || !Array.isArray(attendance)) {
+      return res.status(400).json({ success: false, message: 'Invalid payload.' })
+    }
+
+    // Parse date as LOCAL midnight to avoid UTC off-by-one timezone issue
+    let targetDate
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const [y, m, d] = date.split('-').map(Number)
+      targetDate = new Date(y, m - 1, d, 0, 0, 0, 0)
+    } else {
+      targetDate = new Date()
+      targetDate.setHours(0, 0, 0, 0)
+    }
+
+    const nextDate = new Date(targetDate)
+    nextDate.setDate(nextDate.getDate() + 1)
+
+    let savedCount = 0
+
+    for (const item of attendance) {
+      if (!item.teacherId) continue
+      const tId = Number(item.teacherId)
+      const statusStr = item.status ? String(item.status).toUpperCase() : 'PRESENT'
+      const clockInStr = item.clockIn ? String(item.clockIn).trim() : null
+      const clockOutStr = item.clockOut ? String(item.clockOut).trim() : null
+      const remarkStr = item.remark ? String(item.remark).trim() : null
+
+      const existing = await prisma.staffAttendance.findFirst({
+        where: {
+          branchId: decoded.branchId,
+          teacherId: tId,
+          attendanceDate: {
+            gte: targetDate,
+            lt: nextDate,
+          },
+        },
+      })
+
+      if (existing) {
+        await prisma.staffAttendance.update({
+          where: { id: existing.id },
+          data: {
+            status: statusStr,
+            clockIn: clockInStr,
+            clockOut: clockOutStr,
+            remark: remarkStr,
+          },
+        })
+      } else {
+        await prisma.staffAttendance.create({
+          data: {
+            branchId: decoded.branchId,
+            teacherId: tId,
+            attendanceDate: targetDate,
+            status: statusStr,
+            clockIn: clockInStr,
+            clockOut: clockOutStr,
+            remark: remarkStr,
+          },
+        })
+      }
+      savedCount++
+    }
+
+    return res.json({
+      success: true,
+      savedCount,
+      message: `Staff attendance saved successfully (${savedCount} records).`,
+    })
+  } catch (error) {
+    console.error('[ADMIN] Batch save staff attendance error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to save staff attendance.' })
+  }
+})
+
+/**
  * POST /api/admin/classes
  * Create a new Class for the branch.
  */
@@ -1644,8 +3878,14 @@ router.post('/teachers/onboard', async (req, res) => {
     }
 
     const selectedRole = Number(role) || 3
-    if (![3, 4, 8, 9, 12, 13].includes(selectedRole)) {
-      return res.status(400).json({ success: false, message: 'Invalid staff role.' })
+    const systemRoleCodes = [3, 4, 8, 9, 12, 13]
+    if (!systemRoleCodes.includes(selectedRole)) {
+      const customRoleCheck = await prisma.staffRole.findFirst({
+        where: { roleCode: selectedRole, branchId: decoded.branchId }
+      })
+      if (!customRoleCheck) {
+        return res.status(400).json({ success: false, message: 'Invalid staff role.' })
+      }
     }
 
     // Fetch branch info for email/PDF context

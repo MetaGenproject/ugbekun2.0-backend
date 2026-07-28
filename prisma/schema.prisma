@@ -65,6 +65,14 @@ model Branch {
   subjects        Subject[]
   siblingRequests ParentSiblingRequest[]
   triviaArenas    TriviaArena[]
+  staffRoles      StaffRole[]
+  timetableSlots  TimetableSlot[]
+  evaluationMatrices EvaluationMatrix[]
+  examHalls       ExamHall[]
+  examScheduleSlots ExamScheduleSlot[]
+  questionGroups  QuestionGroup[]
+  cbtDistributions CbtDistribution[]
+  staffAttendances StaffAttendance[]
 
   @@map("branches")
 }
@@ -293,6 +301,10 @@ model Teacher {
   user   User? @relation("UserTeacher", fields: [userId], references: [id])
   
   interventionAlerts InterventionAlert[]
+  timetableSlots     TimetableSlot[]
+  examHalls          ExamHall[]
+  examScheduleSlots  ExamScheduleSlot[]
+  staffAttendances   StaffAttendance[]
 
   @@map("teachers")
 }
@@ -544,6 +556,13 @@ model Class {
   feeAssignments        FeeAssignment[]
   lessonPlans           LessonPlan[]
   questionBankItems     QuestionBank[]
+  timetableSlots        TimetableSlot[]
+  examScheduleSlots     ExamScheduleSlot[]
+
+  evaluationMatrixId    Int?              @map("evaluation_matrix_id")
+  evaluationMatrix      EvaluationMatrix? @relation(fields: [evaluationMatrixId], references: [id])
+
+  cbtDistributions      CbtDistribution[]
 
   @@index([branchId])
   @@map("class")
@@ -563,6 +582,10 @@ model Section {
   teacherAllocations    TeacherAllocation[]
   montessoriAssessments MontessoriAssessment[]
   siblingRequests       ParentSiblingRequest[]
+  timetableSlots        TimetableSlot[]
+  examScheduleSlots     ExamScheduleSlot[]
+
+  cbtDistributions      CbtDistribution[]
 
   @@index([branchId])
   @@map("section")
@@ -593,6 +616,11 @@ model Subject {
   homeworks         Homework[]
   lessonPlans       LessonPlan[]
   questionBankItems QuestionBank[]
+  timetableSlots    TimetableSlot[]
+  examScheduleSlots ExamScheduleSlot[]
+
+  questionGroups    QuestionGroup[]
+  cbtDistributions  CbtDistribution[]
 
   @@index([branchId])
   @@map("subject")
@@ -1463,4 +1491,211 @@ model Event {
 
   @@index([branchId, sessionId])
   @@map("event")
+}
+
+model StaffRole {
+  id          Int       @id @default(autoincrement())
+  name        String
+  roleCode    Int       @map("role_code")
+  description String?   @db.Text
+  isSystem    Boolean   @default(false) @map("is_system")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  branchId Int?    @map("branch_id")
+  branch   Branch? @relation(fields: [branchId], references: [id])
+
+  @@index([branchId])
+  @@map("staff_roles")
+}
+
+model TimetableSlot {
+  id          Int       @id @default(autoincrement())
+  dayOfWeek   String    @map("day_of_week") // MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY
+  startTime   String    @map("start_time")  // e.g. "08:00"
+  endTime     String    @map("end_time")    // e.g. "08:30"
+  type        String    @map("type")        // SUBJECT, ASSEMBLY, BREAK
+  title       String?   @db.Text
+
+  classId     Int       @map("class_id")
+  class       Class     @relation(fields: [classId], references: [id])
+
+  sectionId   Int?      @map("section_id")
+  section     Section?  @relation(fields: [sectionId], references: [id])
+
+  subjectId   Int?      @map("subject_id")
+  subject     Subject?  @relation(fields: [subjectId], references: [id])
+
+  teacherId   Int?      @map("teacher_id")
+  teacher     Teacher?  @relation(fields: [teacherId], references: [id])
+
+  branchId    Int       @map("branch_id")
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  @@index([classId, sectionId, dayOfWeek])
+  @@index([teacherId, dayOfWeek])
+  @@index([branchId])
+  @@map("timetable_slots")
+}
+
+model EvaluationMatrix {
+  id          Int       @id @default(autoincrement())
+  name        String
+  code        String    @map("code")
+  description String?   @db.Text
+  totalMarks  Decimal   @default(100) @map("total_marks") @db.Decimal(5, 2)
+  isDefault   Boolean   @default(false) @map("is_default")
+  components  Json      @default("[]")
+
+  branchId    Int       @map("branch_id")
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  classes     Class[]
+
+  @@index([branchId])
+  @@map("evaluation_matrices")
+}
+
+model ExamHall {
+  id            Int       @id @default(autoincrement())
+  name          String
+  code          String    @map("code")
+  capacity      Int       @default(50)
+  location      String?   @map("location")
+  facilities    String?   @db.Text
+  status        String    @default("ACTIVE") // ACTIVE, MAINTENANCE, IN_USE
+
+  invigilatorId Int?      @map("invigilator_id")
+  invigilator   Teacher?  @relation(fields: [invigilatorId], references: [id])
+
+  branchId      Int       @map("branch_id")
+  branch        Branch    @relation(fields: [branchId], references: [id])
+
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
+
+  examScheduleSlots ExamScheduleSlot[]
+
+  @@index([branchId])
+  @@map("exam_halls")
+}
+
+model ExamScheduleSlot {
+  id            Int       @id @default(autoincrement())
+  examDate      DateTime  @map("exam_date")
+  startTime     String    @map("start_time")  // e.g. "09:00"
+  endTime       String    @map("end_time")    // e.g. "11:30"
+  instructions  String?   @db.Text
+  isPublished   Boolean   @default(true) @map("is_published")
+
+  classId       Int       @map("class_id")
+  class         Class     @relation(fields: [classId], references: [id])
+
+  sectionId     Int?      @map("section_id")
+  section       Section?  @relation(fields: [sectionId], references: [id])
+
+  subjectId     Int       @map("subject_id")
+  subject       Subject   @relation(fields: [subjectId], references: [id])
+
+  hallId        Int?      @map("hall_id")
+  hall          ExamHall? @relation(fields: [hallId], references: [id])
+
+  invigilatorId Int?      @map("invigilator_id")
+  invigilator   Teacher?  @relation(fields: [invigilatorId], references: [id])
+
+  branchId      Int       @map("branch_id")
+  branch        Branch    @relation(fields: [branchId], references: [id])
+
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
+
+  @@index([classId, sectionId, examDate])
+  @@index([hallId, examDate])
+  @@index([invigilatorId, examDate])
+  @@index([branchId])
+  @@map("exam_schedule_slots")
+}
+
+model QuestionGroup {
+  id          Int               @id @default(autoincrement())
+  title       String
+  description String?           @db.Text
+  groupCode   String            @map("group_code")
+  questionIds Json              @default("[]") @map("question_ids") // Array of question IDs in this group
+
+  subjectId   Int               @map("subject_id")
+  subject     Subject           @relation(fields: [subjectId], references: [id])
+
+  branchId    Int               @map("branch_id")
+  branch      Branch            @relation(fields: [branchId], references: [id])
+
+  distributions CbtDistribution[]
+
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime?         @updatedAt @map("updated_at")
+
+  @@index([branchId, subjectId])
+  @@map("question_groups")
+}
+
+model CbtDistribution {
+  id               Int            @id @default(autoincrement())
+  title            String
+  instructions     String?        @db.Text
+  duration         Int            @default(30) // Minutes
+  passingMark      Float          @default(50.0) @map("passing_mark") // Passing percentage
+  isPublished      Boolean        @default(true) @map("is_published")
+  shuffleQuestions Boolean        @default(true) @map("shuffle_questions")
+  showResults      Boolean        @default(true) @map("show_results")
+
+  groupId          Int?           @map("group_id")
+  group            QuestionGroup? @relation(fields: [groupId], references: [id])
+
+  classId          Int            @map("class_id")
+  class            Class          @relation(fields: [classId], references: [id])
+
+  sectionId        Int?           @map("section_id")
+  section          Section?       @relation(fields: [sectionId], references: [id])
+
+  subjectId        Int            @map("subject_id")
+  subject          Subject        @relation(fields: [subjectId], references: [id])
+
+  startDate        DateTime?      @map("start_date")
+  endDate          DateTime?      @map("end_date")
+
+  branchId         Int            @map("branch_id")
+  branch           Branch         @relation(fields: [branchId], references: [id])
+
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime?      @updatedAt @map("updated_at")
+
+  @@index([classId, sectionId])
+  @@index([branchId])
+  @@map("cbt_distributions")
+}
+
+model StaffAttendance {
+  id             Int       @id @default(autoincrement())
+  teacherId      Int       @map("teacher_id")
+  attendanceDate DateTime  @map("attendance_date")
+  status         String    @map("status") // PRESENT, ABSENT, LATE, HALF_DAY, ON_LEAVE
+  clockIn        String?   @map("clock_in")
+  clockOut       String?   @map("clock_out")
+  remark         String?   @map("remark")
+  branchId       Int       @map("branch_id")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+  branch  Branch  @relation(fields: [branchId], references: [id])
+
+  @@index([teacherId, attendanceDate])
+  @@index([branchId, attendanceDate])
+  @@map("staff_attendance")
 }
