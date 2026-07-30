@@ -58,6 +58,8 @@ model Branch {
   feeAssignments         FeeAssignment[]
   invoices               Invoice[]
   payments               Payment[]
+  libraryResources       LibraryResource[]
+  libraryIssues          LibraryIssue[]
   gamificationConfig     GamificationConfig?
 
   classes         Class[]
@@ -73,6 +75,14 @@ model Branch {
   questionGroups  QuestionGroup[]
   cbtDistributions CbtDistribution[]
   staffAttendances StaffAttendance[]
+  leaveCategories LeaveCategory[]
+  leaveRequests   LeaveRequest[]
+  payrollComponents PayrollComponent[]
+  payrollRuns     PayrollRun[]
+  payslips        Payslip[]
+  salaryAdvances  SalaryAdvance[]
+  staffConducts   StaffConduct[]
+  employmentLetters EmploymentLetter[]
 
   @@map("branches")
 }
@@ -1699,3 +1709,235 @@ model StaffAttendance {
   @@index([branchId, attendanceDate])
   @@map("staff_attendance")
 }
+
+model LeaveCategory {
+  id                 Int       @id @default(autoincrement())
+  name               String
+  daysPerYear        Int       @default(14) @map("days_per_year")
+  isPaid             Boolean   @default(true) @map("is_paid")
+  requiresAttachment Boolean   @default(false) @map("requires_attachment")
+  applicableRoles    String    @default("ALL") @map("applicable_roles") // ALL, TEACHER, STAFF
+  description        String?   @db.Text
+  active             Boolean   @default(true)
+  branchId           Int       @map("branch_id")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime? @updatedAt @map("updated_at")
+
+  branch        Branch         @relation(fields: [branchId], references: [id])
+  leaveRequests LeaveRequest[]
+
+  @@index([branchId])
+  @@map("leave_categories")
+}
+
+model LeaveRequest {
+  id              Int       @id @default(autoincrement())
+  leaveCategoryId Int       @map("leave_category_id")
+  applicantId     Int       @map("applicant_id") // Teacher ID or User ID
+  applicantType   String    @default("TEACHER") @map("applicant_type") // TEACHER, STAFF, USER
+  applicantName   String    @map("applicant_name")
+  startDate       DateTime  @map("start_date")
+  endDate         DateTime  @map("end_date")
+  totalDays       Int       @default(1) @map("total_days")
+  reason          String    @db.Text
+  attachmentUrl   String?   @map("attachment_url")
+  status          String    @default("PENDING") // PENDING, APPROVED, REJECTED, CANCELLED
+  reviewedBy      Int?      @map("reviewed_by")
+  reviewerNotes   String?   @map("reviewer_notes") @db.Text
+  reviewedAt      DateTime? @map("reviewed_at")
+  branchId        Int       @map("branch_id")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  leaveCategory LeaveCategory @relation(fields: [leaveCategoryId], references: [id])
+  branch        Branch        @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, status])
+  @@index([applicantId])
+  @@map("leave_requests")
+}
+
+model PayrollComponent {
+  id                 Int       @id @default(autoincrement())
+  staffId            Int       @map("staff_id") // Teacher ID or User ID
+  staffType          String    @default("TEACHER") @map("staff_type") // TEACHER, STAFF
+  staffName          String    @map("staff_name")
+  staffRole          String    @default("Teacher") @map("staff_role")
+  baseSalary         Decimal   @default(0) @db.Decimal(18, 2) @map("base_salary")
+  housingAllowance   Decimal   @default(0) @db.Decimal(18, 2) @map("housing_allowance")
+  transportAllowance Decimal   @default(0) @db.Decimal(18, 2) @map("transport_allowance")
+  medicalAllowance   Decimal   @default(0) @db.Decimal(18, 2) @map("medical_allowance")
+  taxDeduction       Decimal   @default(0) @db.Decimal(18, 2) @map("tax_deduction")
+  pensionDeduction   Decimal   @default(0) @db.Decimal(18, 2) @map("pension_deduction")
+  otherDeductions    Decimal   @default(0) @db.Decimal(18, 2) @map("other_deductions")
+  bankName           String?   @map("bank_name")
+  accountNumber      String?   @map("account_number")
+  branchId           Int       @map("branch_id")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, staffId])
+  @@map("payroll_components")
+}
+
+model PayrollRun {
+  id               Int       @id @default(autoincrement())
+  monthYear        String    @map("month_year") // e.g. "July 2026"
+  totalGross       Decimal   @default(0) @db.Decimal(18, 2) @map("total_gross")
+  totalDeductions  Decimal   @default(0) @db.Decimal(18, 2) @map("total_deductions")
+  totalNet         Decimal   @default(0) @db.Decimal(18, 2) @map("total_net")
+  staffCount       Int       @default(0) @map("staff_count")
+  status           String    @default("DRAFT") // DRAFT, SUBMITTED, APPROVED, PAID
+  approvedBy       Int?      @map("approved_by")
+  approvedAt       DateTime? @map("approved_at")
+  paidAt           DateTime? @map("paid_at")
+  branchId         Int       @map("branch_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
+
+  branch   Branch    @relation(fields: [branchId], references: [id])
+  payslips Payslip[]
+
+  @@index([branchId, monthYear])
+  @@map("payroll_runs")
+}
+
+model Payslip {
+  id                 Int       @id @default(autoincrement())
+  payrollRunId       Int       @map("payroll_run_id")
+  staffId            Int       @map("staff_id")
+  staffName          String    @map("staff_name")
+  staffRole          String    @default("Teacher") @map("staff_role")
+  baseSalary         Decimal   @default(0) @db.Decimal(18, 2) @map("base_salary")
+  totalAllowances    Decimal   @default(0) @db.Decimal(18, 2) @map("total_allowances")
+  totalDeductions    Decimal   @default(0) @db.Decimal(18, 2) @map("total_deductions")
+  netSalary          Decimal   @default(0) @db.Decimal(18, 2) @map("net_salary")
+  paymentMethod      String    @default("Bank Transfer") @map("payment_method")
+  status             String    @default("PENDING") // PENDING, PAID
+  sentAt             DateTime? @map("sent_at")
+  branchId           Int       @map("branch_id")
+  createdAt          DateTime  @default(now()) @map("created_at")
+
+  payrollRun PayrollRun @relation(fields: [payrollRunId], references: [id])
+  branch     Branch     @relation(fields: [branchId], references: [id])
+
+  @@index([payrollRunId])
+  @@index([branchId])
+  @@map("payslips")
+}
+
+model SalaryAdvance {
+  id               Int       @id @default(autoincrement())
+  staffId          Int       @map("staff_id")
+  staffName        String    @map("staff_name")
+  staffRole        String    @default("Teacher") @map("staff_role")
+  requestedAmount  Decimal   @db.Decimal(18, 2) @map("requested_amount")
+  monthlyDeduction Decimal   @db.Decimal(18, 2) @map("monthly_deduction")
+  repaymentMonths  Int       @default(1) @map("repayment_months")
+  reason           String    @db.Text
+  status           String    @default("PENDING") // PENDING, APPROVED, REJECTED, REPAID
+  reviewedBy       Int?      @map("reviewed_by")
+  reviewerNotes    String?   @map("reviewer_notes") @db.Text
+  reviewedAt       DateTime? @map("reviewed_at")
+  branchId         Int       @map("branch_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, status])
+  @@map("salary_advances")
+}
+
+model StaffConduct {
+  id           Int       @id @default(autoincrement())
+  staffId      Int       @map("staff_id")
+  staffName    String    @map("staff_name")
+  staffRole    String    @default("Teacher") @map("staff_role")
+  incidentDate DateTime  @map("incident_date")
+  type         String    @default("WARNING") @map("type") // COMMENDATION, WARNING, INFRACTION, DISCIPLINARY
+  title        String
+  description  String    @db.Text
+  actionTaken  String?   @map("action_taken") @db.Text
+  issuedBy     String    @default("School Admin") @map("issued_by")
+  branchId     Int       @map("branch_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, staffId])
+  @@map("staff_conducts")
+}
+
+model EmploymentLetter {
+  id            Int       @id @default(autoincrement())
+  staffId       Int       @map("staff_id")
+  staffName     String    @map("staff_name")
+  jobTitle      String    @map("job_title")
+  joiningDate   DateTime  @map("joining_date")
+  salaryAmount  Decimal   @db.Decimal(18, 2) @map("salary_amount")
+  letterContent String    @db.Text @map("letter_content")
+  isAiGenerated Boolean   @default(false) @map("is_ai_generated")
+  issuedDate    DateTime  @default(now()) @map("issued_date")
+  branchId      Int       @map("branch_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, staffId])
+  @@map("employment_letters")
+}
+
+model LibraryResource {
+  id              Int       @id @default(autoincrement())
+  branchId        Int       @map("branch_id")
+  title           String
+  author          String
+  isbn            String?
+  category        String    @default("General")
+  type            String    @default("PHYSICAL_BOOK")
+  totalCopies     Int       @default(1) @map("total_copies")
+  availableCopies  Int       @default(1) @map("available_copies")
+  fileUrl         String?   @map("file_url")
+  videoUrl        String?   @map("video_url")
+  description     String?   @db.Text
+  isAiGenerated   Boolean   @default(false) @map("is_ai_generated")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+  issues LibraryIssue[]
+
+  @@index([branchId, type])
+  @@map("library_resources")
+}
+
+model LibraryIssue {
+  id           Int       @id @default(autoincrement())
+  branchId     Int       @map("branch_id")
+  resourceId   Int       @map("resource_id")
+  borrowerId   Int       @map("borrower_id")
+  borrowerType String    @default("STUDENT") @map("borrower_type")
+  borrowerName String    @map("borrower_name")
+  borrowerRole String?   @map("borrower_role")
+  issueDate    DateTime  @default(now()) @map("issue_date")
+  dueDate      DateTime  @map("due_date")
+  returnDate   DateTime? @map("return_date")
+  status       String    @default("ISSUED")
+  remarks      String?   @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+  resource LibraryResource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@index([branchId, status])
+  @@index([resourceId])
+  @@map("library_issues")
+}
+
+

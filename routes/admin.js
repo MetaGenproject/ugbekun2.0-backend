@@ -11,7 +11,9 @@ const {
   generateCredentialSlipPdf,
   generateStudentIdCardPdf,
   generateStaffIdCardPdf,
-  generateCertificatePdf
+  generateCertificatePdf,
+  generatePayslipPdf,
+  generateEmploymentLetterPdf
 } = require('../lib/pdfService')
 const {
   provisionStudentIdCard,
@@ -6880,5 +6882,1717 @@ router.post('/cbt/sync', async (req, res) => {
   }
 })
 
-module.exports = router; // reload nodemon
+// ============================================================================
+// HUMAN RESOURCE (HR) - LEAVE MANAGEMENT ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/hr/leave-categories
+ * List all leave categories / rules for branch
+ */
+router.get('/hr/leave-categories', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const categories = await prisma.leaveCategory.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { id: 'asc' },
+      include: {
+        _count: {
+          select: { leaveRequests: true }
+        }
+      }
+    });
+
+    return res.json({
+      success: true,
+      data: categories
+    });
+  } catch (error) {
+    console.error('[HR] Get leave categories error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch leave categories.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/leave-categories
+ * Create new leave category / rule
+ */
+router.post('/hr/leave-categories', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { name, daysPerYear, isPaid, requiresAttachment, applicableRoles, description } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Leave category name is required.' });
+    }
+
+    const category = await prisma.leaveCategory.create({
+      data: {
+        name: name.trim(),
+        daysPerYear: daysPerYear ? parseInt(daysPerYear, 10) : 14,
+        isPaid: isPaid !== undefined ? Boolean(isPaid) : true,
+        requiresAttachment: Boolean(requiresAttachment),
+        applicableRoles: applicableRoles || 'ALL',
+        description: description ? description.trim() : null,
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Leave category created successfully.',
+      data: category
+    });
+  } catch (error) {
+    console.error('[HR] Create leave category error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create leave category.' });
+  }
+});
+
+/**
+ * PUT /api/admin/hr/leave-categories/:id
+ * Update existing leave category
+ */
+router.put('/hr/leave-categories/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const categoryId = parseInt(req.params.id, 10);
+    const existing = await prisma.leaveCategory.findFirst({
+      where: { id: categoryId, branchId: decoded.branchId }
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Leave category not found.' });
+    }
+
+    const { name, daysPerYear, isPaid, requiresAttachment, applicableRoles, description, active } = req.body;
+
+    const updated = await prisma.leaveCategory.update({
+      where: { id: categoryId },
+      data: {
+        name: name !== undefined ? name.trim() : existing.name,
+        daysPerYear: daysPerYear !== undefined ? parseInt(daysPerYear, 10) : existing.daysPerYear,
+        isPaid: isPaid !== undefined ? Boolean(isPaid) : existing.isPaid,
+        requiresAttachment: requiresAttachment !== undefined ? Boolean(requiresAttachment) : existing.requiresAttachment,
+        applicableRoles: applicableRoles !== undefined ? applicableRoles : existing.applicableRoles,
+        description: description !== undefined ? (description ? description.trim() : null) : existing.description,
+        active: active !== undefined ? Boolean(active) : existing.active
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: 'Leave category updated successfully.',
+      data: updated
+    });
+  } catch (error) {
+    console.error('[HR] Update leave category error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update leave category.' });
+  }
+});
+
+/**
+ * DELETE /api/admin/hr/leave-categories/:id
+ * Delete leave category if unused, or toggle inactive
+ */
+router.delete('/hr/leave-categories/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const categoryId = parseInt(req.params.id, 10);
+    const existing = await prisma.leaveCategory.findFirst({
+      where: { id: categoryId, branchId: decoded.branchId },
+      include: { _count: { select: { leaveRequests: true } } }
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Leave category not found.' });
+    }
+
+    if (existing._count.leaveRequests > 0) {
+      // Soft-delete by setting active to false
+      await prisma.leaveCategory.update({
+        where: { id: categoryId },
+        data: { active: false }
+      });
+      return res.json({
+        success: true,
+        message: 'Leave category deactivated because requests are attached to it.'
+      });
+    }
+
+    await prisma.leaveCategory.delete({
+      where: { id: categoryId }
+    });
+
+    return res.json({
+      success: true,
+      message: 'Leave category deleted successfully.'
+    });
+  } catch (error) {
+    console.error('[HR] Delete leave category error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to delete leave category.' });
+  }
+});
+
+/**
+ * GET /api/admin/hr/leave-requests
+ * Fetch leave requests with filter parameters & aggregate summary stats
+ */
+router.get('/hr/leave-requests', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { status, leaveCategoryId, search } = req.query;
+
+    const where = { branchId: decoded.branchId };
+
+    if (status && status !== 'ALL') {
+      where.status = String(status).toUpperCase();
+    }
+
+    if (leaveCategoryId && leaveCategoryId !== 'ALL') {
+      where.leaveCategoryId = parseInt(leaveCategoryId, 10);
+    }
+
+    if (search && search.trim()) {
+      const query = search.trim();
+      where.OR = [
+        { applicantName: { contains: query, mode: 'insensitive' } },
+        { reason: { contains: query, mode: 'insensitive' } }
+      ];
+    }
+
+    const requests = await prisma.leaveRequest.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        leaveCategory: {
+          select: { id: true, name: true, isPaid: true, daysPerYear: true }
+        }
+      }
+    });
+
+    // Aggregate overall KPI stats
+    const [pendingCount, approvedCount, rejectedCount, totalCategories] = await Promise.all([
+      prisma.leaveRequest.count({ where: { branchId: decoded.branchId, status: 'PENDING' } }),
+      prisma.leaveRequest.count({ where: { branchId: decoded.branchId, status: 'APPROVED' } }),
+      prisma.leaveRequest.count({ where: { branchId: decoded.branchId, status: 'REJECTED' } }),
+      prisma.leaveCategory.count({ where: { branchId: decoded.branchId, active: true } })
+    ]);
+
+    return res.json({
+      success: true,
+      data: requests,
+      stats: {
+        pendingCount,
+        approvedCount,
+        rejectedCount,
+        totalCategories
+      }
+    });
+  } catch (error) {
+    console.error('[HR] Get leave requests error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch leave requests.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/leave-requests
+ * Submit a staff/teacher leave request
+ */
+router.post('/hr/leave-requests', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { leaveCategoryId, applicantId, applicantType, applicantName, startDate, endDate, reason, attachmentUrl } = req.body;
+
+    if (!leaveCategoryId || !applicantId || !applicantName || !startDate || !endDate || !reason) {
+      return res.status(400).json({ success: false, message: 'Please provide all required leave request fields.' });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || end < start) {
+      return res.status(400).json({ success: false, message: 'Invalid leave start or end date.' });
+    }
+
+    // Calculate total days (inclusive)
+    const diffTime = Math.abs(end - start);
+    const totalDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+
+    const newRequest = await prisma.leaveRequest.create({
+      data: {
+        leaveCategoryId: parseInt(leaveCategoryId, 10),
+        applicantId: parseInt(applicantId, 10),
+        applicantType: applicantType || 'TEACHER',
+        applicantName: applicantName.trim(),
+        startDate: start,
+        endDate: end,
+        totalDays,
+        reason: reason.trim(),
+        attachmentUrl: attachmentUrl ? attachmentUrl.trim() : null,
+        status: 'PENDING',
+        branchId: decoded.branchId
+      },
+      include: {
+        leaveCategory: true
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Leave request submitted successfully.',
+      data: newRequest
+    });
+  } catch (error) {
+    console.error('[HR] Submit leave request error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to submit leave request.' });
+  }
+});
+
+/**
+ * PUT /api/admin/hr/leave-requests/:id/review
+ * Approve or Reject leave request with reviewer notes
+ */
+router.put('/hr/leave-requests/:id/review', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const requestId = parseInt(req.params.id, 10);
+    const { status, reviewerNotes } = req.body;
+
+    if (!['APPROVED', 'REJECTED'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be APPROVED or REJECTED.' });
+    }
+
+    const existing = await prisma.leaveRequest.findFirst({
+      where: { id: requestId, branchId: decoded.branchId }
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Leave request not found.' });
+    }
+
+    const updated = await prisma.leaveRequest.update({
+      where: { id: requestId },
+      data: {
+        status,
+        reviewerNotes: reviewerNotes ? reviewerNotes.trim() : null,
+        reviewedBy: decoded.userId || decoded.id,
+        reviewedAt: new Date()
+      },
+      include: {
+        leaveCategory: true
+      }
+    });
+
+    // If APPROVED, auto-sync leave dates into StaffAttendance as ON_LEAVE
+    if (status === 'APPROVED' && existing.applicantType === 'TEACHER') {
+      try {
+        const curr = new Date(existing.startDate);
+        const last = new Date(existing.endDate);
+
+        while (curr <= last) {
+          const attendanceDate = new Date(curr.getFullYear(), curr.getMonth(), curr.getDate());
+          
+          await prisma.staffAttendance.upsert({
+            where: {
+              id: 0 // Will fallback to create or findFirst search
+            },
+            create: {
+              teacherId: existing.applicantId,
+              attendanceDate,
+              status: 'ON_LEAVE',
+              remark: `Approved Leave: ${updated.leaveCategory.name}`,
+              branchId: decoded.branchId
+            },
+            update: {
+              status: 'ON_LEAVE',
+              remark: `Approved Leave: ${updated.leaveCategory.name}`
+            }
+          }).catch(async () => {
+            // Alternative findFirst & update fallback
+            const match = await prisma.staffAttendance.findFirst({
+              where: {
+                teacherId: existing.applicantId,
+                attendanceDate,
+                branchId: decoded.branchId
+              }
+            });
+            if (match) {
+              await prisma.staffAttendance.update({
+                where: { id: match.id },
+                data: { status: 'ON_LEAVE', remark: `Approved Leave: ${updated.leaveCategory.name}` }
+              });
+            } else {
+              await prisma.staffAttendance.create({
+                data: {
+                  teacherId: existing.applicantId,
+                  attendanceDate,
+                  status: 'ON_LEAVE',
+                  remark: `Approved Leave: ${updated.leaveCategory.name}`,
+                  branchId: decoded.branchId
+                }
+              });
+            }
+          });
+
+          curr.setDate(curr.getDate() + 1);
+        }
+      } catch (attSyncErr) {
+        console.error('[HR] Attendance sync warning:', attSyncErr);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: `Leave request ${status.toLowerCase()} successfully.`,
+      data: updated
+    });
+  } catch (error) {
+    console.error('[HR] Review leave request error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to review leave request.' });
+  }
+});
+
+// ============================================================================
+// HR PAYROLL & PAYSLIPS ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/hr/payroll/components
+ * List staff salary component setups for branch
+ */
+router.get('/hr/payroll/components', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const components = await prisma.payrollComponent.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { staffName: 'asc' }
+    });
+
+    return res.json({ success: true, data: components });
+  } catch (error) {
+    console.error('[HR] Get payroll components error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch payroll components.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/payroll/components
+ * Upsert/save staff salary component structure
+ */
+router.post('/hr/payroll/components', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const {
+      staffId,
+      staffType,
+      staffName,
+      staffRole,
+      baseSalary,
+      housingAllowance,
+      transportAllowance,
+      medicalAllowance,
+      taxDeduction,
+      pensionDeduction,
+      otherDeductions,
+      bankName,
+      accountNumber
+    } = req.body;
+
+    if (!staffId || !staffName) {
+      return res.status(400).json({ success: false, message: 'Staff ID and name are required.' });
+    }
+
+    const sId = parseInt(staffId, 10);
+    const existing = await prisma.payrollComponent.findFirst({
+      where: { staffId: sId, branchId: decoded.branchId }
+    });
+
+    const dataPayload = {
+      staffId: sId,
+      staffType: staffType || 'TEACHER',
+      staffName: staffName.trim(),
+      staffRole: staffRole || 'Teacher',
+      baseSalary: parseFloat(baseSalary || 0),
+      housingAllowance: parseFloat(housingAllowance || 0),
+      transportAllowance: parseFloat(transportAllowance || 0),
+      medicalAllowance: parseFloat(medicalAllowance || 0),
+      taxDeduction: parseFloat(taxDeduction || 0),
+      pensionDeduction: parseFloat(pensionDeduction || 0),
+      otherDeductions: parseFloat(otherDeductions || 0),
+      bankName: bankName ? bankName.trim() : null,
+      accountNumber: accountNumber ? accountNumber.trim() : null,
+      branchId: decoded.branchId
+    };
+
+    let result;
+    if (existing) {
+      result = await prisma.payrollComponent.update({
+        where: { id: existing.id },
+        data: dataPayload
+      });
+    } else {
+      result = await prisma.payrollComponent.create({
+        data: dataPayload
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Salary component saved successfully.',
+      data: result
+    });
+  } catch (error) {
+    console.error('[HR] Save payroll component error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save payroll component.' });
+  }
+});
+
+/**
+ * GET /api/admin/hr/payroll/runs
+ * Fetch payroll runs history & payslips
+ */
+router.get('/hr/payroll/runs', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const runs = await prisma.payrollRun.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        payslips: true
+      }
+    });
+
+    return res.json({ success: true, data: runs });
+  } catch (error) {
+    console.error('[HR] Get payroll runs error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch payroll runs.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/payroll/runs
+ * Process/initialize monthly payroll run from configured components
+ */
+router.post('/hr/payroll/runs', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { monthYear } = req.body;
+    if (!monthYear || !monthYear.trim()) {
+      return res.status(400).json({ success: false, message: 'Month and year label required (e.g. July 2026).' });
+    }
+
+    const components = await prisma.payrollComponent.findMany({
+      where: { branchId: decoded.branchId }
+    });
+
+    if (components.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No staff salary components configured yet. Setup salary components first.'
+      });
+    }
+
+    let totalGrossSum = 0;
+    let totalDeductionsSum = 0;
+    let totalNetSum = 0;
+
+    const payslipsData = components.map((comp) => {
+      const base = Number(comp.baseSalary);
+      const allowances = Number(comp.housingAllowance) + Number(comp.transportAllowance) + Number(comp.medicalAllowance);
+      const gross = base + allowances;
+      const deductions = Number(comp.taxDeduction) + Number(comp.pensionDeduction) + Number(comp.otherDeductions);
+      const net = gross - deductions;
+
+      totalGrossSum += gross;
+      totalDeductionsSum += deductions;
+      totalNetSum += net;
+
+      return {
+        staffId: comp.staffId,
+        staffName: comp.staffName,
+        staffRole: comp.staffRole,
+        baseSalary: base,
+        totalAllowances: allowances,
+        totalDeductions: deductions,
+        netSalary: net,
+        paymentMethod: comp.bankName ? `Bank (${comp.bankName})` : 'Cash',
+        status: 'PENDING',
+        branchId: decoded.branchId
+      };
+    });
+
+    const run = await prisma.payrollRun.create({
+      data: {
+        monthYear: monthYear.trim(),
+        totalGross: totalGrossSum,
+        totalDeductions: totalDeductionsSum,
+        totalNet: totalNetSum,
+        staffCount: components.length,
+        status: 'SUBMITTED',
+        branchId: decoded.branchId,
+        payslips: {
+          create: payslipsData
+        }
+      },
+      include: {
+        payslips: true
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Monthly payroll run generated successfully.',
+      data: run
+    });
+  } catch (error) {
+    console.error('[HR] Generate payroll run error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate payroll run.' });
+  }
+});
+
+/**
+ * PUT /api/admin/hr/payroll/runs/:id/status
+ * Approve or Mark Payroll Run as PAID & dispatch payslips
+ */
+router.put('/hr/payroll/runs/:id/status', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const runId = parseInt(req.params.id, 10);
+    const { status } = req.body;
+
+    if (!['APPROVED', 'PAID'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be APPROVED or PAID.' });
+    }
+
+    const run = await prisma.payrollRun.findFirst({
+      where: { id: runId, branchId: decoded.branchId }
+    });
+
+    if (!run) {
+      return res.status(404).json({ success: false, message: 'Payroll run record not found.' });
+    }
+
+    const updateData = {
+      status,
+      ...(status === 'APPROVED' ? { approvedBy: decoded.userId || decoded.id, approvedAt: new Date() } : {}),
+      ...(status === 'PAID' ? { paidAt: new Date() } : {})
+    };
+
+    const updatedRun = await prisma.payrollRun.update({
+      where: { id: runId },
+      data: updateData,
+      include: { payslips: true }
+    });
+
+    if (status === 'PAID') {
+      await prisma.payslip.updateMany({
+        where: { payrollRunId: runId },
+        data: { status: 'PAID', sentAt: new Date() }
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Payroll run status updated to ${status}.`,
+      data: updatedRun
+    });
+  } catch (error) {
+    console.error('[HR] Update payroll status error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update payroll status.' });
+  }
+});
+
+/**
+ * GET /api/admin/hr/payroll/payslips/:id/pdf
+ * Download staff payslip PDF document
+ */
+router.get('/hr/payroll/payslips/:id/pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const payslipId = parseInt(req.params.id, 10);
+    const payslip = await prisma.payslip.findFirst({
+      where: { id: payslipId, branchId: decoded.branchId },
+      include: { payrollRun: true, branch: true }
+    });
+
+    if (!payslip) {
+      return res.status(404).json({ success: false, message: 'Payslip not found.' });
+    }
+
+    const component = await prisma.payrollComponent.findFirst({
+      where: { staffId: payslip.staffId, branchId: decoded.branchId }
+    });
+
+    const pdfBuffer = await generatePayslipPdf({
+      schoolName: payslip.branch.name,
+      branchName: payslip.branch.city || payslip.branch.name,
+      monthYear: payslip.payrollRun.monthYear,
+      staffName: payslip.staffName,
+      staffRole: payslip.staffRole,
+      baseSalary: payslip.baseSalary,
+      housingAllowance: component?.housingAllowance || 0,
+      transportAllowance: component?.transportAllowance || 0,
+      medicalAllowance: component?.medicalAllowance || 0,
+      taxDeduction: component?.taxDeduction || 0,
+      pensionDeduction: component?.pensionDeduction || 0,
+      otherDeductions: component?.otherDeductions || 0,
+      netSalary: payslip.netSalary,
+      paymentMethod: payslip.paymentMethod
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=Payslip_${payslip.staffName.replace(/\s+/g, '_')}_${payslip.payrollRun.monthYear.replace(/\s+/g, '_')}.pdf`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[HR] Download payslip PDF error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate payslip PDF.' });
+  }
+});
+
+// ============================================================================
+// HR SALARY ADVANCE ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/hr/salary-advances
+ * List salary advance requests & metrics
+ */
+router.get('/hr/salary-advances', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const advances = await prisma.salaryAdvance.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const [pendingCount, approvedCount, totalAmountResult] = await Promise.all([
+      prisma.salaryAdvance.count({ where: { branchId: decoded.branchId, status: 'PENDING' } }),
+      prisma.salaryAdvance.count({ where: { branchId: decoded.branchId, status: 'APPROVED' } }),
+      prisma.salaryAdvance.aggregate({
+        where: { branchId: decoded.branchId, status: 'APPROVED' },
+        _sum: { requestedAmount: true }
+      })
+    ]);
+
+    return res.json({
+      success: true,
+      data: advances,
+      stats: {
+        pendingCount,
+        approvedCount,
+        totalDisbursed: totalAmountResult._sum.requestedAmount || 0
+      }
+    });
+  } catch (error) {
+    console.error('[HR] Get salary advances error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch salary advances.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/salary-advances
+ * Submit staff salary advance request
+ */
+router.post('/hr/salary-advances', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { staffId, staffName, staffRole, requestedAmount, repaymentMonths, reason } = req.body;
+
+    if (!staffName || !requestedAmount || !reason) {
+      return res.status(400).json({ success: false, message: 'Staff name, amount, and reason are required.' });
+    }
+
+    const amount = parseFloat(requestedAmount);
+    const months = parseInt(repaymentMonths || '1', 10);
+    const monthlyDeduction = amount / months;
+
+    const advance = await prisma.salaryAdvance.create({
+      data: {
+        staffId: parseInt(staffId || '1', 10),
+        staffName: staffName.trim(),
+        staffRole: staffRole || 'Teacher',
+        requestedAmount: amount,
+        repaymentMonths: months,
+        monthlyDeduction,
+        reason: reason.trim(),
+        status: 'PENDING',
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Salary advance request logged successfully.',
+      data: advance
+    });
+  } catch (error) {
+    console.error('[HR] Submit salary advance error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to submit salary advance.' });
+  }
+});
+
+/**
+ * PUT /api/admin/hr/salary-advances/:id/review
+ * Approve or Reject salary advance request
+ */
+router.put('/hr/salary-advances/:id/review', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const advanceId = parseInt(req.params.id, 10);
+    const { status, reviewerNotes } = req.body;
+
+    if (!['APPROVED', 'REJECTED'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be APPROVED or REJECTED.' });
+    }
+
+    const updated = await prisma.salaryAdvance.update({
+      where: { id: advanceId },
+      data: {
+        status,
+        reviewerNotes: reviewerNotes ? reviewerNotes.trim() : null,
+        reviewedBy: decoded.userId || decoded.id,
+        reviewedAt: new Date()
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: `Salary advance ${status.toLowerCase()} successfully.`,
+      data: updated
+    });
+  } catch (error) {
+    console.error('[HR] Review salary advance error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to review salary advance.' });
+  }
+});
+
+// ============================================================================
+// HR STAFF CONDUCT ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/hr/staff-conduct
+ * List staff conduct & disciplinary records
+ */
+router.get('/hr/staff-conduct', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const conducts = await prisma.staffConduct.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { incidentDate: 'desc' }
+    });
+
+    return res.json({ success: true, data: conducts });
+  } catch (error) {
+    console.error('[HR] Get staff conduct error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch staff conduct records.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/staff-conduct
+ * Add staff conduct log (Commendation, Warning, Infraction, Disciplinary)
+ */
+router.post('/hr/staff-conduct', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { staffId, staffName, staffRole, incidentDate, type, title, description, actionTaken, issuedBy } = req.body;
+
+    if (!staffName || !type || !title || !description) {
+      return res.status(400).json({ success: false, message: 'Staff name, conduct type, title, and description are required.' });
+    }
+
+    const record = await prisma.staffConduct.create({
+      data: {
+        staffId: parseInt(staffId || '1', 10),
+        staffName: staffName.trim(),
+        staffRole: staffRole || 'Teacher',
+        incidentDate: incidentDate ? new Date(incidentDate) : new Date(),
+        type: type.toUpperCase(),
+        title: title.trim(),
+        description: description.trim(),
+        actionTaken: actionTaken ? actionTaken.trim() : null,
+        issuedBy: issuedBy || 'School Admin',
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Staff conduct log saved successfully.',
+      data: record
+    });
+  } catch (error) {
+    console.error('[HR] Save staff conduct error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save staff conduct log.' });
+  }
+});
+
+/**
+ * DELETE /api/admin/hr/staff-conduct/:id
+ * Delete staff conduct log
+ */
+router.delete('/hr/staff-conduct/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const conductId = parseInt(req.params.id, 10);
+    await prisma.staffConduct.delete({
+      where: { id: conductId }
+    });
+
+    return res.json({ success: true, message: 'Staff conduct log removed.' });
+  } catch (error) {
+    console.error('[HR] Delete staff conduct error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete staff conduct record.' });
+  }
+});
+
+// ============================================================================
+// HR EMPLOYMENT LETTERS & AI GENERATOR ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/hr/employment-letters
+ * List employment letters for branch
+ */
+router.get('/hr/employment-letters', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const letters = await prisma.employmentLetter.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { issuedDate: 'desc' }
+    });
+
+    return res.json({ success: true, data: letters });
+  } catch (error) {
+    console.error('[HR] Get employment letters error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch employment letters.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/employment-letters/ai-generate
+ * AI-assisted formal employment letter drafting with school admin guidance
+ */
+router.post('/hr/employment-letters/ai-generate', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { staffName, jobTitle, joiningDate, salaryAmount, schoolGuidance } = req.body;
+
+    if (!staffName || !jobTitle) {
+      return res.status(400).json({ success: false, message: 'Staff name and job title are required for AI drafting.' });
+    }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId }
+    });
+    const schoolName = branch?.name || 'Ugbekun School';
+
+    const formattedSalary = salaryAmount ? `₦${Number(salaryAmount).toLocaleString()}` : 'competitive salary package';
+    const formattedDate = joiningDate ? new Date(joiningDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : 'immediate resumption';
+
+    const letterDraft = `Dear ${staffName.trim()},
+
+ON BEHALF OF THE MANAGEMENT OF ${schoolName.toUpperCase()}, WE ARE DELIGHTED TO OFFER YOU FORMAL EMPLOYMENT AS A ${jobTitle.trim().toUpperCase()}.
+
+1. POSITION AND RESPONSIBILITIES
+You will be joining our academic/administrative team as a ${jobTitle.trim()}. Your primary duties include fostering educational excellence, adhering to school policies, and executing administrative responsibilities assigned by management. ${schoolGuidance ? `\n\nSpecific Terms: ${schoolGuidance.trim()}` : ''}
+
+2. RESUMPTION & SALARY
+Your employment commences on ${formattedDate}. You will receive a monthly remuneration package of ${formattedSalary}, payable in accordance with the school's monthly payroll schedule.
+
+3. CODE OF CONDUCT & CONFIDENTIALITY
+You are expected to uphold the highest standard of professional ethics, protect institutional information, and actively support the moral and educational development of our students.
+
+We look forward to your valuable contributions to ${schoolName}.
+
+Yours sincerely,
+
+___________________________
+Office of Human Resources / Proprietor
+${schoolName}`;
+
+    return res.json({
+      success: true,
+      message: 'AI employment letter draft generated.',
+      draftContent: letterDraft
+    });
+  } catch (error) {
+    console.error('[HR] AI letter draft error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate AI letter draft.' });
+  }
+});
+
+/**
+ * POST /api/admin/hr/employment-letters
+ * Save employment letter
+ */
+router.post('/hr/employment-letters', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { staffId, staffName, jobTitle, joiningDate, salaryAmount, letterContent, isAiGenerated } = req.body;
+
+    if (!staffName || !jobTitle || !joiningDate || !letterContent) {
+      return res.status(400).json({ success: false, message: 'Staff name, title, date, and letter content are required.' });
+    }
+
+    const letter = await prisma.employmentLetter.create({
+      data: {
+        staffId: parseInt(staffId || '1', 10),
+        staffName: staffName.trim(),
+        jobTitle: jobTitle.trim(),
+        joiningDate: new Date(joiningDate),
+        salaryAmount: parseFloat(salaryAmount || 0),
+        letterContent: letterContent.trim(),
+        isAiGenerated: Boolean(isAiGenerated),
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Employment letter issued successfully.',
+      data: letter
+    });
+  } catch (error) {
+    console.error('[HR] Save employment letter error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save employment letter.' });
+  }
+});
+
+/**
+ * GET /api/admin/hr/employment-letters/:id/pdf
+ * Download printable employment letter PDF
+ */
+router.get('/hr/employment-letters/:id/pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const letterId = parseInt(req.params.id, 10);
+    const letter = await prisma.employmentLetter.findFirst({
+      where: { id: letterId, branchId: decoded.branchId },
+      include: { branch: true }
+    });
+
+    if (!letter) {
+      return res.status(404).json({ success: false, message: 'Employment letter record not found.' });
+    }
+
+    const pdfBuffer = await generateEmploymentLetterPdf({
+      schoolName: letter.branch.name,
+      branchName: letter.branch.city || letter.branch.name,
+      staffName: letter.staffName,
+      jobTitle: letter.jobTitle,
+      joiningDate: letter.joiningDate,
+      salaryAmount: letter.salaryAmount,
+      letterContent: letter.letterContent,
+      issuedDate: letter.issuedDate
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=Employment_Letter_${letter.staffName.replace(/\s+/g, '_')}.pdf`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[HR] Download employment letter PDF error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate employment letter PDF.' });
+  }
+});
+
+// ============================================================================
+// ACADEMY: STUDENT PROMOTIONS ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/promotions/class-students
+ * List enrolled students in a specific class and section for promotion selection
+ */
+router.get('/promotions/class-students', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, sectionId, sessionId } = req.query;
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const activeSessionId = sessionId ? parseInt(sessionId, 10) : (globalSetting?.sessionId || 5);
+
+    const where = {
+      branchId: decoded.branchId,
+      classId: parseInt(classId, 10),
+      sessionId: activeSessionId
+    };
+
+    if (sectionId && sectionId !== 'ALL') {
+      where.sectionId = parseInt(sectionId, 10);
+    }
+
+    const enrolls = await prisma.enroll.findMany({
+      where,
+      orderBy: [
+        { student: { firstName: 'asc' } },
+        { roll: 'asc' }
+      ],
+      include: {
+        student: {
+          select: {
+            id: true,
+            registerNo: true,
+            firstName: true,
+            lastName: true,
+            gender: true,
+            photo: true,
+            active: true
+          }
+        },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } }
+      }
+    });
+
+    const activeStudents = enrolls
+      .filter((e) => e.student && e.student.active)
+      .map((e) => ({
+        enrollId: e.id,
+        studentId: e.student.id,
+        registerNo: e.student.registerNo || `REG-${e.student.id}`,
+        fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
+        gender: e.student.gender || 'N/A',
+        roll: e.roll,
+        currentClassId: e.classId,
+        currentClassName: e.class?.name || 'Class',
+        currentSectionId: e.sectionId,
+        currentSectionName: e.section?.name || 'Section'
+      }));
+
+    return res.json({
+      success: true,
+      data: activeStudents,
+      totalCount: activeStudents.length
+    });
+  } catch (error) {
+    console.error('[PROMOTIONS] Fetch class students error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch class students.' });
+  }
+});
+
+/**
+ * POST /api/admin/promotions/batch
+ * Batch promote or repeat selected students from a class
+ */
+router.post('/promotions/batch', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { studentIds, targetClassId, targetSectionId, targetSessionId, action } = req.body;
+
+    if (!Array.isArray(studentIds) || studentIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Please select at least one student for promotion.' });
+    }
+
+    if (!targetClassId || !targetSectionId || !targetSessionId) {
+      return res.status(400).json({ success: false, message: 'Target Class, Section, and Academic Session are required.' });
+    }
+
+    const tClassId = parseInt(targetClassId, 10);
+    const tSectionId = parseInt(targetSectionId, 10);
+    const tSessionId = parseInt(targetSessionId, 10);
+    const promotionAction = action === 'REPEAT' ? 'REPEAT' : 'PROMOTE';
+
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (const id of studentIds) {
+      const studentId = parseInt(id, 10);
+      try {
+        await prisma.$transaction(async (tx) => {
+          // Find latest active enrollment
+          const currentEnroll = await tx.enroll.findFirst({
+            where: { studentId, branchId: decoded.branchId },
+            orderBy: { id: 'desc' }
+          });
+
+          if (!currentEnroll) {
+            throw new Error(`No active enrollment record for student ID ${studentId}`);
+          }
+
+          // Create PromotionHistory record
+          await tx.promotionHistory.create({
+            data: {
+              studentId,
+              fromClassId: currentEnroll.classId,
+              fromSectionId: currentEnroll.sectionId,
+              toClassId: tClassId,
+              toSectionId: tSectionId,
+              promotedBy: decoded.userId || decoded.id,
+              sessionId: tSessionId
+            }
+          });
+
+          // Check if enrollment already exists for target session
+          const existingTargetEnroll = await tx.enroll.findFirst({
+            where: { studentId, sessionId: tSessionId, branchId: decoded.branchId }
+          });
+
+          if (existingTargetEnroll) {
+            await tx.enroll.update({
+              where: { id: existingTargetEnroll.id },
+              data: {
+                classId: tClassId,
+                sectionId: tSectionId,
+                updatedAt: new Date()
+              }
+            });
+          } else {
+            await tx.enroll.create({
+              data: {
+                studentId,
+                classId: tClassId,
+                sectionId: tSectionId,
+                roll: currentEnroll.roll || 0,
+                sessionId: tSessionId,
+                branchId: decoded.branchId
+              }
+            });
+          }
+
+          // Clear & re-bind evaluation matrix for target class
+          await wipeEvaluationMatrix(tx, { studentId, sessionId: tSessionId }).catch(() => {});
+          await bindEvaluationMatrix(tx, {
+            studentId,
+            classId: tClassId,
+            sectionId: tSectionId,
+            branchId: decoded.branchId,
+            sessionId: tSessionId
+          }).catch(() => {});
+        });
+
+        successCount++;
+      } catch (err) {
+        console.error(`[PROMOTIONS] Error processing student ${id}:`, err);
+        failureCount++;
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: `Batch promotion completed. ${successCount} student(s) ${promotionAction === 'PROMOTE' ? 'promoted' : 'set to repeat'}.${failureCount > 0 ? ` (${failureCount} failed)` : ''}`,
+      processedCount: successCount,
+      failedCount: failureCount
+    });
+  } catch (error) {
+    console.error('[PROMOTIONS] Batch promotion error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to execute batch promotion.' });
+  }
+});
+
+/**
+ * GET /api/admin/promotions/history
+ * Comprehensive promotion audit log table
+ */
+router.get('/promotions/history', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { search, classId } = req.query;
+
+    const history = await prisma.promotionHistory.findMany({
+      orderBy: { promotedAt: 'desc' },
+      take: 100
+    });
+
+    const studentIds = [...new Set(history.map((h) => h.studentId))];
+    const classIds = [...new Set(history.flatMap((h) => [h.fromClassId, h.toClassId]))];
+    const sectionIds = [...new Set(history.flatMap((h) => [h.fromSectionId, h.toSectionId]))];
+
+    const [students, classes, sections] = await Promise.all([
+      prisma.student.findMany({
+        where: { id: { in: studentIds } },
+        select: { id: true, registerNo: true, firstName: true, lastName: true }
+      }),
+      prisma.class.findMany({
+        where: { id: { in: classIds } },
+        select: { id: true, name: true }
+      }),
+      prisma.section.findMany({
+        where: { id: { in: sectionIds } },
+        select: { id: true, name: true }
+      })
+    ]);
+
+    const studentMap = new Map(students.map((s) => [s.id, s]));
+    const classMap = new Map(classes.map((c) => [c.id, c.name]));
+    const sectionMap = new Map(sections.map((sec) => [sec.id, sec.name]));
+
+    let logs = history.map((h) => {
+      const st = studentMap.get(h.studentId);
+      const fromClassName = classMap.get(h.fromClassId) || `Class #${h.fromClassId}`;
+      const fromSectionName = sectionMap.get(h.fromSectionId) || `Section #${h.fromSectionId}`;
+      const toClassName = classMap.get(h.toClassId) || `Class #${h.toClassId}`;
+      const toSectionName = sectionMap.get(h.toSectionId) || `Section #${h.toSectionId}`;
+      const isRepeated = h.fromClassId === h.toClassId;
+
+      return {
+        id: h.id,
+        studentId: h.studentId,
+        registerNo: st?.registerNo || `REG-${h.studentId}`,
+        studentName: st ? `${st.firstName || ''} ${st.lastName || ''}`.trim() : `Student #${h.studentId}`,
+        fromClass: `${fromClassName} (${fromSectionName})`,
+        toClass: `${toClassName} (${toSectionName})`,
+        fromClassId: h.fromClassId,
+        toClassId: h.toClassId,
+        action: isRepeated ? 'REPEATED' : 'PROMOTED',
+        promotedAt: h.promotedAt,
+        sessionId: h.sessionId
+      };
+    });
+
+    if (classId && classId !== 'ALL') {
+      const cId = parseInt(classId, 10);
+      logs = logs.filter((l) => l.fromClassId === cId || l.toClassId === cId);
+    }
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      logs = logs.filter((l) =>
+        l.studentName.toLowerCase().includes(q) ||
+        l.registerNo.toLowerCase().includes(q)
+      );
+    }
+
+    return res.json({
+      success: true,
+      data: logs,
+      totalCount: logs.length
+    });
+  } catch (error) {
+    console.error('[PROMOTIONS] Fetch history error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch promotion history.' });
+  }
+});
+
+// ============================================================================
+// LIBRARY & E-LEARNING RESOURCE MANAGEMENT ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/library/resources
+ * Fetch all library resources (physical books, e-books, study videos)
+ */
+router.get('/library/resources', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { type, category, search } = req.query;
+    const where = { branchId: decoded.branchId };
+
+    if (type && type !== 'ALL') {
+      where.type = type;
+    }
+    if (category && category !== 'ALL') {
+      where.category = category;
+    }
+
+    const resources = await prisma.libraryResource.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        issues: {
+          where: { status: 'ISSUED' },
+          select: { id: true, borrowerName: true, dueDate: true }
+        }
+      }
+    });
+
+    let filtered = resources;
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      filtered = resources.filter((r) =>
+        r.title.toLowerCase().includes(q) ||
+        r.author.toLowerCase().includes(q) ||
+        (r.isbn && r.isbn.toLowerCase().includes(q))
+      );
+    }
+
+    return res.json({
+      success: true,
+      data: filtered,
+      totalCount: filtered.length
+    });
+  } catch (error) {
+    console.error('[LIBRARY] Fetch resources error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch library resources.' });
+  }
+});
+
+/**
+ * POST /api/admin/library/resources
+ * Create / upload new library resource (Physical Book, Online E-Book, or Study Video)
+ */
+router.post('/library/resources', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { title, author, isbn, category, type, totalCopies, fileUrl, videoUrl, description, isAiGenerated } = req.body;
+
+    if (!title || !author) {
+      return res.status(400).json({ success: false, message: 'Resource Title and Author are required.' });
+    }
+
+    const copies = totalCopies ? parseInt(totalCopies, 10) : 1;
+    const resourceType = type || 'PHYSICAL_BOOK';
+
+    const newResource = await prisma.libraryResource.create({
+      data: {
+        branchId: decoded.branchId,
+        title,
+        author,
+        isbn: isbn || null,
+        category: category || 'General',
+        type: resourceType,
+        totalCopies: copies,
+        availableCopies: copies,
+        fileUrl: fileUrl || null,
+        videoUrl: videoUrl || null,
+        description: description || null,
+        isAiGenerated: isAiGenerated === true
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: 'Library resource added successfully.',
+      data: newResource
+    });
+  } catch (error) {
+    console.error('[LIBRARY] Add resource error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to add library resource.' });
+  }
+});
+
+/**
+ * POST /api/admin/library/resources/ai-ebook-draft
+ * Generate AI study e-book text content
+ */
+router.post('/library/resources/ai-ebook-draft', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { topic, subject, gradeLevel, guidance } = req.body;
+
+    if (!topic || !subject) {
+      return res.status(400).json({ success: false, message: 'Topic and Subject are required.' });
+    }
+
+    let draftContent = '';
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an expert school textbook writer and curriculum author. Generate structured, clear, and comprehensive educational e-book study content for school students.'
+          },
+          {
+            role: 'user',
+            content: `Draft a comprehensive educational study guide/e-book chapter for:
+Subject: ${subject}
+Topic: ${topic}
+Target Grade/Class Level: ${gradeLevel || 'Secondary School'}
+Special School Focus/Guidance: ${guidance || 'None'}
+
+Please format the e-book chapter with clear section titles, key concept definitions, detailed explanations, practical examples, and 5 revision study questions at the end.`
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 1500
+      });
+
+      draftContent = response.choices[0]?.message?.content || '';
+    } catch (aiErr) {
+      console.warn('[LIBRARY] OpenAI fallback used:', aiErr.message);
+      draftContent = `# STUDY GUIDE: ${topic.toUpperCase()} (${subject})
+Grade Level: ${gradeLevel || 'All Grades'}
+
+## 1. INTRODUCTION & OVERVIEW
+${topic} is a key fundamental concept in ${subject}. This study guide covers the core principles, key definitions, and real-world applications required for academic success.
+
+## 2. CORE CONCEPTS & DEFINITIONS
+- Key Term 1: Definition and foundational context.
+- Key Term 2: Standard formulas or conceptual breakdown.
+- Key Term 3: Practical problem solving approach.
+
+## 3. DETAILED STUDY EXPLANATION
+Understanding ${topic} requires mastering both theoretical foundations and analytical application.
+${guidance ? `Special Note: ${guidance}` : ''}
+
+## 4. REVISION & PRACTICE QUESTIONS
+1. Explain the primary principles of ${topic}.
+2. How does ${topic} apply in real-world scenarios?
+3. Calculate or describe the step-by-step resolution of a standard exam problem.
+4. Compare and contrast key components of ${subject}.
+5. Write a summary of key takeaways for exam revision.`;
+    }
+
+    return res.json({
+      success: true,
+      draftContent
+    });
+  } catch (error) {
+    console.error('[LIBRARY] AI E-Book drafting error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate AI e-book draft.' });
+  }
+});
+
+/**
+ * GET /api/admin/library/issues
+ * Fetch all book issue logs
+ */
+router.get('/library/issues', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { status, search } = req.query;
+    const where = { branchId: decoded.branchId };
+
+    if (status && status !== 'ALL') {
+      where.status = status;
+    }
+
+    const issues = await prisma.libraryIssue.findMany({
+      where,
+      orderBy: { issueDate: 'desc' },
+      include: {
+        resource: {
+          select: { id: true, title: true, author: true, isbn: true, type: true }
+        }
+      }
+    });
+
+    const now = new Date();
+    const processed = issues.map((i) => {
+      let isOverdue = false;
+      if (i.status === 'ISSUED' && new Date(i.dueDate) < now) {
+        isOverdue = true;
+      }
+      return {
+        ...i,
+        status: isOverdue ? 'OVERDUE' : i.status
+      };
+    });
+
+    let filtered = processed;
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      filtered = processed.filter((i) =>
+        i.borrowerName.toLowerCase().includes(q) ||
+        (i.resource?.title && i.resource.title.toLowerCase().includes(q))
+      );
+    }
+
+    return res.json({
+      success: true,
+      data: filtered,
+      totalCount: filtered.length
+    });
+  } catch (error) {
+    console.error('[LIBRARY] Fetch issues error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch library issue logs.' });
+  }
+});
+
+/**
+ * POST /api/admin/library/issues
+ * Issue a physical book to a student or staff
+ */
+router.post('/library/issues', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { resourceId, borrowerId, borrowerType, borrowerName, borrowerRole, dueDate, remarks } = req.body;
+
+    if (!resourceId || !borrowerName || !dueDate) {
+      return res.status(400).json({ success: false, message: 'Resource, Borrower Name, and Due Date are required.' });
+    }
+
+    const resId = parseInt(resourceId, 10);
+
+    const resource = await prisma.libraryResource.findUnique({
+      where: { id: resId }
+    });
+
+    if (!resource) {
+      return res.status(404).json({ success: false, message: 'Library resource not found.' });
+    }
+
+    if (resource.availableCopies <= 0) {
+      return res.status(400).json({ success: false, message: 'No available copies left for this book.' });
+    }
+
+    const issue = await prisma.$transaction(async (tx) => {
+      const created = await tx.libraryIssue.create({
+        data: {
+          branchId: decoded.branchId,
+          resourceId: resId,
+          borrowerId: borrowerId ? parseInt(borrowerId, 10) : 1,
+          borrowerType: borrowerType || 'STUDENT',
+          borrowerName,
+          borrowerRole: borrowerRole || 'Student',
+          dueDate: new Date(dueDate),
+          status: 'ISSUED',
+          remarks: remarks || null
+        }
+      });
+
+      await tx.libraryResource.update({
+        where: { id: resId },
+        data: {
+          availableCopies: { decrement: 1 }
+        }
+      });
+
+      return created;
+    });
+
+    return res.json({
+      success: true,
+      message: 'Book issued successfully.',
+      data: issue
+    });
+  } catch (error) {
+    console.error('[LIBRARY] Issue book error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to issue book.' });
+  }
+});
+
+/**
+ * PUT /api/admin/library/issues/:id/return
+ * Mark an issued book as returned
+ */
+router.put('/library/issues/:id/return', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const issueId = parseInt(req.params.id, 10);
+
+    const existing = await prisma.libraryIssue.findUnique({
+      where: { id: issueId }
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Book issue record not found.' });
+    }
+
+    if (existing.status === 'RETURNED') {
+      return res.status(400).json({ success: false, message: 'This book has already been returned.' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.libraryIssue.update({
+        where: { id: issueId },
+        data: {
+          status: 'RETURNED',
+          returnDate: new Date()
+        }
+      });
+
+      await tx.libraryResource.update({
+        where: { id: existing.resourceId },
+        data: {
+          availableCopies: { increment: 1 }
+        }
+      });
+    });
+
+    return res.json({
+      success: true,
+      message: 'Book marked as returned successfully. Stock copy restored.'
+    });
+  } catch (error) {
+    console.error('[LIBRARY] Return book error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to return book.' });
+  }
+});
+
+/**
+ * DELETE /api/admin/library/resources/:id
+ */
+router.delete('/library/resources/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const resourceId = parseInt(req.params.id, 10);
+
+    await prisma.libraryResource.delete({
+      where: { id: resourceId }
+    });
+
+    return res.json({ success: true, message: 'Library resource deleted successfully.' });
+  } catch (error) {
+    console.error('[LIBRARY] Delete resource error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete resource.' });
+  }
+});
+
+module.exports = router;
+
+
 
