@@ -1,5 +1,5 @@
 require('dotenv').config();
-// Attendance fix: timezone-safe date parsing for save & fetch endpoints
+// ID Card PDF download query fix applied
 const express = require('express');
 const cors = require('cors');
 const path = require('path');

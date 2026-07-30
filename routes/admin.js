@@ -5118,7 +5118,8 @@ router.get('/id-cards/:cardId/download', async (req, res) => {
         student: {
           include: {
             enrolls: {
-              where: { active: true },
+              orderBy: { id: 'desc' },
+              take: 1,
               include: {
                 class: true,
                 section: true
@@ -5181,6 +5182,122 @@ router.get('/id-cards/:cardId/download', async (req, res) => {
   } catch (error) {
     console.error('[ADMIN] Download ID PDF error:', error);
     return res.status(500).json({ success: false, message: 'Failed to generate ID card PDF document.' });
+  }
+});
+
+/**
+ * GET /api/admin/card-template
+ * Return branch card design settings (colors, layout) + stats
+ */
+router.get('/card-template', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: {
+        name: true,
+        city: true,
+        systemLogo: true,
+        idCardPrimaryColor: true,
+        idCardSecondaryColor: true,
+        idCardLayoutType: true,
+      }
+    });
+
+    if (!branch) return res.status(404).json({ success: false, message: 'Branch not found.' });
+
+    const [totalCards, activeCards, revokedCards] = await Promise.all([
+      prisma.idCard.count({ where: { branchId: decoded.branchId } }),
+      prisma.idCard.count({ where: { branchId: decoded.branchId, status: 'active' } }),
+      prisma.idCard.count({ where: { branchId: decoded.branchId, status: 'revoked' } }),
+    ]);
+
+    return res.json({
+      success: true,
+      template: {
+        schoolName: branch.name,
+        branchName: branch.city || branch.name,
+        logo: branch.systemLogo,
+        primaryColor: branch.idCardPrimaryColor || '#1b5e20',
+        secondaryColor: branch.idCardSecondaryColor || '#2e7d32',
+        layoutType: branch.idCardLayoutType || 'classic',
+      },
+      stats: { totalCards, activeCards, revokedCards }
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get card template error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load card template.' });
+  }
+});
+
+/**
+ * PUT /api/admin/card-template
+ * Update branch card design settings
+ */
+router.put('/card-template', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+  try {
+    const { primaryColor, secondaryColor, layoutType } = req.body;
+
+    const validLayouts = ['classic', 'modern', 'minimal'];
+    if (layoutType && !validLayouts.includes(layoutType)) {
+      return res.status(400).json({ success: false, message: 'Invalid layout type.' });
+    }
+
+    const updated = await prisma.branch.update({
+      where: { id: decoded.branchId },
+      data: {
+        ...(primaryColor ? { idCardPrimaryColor: primaryColor } : {}),
+        ...(secondaryColor ? { idCardSecondaryColor: secondaryColor } : {}),
+        ...(layoutType ? { idCardLayoutType: layoutType } : {}),
+      },
+      select: { idCardPrimaryColor: true, idCardSecondaryColor: true, idCardLayoutType: true }
+    });
+
+    return res.json({
+      success: true,
+      message: 'Card template settings updated successfully.',
+      template: {
+        primaryColor: updated.idCardPrimaryColor,
+        secondaryColor: updated.idCardSecondaryColor,
+        layoutType: updated.idCardLayoutType
+      }
+    });
+  } catch (error) {
+    console.error('[ADMIN] Update card template error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update card template.' });
+  }
+});
+
+/**
+ * GET /api/admin/id-cards/stats
+ * Stats breakdown of ID cards (by type, status)
+ */
+router.get('/id-cards/stats', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+  try {
+    const [studentActive, studentRevoked, staffActive, staffRevoked] = await Promise.all([
+      prisma.idCard.count({ where: { branchId: decoded.branchId, entityType: 'student', status: 'active' } }),
+      prisma.idCard.count({ where: { branchId: decoded.branchId, entityType: 'student', status: 'revoked' } }),
+      prisma.idCard.count({ where: { branchId: decoded.branchId, entityType: 'staff', status: 'active' } }),
+      prisma.idCard.count({ where: { branchId: decoded.branchId, entityType: 'staff', status: 'revoked' } }),
+    ]);
+    return res.json({
+      success: true,
+      stats: {
+        student: { active: studentActive, revoked: studentRevoked, total: studentActive + studentRevoked },
+        staff: { active: staffActive, revoked: staffRevoked, total: staffActive + staffRevoked },
+        total: studentActive + studentRevoked + staffActive + staffRevoked,
+        totalActive: studentActive + staffActive,
+        totalRevoked: studentRevoked + staffRevoked,
+      }
+    });
+  } catch (error) {
+    console.error('[ADMIN] ID cards stats error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load ID card stats.' });
   }
 });
 
