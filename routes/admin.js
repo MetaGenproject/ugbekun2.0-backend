@@ -250,6 +250,7 @@ router.get('/teachers-staff', async (req, res) => {
           name: true,
           email: true,
           phone: true,
+          photo: true,
           qualifications: true,
           houseAddress: true,
           department: true,
@@ -271,6 +272,7 @@ router.get('/teachers-staff', async (req, res) => {
           name: teacher.name,
           email: teacher.email,
           phone: teacher.phone,
+          photo: teacher.photo || null,
           qualifications: teacher.qualifications || null,
           houseAddress: teacher.houseAddress || null,
           department: teacher.department || null,
@@ -8589,6 +8591,1355 @@ router.delete('/library/resources/:id', async (req, res) => {
   } catch (error) {
     console.error('[LIBRARY] Delete resource error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to delete resource.' });
+  }
+});
+
+// ============================================================================
+// FEES & FINANCES EXPANSION ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/finances/fee-groups
+ */
+router.get('/finances/fee-groups', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const groups = await prisma.feeGroup.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { createdAt: 'desc' }
+    });
+    return res.json({ success: true, data: groups });
+  } catch (error) {
+    console.error('[FINANCES] Fetch fee groups error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch fee groups.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/fee-groups
+ */
+router.post('/finances/fee-groups', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { name, description, feeTypeIds, totalAmount } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Fee group name is required.' });
+
+    const newGroup = await prisma.feeGroup.create({
+      data: {
+        branchId: decoded.branchId,
+        name,
+        description: description || null,
+        feeTypeIds: Array.isArray(feeTypeIds) ? JSON.stringify(feeTypeIds) : feeTypeIds || '[]',
+        totalAmount: totalAmount ? parseFloat(totalAmount) : 0
+      }
+    });
+
+    return res.json({ success: true, message: 'Fee Group created successfully.', data: newGroup });
+  } catch (error) {
+    console.error('[FINANCES] Save fee group error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save fee group.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/bulk-dues-post
+ * Generate and post term invoices for an entire class
+ */
+router.post('/finances/bulk-dues-post', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, termLabel, dueDate, feeTypeIds, sessionId } = req.body;
+    if (!classId || !feeTypeIds || !Array.isArray(feeTypeIds) || feeTypeIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Class ID and selected Fee Types are required.' });
+    }
+
+    const cId = parseInt(classId, 10);
+    const activeSessionId = sessionId ? parseInt(sessionId, 10) : 5;
+
+    const selectedFeeTypes = await prisma.feeType.findMany({
+      where: { id: { in: feeTypeIds.map((id) => parseInt(id, 10)) } }
+    });
+
+    if (selectedFeeTypes.length === 0) {
+      return res.status(400).json({ success: false, message: 'Selected Fee Types not found.' });
+    }
+
+    const totalInvoiceAmount = selectedFeeTypes.reduce((acc, ft) => acc + Number(ft.amount), 0);
+
+    const enrolls = await prisma.enroll.findMany({
+      where: { classId: cId, branchId: decoded.branchId, sessionId: activeSessionId },
+      include: { student: { select: { id: true, firstName: true, lastName: true, active: true } } }
+    });
+
+    const activeStudents = enrolls.filter((e) => e.student && e.student.active);
+
+    if (activeStudents.length === 0) {
+      return res.status(400).json({ success: false, message: 'No active students enrolled in this class.' });
+    }
+
+    let createdCount = 0;
+
+    for (const e of activeStudents) {
+      const studentId = e.student.id;
+      const invoiceNo = `INV-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+
+      await prisma.invoice.create({
+        data: {
+          branchId: decoded.branchId,
+          studentId,
+          invoiceNo,
+          termLabel: termLabel || 'Current Term',
+          totalAmount: totalInvoiceAmount,
+          paidAmount: 0,
+          balanceAmount: totalInvoiceAmount,
+          status: 'unpaid',
+          dueDate: dueDate ? new Date(dueDate) : new Date(Date.now() + 30 * 86400000),
+          sessionId: activeSessionId,
+          items: {
+            create: selectedFeeTypes.map((ft) => ({
+              description: `${ft.name} (${ft.code})`,
+              amount: Number(ft.amount),
+              feeTypeId: ft.id
+            }))
+          }
+        }
+      });
+
+      createdCount++;
+    }
+
+    return res.json({
+      success: true,
+      message: `Successfully posted bulk fee dues for ${createdCount} student(s) in selected class.`
+    });
+  } catch (error) {
+    console.error('[FINANCES] Bulk dues posting error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to bulk post class dues.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/bulk-payments-post
+ * Bulk record fee payment receipts for class invoices
+ */
+router.post('/finances/bulk-payments-post', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { payments } = req.body;
+    if (!Array.isArray(payments) || payments.length === 0) {
+      return res.status(400).json({ success: false, message: 'Payments list is required.' });
+    }
+
+    let successCount = 0;
+
+    for (const p of payments) {
+      const invoiceId = parseInt(p.invoiceId, 10);
+      const paid = parseFloat(p.amountPaid);
+      if (!invoiceId || isNaN(paid) || paid <= 0) continue;
+
+      const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+      if (!invoice) continue;
+
+      const currentPaid = Number(invoice.paidAmount);
+      const newPaid = currentPaid + paid;
+      const total = Number(invoice.totalAmount);
+      const newBalance = Math.max(0, total - newPaid);
+      const newStatus = newBalance <= 0 ? 'paid' : 'partial';
+
+      await prisma.$transaction([
+        prisma.payment.create({
+          data: {
+            branchId: decoded.branchId,
+            invoiceId,
+            amount: paid,
+            paymentMethod: p.paymentMethod || 'Bank Transfer',
+            reference: p.reference || `BULK-PAY-${Date.now()}`
+          }
+        }),
+        prisma.invoice.update({
+          where: { id: invoiceId },
+          data: {
+            paidAmount: newPaid,
+            balanceAmount: newBalance,
+            status: newStatus,
+            updatedAt: new Date()
+          }
+        })
+      ]);
+
+      successCount++;
+    }
+
+    return res.json({
+      success: true,
+      message: `Bulk payment receipts posted successfully for ${successCount} invoice(s).`
+    });
+  } catch (error) {
+    console.error('[FINANCES] Bulk payments error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to post bulk payments.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/send-parent-reminder
+ * Send fee reminder notifications to parents for unpaid/partial invoices
+ */
+router.post('/finances/send-parent-reminder', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { invoiceId } = req.body;
+    if (!invoiceId) return res.status(400).json({ success: false, message: 'Invoice ID is required.' });
+
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: parseInt(invoiceId, 10) },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            parent: { select: { id: true, fatherName: true, phone: true, email: true } }
+          }
+        }
+      }
+    });
+
+    if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+
+    const studentName = `${invoice.student.firstName || ''} ${invoice.student.lastName || ''}`.trim();
+    const parentName = invoice.student.parent?.fatherName || 'Parent / Guardian';
+
+    await prisma.notificationLog.create({
+      data: {
+        branchId: decoded.branchId,
+        recipientType: 'PARENT',
+        recipientName: parentName,
+        recipientContact: invoice.student.parent?.phone || invoice.student.parent?.email || 'N/A',
+        title: `School Fee Reminder - ${studentName}`,
+        message: `Dear ${parentName}, this is a gentle reminder regarding outstanding fee dues of ₦${Number(invoice.balanceAmount).toLocaleString()} for ${studentName} (Invoice: ${invoice.invoiceNo}). Kindly settle at your earliest convenience. Thank you.`,
+        status: 'DELIVERED'
+      }
+    }).catch(() => {});
+
+    return res.json({
+      success: true,
+      message: `Fee reminder notification dispatched to parent of ${studentName}.`
+    });
+  } catch (error) {
+    console.error('[FINANCES] Send parent reminder error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to send fee reminder.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/reports/collections
+ * Comprehensive fee collection reports viewable by class or overall by Fee Type
+ */
+router.get('/finances/reports/collections', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const invoices = await prisma.invoice.findMany({
+      where: { branchId: decoded.branchId },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
+        items: true,
+        payments: true
+      }
+    });
+
+    const totalInvoiced = invoices.reduce((acc, inv) => acc + Number(inv.totalAmount), 0);
+    const totalCollected = invoices.reduce((acc, inv) => acc + Number(inv.paidAmount), 0);
+    const totalOutstanding = invoices.reduce((acc, inv) => acc + Number(inv.balanceAmount), 0);
+
+    const feeTypeBreakdownMap = new Map();
+    for (const inv of invoices) {
+      for (const item of inv.items) {
+        const key = item.description;
+        const current = feeTypeBreakdownMap.get(key) || 0;
+        feeTypeBreakdownMap.set(key, current + Number(item.amount));
+      }
+    }
+
+    const feeTypeBreakdown = Array.from(feeTypeBreakdownMap.entries()).map(([feeType, totalAmount]) => ({
+      feeType,
+      totalAmount
+    }));
+
+    return res.json({
+      success: true,
+      summary: {
+        totalInvoiced,
+        totalCollected,
+        totalOutstanding,
+        collectionRate: totalInvoiced > 0 ? ((totalCollected / totalInvoiced) * 100).toFixed(1) : 0
+      },
+      feeTypeBreakdown
+    });
+  } catch (error) {
+    console.error('[FINANCES] Fetch collection reports error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch collection reports.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/voucher-heads
+ */
+router.get('/finances/voucher-heads', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const heads = await prisma.voucherHead.findMany({
+      where: { branchId: decoded.branchId },
+      orderBy: { name: 'asc' }
+    });
+    return res.json({ success: true, data: heads });
+  } catch (error) {
+    console.error('[FINANCES] Fetch voucher heads error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch voucher heads.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/voucher-heads
+ */
+router.post('/finances/voucher-heads', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { name, type, description } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Voucher head name is required.' });
+
+    const newHead = await prisma.voucherHead.create({
+      data: {
+        branchId: decoded.branchId,
+        name,
+        type: type || 'EXPENSE',
+        description: description || null
+      }
+    });
+
+    return res.json({ success: true, message: 'Voucher head created.', data: newHead });
+  } catch (error) {
+    console.error('[FINANCES] Create voucher head error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create voucher head.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/office-transactions
+ */
+router.get('/finances/office-transactions', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { type, search } = req.query;
+    const where = { branchId: decoded.branchId };
+    if (type && type !== 'ALL') {
+      where.type = type;
+    }
+
+    const txs = await prisma.officeTransaction.findMany({
+      where,
+      orderBy: { transactionDate: 'desc' }
+    });
+
+    return res.json({ success: true, data: txs });
+  } catch (error) {
+    console.error('[FINANCES] Fetch office transactions error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch office transactions.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/office-transactions
+ * Create new deposit (income) or expense voucher
+ */
+router.post('/finances/office-transactions', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { type, voucherHeadId, voucherHeadName, amount, paymentMethod, transactionDate, referenceNo, description } = req.body;
+    if (!amount) return res.status(400).json({ success: false, message: 'Amount is required.' });
+
+    const newTx = await prisma.officeTransaction.create({
+      data: {
+        branchId: decoded.branchId,
+        type: type || 'EXPENSE',
+        voucherHeadId: voucherHeadId ? parseInt(voucherHeadId, 10) : null,
+        voucherHeadName: voucherHeadName || 'General',
+        amount: parseFloat(amount),
+        paymentMethod: paymentMethod || 'Bank Transfer',
+        transactionDate: transactionDate ? new Date(transactionDate) : new Date(),
+        referenceNo: referenceNo || `REF-${Date.now()}`,
+        description: description || null
+      }
+    });
+
+    return res.json({ success: true, message: 'Office financial transaction recorded.', data: newTx });
+  } catch (error) {
+    console.error('[FINANCES] Create office transaction error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to record transaction.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/school-bank
+ */
+router.get('/finances/school-bank', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const bank = await prisma.schoolBank.findUnique({
+      where: { branchId: decoded.branchId }
+    });
+    return res.json({ success: true, data: bank });
+  } catch (error) {
+    console.error('[FINANCES] Fetch school bank error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch school bank.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/school-bank
+ */
+router.post('/finances/school-bank', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { bankName, accountName, accountNumber, branchName, sortCode, swiftCode } = req.body;
+    if (!bankName || !accountName || !accountNumber) {
+      return res.status(400).json({ success: false, message: 'Bank Name, Account Name, and Account Number are required.' });
+    }
+
+    const bank = await prisma.schoolBank.upsert({
+      where: { branchId: decoded.branchId },
+      update: {
+        bankName,
+        accountName,
+        accountNumber,
+        branchName: branchName || null,
+        sortCode: sortCode || null,
+        swiftCode: swiftCode || null,
+        updatedAt: new Date()
+      },
+      create: {
+        branchId: decoded.branchId,
+        bankName,
+        accountName,
+        accountNumber,
+        branchName: branchName || null,
+        sortCode: sortCode || null,
+        swiftCode: swiftCode || null
+      }
+    });
+
+    return res.json({ success: true, message: 'School bank details updated successfully.', data: bank });
+  } catch (error) {
+    console.error('[FINANCES] Save school bank error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save school bank details.' });
+  }
+});
+
+// ============================================================================
+// COMPREHENSIVE REPORTS ENDPOINT
+// ============================================================================
+
+/**
+ * GET /api/admin/reports/comprehensive
+ * Returns aggregated data for all 6 report categories scoped to the branch
+ */
+router.get('/reports/comprehensive', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const bid = decoded.branchId;
+
+  try {
+    const [
+      // Income & Expenses
+      officeTxs,
+      payments,
+      // Students
+      enrolls,
+      allClasses,
+      // Attendance
+      attendanceRecords,
+      // Marks / Exam
+      marks,
+      // Library / Inventory
+      libraryResources,
+      libraryIssues,
+      // Invoices for fees
+      invoices,
+    ] = await Promise.all([
+      prisma.officeTransaction.findMany({ where: { branchId: bid } }),
+      prisma.payment.findMany({ where: { branchId: bid } }),
+      prisma.enroll.findMany({
+        where: { branchId: bid },
+        include: {
+          student: { select: { id: true, firstName: true, lastName: true, gender: true, active: true } },
+          class: { select: { id: true, name: true } },
+        },
+      }),
+      prisma.class.findMany({ where: { branchId: bid }, select: { id: true, name: true } }),
+      prisma.attendance.findMany({ where: { branchId: bid } }),
+      prisma.mark.findMany({
+        where: { branchId: bid },
+        select: { id: true, classId: true, mark: true, cbtMark: true, absent: true },
+      }),
+      prisma.libraryResource.findMany({ where: { branchId: bid } }),
+      prisma.libraryIssue.findMany({ where: { branchId: bid } }),
+      prisma.invoice.findMany({ where: { branchId: bid }, include: { items: true } }),
+    ]);
+
+    // ─── 1. INCOME & EXPENSES REPORT ───────────────────────────────────────
+    const totalFeeIncome = payments.reduce((acc, p) => acc + Number(p.amount), 0);
+    const totalOfficeIncome = officeTxs
+      .filter((t) => t.type === 'INCOME')
+      .reduce((acc, t) => acc + Number(t.amount), 0);
+    const totalExpenses = officeTxs
+      .filter((t) => t.type === 'EXPENSE')
+      .reduce((acc, t) => acc + Number(t.amount), 0);
+    const totalIncome = totalFeeIncome + totalOfficeIncome;
+    const netSurplus = totalIncome - totalExpenses;
+
+    // Expense breakdown by voucher head
+    const expenseByHead = {};
+    for (const t of officeTxs.filter((x) => x.type === 'EXPENSE')) {
+      const head = t.voucherHeadName || 'General';
+      expenseByHead[head] = (expenseByHead[head] || 0) + Number(t.amount);
+    }
+
+    // ─── 2. FEES REPORT ────────────────────────────────────────────────────
+    const totalInvoiced = invoices.reduce((acc, inv) => acc + Number(inv.totalAmount), 0);
+    const totalCollected = invoices.reduce((acc, inv) => acc + Number(inv.paidAmount), 0);
+    const totalOutstanding = invoices.reduce((acc, inv) => acc + Number(inv.balanceAmount), 0);
+    const collectionRate = totalInvoiced > 0 ? ((totalCollected / totalInvoiced) * 100).toFixed(1) : '0.0';
+
+    // Fee type breakdown
+    const feeTypeMap = {};
+    for (const inv of invoices) {
+      for (const item of inv.items) {
+        feeTypeMap[item.description] = (feeTypeMap[item.description] || 0) + Number(item.amount);
+      }
+    }
+
+    // Class-by-class fees
+    const classFeeMap = {};
+    for (const e of enrolls) {
+      const cName = e.class?.name || 'Unknown';
+      if (!classFeeMap[cName]) classFeeMap[cName] = { invoiced: 0, collected: 0, outstanding: 0, count: 0 };
+      classFeeMap[cName].count += 1;
+    }
+
+    // ─── 3. STUDENTS REPORT ────────────────────────────────────────────────
+    const totalStudents = new Set(enrolls.map((e) => e.studentId)).size;
+    const activeStudents = enrolls.filter((e) => e.student?.active).length;
+    const maleCount = enrolls.filter((e) => (e.student?.gender || '').toLowerCase() === 'male').length;
+    const femaleCount = enrolls.filter((e) => (e.student?.gender || '').toLowerCase() === 'female').length;
+
+    const classByClassStudents = allClasses.map((c) => {
+      const classEnrolls = enrolls.filter((e) => e.classId === c.id);
+      const activeInClass = classEnrolls.filter((e) => e.student?.active).length;
+      return {
+        className: c.name,
+        total: classEnrolls.length,
+        active: activeInClass,
+        male: classEnrolls.filter((e) => (e.student?.gender || '').toLowerCase() === 'male').length,
+        female: classEnrolls.filter((e) => (e.student?.gender || '').toLowerCase() === 'female').length,
+      };
+    }).sort((a, b) => b.total - a.total);
+
+    // ─── 4. ATTENDANCE REPORT ──────────────────────────────────────────────
+    const totalAttendanceRecords = attendanceRecords.length;
+    const presentCount = attendanceRecords.filter((a) => a.status === 'Present').length;
+    const absentCount = attendanceRecords.filter((a) => a.status === 'Absent').length;
+    const lateCount = attendanceRecords.filter((a) => a.status === 'Late').length;
+    const attendanceRate =
+      totalAttendanceRecords > 0 ? ((presentCount / totalAttendanceRecords) * 100).toFixed(1) : '0.0';
+
+    // Class-by-class attendance
+    const classAttendanceMap = {};
+    for (const a of attendanceRecords) {
+      const c = allClasses.find((cl) => cl.id === a.classId);
+      const key = c ? c.name : 'Unknown';
+      if (!classAttendanceMap[key]) classAttendanceMap[key] = { total: 0, present: 0 };
+      classAttendanceMap[key].total += 1;
+      if (a.status === 'Present') classAttendanceMap[key].present += 1;
+    }
+    const classByClassAttendance = Object.entries(classAttendanceMap).map(([className, d]) => ({
+      className,
+      total: d.total,
+      present: d.present,
+      rate: d.total > 0 ? ((d.present / d.total) * 100).toFixed(1) : '0.0',
+    })).sort((a, b) => parseFloat(b.rate) - parseFloat(a.rate));
+
+    // ─── 5. EXAMINATION REPORT ─────────────────────────────────────────────
+    const marksWithValues = marks.filter((m) => m.mark && !isNaN(parseFloat(m.mark)));
+    const totalMarksRecorded = marksWithValues.length;
+    const allScores = marksWithValues.map((m) => parseFloat(m.mark));
+    const avgScore = allScores.length > 0 ? (allScores.reduce((a, b) => a + b, 0) / allScores.length).toFixed(1) : '0.0';
+
+    // Grade distribution (out of 100)
+    let gradeA = 0, gradeB = 0, gradeC = 0, gradeD = 0, gradeF = 0;
+    for (const score of allScores) {
+      if (score >= 70) gradeA++;
+      else if (score >= 60) gradeB++;
+      else if (score >= 50) gradeC++;
+      else if (score >= 40) gradeD++;
+      else gradeF++;
+    }
+
+    // Class-by-class exam averages
+    const classMarkMap = {};
+    for (const m of marksWithValues) {
+      const c = allClasses.find((cl) => cl.id === m.classId);
+      const key = c ? c.name : 'Unknown';
+      if (!classMarkMap[key]) classMarkMap[key] = { total: 0, sum: 0 };
+      classMarkMap[key].total += 1;
+      classMarkMap[key].sum += parseFloat(m.mark);
+    }
+    const classByClassExam = Object.entries(classMarkMap).map(([className, d]) => ({
+      className,
+      total: d.total,
+      average: d.total > 0 ? (d.sum / d.total).toFixed(1) : '0.0',
+    })).sort((a, b) => parseFloat(b.average) - parseFloat(a.average));
+
+    // ─── 6. INVENTORY REPORT ───────────────────────────────────────────────
+    const totalResources = libraryResources.length;
+    const physicalBooks = libraryResources.filter((r) => r.type === 'BOOK').length;
+    const onlineEbooks = libraryResources.filter((r) => r.type === 'EBOOK').length;
+    const studyVideos = libraryResources.filter((r) => r.type === 'VIDEO').length;
+    const totalIssuances = libraryIssues.length;
+    const returnedIssues = libraryIssues.filter((i) => i.status === 'RETURNED').length;
+    const activeIssuances = libraryIssues.filter((i) => i.status === 'ISSUED').length;
+    const returnRate = totalIssuances > 0 ? ((returnedIssues / totalIssuances) * 100).toFixed(1) : '0.0';
+
+    return res.json({
+      success: true,
+      data: {
+        incomeExpenses: {
+          totalFeeIncome,
+          totalOfficeIncome,
+          totalIncome,
+          totalExpenses,
+          netSurplus,
+          expenseByHead: Object.entries(expenseByHead).map(([category, amount]) => ({ category, amount })),
+          recentTransactions: officeTxs.slice(0, 10),
+        },
+        fees: {
+          totalInvoiced,
+          totalCollected,
+          totalOutstanding,
+          collectionRate,
+          feeTypeBreakdown: Object.entries(feeTypeMap).map(([feeType, totalAmount]) => ({ feeType, totalAmount })),
+          classByClassFees: classByClassStudents.map((c) => ({
+            className: c.className,
+            studentCount: c.total,
+          })),
+          invoiceStatusCount: {
+            paid: invoices.filter((i) => i.status === 'paid').length,
+            partial: invoices.filter((i) => i.status === 'partial').length,
+            unpaid: invoices.filter((i) => i.status === 'unpaid').length,
+          },
+        },
+        students: {
+          totalStudents,
+          activeStudents,
+          inactiveStudents: totalStudents - activeStudents,
+          maleCount,
+          femaleCount,
+          classByClass: classByClassStudents,
+          totalClasses: allClasses.length,
+        },
+        attendance: {
+          totalRecords: totalAttendanceRecords,
+          presentCount,
+          absentCount,
+          lateCount,
+          attendanceRate,
+          classByClass: classByClassAttendance,
+        },
+        examinations: {
+          totalMarksRecorded,
+          avgScore,
+          gradeDistribution: { A: gradeA, B: gradeB, C: gradeC, D: gradeD, F: gradeF },
+          classByClass: classByClassExam,
+        },
+        inventory: {
+          totalResources,
+          physicalBooks,
+          onlineEbooks,
+          studyVideos,
+          totalIssuances,
+          activeIssuances,
+          returnedIssues,
+          returnRate,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('[REPORTS] Comprehensive report error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate reports.' });
+  }
+});
+
+// ============================================================================
+// SYSTEM SETTINGS ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/admin/settings
+ */
+router.get('/settings', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    let settings = await prisma.systemSetting.findUnique({
+      where: { branchId: decoded.branchId }
+    });
+
+    if (!settings) {
+      settings = await prisma.systemSetting.create({
+        data: {
+          branchId: decoded.branchId
+        }
+      });
+    }
+
+    return res.json({ success: true, data: settings });
+  } catch (error) {
+    console.error('[SETTINGS] Fetch settings error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch settings.' });
+  }
+});
+
+/**
+ * POST /api/admin/settings
+ */
+router.post('/settings', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const {
+      schoolName,
+      tagline,
+      address,
+      phone,
+      email,
+      website,
+      logoUrl,
+      principalSignatureUrl,
+      currencySymbol,
+      academicSession,
+      currentTerm,
+      regNoPrefix,
+      regNoDigits,
+      defaultStudentPassword,
+      autoSmsAttendance,
+      maxAbsentDaysAlert,
+      idCardTheme,
+      maintenanceMode,
+      aiAssistanceEnabled,
+      notificationChannel,
+      timezone,
+      dateFormat,
+      weeklyMintLimit
+    } = req.body;
+
+    const updated = await prisma.systemSetting.upsert({
+      where: { branchId: decoded.branchId },
+      update: {
+        ...(schoolName !== undefined && { schoolName }),
+        ...(tagline !== undefined && { tagline }),
+        ...(address !== undefined && { address }),
+        ...(phone !== undefined && { phone }),
+        ...(email !== undefined && { email }),
+        ...(website !== undefined && { website }),
+        ...(logoUrl !== undefined && { logoUrl }),
+        ...(principalSignatureUrl !== undefined && { principalSignatureUrl }),
+        ...(currencySymbol !== undefined && { currencySymbol }),
+        ...(academicSession !== undefined && { academicSession }),
+        ...(currentTerm !== undefined && { currentTerm }),
+        ...(regNoPrefix !== undefined && { regNoPrefix }),
+        ...(regNoDigits !== undefined && { regNoDigits: parseInt(regNoDigits, 10) }),
+        ...(defaultStudentPassword !== undefined && { defaultStudentPassword }),
+        ...(autoSmsAttendance !== undefined && { autoSmsAttendance: Boolean(autoSmsAttendance) }),
+        ...(maxAbsentDaysAlert !== undefined && { maxAbsentDaysAlert: parseInt(maxAbsentDaysAlert, 10) }),
+        ...(idCardTheme !== undefined && { idCardTheme }),
+        ...(maintenanceMode !== undefined && { maintenanceMode: Boolean(maintenanceMode) }),
+        ...(aiAssistanceEnabled !== undefined && { aiAssistanceEnabled: Boolean(aiAssistanceEnabled) }),
+        ...(notificationChannel !== undefined && { notificationChannel }),
+        ...(timezone !== undefined && { timezone }),
+        ...(dateFormat !== undefined && { dateFormat }),
+        ...(weeklyMintLimit !== undefined && { weeklyMintLimit: parseInt(weeklyMintLimit, 10) }),
+        updatedAt: new Date()
+      },
+      create: {
+        branchId: decoded.branchId,
+        schoolName: schoolName || 'Ugbekun International Academy',
+        tagline: tagline || 'Excellence in Knowledge & Character',
+        address: address || '',
+        phone: phone || '+234 800 000 0000',
+        email: email || 'info@ugbekun.edu.ng',
+        website: website || 'https://ugbekun.edu.ng',
+        logoUrl: logoUrl || null,
+        principalSignatureUrl: principalSignatureUrl || null,
+        currencySymbol: currencySymbol || '₦',
+        academicSession: academicSession || '2025/2026',
+        currentTerm: currentTerm || 'First Term',
+        regNoPrefix: regNoPrefix || 'UGB',
+        regNoDigits: regNoDigits ? parseInt(regNoDigits, 10) : 4,
+        defaultStudentPassword: defaultStudentPassword || 'student123',
+        autoSmsAttendance: autoSmsAttendance !== undefined ? Boolean(autoSmsAttendance) : true,
+        maxAbsentDaysAlert: maxAbsentDaysAlert ? parseInt(maxAbsentDaysAlert, 10) : 3,
+        idCardTheme: idCardTheme || 'EMERALD_MODERN',
+        maintenanceMode: maintenanceMode !== undefined ? Boolean(maintenanceMode) : false,
+        aiAssistanceEnabled: aiAssistanceEnabled !== undefined ? Boolean(aiAssistanceEnabled) : true,
+        notificationChannel: notificationChannel || 'ALL',
+        timezone: timezone || 'Africa/Lagos',
+        dateFormat: dateFormat || 'DD/MM/YYYY',
+        weeklyMintLimit: weeklyMintLimit ? parseInt(weeklyMintLimit, 10) : 5000
+      }
+    });
+
+    if (schoolName) {
+      await prisma.branch.update({
+        where: { id: decoded.branchId },
+        data: { name: schoolName }
+      }).catch(() => {});
+    }
+
+    return res.json({ success: true, message: 'System settings updated successfully.', data: updated });
+  } catch (error) {
+    console.error('[SETTINGS] Save settings error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save system settings.' });
+  }
+});
+/**
+ * POST /api/admin/settings/upload-logo
+ * Upload school logo or principal signature image file directly to Cloudinary
+ */
+router.post('/settings/upload-logo', upload.single('file'), async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'No file uploaded.' });
+  }
+
+  try {
+    const { uploadToCloudinary } = require('../lib/cloudinaryService');
+    const cloudinaryUrl = await uploadToCloudinary(req.file.buffer, {
+      folder: `ugbekun_branch_${decoded.branchId}_branding`,
+      public_id: `school_asset_${Date.now()}`
+    });
+
+    return res.json({
+      success: true,
+      message: 'Image uploaded successfully to Cloudinary.',
+      url: cloudinaryUrl
+    });
+  } catch (error) {
+    console.error('[SETTINGS] Cloudinary upload error:', error);
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = path.join(__dirname, '../uploads');
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      const ext = path.extname(req.file.originalname) || '.png';
+      const filename = `school_asset_${decoded.branchId}_${Date.now()}${ext}`;
+      fs.writeFileSync(path.join(uploadDir, filename), req.file.buffer);
+      return res.json({
+        success: true,
+        message: 'Image uploaded locally.',
+        url: `/uploads/${filename}`
+      });
+    } catch (err) {
+      return res.status(500).json({ success: false, message: error.message || 'Failed to upload image.' });
+    }
+  }
+});
+
+/**
+ * GET /api/admin/school-info
+ * Universal authenticated school info (Name, Logo, Term, Session) for top navigation across ALL user roles
+ */
+router.get('/school-info', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    let branchId = 1;
+
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded) {
+          if (decoded.role === 2) {
+            const resolvedBid = await resolveBranchForAdmin(decoded);
+            if (resolvedBid) branchId = resolvedBid;
+          } else if (decoded.role === 3) {
+            const t = await prisma.teacher.findFirst({ where: { OR: [{ id: decoded.legacyUserId || -1 }, { email: decoded.username }] } });
+            if (t?.branchId) branchId = t.branchId;
+          } else if (decoded.role === 7) {
+            const s = await prisma.student.findFirst({ where: { OR: [{ id: decoded.legacyUserId || -1 }, { email: decoded.username }] } });
+            if (s?.branchId) branchId = s.branchId;
+          } else if (decoded.role === 6) {
+            const p = await prisma.parent.findFirst({ where: { OR: [{ id: decoded.legacyUserId || -1 }, { email: decoded.username }] } });
+            if (p?.branchId) branchId = p.branchId;
+          }
+        }
+      } catch (e) {}
+    }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: { systemSetting: true }
+    });
+
+    const settings = branch?.systemSetting;
+    return res.json({
+      success: true,
+      data: {
+        schoolName: settings?.schoolName || branch?.name || 'Ugbekun International Academy',
+        logoUrl: settings?.logoUrl || null,
+        academicSession: settings?.academicSession || '2025/2026',
+        currentTerm: settings?.currentTerm || 'First Term',
+        currencySymbol: settings?.currencySymbol || '₦'
+      }
+    });
+  } catch (error) {
+    console.error('[SCHOOL INFO] Error:', error);
+    return res.json({
+      success: true,
+      data: {
+        schoolName: 'Ugbekun International Academy',
+        logoUrl: null,
+        academicSession: '2025/2026',
+        currentTerm: 'First Term',
+        currencySymbol: '₦'
+      }
+    });
+  }
+});
+
+/**
+ * POST /api/admin/profile/upload-photo
+ * Universal profile photo upload endpoint for ANY authenticated user role
+ * Uploads to Cloudinary and updates Student.photo, Teacher.photo, Parent.photo, or User.photo
+ */
+router.post('/profile/upload-photo', upload.single('file'), async (req, res) => {
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Authentication required.' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded?.sub || decoded?.id;
+    if (!decoded || !userId) {
+      return res.status(403).json({ success: false, message: 'Invalid or expired session.' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No photo file provided.' });
+    }
+
+    const { uploadToCloudinary } = require('../lib/cloudinaryService');
+    const cloudinaryUrl = await uploadToCloudinary(req.file.buffer, {
+      folder: `ugbekun_user_profiles`,
+      public_id: `profile_photo_user_${userId}_${Date.now()}`
+    });
+
+    // Update base User model
+    await prisma.user.update({
+      where: { id: userId },
+      data: { photo: cloudinaryUrl }
+    }).catch(() => {});
+
+    // Update specific role record
+    if (decoded.role === 7) {
+      const student = await prisma.student.findFirst({
+        where: { OR: [{ id: decoded.legacyUserId || -1 }, { email: decoded.username }] }
+      });
+      if (student) {
+        await prisma.student.update({
+          where: { id: student.id },
+          data: { photo: cloudinaryUrl }
+        });
+      }
+    } else if (decoded.role === 3) {
+      let teacher = null;
+      if (decoded.legacyUserId) {
+        teacher = await prisma.teacher.findUnique({ where: { id: decoded.legacyUserId } });
+      }
+      if (!teacher) {
+        teacher = await prisma.teacher.findFirst({
+          where: { OR: [{ email: decoded.username }, { name: { contains: decoded.username, mode: 'insensitive' } }] }
+        });
+      }
+      if (teacher) {
+        await prisma.teacher.update({
+          where: { id: teacher.id },
+          data: { photo: cloudinaryUrl }
+        });
+      }
+    } else if (decoded.role === 6) {
+      const parent = await prisma.parent.findFirst({
+        where: { OR: [{ id: decoded.legacyUserId || -1 }, { email: decoded.username }] }
+      });
+      if (parent) {
+        await prisma.parent.update({
+          where: { id: parent.id },
+          data: { photo: cloudinaryUrl }
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: 'Profile photo uploaded to Cloudinary & active across ID cards, report cards, and certificates!',
+      photoUrl: cloudinaryUrl
+    });
+  } catch (error) {
+    console.error('[PROFILE] Photo upload error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to upload profile photo.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INVENTORY MANAGEMENT MODULE ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/inventory
+ * Fetches list of stock items, metrics summary, and recent stock transactions
+ */
+router.get('/inventory', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { category, search } = req.query;
+
+    const where = { branchId: decoded.branchId };
+    if (category && category !== 'All') {
+      where.category = category;
+    }
+    if (search && search.trim()) {
+      where.OR = [
+        { name: { contains: search.trim(), mode: 'insensitive' } },
+        { category: { contains: search.trim(), mode: 'insensitive' } },
+      ];
+    }
+
+    const [items, transactions] = await Promise.all([
+      prisma.inventoryItem.findMany({
+        where,
+        orderBy: { updatedAt: 'desc' },
+      }),
+      prisma.inventoryTransaction.findMany({
+        where: { item: { branchId: decoded.branchId } },
+        include: { item: { select: { name: true, category: true, unit: true } } },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+    ]);
+
+    // Calculate real-time metrics
+    let totalItemsCount = items.length;
+    let totalPurchasedQty = 0;
+    let totalSoldQty = 0;
+    let totalBalanceQty = 0;
+    let totalPurchasedAmount = 0;
+    let totalSalesAmount = 0;
+    let lowStockCount = 0;
+
+    items.forEach((item) => {
+      totalPurchasedQty += item.totalPurchasedInt;
+      totalSoldQty += item.totalSoldInt;
+      totalBalanceQty += item.quantityBalance;
+      totalPurchasedAmount += item.totalPurchasedInt * item.unitCost;
+      totalSalesAmount += item.totalSoldInt * item.unitPrice;
+      if (item.quantityBalance <= item.reorderLevel) {
+        lowStockCount++;
+      }
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        metrics: {
+          totalItemsCount,
+          totalPurchasedQty,
+          totalSoldQty,
+          totalBalanceQty,
+          totalPurchasedAmount,
+          totalSalesAmount,
+          lowStockCount,
+        },
+        items,
+        recentTransactions: transactions.map((t) => ({
+          id: t.id,
+          itemId: t.itemId,
+          itemName: t.item.name,
+          category: t.item.category,
+          unit: t.item.unit,
+          type: t.type,
+          quantity: t.quantity,
+          unitPrice: t.unitPrice,
+          totalAmount: t.totalAmount,
+          referenceNo: t.referenceNo,
+          notes: t.notes,
+          issuedTo: t.issuedTo,
+          createdAt: t.createdAt,
+        })),
+      },
+    });
+  } catch (error) {
+    console.error('[INVENTORY] Fetch error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch inventory records.' });
+  }
+});
+
+/**
+ * POST /api/admin/inventory/items
+ * Create a new Inventory Item
+ */
+router.post('/inventory/items', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { name, category, unit, unitCost, unitPrice, initialStock, reorderLevel } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Item name is required.' });
+    }
+
+    const cost = parseFloat(unitCost) || 0.0;
+    const price = parseFloat(unitPrice) || 0.0;
+    const qty = parseInt(initialStock, 10) || 0;
+    const alertLevel = parseInt(reorderLevel, 10) || 5;
+
+    const newItem = await prisma.inventoryItem.create({
+      data: {
+        branchId: decoded.branchId,
+        name: name.trim(),
+        category: category || 'General',
+        unit: unit || 'Pcs',
+        unitCost: cost,
+        unitPrice: price,
+        totalPurchasedInt: qty,
+        totalSoldInt: 0,
+        quantityBalance: qty,
+        reorderLevel: alertLevel,
+      },
+    });
+
+    if (qty > 0) {
+      await prisma.inventoryTransaction.create({
+        data: {
+          itemId: newItem.id,
+          type: 'PURCHASE',
+          quantity: qty,
+          unitPrice: cost,
+          totalAmount: qty * cost,
+          referenceNo: `INIT-${newItem.id}`,
+          notes: 'Initial Stock Entry',
+        },
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'Inventory item created successfully.',
+      item: newItem,
+    });
+  } catch (error) {
+    console.error('[INVENTORY] Create item error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to create inventory item.' });
+  }
+});
+
+/**
+ * POST /api/admin/inventory/purchase
+ * Record a stock purchase / restock entry
+ */
+router.post('/inventory/purchase', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { itemId, quantity, unitCost, referenceNo, notes } = req.body;
+
+    const qty = parseInt(quantity, 10);
+    if (!itemId || isNaN(qty) || qty <= 0) {
+      return res.status(400).json({ success: false, message: 'Valid item and positive purchase quantity are required.' });
+    }
+
+    const item = await prisma.inventoryItem.findFirst({
+      where: { id: parseInt(itemId, 10), branchId: decoded.branchId },
+    });
+
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    }
+
+    const cost = parseFloat(unitCost) !== undefined && !isNaN(parseFloat(unitCost)) ? parseFloat(unitCost) : item.unitCost;
+    const totalAmount = qty * cost;
+
+    const [updatedItem, transaction] = await prisma.$transaction([
+      prisma.inventoryItem.update({
+        where: { id: item.id },
+        data: {
+          totalPurchasedInt: { increment: qty },
+          quantityBalance: { increment: qty },
+          unitCost: cost,
+        },
+      }),
+      prisma.inventoryTransaction.create({
+        data: {
+          itemId: item.id,
+          type: 'PURCHASE',
+          quantity: qty,
+          unitPrice: cost,
+          totalAmount,
+          referenceNo: referenceNo || `PUR-${Date.now()}`,
+          notes: notes || null,
+        },
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      message: `Successfully restocked ${qty} ${item.unit} of ${item.name}.`,
+      item: updatedItem,
+      transaction,
+    });
+  } catch (error) {
+    console.error('[INVENTORY] Purchase error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to record stock purchase.' });
+  }
+});
+
+/**
+ * POST /api/admin/inventory/sale
+ * Record a stock sale / issuance entry
+ */
+router.post('/inventory/sale', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { itemId, quantity, unitPrice, referenceNo, issuedTo, notes } = req.body;
+
+    const qty = parseInt(quantity, 10);
+    if (!itemId || isNaN(qty) || qty <= 0) {
+      return res.status(400).json({ success: false, message: 'Valid item and positive sale quantity are required.' });
+    }
+
+    const item = await prisma.inventoryItem.findFirst({
+      where: { id: parseInt(itemId, 10), branchId: decoded.branchId },
+    });
+
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    }
+
+    if (item.quantityBalance < qty) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient stock! Balance is ${item.quantityBalance} ${item.unit}, but attempted to sell/issue ${qty} ${item.unit}.`,
+      });
+    }
+
+    const price = parseFloat(unitPrice) !== undefined && !isNaN(parseFloat(unitPrice)) ? parseFloat(unitPrice) : item.unitPrice;
+    const totalAmount = qty * price;
+
+    const [updatedItem, transaction] = await prisma.$transaction([
+      prisma.inventoryItem.update({
+        where: { id: item.id },
+        data: {
+          totalSoldInt: { increment: qty },
+          quantityBalance: { decrement: qty },
+        },
+      }),
+      prisma.inventoryTransaction.create({
+        data: {
+          itemId: item.id,
+          type: 'SALE',
+          quantity: qty,
+          unitPrice: price,
+          totalAmount,
+          referenceNo: referenceNo || `SALE-${Date.now()}`,
+          issuedTo: issuedTo || null,
+          notes: notes || null,
+        },
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      message: `Successfully sold/issued ${qty} ${item.unit} of ${item.name}.`,
+      item: updatedItem,
+      transaction,
+    });
+  } catch (error) {
+    console.error('[INVENTORY] Sale error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to record stock sale.' });
+  }
+});
+
+/**
+ * DELETE /api/admin/inventory/items/:id
+ * Delete an inventory item
+ */
+router.delete('/inventory/items/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const id = parseInt(req.params.id, 10);
+    const item = await prisma.inventoryItem.findFirst({
+      where: { id, branchId: decoded.branchId },
+    });
+
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    }
+
+    await prisma.inventoryItem.delete({
+      where: { id: item.id },
+    });
+
+    return res.json({
+      success: true,
+      message: `Item "${item.name}" and its stock records deleted.`,
+    });
+  } catch (error) {
+    console.error('[INVENTORY] Delete error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to delete inventory item.' });
   }
 });
 

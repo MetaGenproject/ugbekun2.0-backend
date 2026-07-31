@@ -1,5 +1,5 @@
 require('dotenv').config();
-// Library & E-learning endpoints verified & reloaded
+// Inventory & Stock Control module active & reloaded
 const express = require('express');
 const cors = require('cors');
 const path = require('path');

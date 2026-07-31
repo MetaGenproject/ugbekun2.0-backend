@@ -187,9 +187,28 @@ router.get('/profile', async (req, res) => {
       }
     })
 
+    const teacherRecord = await prisma.teacher.findUnique({
+      where: { id: req.teacherId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        photo: true,
+        department: true,
+        qualifications: true,
+      }
+    })
+
     res.json({
       success: true,
       teacherId: req.teacherId,
+      name: teacherRecord?.name || 'Teacher Account',
+      email: teacherRecord?.email || null,
+      phone: teacherRecord?.phone || null,
+      photo: teacherRecord?.photo || null,
+      department: teacherRecord?.department || null,
+      qualifications: teacherRecord?.qualifications || null,
       isFormTeacher: formAllocations.length > 0,
       isSubjectTeacher: subjectAssignments.length > 0,
       formAllocations: formAllocations.map(a => ({

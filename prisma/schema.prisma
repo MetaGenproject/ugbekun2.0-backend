@@ -60,7 +60,13 @@ model Branch {
   payments               Payment[]
   libraryResources       LibraryResource[]
   libraryIssues          LibraryIssue[]
+  feeGroups              FeeGroup[]
+  voucherHeads           VoucherHead[]
+  officeTransactions     OfficeTransaction[]
+  schoolBank             SchoolBank?
+  systemSetting          SystemSetting?
   gamificationConfig     GamificationConfig?
+  inventoryItems         InventoryItem[]
 
   classes         Class[]
   sections        Section[]
@@ -151,6 +157,7 @@ model User {
   username     String    @unique
   password     String // Bcrypt-compatible hash — directly migrated
   role         Int // Legacy tinyint role code
+  photo        String?   @map("photo")
   active       Boolean   @default(true)
   lastLogin    DateTime?
   createdAt    DateTime  @default(now())
@@ -1938,6 +1945,153 @@ model LibraryIssue {
   @@index([branchId, status])
   @@index([resourceId])
   @@map("library_issues")
+}
+
+model FeeGroup {
+  id          Int       @id @default(autoincrement())
+  branchId    Int       @map("branch_id")
+  name        String
+  description String?   @db.Text
+  feeTypeIds  String    @default("[]") @map("fee_type_ids")
+  totalAmount Decimal   @default(0) @map("total_amount") @db.Decimal(18, 2)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId])
+  @@map("fee_groups")
+}
+
+model VoucherHead {
+  id          Int       @id @default(autoincrement())
+  branchId    Int       @map("branch_id")
+  name        String
+  type        String    @default("EXPENSE")
+  description String?   @db.Text
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, type])
+  @@map("voucher_heads")
+}
+
+model OfficeTransaction {
+  id              Int       @id @default(autoincrement())
+  branchId        Int       @map("branch_id")
+  type            String    @default("EXPENSE")
+  voucherHeadId   Int?      @map("voucher_head_id")
+  voucherHeadName String?   @map("voucher_head_name")
+  amount          Decimal   @db.Decimal(18, 2)
+  paymentMethod   String    @default("Bank Transfer") @map("payment_method")
+  transactionDate DateTime  @default(now()) @map("transaction_date")
+  referenceNo     String?   @map("reference_no")
+  description     String?   @db.Text
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, type])
+  @@map("office_transactions")
+}
+
+model SchoolBank {
+  id            Int       @id @default(autoincrement())
+  branchId      Int       @unique @map("branch_id")
+  bankName      String    @map("bank_name")
+  accountName   String    @map("account_name")
+  accountNumber String    @map("account_number")
+  branchName    String?   @map("branch_name")
+  sortCode      String?   @map("sort_code")
+  swiftCode     String?   @map("swift_code")
+  isActive      Boolean   @default(true) @map("is_active")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@map("school_banks")
+}
+
+model SystemSetting {
+  id                    Int       @id @default(autoincrement())
+  branchId              Int       @unique @map("branch_id")
+  schoolName            String    @default("Ugbekun International Academy") @map("school_name")
+  tagline               String?   @default("Excellence in Knowledge & Character")
+  address               String?   @db.Text
+  phone                 String?   @default("+234 800 000 0000")
+  email                 String?   @default("info@ugbekun.edu.ng")
+  website               String?   @default("https://ugbekun.edu.ng")
+  logoUrl               String?   @map("logo_url")
+  principalSignatureUrl String?   @map("principal_signature_url")
+  currencySymbol        String    @default("₦") @map("currency_symbol")
+  academicSession       String    @default("2025/2026") @map("academic_session")
+  currentTerm           String    @default("First Term") @map("current_term")
+
+  regNoPrefix           String    @default("UGB") @map("reg_no_prefix")
+  regNoDigits           Int       @default(4) @map("reg_no_digits")
+  defaultStudentPassword String   @default("student123") @map("default_student_password")
+  autoSmsAttendance     Boolean   @default(true) @map("auto_sms_attendance")
+  maxAbsentDaysAlert    Int       @default(3) @map("max_absent_days_alert")
+  idCardTheme           String    @default("EMERALD_MODERN") @map("id_card_theme")
+
+  maintenanceMode       Boolean   @default(false) @map("maintenance_mode")
+  aiAssistanceEnabled   Boolean   @default(true) @map("ai_assistance_enabled")
+  notificationChannel   String    @default("ALL") @map("notification_channel")
+  timezone              String    @default("Africa/Lagos")
+  dateFormat            String    @default("DD/MM/YYYY") @map("date_format")
+  weeklyMintLimit       Int       @default(5000) @map("weekly_mint_limit")
+
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@map("system_settings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INVENTORY MANAGEMENT MODULE
+// ─────────────────────────────────────────────────────────────────────────────
+
+model InventoryItem {
+  id                Int      @id @default(autoincrement())
+  branchId          Int
+  branch            Branch   @relation(fields: [branchId], references: [id])
+  name              String
+  category          String   @default("General") // Uniforms, Books, Stationery, Sports, General
+  unit              String   @default("Pcs") // Pcs, Packs, Pairs, Boxes
+  unitCost          Float    @default(0.0) // Cost price per unit
+  unitPrice         Float    @default(0.0) // Selling price per unit
+  totalPurchasedInt Int      @default(0) // Total quantity restocked/purchased
+  totalSoldInt      Int      @default(0) // Total quantity sold/issued
+  quantityBalance   Int      @default(0) // Current balance stock
+  reorderLevel      Int      @default(5) // Reorder threshold alert level
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  transactions      InventoryTransaction[]
+
+  @@map("inventory_items")
+}
+
+model InventoryTransaction {
+  id          Int           @id @default(autoincrement())
+  itemId      Int
+  item        InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  type        String        // "PURCHASE" or "SALE"
+  quantity    Int
+  unitPrice   Float
+  totalAmount Float
+  referenceNo String?
+  notes       String?
+  issuedTo    String?       // Student / Staff / Customer name
+  createdAt   DateTime      @default(now())
+
+  @@map("inventory_transactions")
 }
 
 
