@@ -63,8 +63,6 @@ app.use(cors({
   optionsSuccessStatus: 200
 }));
 
-// Enable preflight for all routes
-app.options('*', cors());
 // Allow larger JSON payloads for base64-encoded logos
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
