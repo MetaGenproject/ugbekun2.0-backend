@@ -47,7 +47,7 @@ app.use(cors({
       return;
     }
 
-    // Dynamic pattern matching for local network IPs (e.g. http://192.168.x.x:3000) and Vercel preview domains
+    // Dynamic pattern matching for local network IPs and Vercel preview domains
     const isAllowedHostPattern = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|.*\.vercel\.app)(:\d+)?$/i.test(origin);
 
     if (isAllowedHostPattern) {
@@ -58,9 +58,13 @@ app.use(cors({
     callback(null, false);
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-teacher-id', 'X-Requested-With', 'Cache-Control', 'cache-control', 'Pragma', 'pragma', 'Expires', 'expires']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['*'],
+  optionsSuccessStatus: 200
 }));
+
+// Enable preflight for all routes
+app.options('*', cors());
 // Allow larger JSON payloads for base64-encoded logos
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
