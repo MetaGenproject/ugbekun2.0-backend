@@ -1,5 +1,6 @@
 const express = require('express')
 const jwt = require('jsonwebtoken')
+const bcrypt = require('bcryptjs')
 const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
@@ -1004,6 +1005,452 @@ router.get('/events', async (req, res) => {
   } catch (error) {
     console.error('[PARENT] Get events error:', error)
     return res.status(500).json({ success: false, message: 'Failed to fetch events.' })
+  }
+})
+
+/**
+ * GET /api/parent/child/:studentId/invoices
+ * Fetch fee invoices, itemized breakdown, payment receipts, and school bank details for a child.
+ */
+router.get('/child/:studentId/invoices', assertChildLinked, async (req, res) => {
+  try {
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        studentId: req.studentId,
+        branchId: req.studentBranchId,
+      },
+      include: {
+        items: true,
+        payments: {
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    const schoolBank = await prisma.schoolBank.findFirst({
+      where: {
+        branchId: req.studentBranchId,
+        isActive: true,
+      },
+    })
+
+    let totalFeeAmount = 0
+    let totalPaidAmount = 0
+
+    const formattedInvoices = invoices.map(inv => {
+      const amount = Number(inv.amount || 0)
+      const paid = Number(inv.paidAmount || 0)
+      const balance = Number(inv.balance || 0)
+      totalFeeAmount += amount
+      totalPaidAmount += paid
+
+      return {
+        id: inv.id,
+        invoiceNo: inv.invoiceNo || `INV-${inv.id}`,
+        title: inv.title || 'Term Fee Invoice',
+        amount,
+        discount: Number(inv.discount || 0),
+        fine: Number(inv.fine || 0),
+        paidAmount: paid,
+        balance,
+        status: inv.status || (balance <= 0 ? 'PAID' : paid > 0 ? 'PARTIAL' : 'UNPAID'),
+        dueDate: inv.dueDate,
+        createdAt: inv.createdAt,
+        items: inv.items.map(item => ({
+          id: item.id,
+          name: item.name,
+          amount: Number(item.amount || 0),
+        })),
+        payments: inv.payments.map(p => ({
+          id: p.id,
+          amount: Number(p.amount || 0),
+          paymentMethod: p.paymentMethod,
+          transactionRef: p.transactionRef,
+          paidAt: p.createdAt,
+        })),
+      }
+    })
+
+    const totalBalance = Math.max(0, totalFeeAmount - totalPaidAmount)
+
+    return res.json({
+      success: true,
+      invoices: formattedInvoices,
+      schoolBank: schoolBank ? {
+        bankName: schoolBank.bankName,
+        accountName: schoolBank.accountName,
+        accountNumber: schoolBank.accountNumber,
+        branchName: schoolBank.branchName,
+        sortCode: schoolBank.sortCode,
+      } : null,
+      totalFeeAmount,
+      totalPaidAmount,
+      totalBalance,
+    })
+  } catch (error) {
+    console.error('[PARENT] Get child invoices error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to retrieve fee invoices.' })
+  }
+})
+
+/**
+ * GET /api/parent/child/:studentId/timetable
+ * Fetch timetable slots and exam schedule slots for a child.
+ */
+router.get('/child/:studentId/timetable', assertChildLinked, async (req, res) => {
+  if (!req.childClassId) {
+    return res.json({ success: true, timetableSlots: [], examScheduleSlots: [] })
+  }
+
+  try {
+    const timetableSlots = await prisma.timetableSlot.findMany({
+      where: {
+        classId: req.childClassId,
+        branchId: req.studentBranchId,
+        ...(req.childSectionId ? { sectionId: req.childSectionId } : {}),
+      },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        teacher: { select: { id: true, name: true } },
+      },
+      orderBy: [
+        { dayOfWeek: 'asc' },
+        { startTime: 'asc' },
+      ],
+    })
+
+    const examScheduleSlots = await prisma.examScheduleSlot.findMany({
+      where: {
+        classId: req.childClassId,
+        branchId: req.studentBranchId,
+        isPublished: true,
+        ...(req.childSectionId ? { sectionId: req.childSectionId } : {}),
+      },
+      include: {
+        subject: { select: { name: true, subjectCode: true } },
+        hall: { select: { name: true, location: true } },
+        invigilator: { select: { name: true } },
+      },
+      orderBy: { examDate: 'asc' },
+    })
+
+    return res.json({
+      success: true,
+      timetableSlots: timetableSlots.map(slot => ({
+        id: slot.id,
+        dayOfWeek: slot.dayOfWeek,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        type: slot.type,
+        title: slot.title || slot.subject?.name || 'Class Period',
+        subjectName: slot.subject?.name || null,
+        subjectCode: slot.subject?.subjectCode || null,
+        teacherName: slot.teacher?.name || null,
+      })),
+      examScheduleSlots: examScheduleSlots.map(slot => ({
+        id: slot.id,
+        examDate: slot.examDate,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        instructions: slot.instructions,
+        subjectName: slot.subject.name,
+        subjectCode: slot.subject.subjectCode,
+        hallName: slot.hall?.name || 'Main Exam Hall',
+        invigilatorName: slot.invigilator?.name || 'Invigilator',
+      })),
+    })
+  } catch (error) {
+    console.error('[PARENT] Get child timetable error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to retrieve timetable slots.' })
+  }
+})
+
+/**
+ * GET /api/parent/child/:studentId/teachers
+ * Fetch form teacher and subject teachers for a child.
+ */
+router.get('/child/:studentId/teachers', assertChildLinked, async (req, res) => {
+  if (!req.childClassId) {
+    return res.json({ success: true, formTeacher: null, subjectTeachers: [] })
+  }
+
+  try {
+    const formAllocation = await prisma.teacherAllocation.findFirst({
+      where: {
+        classId: req.childClassId,
+        sectionId: req.childSectionId,
+        sessionId: req.childSessionId,
+        branchId: req.studentBranchId,
+      },
+      include: {
+        teacher: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+            photo: true,
+            department: true,
+            qualifications: true,
+          },
+        },
+      },
+    })
+
+    const subjectAssigns = await prisma.subjectAssign.findMany({
+      where: {
+        classId: req.childClassId,
+        sectionId: req.childSectionId,
+        sessionId: req.childSessionId,
+        branchId: req.studentBranchId,
+      },
+      include: {
+        teacher: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+            photo: true,
+            department: true,
+          },
+        },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+      },
+    })
+
+    const teacherMap = new Map()
+    subjectAssigns.forEach(sa => {
+      if (!sa.teacher) return
+      const tid = sa.teacher.id
+      if (!teacherMap.has(tid)) {
+        teacherMap.set(tid, {
+          id: sa.teacher.id,
+          name: sa.teacher.name,
+          email: sa.teacher.email,
+          phone: sa.teacher.phone,
+          photo: sa.teacher.photo,
+          department: sa.teacher.department,
+          subjects: [],
+        })
+      }
+      teacherMap.get(tid).subjects.push({
+        id: sa.subject.id,
+        name: sa.subject.name,
+        code: sa.subject.subjectCode,
+      })
+    })
+
+    return res.json({
+      success: true,
+      formTeacher: formAllocation?.teacher || null,
+      subjectTeachers: Array.from(teacherMap.values()),
+    })
+  } catch (error) {
+    console.error('[PARENT] Get child teachers error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to retrieve teachers directory.' })
+  }
+})
+
+/**
+ * GET /api/parent/messages
+ * Fetch messages exchanged between parent and teachers/admin.
+ */
+router.get('/messages', async (req, res) => {
+  try {
+    const messages = await prisma.parentMessage.findMany({
+      where: {
+        parentId: req.parentId,
+        branchId: req.branchId,
+      },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    return res.json({
+      success: true,
+      messages: messages.map(m => ({
+        id: m.id,
+        senderType: m.senderType,
+        recipientRole: m.recipientRole,
+        subject: m.subject,
+        message: m.message,
+        isRead: m.isRead,
+        childName: m.student ? `${m.student.firstName} ${m.student.lastName}` : null,
+        createdAt: m.createdAt,
+      })),
+    })
+  } catch (error) {
+    console.error('[PARENT] Get messages error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch messages.' })
+  }
+})
+
+/**
+ * POST /api/parent/messages
+ * Send a message to form teacher or school admin.
+ */
+router.post('/messages', async (req, res) => {
+  try {
+    const { studentId, recipientRole = 'TEACHER', recipientId, subject, message } = req.body || {}
+
+    if (!message || !message.trim()) {
+      return res.status(400).json({ success: false, message: 'Message content is required.' })
+    }
+
+    const newMessage = await prisma.parentMessage.create({
+      data: {
+        parentId: req.parentId,
+        branchId: req.branchId,
+        studentId: studentId ? Number(studentId) : null,
+        recipientId: recipientId ? Number(recipientId) : null,
+        recipientRole,
+        senderType: 'PARENT',
+        subject: subject ? subject.trim() : 'Parent Inquiry',
+        message: message.trim(),
+      },
+    })
+
+    return res.status(201).json({
+      success: true,
+      message: 'Message sent successfully.',
+      data: newMessage,
+    })
+  } catch (error) {
+    console.error('[PARENT] Post message error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to send message.' })
+  }
+})
+
+/**
+ * GET /api/parent/profile
+ * Get parent profile details.
+ */
+router.get('/profile', async (req, res) => {
+  try {
+    const parent = await prisma.parent.findUnique({
+      where: { id: req.parentId },
+      include: {
+        user: { select: { username: true } },
+        branch: { select: { name: true, code: true } },
+      },
+    })
+
+    if (!parent) {
+      return res.status(404).json({ success: false, message: 'Parent profile not found.' })
+    }
+
+    return res.json({
+      success: true,
+      parent: {
+        id: parent.id,
+        username: parent.user?.username || '',
+        name: parent.name,
+        relation: parent.relation,
+        fatherName: parent.fatherName,
+        motherName: parent.motherName,
+        occupation: parent.occupation,
+        education: parent.education,
+        income: parent.income,
+        email: parent.email,
+        mobileno: parent.mobileno,
+        address: parent.address,
+        city: parent.city,
+        state: parent.state,
+        photo: parent.photo,
+        branchName: parent.branch?.name || null,
+      },
+    })
+  } catch (error) {
+    console.error('[PARENT] Get profile error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to retrieve profile.' })
+  }
+})
+
+/**
+ * PUT /api/parent/profile
+ * Update parent profile information.
+ */
+router.put('/profile', async (req, res) => {
+  try {
+    const { name, email, mobileno, address, city, state, occupation, education, fatherName, motherName } = req.body || {}
+
+    const updated = await prisma.parent.update({
+      where: { id: req.parentId },
+      data: {
+        ...(name ? { name: name.trim() } : {}),
+        ...(email ? { email: email.trim() } : {}),
+        ...(mobileno ? { mobileno: mobileno.trim() } : {}),
+        ...(address ? { address: address.trim() } : {}),
+        ...(city ? { city: city.trim() } : {}),
+        ...(state ? { state: state.trim() } : {}),
+        ...(occupation ? { occupation: occupation.trim() } : {}),
+        ...(education ? { education: education.trim() } : {}),
+        ...(fatherName ? { fatherName: fatherName.trim() } : {}),
+        ...(motherName ? { motherName: motherName.trim() } : {}),
+        updatedAt: new Date(),
+      },
+    })
+
+    return res.json({ success: true, message: 'Profile updated successfully.', parent: updated })
+  } catch (error) {
+    console.error('[PARENT] Update profile error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to update profile.' })
+  }
+})
+
+/**
+ * PUT /api/parent/change-password
+ * Change parent login password.
+ */
+router.put('/change-password', async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {}
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current and new passwords are required.' })
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters long.' })
+    }
+
+    const parent = await prisma.parent.findUnique({
+      where: { id: req.parentId },
+      select: { userId: true },
+    })
+
+    if (!parent || !parent.userId) {
+      return res.status(400).json({ success: false, message: 'User credential not linked to parent profile.' })
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: parent.userId },
+    })
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User record not found.' })
+    }
+
+    const isValid = bcrypt.compareSync(currentPassword, user.password)
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: 'Current password provided is incorrect.' })
+    }
+
+    const hashedPassword = bcrypt.hashSync(newPassword, 10)
+    await prisma.user.update({
+      where: { id: parent.userId },
+      data: {
+        password: hashedPassword,
+        updatedAt: new Date(),
+      },
+    })
+
+    return res.json({ success: true, message: 'Password updated successfully.' })
+  } catch (error) {
+    console.error('[PARENT] Change password error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to change password.' })
   }
 })
 

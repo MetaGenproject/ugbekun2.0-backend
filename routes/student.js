@@ -298,9 +298,9 @@ router.get('/dashboard-overview', async (req, res) => {
       })
       const submittedExIds = new Set(
         (await prisma.onlineExamSubmission.findMany({
-          where: { studentId: req.studentId, examId: { in: onlineExams.map(e => e.id) } },
-          select: { examId: true }
-        })).map(s => s.examId)
+          where: { studentId: req.studentId, onlineExamId: { in: onlineExams.map(e => e.id) } },
+          select: { onlineExamId: true }
+        })).map(s => s.onlineExamId)
       )
       upcomingExams = onlineExams.map(ex => {
         const examDate = ex.examDate ? new Date(ex.examDate) : null
@@ -382,28 +382,28 @@ router.get('/dashboard-overview', async (req, res) => {
     const recentHwSubs = await prisma.homeworkSubmission.findMany({
       where: { studentId: req.studentId },
       include: { homework: { include: { subject: { select: { name: true } } } } },
-      orderBy: { submittedAt: 'desc' },
+      orderBy: { createdAt: 'desc' },
       take: 3
     })
     recentHwSubs.forEach(s => {
       recentActivities.push({
         type: 'homework_submitted',
         text: `You submitted ${s.homework?.subject?.name || 'a'} homework`,
-        timestamp: s.submittedAt
+        timestamp: s.createdAt
       })
     })
 
     const recentExamSubs = await prisma.onlineExamSubmission.findMany({
       where: { studentId: req.studentId },
-      include: { exam: { include: { subject: { select: { name: true } } } } },
+      include: { onlineExam: { include: { subject: { select: { name: true } } } } },
       orderBy: { submittedAt: 'desc' },
       take: 3
     })
     recentExamSubs.forEach(s => {
-      const scoreText = s.score !== null ? ` (Score: ${s.score})` : ''
+      const scoreText = s.totalMark !== null && s.totalMark !== undefined ? ` (Score: ${s.totalMark})` : ''
       recentActivities.push({
         type: 'exam_submitted',
-        text: `You completed ${s.exam?.subject?.name || ''} exam${scoreText}`,
+        text: `You completed ${s.onlineExam?.subject?.name || ''} exam${scoreText}`,
         timestamp: s.submittedAt
       })
     })
@@ -440,7 +440,7 @@ router.get('/dashboard-overview', async (req, res) => {
     })
   } catch (error) {
     console.error('[STUDENT] Dashboard overview error:', error)
-    res.status(500).json({ success: false, message: 'Failed to load dashboard overview.' })
+    res.status(500).json({ success: false, message: error.message || 'Failed to load dashboard overview.' })
   }
 })
 
@@ -1921,11 +1921,378 @@ router.get('/events', async (req, res) => {
         startDate: 'asc'
       }
     })
-
     return res.json({ success: true, events })
   } catch (error) {
     console.error('[STUDENT] Get events error:', error)
     return res.status(500).json({ success: false, message: 'Failed to fetch events.' })
+  }
+})
+
+/**
+ * GET /api/student/teachers
+ * Fetch Form Teacher & Subject Teachers for the student's enrolled class.
+ */
+router.get('/teachers', assertStudent, async (req, res) => {
+  try {
+    if (!req.classId || !req.sectionId) {
+      return res.json({ success: true, formTeacher: null, subjectTeachers: [] })
+    }
+
+    const [formAlloc, subjectAssigns] = await Promise.all([
+      prisma.teacherAllocation.findFirst({
+        where: {
+          classId: req.classId,
+          sectionId: req.sectionId,
+          branchId: req.branchId
+        },
+        include: {
+          teacher: {
+            select: { id: true, name: true, email: true, phone: true, photo: true, department: true }
+          }
+        }
+      }),
+      prisma.subjectAssign.findMany({
+        where: {
+          classId: req.classId,
+          sectionId: req.sectionId,
+          branchId: req.branchId
+        },
+        include: {
+          teacher: {
+            select: { id: true, name: true, email: true, phone: true, photo: true, department: true }
+          },
+          subject: {
+            select: { id: true, name: true, subjectCode: true }
+          }
+        }
+      })
+    ])
+
+    const formTeacher = formAlloc?.teacher ? {
+      id: formAlloc.teacher.id,
+      name: formAlloc.teacher.name,
+      email: formAlloc.teacher.email,
+      phone: formAlloc.teacher.phone,
+      photo: formAlloc.teacher.photo,
+      department: formAlloc.teacher.department,
+      role: 'Form Teacher'
+    } : null
+
+    const teacherMap = new Map()
+    subjectAssigns.forEach(sa => {
+      if (sa.teacher) {
+        if (!teacherMap.has(sa.teacher.id)) {
+          teacherMap.set(sa.teacher.id, {
+            id: sa.teacher.id,
+            name: sa.teacher.name,
+            email: sa.teacher.email,
+            phone: sa.teacher.phone,
+            photo: sa.teacher.photo,
+            department: sa.teacher.department,
+            subjects: []
+          })
+        }
+        if (sa.subject) {
+          teacherMap.get(sa.teacher.id).subjects.push({
+            id: sa.subject.id,
+            name: sa.subject.name,
+            code: sa.subject.subjectCode
+          })
+        }
+      }
+    })
+
+    res.json({
+      success: true,
+      formTeacher,
+      subjectTeachers: Array.from(teacherMap.values())
+    })
+  } catch (error) {
+    console.error('[STUDENT] Teachers fetch error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch teachers.' })
+  }
+})
+
+/**
+ * GET /api/student/invoices
+ * Fetch fee invoices, itemized breakdown, paid/balance due, and official school bank account.
+ */
+router.get('/invoices', assertStudent, async (req, res) => {
+  try {
+    const [invoices, schoolBank] = await Promise.all([
+      prisma.invoice.findMany({
+        where: { studentId: req.studentId, branchId: req.branchId },
+        include: {
+          items: true,
+          payments: true
+        },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.schoolBank.findUnique({
+        where: { branchId: req.branchId }
+      })
+    ])
+
+    let totalFeeAmount = 0
+    let totalPaidAmount = 0
+
+    const formattedInvoices = invoices.map(inv => {
+      const amount = Number(inv.totalAmount || inv.amount || 0)
+      const paid = inv.payments.reduce((sum, p) => sum + Number(p.amount || 0), 0)
+      const balance = Math.max(0, amount - paid)
+
+      totalFeeAmount += amount
+      totalPaidAmount += paid
+
+      let status = 'UNPAID'
+      if (balance === 0 && amount > 0) status = 'PAID'
+      else if (paid > 0) status = 'PARTIAL'
+
+      return {
+        id: inv.id,
+        invoiceNo: inv.invoiceNo || `INV-${inv.id}`,
+        title: inv.title || 'Term School Fee Invoice',
+        amount,
+        discount: Number(inv.discount || 0),
+        fine: Number(inv.fine || 0),
+        paidAmount: paid,
+        balance,
+        status,
+        dueDate: inv.dueDate,
+        createdAt: inv.createdAt,
+        items: inv.items.map(it => ({ id: it.id, name: it.name, amount: Number(it.amount || 0) })),
+        payments: inv.payments.map(p => ({
+          id: p.id,
+          amount: Number(p.amount || 0),
+          paymentMethod: p.paymentMethod || 'Bank Transfer',
+          paidAt: p.createdAt
+        }))
+      }
+    })
+
+    const totalBalance = Math.max(0, totalFeeAmount - totalPaidAmount)
+
+    res.json({
+      success: true,
+      invoices: formattedInvoices,
+      schoolBank: schoolBank ? {
+        bankName: schoolBank.bankName,
+        accountName: schoolBank.accountName,
+        accountNumber: schoolBank.accountNumber,
+        branchName: schoolBank.branchName,
+        sortCode: schoolBank.sortCode
+      } : null,
+      totalFeeAmount,
+      totalPaidAmount,
+      totalBalance
+    })
+  } catch (error) {
+    console.error('[STUDENT] Invoices fetch error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch invoices.' })
+  }
+})
+
+/**
+ * GET /api/student/timetable
+ * Fetch weekly class period slots & exam schedule slots.
+ */
+router.get('/timetable', assertStudent, async (req, res) => {
+  try {
+    if (!req.classId || !req.sectionId) {
+      return res.json({ success: true, timetableSlots: [], examScheduleSlots: [] })
+    }
+
+    const [timetableSlots, examSlots] = await Promise.all([
+      prisma.timetableSlot.findMany({
+        where: { classId: req.classId, sectionId: req.sectionId, branchId: req.branchId },
+        include: {
+          subject: { select: { name: true, subjectCode: true } },
+          teacher: { select: { name: true } }
+        },
+        orderBy: { startTime: 'asc' }
+      }),
+      prisma.examScheduleSlot.findMany({
+        where: { classId: req.classId, sectionId: req.sectionId, branchId: req.branchId },
+        include: {
+          subject: { select: { name: true, subjectCode: true } },
+          hall: { select: { hallName: true } },
+          invigilator: { select: { name: true } }
+        },
+        orderBy: { examDate: 'asc' }
+      })
+    ])
+
+    res.json({
+      success: true,
+      timetableSlots: timetableSlots.map(s => ({
+        id: s.id,
+        dayOfWeek: s.dayOfWeek,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        type: s.type,
+        title: s.title || s.subject?.name || 'Period',
+        subjectName: s.subject?.name || null,
+        subjectCode: s.subject?.subjectCode || null,
+        teacherName: s.teacher?.name || null
+      })),
+      examScheduleSlots: examSlots.map(es => ({
+        id: es.id,
+        examDate: es.examDate,
+        startTime: es.startTime,
+        endTime: es.endTime,
+        instructions: es.instructions,
+        subjectName: es.subject?.name || 'Subject',
+        subjectCode: es.subject?.subjectCode || 'SUB',
+        hallName: es.hall?.hallName || 'Examination Hall',
+        invigilatorName: es.invigilator?.name || 'Invigilator'
+      }))
+    })
+  } catch (error) {
+    console.error('[STUDENT] Timetable fetch error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch timetable.' })
+  }
+})
+
+/**
+ * GET /api/student/reminders
+ */
+router.get('/reminders', assertStudent, async (req, res) => {
+  try {
+    const reminders = await prisma.studentReminder.findMany({
+      where: { studentId: req.studentId },
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, reminders })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch study reminders.' })
+  }
+})
+
+/**
+ * POST /api/student/reminders
+ */
+router.post('/reminders', assertStudent, async (req, res) => {
+  try {
+    const { text, subtext } = req.body
+    if (!text) return res.status(400).json({ success: false, message: 'Reminder text is required.' })
+
+    const reminder = await prisma.studentReminder.create({
+      data: {
+        studentId: req.studentId,
+        text,
+        subtext: subtext || null
+      }
+    })
+    res.json({ success: true, reminder })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to create study reminder.' })
+  }
+})
+
+/**
+ * PUT /api/student/reminders/:id/toggle
+ */
+router.put('/reminders/:id/toggle', assertStudent, async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    const reminder = await prisma.studentReminder.findUnique({ where: { id } })
+    if (!reminder || reminder.studentId !== req.studentId) {
+      return res.status(404).json({ success: false, message: 'Reminder not found.' })
+    }
+
+    const updated = await prisma.studentReminder.update({
+      where: { id },
+      data: { done: !reminder.done }
+    })
+    res.json({ success: true, reminder: updated })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to toggle reminder.' })
+  }
+})
+
+/**
+ * DELETE /api/student/reminders/:id
+ */
+router.delete('/reminders/:id', assertStudent, async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    await prisma.studentReminder.deleteMany({
+      where: { id, studentId: req.studentId }
+    })
+    res.json({ success: true, message: 'Reminder deleted.' })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to delete reminder.' })
+  }
+})
+
+/**
+ * GET /api/student/messages
+ */
+router.get('/messages', assertStudent, async (req, res) => {
+  try {
+    const messages = await prisma.studentMessage.findMany({
+      where: { studentId: req.studentId },
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, messages })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch student messages.' })
+  }
+})
+
+/**
+ * POST /api/student/messages
+ */
+router.post('/messages', assertStudent, async (req, res) => {
+  try {
+    const { recipientRole, recipientId, subject, message } = req.body
+    if (!message) return res.status(400).json({ success: false, message: 'Message content is required.' })
+
+    const newMessage = await prisma.studentMessage.create({
+      data: {
+        branchId: req.branchId,
+        studentId: req.studentId,
+        recipientId: recipientId ? Number(recipientId) : null,
+        recipientRole: recipientRole || 'TEACHER',
+        subject: subject || 'Student Inquiry',
+        message
+      }
+    })
+
+    res.json({ success: true, message: 'Message sent successfully.', newMessage })
+  } catch (error) {
+    console.error('[STUDENT] Send message error:', error)
+    res.status(500).json({ success: false, message: 'Failed to send message.' })
+  }
+})
+
+/**
+ * PUT /api/student/change-password
+ */
+router.put('/change-password', assertStudent, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current and new passwords are required.' })
+    }
+
+    const bcrypt = require('bcryptjs')
+    const user = await prisma.user.findUnique({ where: { id: req.userId } })
+    if (!user) return res.status(404).json({ success: false, message: 'User record not found.' })
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password)
+    if (!isMatch) return res.status(400).json({ success: false, message: 'Current password is incorrect.' })
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10)
+    await prisma.user.update({
+      where: { id: req.userId },
+      data: { password: hashedPassword }
+    })
+
+    res.json({ success: true, message: 'Password updated successfully.' })
+  } catch (error) {
+    console.error('[STUDENT] Change password error:', error)
+    res.status(500).json({ success: false, message: 'Failed to update password.' })
   }
 })
 

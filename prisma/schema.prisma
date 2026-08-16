@@ -72,6 +72,9 @@ model Branch {
   sections        Section[]
   subjects        Subject[]
   siblingRequests ParentSiblingRequest[]
+  parentMessages  ParentMessage[]
+  studentMessages StudentMessage[]
+  teacherActivities TeacherActivity[]
   triviaArenas    TriviaArena[]
   staffRoles      StaffRole[]
   timetableSlots  TimetableSlot[]
@@ -208,6 +211,7 @@ model Parent {
   userId          Int?                   @unique
   user            User?                  @relation("UserParent", fields: [userId], references: [id])
   siblingRequests ParentSiblingRequest[]
+  messages        ParentMessage[]
 
   @@map("parents")
 }
@@ -277,6 +281,9 @@ model Student {
   wallet                StudentWallet?
   arenaParticipants     TriviaArenaParticipant[]
   aiSessions            AiCompanionSession[]
+  parentMessages        ParentMessage[]
+  studentMessages       StudentMessage[]
+  studentReminders       StudentReminder[]
 
   @@map("students")
 }
@@ -322,6 +329,8 @@ model Teacher {
   examHalls          ExamHall[]
   examScheduleSlots  ExamScheduleSlot[]
   staffAttendances   StaffAttendance[]
+  activities         TeacherActivity[]
+  reminders          TeacherReminder[]
 
   @@map("teachers")
 }
@@ -957,6 +966,29 @@ model ParentSiblingRequest {
   @@index([parentId])
   @@index([branchId])
   @@map("parent_sibling_requests")
+}
+
+model ParentMessage {
+  id            Int       @id @default(autoincrement())
+  branchId      Int       @map("branch_id")
+  parentId      Int       @map("parent_id")
+  studentId     Int?      @map("student_id")
+  recipientId   Int?      @map("recipient_id")
+  recipientRole String    @default("TEACHER") @map("recipient_role")
+  senderType    String    @map("sender_type")
+  subject       String?
+  message       String    @db.Text
+  isRead        Boolean   @default(false) @map("is_read")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
+
+  parent  Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  student Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  branch  Branch   @relation(fields: [branchId], references: [id])
+
+  @@index([parentId, recipientId])
+  @@index([branchId])
+  @@map("parent_messages")
 }
 
 model IdCard {
@@ -2092,6 +2124,78 @@ model InventoryTransaction {
   createdAt   DateTime      @default(now())
 
   @@map("inventory_transactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEACHER AUDIT ACTIVITIES & REMINDERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TeacherActivity {
+  id        Int      @id @default(autoincrement())
+  branchId  Int      @map("branch_id")
+  teacherId Int      @map("teacher_id")
+  activity  String
+  type      String   @default("GENERAL") // HOMEWORK, EXAM, SCORES, ATTENDANCE, LESSON
+  createdAt DateTime @default(now()) @map("created_at")
+
+  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id])
+
+  @@index([teacherId])
+  @@index([branchId])
+  @@map("teacher_activities")
+}
+
+model TeacherReminder {
+  id        Int      @id @default(autoincrement())
+  teacherId Int      @map("teacher_id")
+  text      String
+  subtext   String?
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@index([teacherId])
+  @@map("teacher_reminders")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STUDENT MESSAGING & REMINDERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model StudentMessage {
+  id            Int       @id @default(autoincrement())
+  branchId      Int       @map("branch_id")
+  studentId     Int       @map("student_id")
+  recipientId   Int?      @map("recipient_id")
+  recipientRole String    @default("TEACHER") @map("recipient_role")
+  subject       String?
+  message       String    @db.Text
+  isRead        Boolean   @default(false) @map("is_read")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime? @updatedAt @map("updated_at")
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id])
+
+  @@index([studentId])
+  @@index([branchId])
+  @@map("student_messages")
+}
+
+model StudentReminder {
+  id        Int      @id @default(autoincrement())
+  studentId Int      @map("student_id")
+  text      String
+  subtext   String?
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@map("student_reminders")
 }
 
 

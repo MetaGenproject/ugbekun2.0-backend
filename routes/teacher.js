@@ -176,7 +176,7 @@ router.get('/dashboard-overview', async (req, res) => {
     // 1. Fetch Teacher Info & Branch
     const teacher = await prisma.teacher.findUnique({
       where: { id: req.teacherId },
-      include: { branch: { select: { name: true } } }
+      include: { branch: { select: { id: true, name: true } } }
     })
     if (!teacher) {
       return res.status(404).json({ success: false, message: 'Teacher profile not found.' })
@@ -201,16 +201,18 @@ router.get('/dashboard-overview', async (req, res) => {
       })
     ])
 
-    const primaryForm = formAllocations[0] ? `${formAllocations[0].class?.name || ''} ${formAllocations[0].section?.name || ''}`.trim() : 'Primary 5B'
+    const primaryForm = formAllocations[0] 
+      ? `${formAllocations[0].class?.name || ''} ${formAllocations[0].section?.name || ''}`.trim() 
+      : (subjectAssignments[0] ? `${subjectAssignments[0].class?.name || ''} ${subjectAssignments[0].section?.name || ''}`.trim() : 'No Class Allocated')
 
-    // Compute unique classes & unique subjects
+    // Compute unique subjects
     const uniqueSubjectsMap = new Map()
     subjectAssignments.forEach(sa => {
       if (sa.subject && !uniqueSubjectsMap.has(sa.subject.id)) {
         uniqueSubjectsMap.set(sa.subject.id, sa.subject.name)
       }
     })
-    const subjectsCount = uniqueSubjectsMap.size || (subjectAssignments.length > 0 ? subjectAssignments.length : 5)
+    const subjectsCount = uniqueSubjectsMap.size
 
     // Compute total unique students under teacher's classes
     const classSectionPairs = [
@@ -220,17 +222,15 @@ router.get('/dashboard-overview', async (req, res) => {
     
     let totalStudentsCount = 0
     if (classSectionPairs.length > 0) {
-      const studentCountRes = await prisma.enroll.count({
+      totalStudentsCount = await prisma.enroll.count({
         where: {
           OR: classSectionPairs.map(p => ({ classId: p.classId, sectionId: p.sectionId }))
         }
       })
-      totalStudentsCount = studentCountRes
     }
-    if (totalStudentsCount === 0) totalStudentsCount = 32
 
     // 3. Today's Attendance Overview
-    let attendancePct = 87, presentCount = 28, lateCount = 2, absentCount = 2
+    let attendancePct = 0, presentCount = 0, lateCount = 0, absentCount = 0
     if (formAllocations[0]) {
       const todayLogs = await prisma.attendance.findMany({
         where: {
@@ -245,29 +245,35 @@ router.get('/dashboard-overview', async (req, res) => {
         absentCount = todayLogs.filter(l => l.status === 'Absent').length
         const total = todayLogs.length
         attendancePct = Math.round(((presentCount + lateCount) / total) * 100)
-      } else {
-        presentCount = Math.round(totalStudentsCount * 0.87)
-        absentCount = Math.round(totalStudentsCount * 0.06)
-        lateCount = Math.max(0, totalStudentsCount - presentCount - absentCount)
       }
     }
 
     // 4. Assignments & CBT Counts
-    const [assignmentsCount, pendingReviewCount, testsCount, ongoingTestsCount] = await Promise.all([
+    const [assignmentsCount, pendingReviewCount, testsCount, lessonNotesCount] = await Promise.all([
       prisma.homework.count({ where: { teacherId: req.teacherId } }),
       prisma.homeworkSubmission.count({ where: { homework: { teacherId: req.teacherId }, score: null } }),
       prisma.onlineExam.count({ where: { teacherId: req.teacherId } }),
-      prisma.onlineExam.count({ where: { teacherId: req.teacherId } })
+      prisma.lessonPlan.count({ where: { teacherId: req.teacherId } })
     ])
 
-    // 5. Subject Performance Overview (Bar Chart)
-    const subjectPerformance = [
-      { name: 'Mathematics', score: 84 },
-      { name: 'English Language', score: 78 },
-      { name: 'Basic Science', score: 81 },
-      { name: 'Social Studies', score: 76 },
-      { name: 'Computer Studies', score: 88 }
-    ]
+    // 5. Compute Real Subject Performance Overview from Mark Table
+    const subjectPerformance = []
+    for (const [subId, subName] of Array.from(uniqueSubjectsMap.entries())) {
+      const marks = await prisma.mark.findMany({
+        where: { subjectId: subId },
+        select: { mark: true, cbtMark: true }
+      })
+      let totalScore = 0, validCount = 0
+      marks.forEach(m => {
+        const val = Number(m.mark || m.cbtMark || 0)
+        if (val > 0) {
+          totalScore += val
+          validCount++
+        }
+      })
+      const avgScore = validCount > 0 ? Math.round(totalScore / validCount) : 0
+      subjectPerformance.push({ name: subName, score: avgScore })
+    }
 
     // 6. My Classes List
     const myClasses = formAllocations.map(fa => ({
@@ -275,74 +281,94 @@ router.get('/dashboard-overview', async (req, res) => {
       role: 'Class Teacher',
       studentsCount: totalStudentsCount
     }))
-    if (myClasses.length === 0) {
-      myClasses.push(
-        { name: 'Primary 5B', role: 'Class Teacher', studentsCount: 32 },
-        { name: 'Primary 4A', role: 'Subject Teacher', studentsCount: 28 },
-        { name: 'Primary 6C', role: 'Subject Teacher', studentsCount: 30 }
-      )
+    subjectAssignments.forEach(sa => {
+      const className = `${sa.class?.name || ''} ${sa.section?.name || ''}`.trim()
+      if (!myClasses.find(c => c.name === className)) {
+        myClasses.push({
+          name: className,
+          role: 'Subject Teacher',
+          studentsCount: totalStudentsCount
+        })
+      }
+    })
+
+    // 7. Recent Activities Stream (Fetched from DB)
+    const dbActivities = await prisma.teacherActivity.findMany({
+      where: { teacherId: req.teacherId },
+      orderBy: { createdAt: 'desc' },
+      take: 5
+    })
+    const recentActivities = dbActivities.map(a => ({
+      id: a.id,
+      text: a.activity,
+      timestamp: new Date(a.createdAt).toLocaleDateString(),
+      icon: a.type.toLowerCase()
+    }))
+
+    // 8. Reminders List (Fetched from DB)
+    const dbReminders = await prisma.teacherReminder.findMany({
+      where: { teacherId: req.teacherId },
+      orderBy: { createdAt: 'desc' }
+    })
+    const reminders = dbReminders.map(r => ({
+      id: r.id,
+      text: r.text,
+      subtext: r.subtext || undefined,
+      done: r.done
+    }))
+
+    // Compute Overall Class Average
+    let classAverage = 0
+    if (subjectPerformance.length > 0) {
+      const validScores = subjectPerformance.filter(s => s.score > 0)
+      if (validScores.length > 0) {
+        classAverage = Math.round(validScores.reduce((acc, curr) => acc + curr.score, 0) / validScores.length)
+      }
     }
-
-    // 7. Recent Activities Timeline
-    const recentActivities = [
-      { id: 1, text: 'You assigned a new Mathematics homework', timestamp: '2 hours ago', icon: 'homework' },
-      { id: 2, text: 'You created a CBT English Language Test', timestamp: '5 hours ago', icon: 'exam' },
-      { id: 3, text: 'You entered scores for Mathematics Test', timestamp: 'Yesterday, 4:30 PM', icon: 'scores' },
-      { id: 4, text: `You marked attendance for ${primaryForm || 'Primary 5B'}`, timestamp: 'Yesterday, 8:15 AM', icon: 'attendance' },
-      { id: 5, text: 'You published results for Basic Science Test', timestamp: '29 July, 3:20 PM', icon: 'results' }
-    ]
-
-    // 8. Reminders List
-    const reminders = [
-      { id: 1, text: `Complete Mathematics scores entry (${primaryForm || 'Primary 5B'})`, done: true },
-      { id: 2, text: 'Review English assignments', subtext: 'Due today', done: false },
-      { id: 3, text: 'Staff meeting at 2:00 PM', done: false },
-      { id: 4, text: 'Submit lesson notes', subtext: 'Before 5:00 PM', done: false }
-    ]
 
     res.json({
       success: true,
       profile: {
         teacherId: teacher.id,
-        name: teacher.name || `${teacher.firstName || ''} ${teacher.lastName || ''}`.trim() || 'Mr. Kingsley Ebor',
+        name: teacher.name || 'Staff Member',
         email: teacher.email,
         phone: teacher.phone,
         photo: teacher.photo,
-        branchName: teacher.branch?.name || 'Greenfield International School',
-        primaryForm: primaryForm || 'Primary 5B'
+        branchName: teacher.branch?.name || 'School Campus',
+        primaryForm: primaryForm
       },
       kpi: {
-        studentsCount: totalStudentsCount || 32,
-        presentTodayCount: presentCount || 28,
-        subjectsCount: subjectsCount || 5,
-        assignmentsCount: assignmentsCount || 6,
-        pendingReviewCount: pendingReviewCount || 3,
-        testsCount: testsCount || 2,
-        ongoingTestsCount: ongoingTestsCount || 1,
-        classAverage: 82
+        studentsCount: totalStudentsCount,
+        presentTodayCount: presentCount,
+        subjectsCount: subjectsCount,
+        assignmentsCount: assignmentsCount,
+        pendingReviewCount: pendingReviewCount,
+        testsCount: testsCount,
+        ongoingTestsCount: testsCount,
+        classAverage: classAverage
       },
       attendance: {
         overallPercentage: attendancePct,
         presentCount,
         lateCount,
         absentCount,
-        presentPct: Math.round((presentCount / (totalStudentsCount || 32)) * 100) || 87,
-        latePct: Math.round((lateCount / (totalStudentsCount || 32)) * 100) || 6,
-        absentPct: Math.round((absentCount / (totalStudentsCount || 32)) * 100) || 6
+        presentPct: totalStudentsCount > 0 ? Math.round((presentCount / totalStudentsCount) * 100) : 0,
+        latePct: totalStudentsCount > 0 ? Math.round((lateCount / totalStudentsCount) * 100) : 0,
+        absentPct: totalStudentsCount > 0 ? Math.round((absentCount / totalStudentsCount) * 100) : 0
       },
       subjectPerformance,
       teachingSummary: {
-        lessonNotesCount: 18,
-        assignmentsGivenCount: 15,
-        testsCreatedCount: 6,
-        scoresEnteredPct: 78
+        lessonNotesCount,
+        assignmentsGivenCount: assignmentsCount,
+        testsCreatedCount: testsCount,
+        scoresEnteredPct: classAverage > 0 ? 100 : 0
       },
       subjects: Array.from(uniqueSubjectsMap.entries()).map(([id, name], idx) => ({
         id,
         name,
         studentsCount: totalStudentsCount,
-        score: subjectPerformance[idx % subjectPerformance.length]?.score || 80,
-        nextLesson: idx === 0 ? 'Tomorrow 9:00 AM' : idx === 1 ? 'Today 11:00 AM' : 'Friday 10:00 AM'
+        score: subjectPerformance.find(sp => sp.name === name)?.score || 0,
+        nextLesson: 'Scheduled on Timetable'
       })),
       myClasses,
       reminders,
@@ -351,6 +377,200 @@ router.get('/dashboard-overview', async (req, res) => {
   } catch (error) {
     console.error('[TEACHER] Dashboard overview error:', error)
     res.status(500).json({ success: false, message: 'Failed to load teacher dashboard overview.' })
+  }
+})
+
+/**
+ * GET /api/teacher/roster
+ * Fetch student roster for teacher's form and subject classes with parent contact info.
+ */
+router.get('/roster', assertTeacher, async (req, res) => {
+  try {
+    const [formAllocations, subjectAssignments] = await Promise.all([
+      prisma.teacherAllocation.findMany({
+        where: { teacherId: req.teacherId }
+      }),
+      prisma.subjectAssign.findMany({
+        where: { teacherId: req.teacherId }
+      })
+    ])
+
+    const classSectionPairs = [
+      ...formAllocations.map(fa => ({ classId: fa.classId, sectionId: fa.sectionId })),
+      ...subjectAssignments.map(sa => ({ classId: sa.classId, sectionId: sa.sectionId }))
+    ]
+
+    if (classSectionPairs.length === 0) {
+      return res.json({ success: true, students: [] })
+    }
+
+    const enrolls = await prisma.enroll.findMany({
+      where: {
+        OR: classSectionPairs.map(p => ({ classId: p.classId, sectionId: p.sectionId }))
+      },
+      include: {
+        student: {
+          include: {
+            parent: true
+          }
+        },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } }
+      },
+      orderBy: { roll: 'asc' }
+    })
+
+    const students = enrolls.map(e => ({
+      id: e.student.id,
+      registerNo: e.student.registerNo,
+      rollNo: e.roll,
+      firstName: e.student.firstName,
+      lastName: e.student.lastName,
+      gender: e.student.gender,
+      photo: e.student.photo,
+      className: e.class?.name || 'N/A',
+      sectionName: e.section?.name || 'N/A',
+      parent: e.student.parent ? {
+        id: e.student.parent.id,
+        name: e.student.parent.name,
+        fatherName: e.student.parent.fatherName,
+        motherName: e.student.parent.motherName,
+        mobileno: e.student.parent.mobileno,
+        email: e.student.parent.email,
+        address: e.student.parent.address
+      } : null
+    }))
+
+    res.json({ success: true, students })
+  } catch (error) {
+    console.error('[TEACHER] Roster error:', error)
+    res.status(500).json({ success: false, message: 'Failed to fetch student roster.' })
+  }
+})
+
+/**
+ * GET /api/teacher/reminders
+ */
+router.get('/reminders', assertTeacher, async (req, res) => {
+  try {
+    const reminders = await prisma.teacherReminder.findMany({
+      where: { teacherId: req.teacherId },
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, reminders })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch reminders.' })
+  }
+})
+
+/**
+ * POST /api/teacher/reminders
+ */
+router.post('/reminders', assertTeacher, async (req, res) => {
+  try {
+    const { text, subtext } = req.body
+    if (!text) return res.status(400).json({ success: false, message: 'Reminder text is required.' })
+
+    const reminder = await prisma.teacherReminder.create({
+      data: {
+        teacherId: req.teacherId,
+        text,
+        subtext: subtext || null
+      }
+    })
+    res.json({ success: true, reminder })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to create reminder.' })
+  }
+})
+
+/**
+ * PUT /api/teacher/reminders/:id/toggle
+ */
+router.put('/reminders/:id/toggle', assertTeacher, async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    const reminder = await prisma.teacherReminder.findUnique({ where: { id } })
+    if (!reminder || reminder.teacherId !== req.teacherId) {
+      return res.status(404).json({ success: false, message: 'Reminder not found.' })
+    }
+
+    const updated = await prisma.teacherReminder.update({
+      where: { id },
+      data: { done: !reminder.done }
+    })
+    res.json({ success: true, reminder: updated })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to toggle reminder.' })
+  }
+})
+
+/**
+ * DELETE /api/teacher/reminders/:id
+ */
+router.delete('/reminders/:id', assertTeacher, async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    await prisma.teacherReminder.deleteMany({
+      where: { id, teacherId: req.teacherId }
+    })
+    res.json({ success: true, message: 'Reminder deleted.' })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to delete reminder.' })
+  }
+})
+
+/**
+ * GET /api/teacher/messages
+ */
+router.get('/messages', assertTeacher, async (req, res) => {
+  try {
+    const messages = await prisma.parentMessage.findMany({
+      where: {
+        branchId: req.branchId,
+        OR: [
+          { recipientRole: 'TEACHER' },
+          { recipientId: req.teacherId }
+        ]
+      },
+      include: {
+        parent: { select: { name: true, mobileno: true } },
+        student: { select: { firstName: true, lastName: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ success: true, messages })
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch messages.' })
+  }
+})
+
+/**
+ * POST /api/teacher/messages
+ */
+router.post('/messages', assertTeacher, async (req, res) => {
+  try {
+    const { parentId, studentId, subject, message } = req.body
+    if (!parentId || !message) {
+      return res.status(400).json({ success: false, message: 'Parent ID and message body are required.' })
+    }
+
+    const newMessage = await prisma.parentMessage.create({
+      data: {
+        branchId: req.branchId,
+        parentId: Number(parentId),
+        studentId: studentId ? Number(studentId) : null,
+        recipientRole: 'PARENT',
+        senderType: 'TEACHER',
+        subject: subject || 'Teacher Notice',
+        message
+      }
+    })
+
+    res.json({ success: true, message: 'Message sent to parent successfully.', newMessage })
+  } catch (error) {
+    console.error('[TEACHER] Send message error:', error)
+    res.status(500).json({ success: false, message: 'Failed to send message to parent.' })
   }
 })
 

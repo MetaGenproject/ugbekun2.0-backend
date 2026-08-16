@@ -176,3 +176,5 @@ scripts
 scripts* 
 link-admin.js 
 seed-admissions.js
+seed-student-dashboard-live-data.js
+test-student-apis.js
