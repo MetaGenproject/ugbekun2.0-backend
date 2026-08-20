@@ -910,8 +910,8 @@ router.get('/sibling-requests', async (req, res) => {
       birthday: r.birthday,
       status: r.status,
       rejectionReason: r.rejectionReason,
-      className: r.class.name,
-      sectionName: r.section.name,
+      className: r.class?.name || 'Class',
+      sectionName: r.section?.name || 'General',
       createdAt: r.createdAt,
     }))
 

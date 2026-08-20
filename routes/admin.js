@@ -9,12 +9,21 @@ const { generateRegistrationNumber, bindEvaluationMatrix, wipeEvaluationMatrix, 
 const { sendOnboardingCredentials, sendTeacherOnboardingCredentials } = require('../lib/emailService')
 const {
   generateCredentialSlipPdf,
+  generateBatchClassCredentialSlipsPdf,
+  generateReportCardPdf,
+  generateMontessoriReportCardPdf,
+  generateBatchClassReportCardsPdf,
+  generateSingleInvoicePdf,
+  generateBatchClassInvoicesPdf,
   generateStudentIdCardPdf,
   generateStaffIdCardPdf,
   generateCertificatePdf,
   generatePayslipPdf,
-  generateEmploymentLetterPdf
+  generateEmploymentLetterPdf,
+  generateLessonPlanPdf
 } = require('../lib/pdfService')
+const { generatePedagogicalLessonPlan } = require('../lib/lessonPlanService')
+const { generateStudentAiCommentary, generateBatchClassCommentary } = require('../lib/commentaryService')
 const {
   provisionStudentIdCard,
   provisionStaffIdCard,
@@ -29,6 +38,26 @@ const {
   exportFinancialReportCsv,
   exportFinancialReportPdf
 } = require('../lib/accountingService')
+const {
+  parseAikenFormat,
+  parseCsvFormat,
+  parseJsonFormat,
+  generateAiCurriculumQuestions,
+  autoGradeCbtSubmission
+} = require('../lib/cbtService')
+const {
+  getMyEduRideConfig,
+  saveMyEduRideConfig,
+  testMyEduRideConnection,
+  syncStudentsToMyEduRide,
+  getTransportOverview,
+  getBusFleet,
+  getGateLogs,
+  processGateScan,
+  updateStudentBoarding,
+  exportGateLogsCsv,
+  exportGateLogsPdf
+} = require('../lib/myedurideBridgeService')
 const bcrypt = require('bcryptjs')
 const crypto = require('crypto')
 const multer = require('multer')
@@ -2135,6 +2164,61 @@ router.post('/cbt/distributions', async (req, res) => {
       })
     }
 
+    // Resolve questions and sync OnlineExam model
+    let resolvedQuestions = []
+    if (groupId) {
+      const grp = await prisma.questionGroup.findUnique({ where: { id: Number(groupId) } })
+      if (grp && Array.isArray(grp.questionIds) && grp.questionIds.length > 0) {
+        resolvedQuestions = await prisma.questionBank.findMany({
+          where: { id: { in: grp.questionIds.map(Number) } }
+        })
+      }
+    }
+    if (resolvedQuestions.length === 0) {
+      resolvedQuestions = await prisma.questionBank.findMany({
+        where: { branchId: decoded.branchId, subjectId: Number(subjectId) },
+        take: 20
+      })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const activeSessionId = globalSetting?.sessionId || 5
+
+    let onlineExam = await prisma.onlineExam.findFirst({
+      where: {
+        title: title.trim(),
+        classId: Number(classId),
+        subjectId: Number(subjectId),
+        branchId: decoded.branchId
+      }
+    })
+
+    if (onlineExam) {
+      await prisma.onlineExam.update({
+        where: { id: onlineExam.id },
+        data: {
+          duration: Number(duration) || 30,
+          passingMark: Number(passingMark) || 50.0,
+          questions: resolvedQuestions,
+          sessionId: activeSessionId
+        }
+      })
+    } else {
+      await prisma.onlineExam.create({
+        data: {
+          title: title.trim(),
+          classId: Number(classId),
+          subjectId: Number(subjectId),
+          passingMark: Number(passingMark) || 50.0,
+          duration: Number(duration) || 30,
+          branchId: decoded.branchId,
+          sessionId: activeSessionId,
+          questions: resolvedQuestions,
+          examDate: startDate ? new Date(startDate) : new Date()
+        }
+      })
+    }
+
     return res.json({ success: true, distribution: dist, message: 'CBT Test distributed to class successfully.' })
   } catch (error) {
     console.error('[ADMIN] Create CBT distribution error:', error)
@@ -2183,6 +2267,493 @@ router.delete('/cbt/distributions/:id', async (req, res) => {
   } catch (error) {
     console.error('[ADMIN] Delete CBT distribution error:', error)
     return res.status(500).json({ success: false, message: 'Failed to delete CBT distribution.' })
+  }
+})
+
+/**
+ * GET /api/admin/cbt/question-bank
+ * Search & list question bank items with subject and class filters.
+ */
+router.get('/cbt/question-bank', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { subjectId, classId, search, page = 1, limit = 50 } = req.query
+    const p = parseInt(page, 10)
+    const l = parseInt(limit, 10)
+    const skip = (p - 1) * l
+
+    const where = { branchId: decoded.branchId }
+    if (subjectId) where.subjectId = Number(subjectId)
+    if (classId) where.classId = Number(classId)
+    if (search) {
+      where.questionText = { contains: search, mode: 'insensitive' }
+    }
+
+    const [items, total] = await Promise.all([
+      prisma.questionBank.findMany({
+        where,
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          class: { select: { id: true, name: true } }
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: l
+      }),
+      prisma.questionBank.count({ where })
+    ])
+
+    return res.json({
+      success: true,
+      items,
+      total,
+      pagination: {
+        page: p,
+        limit: l,
+        total,
+        totalPages: Math.ceil(total / l)
+      }
+    })
+  } catch (error) {
+    console.error('[ADMIN] Fetch question bank error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to fetch question bank.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/question-bank
+ * Create single question.
+ */
+router.post('/cbt/question-bank', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { questionText, questionType = 'mcq', options = [], correctOption = 'A', marks = 1.0, subjectId, classId } = req.body
+    if (!questionText || !subjectId) {
+      return res.status(400).json({ success: false, message: 'Question prompt and Subject are required.' })
+    }
+
+    const item = await prisma.questionBank.create({
+      data: {
+        branchId: decoded.branchId,
+        questionText: questionText.trim(),
+        questionType,
+        options: Array.isArray(options) ? options : [],
+        correctOption: String(correctOption).trim().toUpperCase(),
+        marks: parseFloat(marks) || 1.0,
+        subjectId: Number(subjectId),
+        classId: classId ? Number(classId) : null
+      },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        class: { select: { id: true, name: true } }
+      }
+    })
+
+    return res.status(201).json({ success: true, item, message: 'Question created successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Create question bank item error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to create question.' })
+  }
+})
+
+/**
+ * PUT /api/admin/cbt/question-bank/:id
+ * Update single question.
+ */
+router.put('/cbt/question-bank/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const id = Number(req.params.id)
+    const { questionText, questionType, options, correctOption, marks, subjectId, classId } = req.body
+
+    const item = await prisma.questionBank.update({
+      where: { id },
+      data: {
+        ...(questionText ? { questionText: questionText.trim() } : {}),
+        ...(questionType ? { questionType } : {}),
+        ...(options ? { options: Array.isArray(options) ? options : [] } : {}),
+        ...(correctOption ? { correctOption: String(correctOption).trim().toUpperCase() } : {}),
+        ...(marks !== undefined ? { marks: parseFloat(marks) } : {}),
+        ...(subjectId ? { subjectId: Number(subjectId) } : {}),
+        ...(classId !== undefined ? { classId: classId ? Number(classId) : null } : {})
+      },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        class: { select: { id: true, name: true } }
+      }
+    })
+
+    return res.json({ success: true, item, message: 'Question updated successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Update question bank item error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to update question.' })
+  }
+})
+
+/**
+ * DELETE /api/admin/cbt/question-bank/:id
+ * Delete single question.
+ */
+router.delete('/cbt/question-bank/:id', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const id = Number(req.params.id)
+    await prisma.questionBank.delete({ where: { id } })
+    return res.json({ success: true, message: 'Question deleted successfully.' })
+  } catch (error) {
+    console.error('[ADMIN] Delete question bank item error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to delete question.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/question-bank/import
+ * Bulk imports questions from Aiken format, CSV, or structured JSON.
+ */
+router.post('/cbt/question-bank/import', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { format = 'aiken', data, subjectId, classId } = req.body
+    if (!data || !subjectId) {
+      return res.status(400).json({ success: false, message: 'Import Data and Subject are required.' })
+    }
+
+    const sId = Number(subjectId)
+    const cId = classId ? Number(classId) : null
+
+    let parsedQuestions = []
+    if (format === 'aiken') {
+      parsedQuestions = parseAikenFormat(typeof data === 'string' ? data : '')
+    } else if (format === 'csv') {
+      parsedQuestions = parseCsvFormat(typeof data === 'string' ? data : '')
+    } else if (format === 'json') {
+      parsedQuestions = parseJsonFormat(data)
+    }
+
+    if (parsedQuestions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid questions could be parsed from the provided format syntax.'
+      })
+    }
+
+    const insertData = parsedQuestions.map(q => ({
+      branchId: decoded.branchId,
+      subjectId: sId,
+      classId: cId,
+      questionText: q.questionText,
+      questionType: q.questionType || 'mcq',
+      options: q.options,
+      correctOption: q.correctOption || 'A',
+      marks: q.marks || 1.0
+    }))
+
+    await prisma.questionBank.createMany({
+      data: insertData
+    })
+
+    return res.status(201).json({
+      success: true,
+      count: insertData.length,
+      message: `Successfully imported ${insertData.length} question(s) into Question Bank.`
+    })
+  } catch (error) {
+    console.error('[ADMIN] Import question bank error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to import questions.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/question-bank/ai-generate
+ * Generates curriculum questions and saves them to Question Bank.
+ */
+router.post('/cbt/question-bank/ai-generate', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { subjectId, classId, topic, classLevel, count = 5, questionType = 'mcq' } = req.body
+    if (!subjectId || !topic) {
+      return res.status(400).json({ success: false, message: 'Subject and Topic are required.' })
+    }
+
+    const sId = Number(subjectId)
+    const cId = classId ? Number(classId) : null
+
+    const subject = await prisma.subject.findUnique({
+      where: { id: sId },
+      select: { name: true }
+    })
+
+    const generated = generateAiCurriculumQuestions({
+      subjectName: subject?.name || 'General Studies',
+      topic: topic.trim(),
+      classLevel: classLevel || 'Secondary',
+      questionCount: Number(count) || 5,
+      questionType
+    })
+
+    const insertData = generated.map(q => ({
+      branchId: decoded.branchId,
+      subjectId: sId,
+      classId: cId,
+      questionText: q.questionText,
+      questionType: q.questionType,
+      options: q.options,
+      correctOption: q.correctOption,
+      marks: q.marks
+    }))
+
+    await prisma.questionBank.createMany({
+      data: insertData
+    })
+
+    return res.status(201).json({
+      success: true,
+      count: insertData.length,
+      questions: generated,
+      message: `AI generated and imported ${insertData.length} question(s) for "${topic}".`
+    })
+  } catch (error) {
+    console.error('[ADMIN] AI generate question bank error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to generate AI questions.' })
+  }
+})
+
+/**
+ * GET /api/admin/cbt/distributions/:id/analytics
+ * Detailed submissions, scores, and question difficulty index.
+ */
+router.get('/cbt/distributions/:id/analytics', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const distId = Number(req.params.id)
+    const dist = await prisma.cbtDistribution.findUnique({
+      where: { id: distId },
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        group: true
+      }
+    })
+
+    if (!dist) {
+      return res.status(404).json({ success: false, message: 'CBT Distribution not found.' })
+    }
+
+    // Resolve question items from group
+    let questions = []
+    if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
+      questions = await prisma.questionBank.findMany({
+        where: { id: { in: dist.group.questionIds.map(Number) } }
+      })
+    } else {
+      // Fallback to class/subject question bank items
+      questions = await prisma.questionBank.findMany({
+        where: { branchId: decoded.branchId, subjectId: dist.subjectId },
+        take: 20
+      })
+    }
+
+    // Resolve enrolled students in class section
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    const enrollWhere = {
+      classId: dist.classId,
+      branchId: decoded.branchId,
+      sessionId
+    }
+    if (dist.sectionId) enrollWhere.sectionId = dist.sectionId
+
+    const enrollments = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } }
+      }
+    })
+    const activeStudents = enrollments.filter(e => e.student && e.student.active)
+
+    // Resolve submissions from OnlineExamSubmission
+    const submissions = await prisma.onlineExamSubmission.findMany({
+      where: {
+        studentId: { in: activeStudents.map(e => e.student.id) }
+      },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } }
+      },
+      orderBy: { submittedAt: 'desc' }
+    })
+
+    const studentRoster = activeStudents.map(e => {
+      const st = e.student
+      const sub = submissions.find(s => s.studentId === st.id)
+      return {
+        studentId: st.id,
+        studentName: `${st.lastName}, ${st.firstName}`,
+        registerNo: st.registerNo || 'Pending',
+        isSubmitted: Boolean(sub && sub.submittedAt),
+        totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
+        submittedAt: sub?.submittedAt || null
+      }
+    })
+
+    const submittedOnly = studentRoster.filter(s => s.isSubmitted && s.totalMark !== null)
+    const totalScoreSum = submittedOnly.reduce((acc, s) => acc + Number(s.totalMark), 0)
+    const averageScore = submittedOnly.length > 0 ? (totalScoreSum / submittedOnly.length) : 0
+    const highestScore = submittedOnly.length > 0 ? Math.max(...submittedOnly.map(s => Number(s.totalMark))) : 0
+    const lowestScore = submittedOnly.length > 0 ? Math.min(...submittedOnly.map(s => Number(s.totalMark))) : 0
+    const passedCount = submittedOnly.filter(s => Number(s.totalMark) >= (dist.passingMark || 50)).length
+    const passRate = submittedOnly.length > 0 ? (passedCount / submittedOnly.length) * 100 : 0
+
+    return res.json({
+      success: true,
+      distribution: dist,
+      totalEnrolled: activeStudents.length,
+      submittedCount: submittedOnly.length,
+      pendingCount: activeStudents.length - submittedOnly.length,
+      averageScore: Math.round(averageScore * 10) / 10,
+      highestScore,
+      lowestScore,
+      passRate: Math.round(passRate * 10) / 10,
+      questionsCount: questions.length,
+      students: studentRoster
+    })
+  } catch (error) {
+    console.error('[ADMIN] Fetch CBT distribution analytics error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to load CBT analytics.' })
+  }
+})
+
+/**
+ * POST /api/admin/cbt/distributions/:id/sync-marks
+ * Syncs student CBT scores directly into official academic Mark table (cbtMark field)
+ */
+router.post('/cbt/distributions/:id/sync-marks', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const distId = Number(req.params.id)
+    const { targetExamId, maxScoreBase = 40 } = req.body
+
+    const dist = await prisma.cbtDistribution.findUnique({
+      where: { id: distId },
+      include: { class: true, subject: true }
+    })
+
+    if (!dist) {
+      return res.status(404).json({ success: false, message: 'CBT Distribution not found.' })
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // Find active Exam if not specified
+    let examId = targetExamId ? Number(targetExamId) : null
+    if (!examId) {
+      let activeExam = await prisma.exam.findFirst({
+        where: { branchId: decoded.branchId, sessionId },
+        orderBy: { id: 'desc' }
+      })
+      if (!activeExam) {
+        activeExam = await prisma.exam.findFirst({
+          where: { branchId: decoded.branchId },
+          orderBy: { id: 'desc' }
+        })
+      }
+      if (!activeExam) {
+        activeExam = await prisma.exam.create({
+          data: {
+            name: 'First Term Assessment Exam',
+            termId: 1,
+            sessionId,
+            branchId: decoded.branchId,
+            type: 1
+          }
+        })
+      }
+      examId = activeExam.id
+    }
+
+    // Resolve submissions and enrollments
+    const enrollments = await prisma.enroll.findMany({
+      where: { classId: dist.classId, branchId: decoded.branchId, sessionId },
+      select: { studentId: true, sectionId: true }
+    })
+    const studentIds = enrollments.map(e => e.studentId)
+    const enrollMap = {}
+    enrollments.forEach(e => { enrollMap[e.studentId] = e.sectionId })
+
+    const submissions = await prisma.onlineExamSubmission.findMany({
+      where: { studentId: { in: studentIds } }
+    })
+
+    let syncedCount = 0
+    for (const sub of submissions) {
+      if (sub.totalMark === null || sub.totalMark === undefined) continue
+
+      const rawScore = Number(sub.totalMark)
+      const scaledScore = Math.min(rawScore, Number(maxScoreBase))
+      const targetSectionId = dist.sectionId || enrollMap[sub.studentId] || 9
+
+      const existingMark = await prisma.mark.findFirst({
+        where: {
+          studentId: sub.studentId,
+          subjectId: dist.subjectId,
+          classId: dist.classId,
+          examId,
+          sessionId,
+          branchId: decoded.branchId
+        }
+      })
+
+      if (existingMark) {
+        await prisma.mark.update({
+          where: { id: existingMark.id },
+          data: { cbtMark: String(scaledScore) }
+        })
+      } else {
+        await prisma.mark.create({
+          data: {
+            studentId: sub.studentId,
+            subjectId: dist.subjectId,
+            classId: dist.classId,
+            sectionId: targetSectionId,
+            examId,
+            sessionId,
+            branchId: decoded.branchId,
+            cbtMark: String(scaledScore),
+            mark: '0',
+            absent: null
+          }
+        })
+      }
+
+      syncedCount++
+    }
+
+    return res.json({
+      success: true,
+      message: `Successfully synchronized ${syncedCount} student CBT score(s) into report card marksheets (CBT Marks max: ${maxScoreBase}).`,
+      syncedCount
+    })
+  } catch (error) {
+    console.error('[ADMIN] Sync CBT marks error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to sync CBT marks to marksheet.' })
   }
 })
 
@@ -2592,6 +3163,124 @@ router.post('/classes', async (req, res) => {
 })
 
 /**
+ * POST /api/admin/classes/seed-preset
+ * One-click school category class & section seeder.
+ * Categories: 'nursery_primary', 'secondary_only', 'combined_k12'
+ */
+router.post('/classes/seed-preset', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const body = req.body || {}
+    const category = (body.category || 'combined_k12').toLowerCase()
+
+    let presetClasses = []
+    if (category === 'nursery_primary' || category === 'primary') {
+      presetClasses = [
+        { name: 'Nursery 1', isEcd: true },
+        { name: 'Nursery 2', isEcd: true },
+        { name: 'Primary 1', isEcd: false },
+        { name: 'Primary 2', isEcd: false },
+        { name: 'Primary 3', isEcd: false },
+        { name: 'Primary 4', isEcd: false },
+        { name: 'Primary 5', isEcd: false },
+        { name: 'Primary 6', isEcd: false },
+      ]
+    } else if (category === 'secondary_only' || category === 'secondary') {
+      presetClasses = [
+        { name: 'JSS 1', isEcd: false },
+        { name: 'JSS 2', isEcd: false },
+        { name: 'JSS 3', isEcd: false },
+        { name: 'SSS 1', isEcd: false },
+        { name: 'SSS 2', isEcd: false },
+        { name: 'SSS 3', isEcd: false },
+      ]
+    } else {
+      // Combined K-12
+      presetClasses = [
+        { name: 'Nursery 1', isEcd: true },
+        { name: 'Nursery 2', isEcd: true },
+        { name: 'Primary 1', isEcd: false },
+        { name: 'Primary 2', isEcd: false },
+        { name: 'Primary 3', isEcd: false },
+        { name: 'Primary 4', isEcd: false },
+        { name: 'Primary 5', isEcd: false },
+        { name: 'Primary 6', isEcd: false },
+        { name: 'JSS 1', isEcd: false },
+        { name: 'JSS 2', isEcd: false },
+        { name: 'JSS 3', isEcd: false },
+        { name: 'SSS 1', isEcd: false },
+        { name: 'SSS 2', isEcd: false },
+        { name: 'SSS 3', isEcd: false },
+      ]
+    }
+
+    const defaultSections = ['A (Gold)', 'B (Silver)']
+    const createdClasses = []
+
+    await prisma.$transaction(async (tx) => {
+      const sectionMap = {}
+      for (const secName of defaultSections) {
+        let sec = await tx.section.findFirst({
+          where: { name: secName, branchId: decoded.branchId }
+        })
+        if (!sec) {
+          sec = await tx.section.create({
+            data: { name: secName, capacity: '40', branchId: decoded.branchId }
+          })
+        }
+        sectionMap[secName] = sec.id
+      }
+
+      for (const item of presetClasses) {
+        let cls = await tx.class.findFirst({
+          where: { name: item.name, branchId: decoded.branchId }
+        })
+        if (!cls) {
+          cls = await tx.class.create({
+            data: {
+              name: item.name,
+              nameNumeric: item.name.replace(/\D/g, '') || '1',
+              isEcd: item.isEcd,
+              branchId: decoded.branchId
+            }
+          })
+        }
+
+        for (const secName of defaultSections) {
+          const secId = sectionMap[secName]
+          if (secId) {
+            const existingAlloc = await tx.sectionsAllocation.findFirst({
+              where: { classId: cls.id, sectionId: secId, branchId: decoded.branchId }
+            })
+            if (!existingAlloc) {
+              await tx.sectionsAllocation.create({
+                data: {
+                  classId: cls.id,
+                  sectionId: secId,
+                  branchId: decoded.branchId
+                }
+              })
+            }
+          }
+        }
+        createdClasses.push(cls)
+      }
+    })
+
+    return res.status(200).json({
+      success: true,
+      message: `Seeded ${createdClasses.length} classes and sections for category "${category}".`,
+      classesCount: createdClasses.length,
+    })
+  } catch (error) {
+    console.error('[ADMIN] Seed class preset error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to seed class presets.' })
+  }
+})
+
+/**
  * POST /api/admin/classes/toggle-ecd
  * Toggle ECD status for a class.
  */
@@ -2907,16 +3596,20 @@ router.post('/exams', async (req, res) => {
   if (!decoded) return
 
   try {
-    const { name, termId, typeId, markDistribution, remark } = req.body
-    if (!name || !Array.isArray(markDistribution)) {
-      return res.status(400).json({ success: false, message: 'Exam Name and Mark Distribution are required.' })
+    const body = req.body || {}
+    const { name, termId, typeId, markDistribution = ['Theory', 'Objective'], remark } = body
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Exam Name is required.' })
     }
+
+    const distList = Array.isArray(markDistribution) ? markDistribution : ['Theory', 'Objective']
 
     const globalSetting = await prisma.globalSettings.findFirst()
     const sessionId = globalSetting?.sessionId || 5
 
     const resolvedIds = []
-    for (const dist of markDistribution) {
+    for (const dist of distList) {
       if (typeof dist === 'string' && isNaN(Number(dist))) {
         let existingDist = await prisma.examMarkDistribution.findFirst({
           where: { name: dist, branchId: decoded.branchId },
@@ -2964,13 +3657,28 @@ router.post('/students/onboard', async (req, res) => {
   if (!decoded) return
 
   try {
-    const { student, parent } = req.body
+    const body = req.body || {}
+    const student = body.student || (body.firstName ? body : null)
+    const parent = body.parent || (body.parentName || body.parent_name || body.name ? body : null)
+
     if (!student || !parent) {
-      return res.status(400).json({ success: false, message: 'Student and Parent details are required.' })
+      return res.status(400).json({ success: false, message: 'Student and Parent details are required in request body.' })
     }
 
-    const { firstName, lastName, gender, birthday, classId, sectionId, currentAddress, permanentAddress, previousDetails } = student
-    const { name: parentName, email: parentEmail, mobileno: parentPhone, relation: parentRelation } = parent
+    const firstName = student.firstName || body.firstName
+    const lastName = student.lastName || body.lastName
+    const gender = student.gender || body.gender || 'Male'
+    const birthday = student.birthday || body.birthday
+    const classId = Number(student.classId || body.classId)
+    const sectionId = Number(student.sectionId || body.sectionId)
+    const currentAddress = student.currentAddress || body.currentAddress
+    const permanentAddress = student.permanentAddress || body.permanentAddress
+    const previousDetails = student.previousDetails || body.previousDetails
+
+    const parentName = parent.name || parent.parentName || body.parentName || body.parent_name
+    const parentEmail = parent.email || parent.parentEmail || body.parentEmail || body.parent_email
+    const parentPhone = parent.mobileno || parent.parentPhone || body.parentPhone || body.mobileno
+    const parentRelation = parent.relation || parent.parentRelation || body.parentRelation || 'Father'
 
     if (!firstName || !lastName || !classId || !sectionId) {
       return res.status(400).json({ success: false, message: 'Student first name, last name, class, and section are required.' })
@@ -3233,7 +3941,7 @@ router.post('/students/import-bulk', async (req, res) => {
   if (!decoded) return
 
   try {
-    const { students } = req.body
+    const { students } = req.body || {}
     if (!students || !Array.isArray(students) || students.length === 0) {
       return res.status(400).json({ success: false, message: 'A non-empty list of students is required.' })
     }
@@ -3313,6 +4021,7 @@ router.post('/students/import-bulk', async (req, res) => {
     }
 
     const results = []
+    const batchParentCache = new Map()
 
     // Execute bulk registration inside transaction
     await prisma.$transaction(async (tx) => {
@@ -3347,24 +4056,44 @@ router.post('/students/import-bulk', async (req, res) => {
         let isExistingParent = false
         let finalParentUsername = null
 
-        // Resolve or create Parent Profile
-        if (row.parentEmail) {
-          parentRecord = await tx.parent.findFirst({
-            where: { email: row.parentEmail, branchId: decoded.branchId },
-          })
+        const normEmail = row.parentEmail ? row.parentEmail.trim().toLowerCase() : ''
+        const normPhone = row.parentPhone ? row.parentPhone.trim().replace(/[\s\-\+]/g, '') : ''
+
+        // Step A: Check in-memory batch cache (Deduplicate siblings in the same CSV upload)
+        if (normEmail && batchParentCache.has(`email:${normEmail}`)) {
+          parentRecord = batchParentCache.get(`email:${normEmail}`)
+          isExistingParent = true
+        } else if (normPhone && batchParentCache.has(`phone:${normPhone}`)) {
+          parentRecord = batchParentCache.get(`phone:${normPhone}`)
+          isExistingParent = true
         }
 
-        if (!parentRecord && row.parentPhone) {
+        // Step B: Search active DB records for this branch
+        if (!parentRecord && normEmail) {
           parentRecord = await tx.parent.findFirst({
-            where: { mobileno: row.parentPhone, branchId: decoded.branchId },
+            where: {
+              branchId: decoded.branchId,
+              email: { equals: normEmail, mode: 'insensitive' },
+            },
           })
+          if (parentRecord) isExistingParent = true
         }
 
+        if (!parentRecord && normPhone) {
+          parentRecord = await tx.parent.findFirst({
+            where: {
+              branchId: decoded.branchId,
+              mobileno: normPhone,
+            },
+          })
+          if (parentRecord) isExistingParent = true
+        }
+
+        // Step C: Create parent profile if not found
         if (parentRecord) {
           parentUserId = parentRecord.userId
-          isExistingParent = true
         } else {
-          const baseUsername = row.parentEmail || row.parentPhone
+          const baseUsername = normEmail || normPhone || `parent_${nextParentId}`
           const cleanUsername = `${baseUsername.split('@')[0]}_parent`
 
           let uniqueUsername = cleanUsername
@@ -3392,9 +4121,9 @@ router.post('/students/import-bulk', async (req, res) => {
           parentRecord = await tx.parent.create({
             data: {
               id: nextParentId++,
-              name: row.parentName,
+              name: row.parentName.trim(),
               relation: row.parentRelation || 'Father',
-              email: row.parentEmail || '',
+              email: normEmail,
               mobileno: row.parentPhone || '',
               active: true,
               branchId: decoded.branchId,
@@ -3402,6 +4131,10 @@ router.post('/students/import-bulk', async (req, res) => {
             },
           })
         }
+
+        // Cache parent record for remaining rows in this bulk upload batch
+        if (normEmail) batchParentCache.set(`email:${normEmail}`, parentRecord)
+        if (normPhone) batchParentCache.set(`phone:${normPhone}`, parentRecord)
 
         // Create Student User
         const studentUsername = `${row.firstName.toLowerCase()}.${row.lastName.toLowerCase()}`
@@ -3509,6 +4242,106 @@ router.post('/students/import-bulk', async (req, res) => {
   } catch (error) {
     console.error('[ADMIN] Bulk student onboarding error:', error)
     return res.status(500).json({ success: false, message: error.message || 'Failed to complete bulk student onboarding.' })
+  }
+})
+
+/**
+ * GET /api/admin/credentials-slips/class-pdf
+ * Export Class-by-Class Batch Login Slips PDF for all students in a class.
+ */
+router.get('/credentials-slips/class-pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res)
+  if (!decoded) return
+
+  try {
+    const classId = req.query.classId
+    const sectionId = req.query.sectionId
+
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'classId query parameter is required.' })
+    }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true, code: true }
+    })
+
+    let targetClass = null
+    let targetSection = null
+
+    if (classId !== 'all') {
+      targetClass = await prisma.class.findFirst({
+        where: { id: Number(classId), branchId: decoded.branchId }
+      })
+      if (!targetClass) {
+        return res.status(404).json({ success: false, message: 'Class not found in this branch.' })
+      }
+    }
+
+    if (sectionId && sectionId !== 'all') {
+      targetSection = await prisma.section.findFirst({
+        where: { id: Number(sectionId), branchId: decoded.branchId }
+      })
+    }
+
+    // Query enrolled students
+    const whereEnroll = {
+      branchId: decoded.branchId,
+      ...(targetClass ? { classId: targetClass.id } : {}),
+      ...(targetSection ? { sectionId: targetSection.id } : {}),
+    }
+
+    const enrolls = await prisma.enroll.findMany({
+      where: whereEnroll,
+      include: {
+        student: {
+          include: {
+            user: { select: { username: true } },
+            parent: {
+              include: {
+                user: { select: { username: true } }
+              }
+            }
+          }
+        },
+        class: { select: { name: true } },
+        section: { select: { name: true } }
+      },
+      orderBy: { id: 'asc' }
+    })
+
+    const slips = enrolls.map(e => {
+      const s = e.student
+      const p = s.parent
+      return {
+        studentName: `${s.firstName} ${s.lastName}`,
+        registerNo: s.registerNo || '',
+        studentUsername: s.user?.username || `${s.firstName.toLowerCase()}.${s.lastName.toLowerCase()}`,
+        studentPassword: 'Check Login Slip / Contact Admin',
+        parentName: p ? p.name : '',
+        parentRelation: p ? p.relation : 'Parent',
+        parentUsername: p?.user?.username || null,
+        parentPassword: 'Check Login Slip / Contact Admin',
+        isExistingParent: true
+      }
+    })
+
+    const pdfBuffer = await generateBatchClassCredentialSlipsPdf({
+      schoolName: branch?.name || 'Ugbekun Academy',
+      branchCode: branch?.code || '',
+      className: targetClass ? targetClass.name : 'All Classes',
+      sectionName: targetSection ? targetSection.name : '',
+      slips,
+      loginUrl: process.env.FRONTEND_URL || 'http://localhost:3000'
+    })
+
+    const safeClassName = targetClass ? targetClass.name.replace(/\s+/g, '_') : 'All_Classes'
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename=Batch_Login_Slips_${safeClassName}.pdf`)
+    return res.send(pdfBuffer)
+  } catch (error) {
+    console.error('[ADMIN] Export batch login slips PDF error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to generate batch login slips PDF.' })
   }
 })
 
@@ -3852,25 +4685,26 @@ router.post('/teachers/onboard', async (req, res) => {
   if (!decoded) return
 
   try {
-    const {
-      name,
-      email,
-      phone,
-      qualifications,
-      houseAddress,
-      department,
-      bankName,
-      accountNumber,
-      accountName,
-      role = 3,
-      isClassTeacher,
-      classTeacherClassId,
-      classTeacherSectionId,
-      isSubjectTeacher,
-      subjectTeacherClassId,
-      subjectTeacherSectionId,
-      subjectTeacherSubjectId,
-    } = req.body
+    const body = req.body || {}
+    const staffData = body.teacher || body.staff || body
+
+    const name = staffData.name || staffData.teacherName || staffData.fullName || staffData.staffName
+    const email = staffData.email || staffData.teacherEmail || staffData.staffEmail
+    const phone = staffData.phone || staffData.mobileno || staffData.phoneNumber || staffData.phoneNo
+    const qualifications = staffData.qualifications
+    const houseAddress = staffData.houseAddress || staffData.address || staffData.currentAddress
+    const department = staffData.department
+    const bankName = staffData.bankName
+    const accountNumber = staffData.accountNumber
+    const accountName = staffData.accountName
+    const role = staffData.role !== undefined ? staffData.role : 3
+    const isClassTeacher = staffData.isClassTeacher
+    const classTeacherClassId = staffData.classTeacherClassId
+    const classTeacherSectionId = staffData.classTeacherSectionId
+    const isSubjectTeacher = staffData.isSubjectTeacher
+    const subjectTeacherClassId = staffData.subjectTeacherClassId
+    const subjectTeacherSectionId = staffData.subjectTeacherSectionId
+    const subjectTeacherSubjectId = staffData.subjectTeacherSubjectId
 
     if (!name || !email) {
       return res.status(400).json({ success: false, message: 'Name and email are required.' })
@@ -4116,7 +4950,18 @@ router.put('/teachers/:id', async (req, res) => {
 
   const teacherId = Number(req.params.id)
   try {
-    const { name, email, phone, qualifications, houseAddress, department, bankName, accountNumber, accountName } = req.body
+    const body = req.body || {}
+    const staffData = body.teacher || body.staff || body
+    const name = staffData.name || staffData.teacherName || staffData.fullName
+    const email = staffData.email || staffData.teacherEmail
+    const phone = staffData.phone || staffData.mobileno
+    const qualifications = staffData.qualifications
+    const houseAddress = staffData.houseAddress || staffData.address
+    const department = staffData.department
+    const bankName = staffData.bankName
+    const accountNumber = staffData.accountNumber
+    const accountName = staffData.accountName
+
     if (!name || !email) {
       return res.status(400).json({ success: false, message: 'Name and email are required.' })
     }
@@ -5717,125 +6562,572 @@ router.post('/finances/fee-assignments', async (req, res) => {
 });
 
 /**
- * POST /api/admin/finances/invoices/bulk
- * Bulk generates invoices for all students in a class based on mandatory fee allocations.
+ * GET /api/admin/finances/invoices/batch-preview
+ * Previews enrolled students in class & section with their existing invoice status and projected billing
  */
-router.post('/finances/invoices/bulk', async (req, res) => {
+router.get('/finances/invoices/batch-preview', async (req, res) => {
   const decoded = await assertBranchAdmin(req, res);
   if (!decoded) return;
 
   try {
-    const { classId, termLabel, dueDate } = req.body;
+    const { classId, sectionId, termLabel, feeTypeIds } = req.query;
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
     const parsedClassId = parseInt(classId, 10);
+    const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
+    const term = (termLabel || 'First Term').trim();
+
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
 
-    // 1. Fetch mandatory fee allocations for the class
-    const allocations = await prisma.feeAssignment.findMany({
-      where: {
-        branchId: decoded.branchId,
-        classId: parsedClassId,
-        sessionId,
-        isOptional: false,
-        active: true
-      },
-      select: { feeTypeId: true }
+    // Fetch class & section names
+    const cls = await prisma.class.findUnique({
+      where: { id: parsedClassId },
+      select: { id: true, name: true }
     });
 
-    if (allocations.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No mandatory fee allocations found for this class. Please assign fees first.'
+    let secName = 'All Sections';
+    if (parsedSectionId) {
+      const sec = await prisma.section.findUnique({
+        where: { id: parsedSectionId },
+        select: { id: true, name: true }
       });
+      if (sec) secName = sec.name;
     }
 
-    const feeTypeIds = allocations.map(a => a.feeTypeId);
+    // Fetch enrolled students
+    const enrollWhere = {
+      classId: parsedClassId,
+      branchId: decoded.branchId,
+      sessionId
+    };
+    if (parsedSectionId) {
+      enrollWhere.sectionId = parsedSectionId;
+    }
 
-    // 2. Fetch all students enrolled in this class for the current session
     const enrollments = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            gender: true,
+            active: true
+          }
+        },
+        section: { select: { id: true, name: true } }
+      },
+      orderBy: { student: { lastName: 'asc' } }
+    });
+
+    const activeEnrollments = enrollments.filter(e => e.student && e.student.active);
+    const studentIds = activeEnrollments.map(e => e.student.id);
+
+    // Fetch existing invoices for these students for this term & session
+    const existingInvoices = await prisma.invoice.findMany({
       where: {
-        classId: parsedClassId,
+        studentId: { in: studentIds },
+        termLabel: term,
         sessionId,
         branchId: decoded.branchId
       },
-      select: { studentId: true }
+      include: { items: true }
     });
 
-    if (enrollments.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'No students enrolled in this class for the current session.'
+    const existingMap = {};
+    existingInvoices.forEach(inv => {
+      existingMap[inv.studentId] = inv;
+    });
+
+    // Resolve fee types
+    let selectedFeeTypes = [];
+    if (feeTypeIds) {
+      const parsedIds = (Array.isArray(feeTypeIds) ? feeTypeIds : String(feeTypeIds).split(',')).map(id => parseInt(id, 10)).filter(Boolean);
+      selectedFeeTypes = await prisma.feeType.findMany({
+        where: { id: { in: parsedIds }, branchId: decoded.branchId }
       });
     }
 
-    let successCount = 0;
-    let errorCount = 0;
+    // If no fee types explicitly selected, fetch class fee assignments
+    if (selectedFeeTypes.length === 0) {
+      const assignments = await prisma.feeAssignment.findMany({
+        where: {
+          classId: parsedClassId,
+          branchId: decoded.branchId,
+          sessionId,
+          active: true
+        },
+        include: { feeType: true }
+      });
+      selectedFeeTypes = assignments.map(a => a.feeType).filter(Boolean);
+    }
 
-    for (const enroll of enrollments) {
+    const totalPerStudent = selectedFeeTypes.reduce((acc, curr) => acc + parseFloat(curr.amount.toString()), 0);
+
+    const studentList = activeEnrollments.map(e => {
+      const st = e.student;
+      const existing = existingMap[st.id];
+
+      return {
+        id: st.id,
+        studentName: `${st.lastName}, ${st.firstName}`,
+        firstName: st.firstName,
+        lastName: st.lastName,
+        registerNo: st.registerNo || 'Pending',
+        gender: st.gender || 'N/A',
+        sectionId: e.section?.id || null,
+        sectionName: e.section?.name || secName,
+        alreadyInvoiced: Boolean(existing),
+        existingInvoiceId: existing?.id || null,
+        existingInvoiceNo: existing?.invoiceNo || null,
+        existingStatus: existing?.status || null,
+        existingTotal: existing ? parseFloat(existing.totalAmount.toString()) : null,
+        existingBalance: existing ? parseFloat(existing.balanceAmount.toString()) : null,
+      };
+    });
+
+    const unInvoicedCount = studentList.filter(s => !s.alreadyInvoiced).length;
+    const projectedTotal = unInvoicedCount * totalPerStudent;
+
+    return res.json({
+      success: true,
+      className: cls?.name || 'Classroom',
+      sectionName: secName,
+      totalEnrolled: studentList.length,
+      alreadyInvoicedCount: studentList.length - unInvoicedCount,
+      unInvoicedCount,
+      totalPerStudent,
+      projectedTotal,
+      feeTypes: selectedFeeTypes.map(ft => ({
+        id: ft.id,
+        name: ft.name,
+        code: ft.code,
+        amount: parseFloat(ft.amount.toString()),
+        frequency: ft.frequency
+      })),
+      students: studentList
+    });
+  } catch (error) {
+    console.error('[ADMIN INVOICES] Batch preview error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to preview batch invoice roster.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/invoices/batch-generate
+ * Bulk generates invoices for all or selected students in a class section with sequential numbering
+ */
+router.post('/finances/invoices/batch-generate', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, sectionId, termLabel, dueDate, feeTypeIds, studentIds, overwriteExisting } = req.body;
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    }
+
+    const parsedClassId = parseInt(classId, 10);
+    const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
+    const term = (termLabel || 'First Term').trim();
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    // Resolve fee types
+    let targetFeeTypeIds = [];
+    if (Array.isArray(feeTypeIds) && feeTypeIds.length > 0) {
+      targetFeeTypeIds = feeTypeIds.map(id => parseInt(id, 10));
+    } else {
+      const assignments = await prisma.feeAssignment.findMany({
+        where: {
+          classId: parsedClassId,
+          branchId: decoded.branchId,
+          sessionId,
+          active: true
+        },
+        select: { feeTypeId: true }
+      });
+      targetFeeTypeIds = assignments.map(a => a.feeTypeId);
+    }
+
+    if (targetFeeTypeIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No fee types selected or assigned to this class. Please select at least one fee type.'
+      });
+    }
+
+    // Resolve students to invoice
+    let targetStudentIds = [];
+    if (Array.isArray(studentIds) && studentIds.length > 0) {
+      targetStudentIds = studentIds.map(id => parseInt(id, 10));
+    } else {
+      const enrollWhere = {
+        classId: parsedClassId,
+        branchId: decoded.branchId,
+        sessionId
+      };
+      if (parsedSectionId) {
+        enrollWhere.sectionId = parsedSectionId;
+      }
+      const enrollments = await prisma.enroll.findMany({
+        where: enrollWhere,
+        include: { student: { select: { id: true, active: true } } }
+      });
+      targetStudentIds = enrollments.filter(e => e.student && e.student.active).map(e => e.student.id);
+    }
+
+    if (targetStudentIds.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No eligible active students found for batch invoice generation.'
+      });
+    }
+
+    let createdCount = 0;
+    let skippedCount = 0;
+    let totalInvoicedSum = 0;
+    const createdInvoices = [];
+
+    for (const sId of targetStudentIds) {
       try {
-        // Check if student already has an invoice for this term to prevent duplicate billing
-        const existingInvoice = await prisma.invoice.findFirst({
+        const existing = await prisma.invoice.findFirst({
           where: {
-            studentId: enroll.studentId,
-            termLabel: termLabel || 'First Term',
+            studentId: sId,
+            termLabel: term,
             sessionId,
             branchId: decoded.branchId
           }
         });
 
-        if (existingInvoice) {
-          // Skip if already billed for this term
-          continue;
+        if (existing) {
+          if (!overwriteExisting) {
+            skippedCount++;
+            continue;
+          } else {
+            // Delete old items and invoice if overwriting
+            await prisma.invoiceItem.deleteMany({ where: { invoiceId: existing.id } });
+            await prisma.payment.deleteMany({ where: { invoiceId: existing.id } });
+            await prisma.invoice.delete({ where: { id: existing.id } });
+          }
         }
 
-        await generateInvoice(prisma, {
-          studentId: enroll.studentId,
-          termLabel: termLabel || 'First Term',
-          feeTypeIds,
+        const invoice = await generateInvoice(prisma, {
+          studentId: sId,
+          termLabel: term,
+          feeTypeIds: targetFeeTypeIds,
           branchId: decoded.branchId,
           sessionId,
           dueDate: dueDate || null
         });
 
-        successCount++;
+        createdCount++;
+        totalInvoicedSum += parseFloat(invoice.totalAmount.toString());
+        createdInvoices.push({
+          id: invoice.id,
+          invoiceNo: invoice.invoiceNo,
+          studentId: sId,
+          totalAmount: parseFloat(invoice.totalAmount.toString())
+        });
       } catch (err) {
-        console.error(`[ADMIN] Bulk invoice fail for student ${enroll.studentId}:`, err);
-        errorCount++;
+        console.error(`[ADMIN INVOICES] Error generating invoice for student ${sId}:`, err);
+        skippedCount++;
       }
     }
 
     return res.status(201).json({
       success: true,
-      message: `Bulk invoicing complete. Invoices generated: ${successCount}. Skipped or failed: ${errorCount}`
+      message: `Batch invoicing complete! Generated ${createdCount} invoice(s) (Total: ₦${totalInvoicedSum.toLocaleString()}), skipped ${skippedCount}.`,
+      createdCount,
+      skippedCount,
+      totalInvoiced: totalInvoicedSum,
+      invoices: createdInvoices
     });
   } catch (error) {
-    console.error('[ADMIN] Bulk generate invoices error:', error);
-    return res.status(500).json({ success: false, message: error.message || 'Failed to bulk generate invoices.' });
+    console.error('[ADMIN INVOICES] Batch generate error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate batch invoices.' });
+  }
+});
+
+/**
+ * POST /api/admin/finances/invoices/bulk (Legacy wrapper redirecting to batch-generate)
+ */
+router.post('/finances/invoices/bulk', async (req, res) => {
+  req.url = '/finances/invoices/batch-generate';
+  return router.handle(req, res);
+});
+
+/**
+ * GET /api/admin/finances/invoices/:id/pdf
+ * 1-Click Single Invoice PDF Download
+ */
+router.get('/finances/invoices/:id/pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const invoiceId = parseInt(req.params.id, 10);
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: invoiceId, branchId: decoded.branchId },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            enrolls: {
+              take: 1,
+              orderBy: { createdAt: 'desc' },
+              include: {
+                class: { select: { name: true } },
+                section: { select: { name: true } }
+              }
+            }
+          }
+        },
+        items: true,
+        payments: true
+      }
+    });
+
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true, code: true }
+    });
+
+    const schoolBank = await prisma.schoolBank.findFirst({
+      where: { branchId: decoded.branchId, isActive: true }
+    });
+
+    const schoolYear = await prisma.schoolYear.findUnique({
+      where: { id: invoice.sessionId || 5 },
+      select: { schoolYear: true }
+    });
+
+    const latestEnroll = invoice.student?.enrolls?.[0];
+    const className = latestEnroll?.class?.name || 'Classroom';
+    const sectionName = latestEnroll?.section?.name || 'Main';
+
+    const pdfBuffer = await generateSingleInvoicePdf({
+      schoolName: branch?.name || 'Ugbekun Schools',
+      branchCode: branch?.code || 'GEN',
+      invoiceNo: invoice.invoiceNo,
+      termLabel: invoice.termLabel,
+      sessionName: schoolYear?.schoolYear || 'Active Session',
+      studentName: `${invoice.student.lastName}, ${invoice.student.firstName}`,
+      registerNo: invoice.student.registerNo || 'Pending',
+      className,
+      sectionName,
+      issuedAt: invoice.issuedAt,
+      dueDate: invoice.dueDate,
+      status: invoice.status,
+      items: invoice.items.map(item => ({
+        description: item.description,
+        amount: parseFloat(item.amount.toString()),
+        feeTypeCode: 'FEE'
+      })),
+      totalAmount: parseFloat(invoice.totalAmount.toString()),
+      paidAmount: parseFloat(invoice.paidAmount.toString()),
+      balanceAmount: parseFloat(invoice.balanceAmount.toString()),
+      schoolBank: schoolBank ? {
+        bankName: schoolBank.bankName,
+        accountName: schoolBank.accountName,
+        accountNumber: schoolBank.accountNumber,
+        sortCode: schoolBank.sortCode
+      } : null
+    });
+
+    const safeInvoiceNo = invoice.invoiceNo.replace(/[\/\\]/g, '_');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Invoice_${safeInvoiceNo}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN INVOICES] Download single invoice PDF error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate invoice PDF.' });
+  }
+});
+
+/**
+ * GET /api/admin/finances/invoices/batch-pdf
+ * 1-Click Whole-Class-Section Multi-Page Batch Fee Invoices PDF Download
+ */
+router.get('/finances/invoices/batch-pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { classId, sectionId, termLabel } = req.query;
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    }
+
+    const parsedClassId = parseInt(classId, 10);
+    const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
+    const term = termLabel ? String(termLabel).trim() : undefined;
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true, code: true }
+    });
+
+    const cls = await prisma.class.findUnique({ where: { id: parsedClassId }, select: { name: true } });
+    const sec = parsedSectionId ? await prisma.section.findUnique({ where: { id: parsedSectionId }, select: { name: true } }) : null;
+    const schoolYear = await prisma.schoolYear.findUnique({ where: { id: sessionId }, select: { schoolYear: true } });
+
+    const className = cls?.name || 'Classroom';
+    const sectionName = sec?.name || '';
+    const sessionName = schoolYear?.schoolYear || 'Active Session';
+
+    // Find enrolled students in this class section
+    const enrollWhere = {
+      classId: parsedClassId,
+      branchId: decoded.branchId,
+      sessionId
+    };
+    if (parsedSectionId) enrollWhere.sectionId = parsedSectionId;
+
+    const enrollments = await prisma.enroll.findMany({
+      where: enrollWhere,
+      select: { studentId: true }
+    });
+    const studentIds = enrollments.map(e => e.studentId);
+
+    if (studentIds.length === 0) {
+      return res.status(404).json({ success: false, message: 'No enrolled students found in this class section.' });
+    }
+
+    // Find invoices for these students
+    const invoiceWhere = {
+      studentId: { in: studentIds },
+      sessionId,
+      branchId: decoded.branchId
+    };
+    if (term) invoiceWhere.termLabel = term;
+
+    const invoices = await prisma.invoice.findMany({
+      where: invoiceWhere,
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true
+          }
+        },
+        items: true
+      },
+      orderBy: { invoiceNo: 'asc' }
+    });
+
+    if (invoices.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No invoices found for this class section. Please generate batch invoices first.'
+      });
+    }
+
+    const schoolBank = await prisma.schoolBank.findFirst({
+      where: { branchId: decoded.branchId, isActive: true }
+    });
+
+    const formattedInvoices = invoices.map(inv => ({
+      invoiceNo: inv.invoiceNo,
+      termLabel: inv.termLabel,
+      studentName: `${inv.student.lastName}, ${inv.student.firstName}`,
+      registerNo: inv.student.registerNo || 'Pending',
+      issuedAt: inv.issuedAt,
+      dueDate: inv.dueDate,
+      status: inv.status,
+      items: inv.items.map(item => ({
+        description: item.description,
+        amount: parseFloat(item.amount.toString()),
+        feeTypeCode: 'FEE'
+      })),
+      totalAmount: parseFloat(inv.totalAmount.toString()),
+      paidAmount: parseFloat(inv.paidAmount.toString()),
+      balanceAmount: parseFloat(inv.balanceAmount.toString())
+    }));
+
+    const pdfBuffer = await generateBatchClassInvoicesPdf({
+      schoolName: branch?.name || 'Ugbekun Schools',
+      branchCode: branch?.code || 'GEN',
+      className,
+      sectionName,
+      sessionName,
+      schoolBank: schoolBank ? {
+        bankName: schoolBank.bankName,
+        accountName: schoolBank.accountName,
+        accountNumber: schoolBank.accountNumber,
+        sortCode: schoolBank.sortCode
+      } : null,
+      invoices: formattedInvoices
+    });
+
+    const safeCls = className.replace(/\s+/g, '_');
+    const safeSec = sectionName.replace(/\s+/g, '_');
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Batch_Invoices_${safeCls}${safeSec ? `_${safeSec}` : ''}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN INVOICES] Download batch invoices PDF error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate batch invoices PDF.' });
   }
 });
 
 /**
  * GET /api/admin/finances/invoices
+ * Retrieves all invoices with optional status, search, classId, sectionId, and termLabel filters
  */
 router.get('/finances/invoices', async (req, res) => {
   const decoded = await assertBranchAdmin(req, res);
   if (!decoded) return;
 
   try {
-    const { status, search, page = 1, limit = 20 } = req.query;
+    const { status, search, classId, sectionId, termLabel, page = 1, limit = 50 } = req.query;
     const p = parseInt(page, 10);
     const l = parseInt(limit, 10);
     const skip = (p - 1) * l;
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
 
     const where = {
       branchId: decoded.branchId
     };
 
-    if (status) where.status = status;
+    if (status && status !== 'all') where.status = status;
+    if (termLabel && termLabel !== 'all') where.termLabel = termLabel;
+
+    // Filter by class / section if provided
+    if (classId) {
+      const parsedClassId = parseInt(classId, 10);
+      const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
+      const enrollWhere = { classId: parsedClassId, branchId: decoded.branchId, sessionId };
+      if (parsedSectionId) enrollWhere.sectionId = parsedSectionId;
+
+      const enrolls = await prisma.enroll.findMany({
+        where: enrollWhere,
+        select: { studentId: true }
+      });
+      const sIds = enrolls.map(e => e.studentId);
+      where.studentId = { in: sIds };
+    }
 
     if (search) {
       where.OR = [
@@ -5844,7 +7136,8 @@ router.get('/finances/invoices', async (req, res) => {
           student: {
             OR: [
               { firstName: { contains: search, mode: 'insensitive' } },
-              { lastName: { contains: search, mode: 'insensitive' } }
+              { lastName: { contains: search, mode: 'insensitive' } },
+              { registerNo: { contains: search, mode: 'insensitive' } }
             ]
           }
         }
@@ -5857,9 +7150,18 @@ router.get('/finances/invoices', async (req, res) => {
         include: {
           student: {
             select: {
+              id: true,
               firstName: true,
               lastName: true,
-              registerNo: true
+              registerNo: true,
+              enrolls: {
+                take: 1,
+                orderBy: { createdAt: 'desc' },
+                include: {
+                  class: { select: { id: true, name: true } },
+                  section: { select: { id: true, name: true } }
+                }
+              }
             }
           },
           items: true,
@@ -5872,9 +7174,44 @@ router.get('/finances/invoices', async (req, res) => {
       prisma.invoice.count({ where })
     ]);
 
+    const formattedInvoices = invoices.map(inv => {
+      const enroll = inv.student?.enrolls?.[0];
+      return {
+        id: inv.id,
+        invoiceNo: inv.invoiceNo,
+        termLabel: inv.termLabel,
+        totalAmount: parseFloat(inv.totalAmount.toString()),
+        paidAmount: parseFloat(inv.paidAmount.toString()),
+        balanceAmount: parseFloat(inv.balanceAmount.toString()),
+        status: inv.status,
+        dueDate: inv.dueDate,
+        issuedAt: inv.issuedAt,
+        student: {
+          id: inv.student.id,
+          firstName: inv.student.firstName,
+          lastName: inv.student.lastName,
+          registerNo: inv.student.registerNo,
+          className: enroll?.class?.name || 'N/A',
+          sectionName: enroll?.section?.name || 'N/A'
+        },
+        items: inv.items.map(it => ({
+          id: it.id,
+          description: it.description,
+          amount: parseFloat(it.amount.toString())
+        })),
+        payments: inv.payments.map(pm => ({
+          id: pm.id,
+          amount: parseFloat(pm.amount.toString()),
+          method: pm.method,
+          reference: pm.reference,
+          paidAt: pm.paidAt
+        }))
+      };
+    });
+
     return res.json({
       success: true,
-      data: invoices,
+      data: formattedInvoices,
       pagination: {
         page: p,
         limit: l,
@@ -5890,6 +7227,7 @@ router.get('/finances/invoices', async (req, res) => {
 
 /**
  * POST /api/admin/finances/invoices
+ * Generates single student invoice
  */
 router.post('/finances/invoices', async (req, res) => {
   const decoded = await assertBranchAdmin(req, res);
@@ -9940,6 +11278,1331 @@ router.delete('/inventory/items/:id', async (req, res) => {
   } catch (error) {
     console.error('[INVENTORY] Delete error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete inventory item.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── AUTOMATED REPORT CARD GENERATION ENGINE (1-CLICK PDF REPORT CARDS) ──────
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/admin/report-cards/classes
+ * Fetch classes and sections with student counts and mark status
+ */
+router.get('/report-cards/classes', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const classes = await prisma.class.findMany({
+      where: { branchId: decoded.branchId },
+      include: {
+        sections: {
+          select: {
+            section: { select: { id: true, name: true } }
+          }
+        },
+        enrolls: {
+          where: { sessionId, branchId: decoded.branchId },
+          select: { studentId: true, sectionId: true }
+        }
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    const formatted = classes.map(c => {
+      const secMap = {};
+      c.sections.forEach(s => {
+        if (s.section) {
+          secMap[s.section.id] = {
+            id: s.section.id,
+            name: s.section.name,
+            studentCount: 0
+          };
+        }
+      });
+
+      c.enrolls.forEach(e => {
+        if (secMap[e.sectionId]) {
+          secMap[e.sectionId].studentCount += 1;
+        }
+      });
+
+      return {
+        id: c.id,
+        name: c.name,
+        isEcd: c.isEcd || false,
+        totalEnrolled: c.enrolls.length,
+        sections: Object.values(secMap)
+      };
+    });
+
+    return res.json({ success: true, classes: formatted });
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] Get classes error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch classes.' });
+  }
+});
+
+/**
+ * GET /api/admin/report-cards/students
+ * Fetch compiled report cards for all students in a class & section
+ */
+router.get('/report-cards/students', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { classId, sectionId } = req.query;
+  if (!classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  }
+
+  try {
+    const parsedClassId = Number(classId);
+    const parsedSectionId = Number(sectionId);
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    // 1. Fetch class info
+    const cls = await prisma.class.findUnique({
+      where: { id: parsedClassId },
+      select: { name: true, isEcd: true }
+    });
+
+    // 2. Fetch enrolled students
+    const enrolls = await prisma.enroll.findMany({
+      where: {
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
+        sessionId,
+        branchId: decoded.branchId
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            gender: true,
+            photo: true
+          }
+        }
+      },
+      orderBy: { student: { lastName: 'asc' } }
+    });
+
+    const studentIds = enrolls.map(e => e.studentId);
+
+    // 3. Fetch all marks for this class & section
+    const marks = await prisma.mark.findMany({
+      where: {
+        studentId: { in: studentIds },
+        sessionId,
+        branchId: decoded.branchId
+      },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        exam: { select: { id: true, name: true } }
+      }
+    });
+
+    // 4. Fetch commentaries & Montessori assessments
+    const commentaries = await prisma.studentCommentary.findMany({
+      where: {
+        studentId: { in: studentIds },
+        sessionId,
+        branchId: decoded.branchId
+      }
+    });
+    const commMap = {};
+    commentaries.forEach(c => { commMap[c.studentId] = c; });
+
+    const montessoriList = await prisma.montessoriAssessment.findMany({
+      where: {
+        studentId: { in: studentIds },
+        sessionId,
+        branchId: decoded.branchId
+      }
+    });
+    const montMap = {};
+    montessoriList.forEach(m => { montMap[m.studentId] = m; });
+
+    // 5. Fetch attendance
+    const attendanceRecords = await prisma.attendance.findMany({
+      where: {
+        studentId: { in: studentIds },
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
+        sessionId,
+        branchId: decoded.branchId
+      },
+      select: { studentId: true, status: true }
+    });
+    const attMap = {};
+    studentIds.forEach(id => {
+      attMap[id] = { total: 0, present: 0, absent: 0, late: 0 };
+    });
+    attendanceRecords.forEach(a => {
+      if (attMap[a.studentId]) {
+        attMap[a.studentId].total += 1;
+        const st = (a.status || '').toLowerCase();
+        if (st === 'present' || st === '1') attMap[a.studentId].present += 1;
+        else if (st === 'absent' || st === '0') attMap[a.studentId].absent += 1;
+        else if (st === 'late') attMap[a.studentId].late += 1;
+      }
+    });
+
+    // 6. Aggregate marks and compute ranks
+    const studentMarksMap = {};
+    const studentAggregates = {};
+    studentIds.forEach(id => {
+      studentMarksMap[id] = [];
+      studentAggregates[id] = { sum: 0, count: 0, totalMarks: 0 };
+    });
+
+    marks.forEach(m => {
+      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0;
+      const examVal = m.mark ? parseFloat(m.mark) : 0;
+      const totalVal = testVal + examVal;
+      if (studentMarksMap[m.studentId]) {
+        studentMarksMap[m.studentId].push({
+          id: m.id,
+          examName: m.exam?.name || 'Evaluation',
+          subjectName: m.subject?.name || 'Subject',
+          subjectCode: m.subject?.subjectCode || 'N/A',
+          cbtMark: m.cbtMark !== null ? String(testVal) : null,
+          theoryMark: m.mark !== null ? String(examVal) : null,
+          mark: String(totalVal),
+          absent: m.absent === '1' || m.absent === 'true'
+        });
+        studentAggregates[m.studentId].sum += totalVal;
+        studentAggregates[m.studentId].count += 1;
+        studentAggregates[m.studentId].totalMarks += totalVal;
+      }
+    });
+
+    // Compute averages and ranks
+    const scores = studentIds.map(id => ({
+      id,
+      avg: studentAggregates[id].count > 0 ? (studentAggregates[id].sum / studentAggregates[id].count) : 0
+    }));
+    scores.sort((a, b) => b.avg - a.avg);
+
+    const rankMap = {};
+    scores.forEach((item, idx) => {
+      rankMap[item.id] = idx + 1;
+    });
+
+    // 7. Assemble students array
+    const studentList = enrolls.map(e => {
+      const st = e.student;
+      const agg = studentAggregates[st.id] || { sum: 0, count: 0, totalMarks: 0 };
+      const avg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
+      const rk = rankMap[st.id] || null;
+      const comm = commMap[st.id];
+      const mont = montMap[st.id];
+      const att = attMap[st.id] || { total: 0, present: 0, absent: 0, late: 0 };
+
+      let grade = 'F';
+      if (avg >= 70) grade = 'A';
+      else if (avg >= 60) grade = 'B';
+      else if (avg >= 50) grade = 'C';
+      else if (avg >= 45) grade = 'D';
+      else if (avg >= 40) grade = 'E';
+
+      const getOrdinal = (n) => {
+        const s = ['th', 'st', 'nd', 'rd'];
+        const v = n % 100;
+        return n + (s[(v - 20) % 10] || s[v] || s[0]);
+      };
+
+      return {
+        id: st.id,
+        studentName: `${st.lastName}, ${st.firstName}`,
+        firstName: st.firstName,
+        lastName: st.lastName,
+        admissionNo: st.registerNo || 'N/A',
+        registerNo: st.registerNo,
+        className: cls?.name || 'Classroom',
+        gender: st.gender || 'N/A',
+        totalMarks: agg.totalMarks,
+        average: avg,
+        grade,
+        position: rk ? `${getOrdinal(rk)} out of ${studentIds.length}` : 'N/A',
+        rank: rk,
+        attendanceDays: att.total > 0 ? `${att.present} / ${att.total} Days` : '0 Days Logged',
+        presentCount: att.present,
+        absentCount: att.absent,
+        totalAttendanceDays: att.total,
+        teacherComment: comm?.remark || (mont?.narrativeComment || ''),
+        principalComment: comm?.reviewNotes || (avg >= 70 ? 'Promoted with distinction.' : (avg >= 50 ? 'Good progress. Promoted.' : 'Needs improvement.')),
+        commentStatus: comm?.status || 'PENDING',
+        isAiGenerated: comm?.isAiGenerated || false,
+        psychomotor: {
+          writingMastery: mont?.writingMastery || 'AC',
+          drawingCapability: mont?.drawingCapability || 'AC',
+          physicalCoordination: mont?.physicalCoordination || 'AC',
+          motorSkillProgression: mont?.motorSkillProgression || 'AC'
+        },
+        affective: {
+          generalPunctuality: mont?.generalPunctuality || 'AC',
+          peerRespect: mont?.peerRespect || 'AC',
+          aestheticNeatness: mont?.aestheticNeatness || 'AC',
+          activeGroupParticipation: mont?.activeGroupParticipation || 'AC'
+        },
+        isEcd: cls?.isEcd || false,
+        subjectsCount: studentMarksMap[st.id]?.length || 0,
+        reportCard: studentMarksMap[st.id] || []
+      };
+    });
+
+    return res.json({
+      success: true,
+      className: cls?.name || 'Classroom',
+      isEcd: cls?.isEcd || false,
+      totalStudents: studentList.length,
+      students: studentList
+    });
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] Get students error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to compile student report cards.' });
+  }
+});
+
+/**
+ * GET /api/admin/report-cards/export-pdf
+ * 1-Click Single Student PDF Report Card Download
+ */
+router.get('/report-cards/export-pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { classId, sectionId, studentId, rankingType = 'full', rankingLimit = 3 } = req.query;
+  if (!classId || !sectionId || !studentId) {
+    return res.status(400).json({ success: false, message: 'classId, sectionId, and studentId are required.' });
+  }
+
+  try {
+    const parsedStudentId = Number(studentId);
+    const parsedClassId = Number(classId);
+    const parsedSectionId = Number(sectionId);
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const student = await prisma.student.findUnique({
+      where: { id: parsedStudentId },
+      include: { branch: { select: { name: true, code: true } } }
+    });
+
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student not found.' });
+    }
+
+    const cls = await prisma.class.findUnique({ where: { id: parsedClassId }, select: { name: true, isEcd: true } });
+    const sec = await prisma.section.findUnique({ where: { id: parsedSectionId }, select: { name: true } });
+    const sess = await prisma.schoolYear.findUnique({ where: { id: sessionId }, select: { schoolYear: true } });
+
+    const className = cls?.name || 'Classroom';
+    const sectionName = sec?.name || 'Main';
+    const sessionName = sess?.schoolYear || 'Active Session';
+
+    let formTeacherName = 'Form Teacher';
+    const formAllocation = await prisma.teacherAllocation.findFirst({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: decoded.branchId },
+      include: { teacher: { select: { name: true } } }
+    });
+    if (formAllocation?.teacher) formTeacherName = formAllocation.teacher.name;
+
+    if (cls?.isEcd) {
+      const assessment = await prisma.montessoriAssessment.findFirst({
+        where: { studentId: parsedStudentId, classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: decoded.branchId },
+        include: { exam: { select: { name: true, resumptionDate: true } } }
+      });
+
+      const pdfBuffer = await generateMontessoriReportCardPdf({
+        schoolName: student.branch?.name || 'Ugbekun Schools',
+        branchCode: student.branch?.code || 'GEN',
+        studentName: `${student.lastName}, ${student.firstName}`,
+        registerNo: student.registerNo,
+        className,
+        sectionName,
+        sessionName,
+        examName: assessment?.exam?.name || 'Term Evaluation',
+        assessment: assessment || {},
+        resumptionDate: assessment?.exam?.resumptionDate || null,
+        formTeacherName
+      });
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="report_card_${student.lastName}_${student.firstName}.pdf"`);
+      return res.send(pdfBuffer);
+    }
+
+    // Standard Report Card
+    const marks = await prisma.mark.findMany({
+      where: { studentId: parsedStudentId, sessionId, branchId: decoded.branchId },
+      include: {
+        subject: { select: { name: true, subjectCode: true } },
+        exam: { select: { name: true, resumptionDate: true } }
+      }
+    });
+
+    // Class benchmark averages
+    const allClassMarks = await prisma.mark.findMany({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: decoded.branchId },
+      select: { examId: true, subjectId: true, mark: true, cbtMark: true }
+    });
+    const avgMap = {};
+    allClassMarks.forEach(m => {
+      const k = `${m.examId}-${m.subjectId}`;
+      if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
+      const tot = (parseFloat(m.cbtMark || '0')) + (parseFloat(m.mark || '0'));
+      avgMap[k].sum += tot;
+      avgMap[k].count += 1;
+    });
+
+    let totalSum = 0;
+    let marksCount = 0;
+    const reportCard = marks.map(m => {
+      const testScore = m.cbtMark ? parseFloat(m.cbtMark) : 0;
+      const examScore = m.mark ? parseFloat(m.mark) : 0;
+      const totalScore = testScore + examScore;
+      totalSum += totalScore;
+      marksCount += 1;
+
+      const k = `${m.examId}-${m.subjectId}`;
+      const cAvg = avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : totalScore;
+
+      return {
+        id: m.id,
+        examName: m.exam?.name || 'Term Evaluation',
+        subjectName: m.subject?.name || 'Subject',
+        subjectCode: m.subject?.subjectCode || 'N/A',
+        cbtMark: String(testScore),
+        theoryMark: String(examScore),
+        mark: String(totalScore),
+        absent: m.absent === '1' || m.absent === 'true',
+        classAverage: cAvg
+      };
+    });
+
+    const overallAverage = marksCount > 0 ? Number((totalSum / marksCount).toFixed(1)) : 0;
+
+    // Rank
+    const enrolls = await prisma.enroll.findMany({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: decoded.branchId },
+      select: { studentId: true }
+    });
+    const studentIds = enrolls.map(e => e.studentId);
+    const aggMap = {};
+    studentIds.forEach(id => { aggMap[id] = { sum: 0, count: 0 }; });
+    allClassMarks.forEach(m => {
+      if (aggMap[m.studentId]) {
+        aggMap[m.studentId].sum += (parseFloat(m.cbtMark || '0') + parseFloat(m.mark || '0'));
+        aggMap[m.studentId].count += 1;
+      }
+    });
+    const scoreRankList = studentIds.map(id => ({
+      id,
+      avg: aggMap[id]?.count > 0 ? (aggMap[id].sum / aggMap[id].count) : 0
+    })).sort((a, b) => b.avg - a.avg);
+
+    const rankIdx = scoreRankList.findIndex(s => s.id === parsedStudentId);
+    const rank = rankIdx !== -1 ? rankIdx + 1 : null;
+
+    const comm = await prisma.studentCommentary.findFirst({
+      where: { studentId: parsedStudentId, sessionId, branchId: decoded.branchId }
+    });
+
+    const pdfBuffer = await generateReportCardPdf({
+      schoolName: student.branch?.name || 'Ugbekun Schools',
+      branchCode: student.branch?.code || 'GEN',
+      studentName: `${student.lastName}, ${student.firstName}`,
+      registerNo: student.registerNo,
+      className,
+      sectionName,
+      sessionName,
+      reportCard,
+      overallAverage,
+      commentary: comm?.remark || '',
+      rank,
+      totalClassStudents: studentIds.length,
+      rankingType,
+      rankingLimit: Number(rankingLimit),
+      resumptionDate: marks[0]?.exam?.resumptionDate || null,
+      formTeacherName
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="report_card_${student.lastName}_${student.firstName}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] Single PDF export error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate report card PDF.' });
+  }
+});
+
+/**
+ * GET /api/admin/report-cards/export-batch-pdf
+ * 1-Click Whole-Class Multi-Page Batch PDF Report Card Generator
+ */
+router.get('/report-cards/export-batch-pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { classId, sectionId, rankingType = 'full', rankingLimit = 3 } = req.query;
+  if (!classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  }
+
+  try {
+    const parsedClassId = Number(classId);
+    const parsedSectionId = Number(sectionId);
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true, code: true }
+    });
+
+    const cls = await prisma.class.findUnique({ where: { id: parsedClassId }, select: { name: true, isEcd: true } });
+    const sec = await prisma.section.findUnique({ where: { id: parsedSectionId }, select: { name: true } });
+    const sess = await prisma.schoolYear.findUnique({ where: { id: sessionId }, select: { schoolYear: true } });
+
+    const className = cls?.name || 'Classroom';
+    const sectionName = sec?.name || 'Main';
+    const sessionName = sess?.schoolYear || 'Active Session';
+
+    let formTeacherName = 'Form Teacher';
+    const formAllocation = await prisma.teacherAllocation.findFirst({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: decoded.branchId },
+      include: { teacher: { select: { name: true } } }
+    });
+    if (formAllocation?.teacher) formTeacherName = formAllocation.teacher.name;
+
+    // Fetch enrolled students
+    const enrolls = await prisma.enroll.findMany({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: decoded.branchId },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } }
+      },
+      orderBy: { student: { lastName: 'asc' } }
+    });
+
+    const studentIds = enrolls.map(e => e.studentId);
+
+    if (studentIds.length === 0) {
+      return res.status(404).json({ success: false, message: 'No enrolled students found in this class/section.' });
+    }
+
+    // Fetch all class marks
+    const allMarks = await prisma.mark.findMany({
+      where: { studentId: { in: studentIds }, sessionId, branchId: decoded.branchId },
+      include: {
+        subject: { select: { name: true, subjectCode: true } },
+        exam: { select: { name: true, resumptionDate: true } }
+      }
+    });
+
+    // Compute subject class averages
+    const avgMap = {};
+    allMarks.forEach(m => {
+      const k = `${m.examId}-${m.subjectId}`;
+      if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
+      const tot = (parseFloat(m.cbtMark || '0')) + (parseFloat(m.mark || '0'));
+      avgMap[k].sum += tot;
+      avgMap[k].count += 1;
+    });
+
+    // Student aggregates & ranking
+    const studentAggregates = {};
+    const studentMarksMap = {};
+    studentIds.forEach(id => {
+      studentAggregates[id] = { sum: 0, count: 0 };
+      studentMarksMap[id] = [];
+    });
+
+    allMarks.forEach(m => {
+      const testScore = m.cbtMark ? parseFloat(m.cbtMark) : 0;
+      const examScore = m.mark ? parseFloat(m.mark) : 0;
+      const totalScore = testScore + examScore;
+
+      if (studentMarksMap[m.studentId]) {
+        const k = `${m.examId}-${m.subjectId}`;
+        const cAvg = avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : totalScore;
+
+        studentMarksMap[m.studentId].push({
+          id: m.id,
+          examName: m.exam?.name || 'Evaluation',
+          subjectName: m.subject?.name || 'Subject',
+          subjectCode: m.subject?.subjectCode || 'N/A',
+          cbtMark: String(testScore),
+          theoryMark: String(examScore),
+          mark: String(totalScore),
+          absent: m.absent === '1' || m.absent === 'true',
+          classAverage: cAvg
+        });
+
+        studentAggregates[m.studentId].sum += totalScore;
+        studentAggregates[m.studentId].count += 1;
+      }
+    });
+
+    const rankList = studentIds.map(id => ({
+      id,
+      avg: studentAggregates[id].count > 0 ? (studentAggregates[id].sum / studentAggregates[id].count) : 0
+    })).sort((a, b) => b.avg - a.avg);
+
+    const rankMap = {};
+    rankList.forEach((item, idx) => { rankMap[item.id] = idx + 1; });
+
+    // Fetch commentaries & Montessori
+    const commentaries = await prisma.studentCommentary.findMany({
+      where: { studentId: { in: studentIds }, sessionId, branchId: decoded.branchId }
+    });
+    const commMap = {};
+    commentaries.forEach(c => { commMap[c.studentId] = c; });
+
+    const montessoriList = await prisma.montessoriAssessment.findMany({
+      where: { studentId: { in: studentIds }, sessionId, branchId: decoded.branchId },
+      include: { exam: { select: { name: true, resumptionDate: true } } }
+    });
+    const montMap = {};
+    montessoriList.forEach(m => { montMap[m.studentId] = m; });
+
+    // Assemble student objects for batch generation
+    const batchStudents = enrolls.map(e => {
+      const st = e.student;
+      const agg = studentAggregates[st.id] || { sum: 0, count: 0 };
+      const avg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
+      const rk = rankMap[st.id] || null;
+      const comm = commMap[st.id];
+      const mont = montMap[st.id];
+
+      return {
+        studentName: `${st.lastName}, ${st.firstName}`,
+        registerNo: st.registerNo || 'N/A',
+        isEcd: cls?.isEcd || false,
+        reportCard: studentMarksMap[st.id] || [],
+        overallAverage: avg,
+        commentary: comm?.remark || '',
+        rank: rk,
+        totalClassStudents: studentIds.length,
+        rankingType,
+        rankingLimit: Number(rankingLimit),
+        resumptionDate: allMarks[0]?.exam?.resumptionDate || null,
+        formTeacherName,
+        examName: mont?.exam?.name || 'Term Evaluation',
+        assessment: mont || {}
+      };
+    });
+
+    const pdfBuffer = await generateBatchClassReportCardsPdf({
+      schoolName: branch?.name || 'Ugbekun Schools',
+      branchCode: branch?.code || 'GEN',
+      className,
+      sectionName,
+      sessionName,
+      students: batchStudents
+    });
+
+    const safeClassName = className.replace(/\s+/g, '_');
+    const safeSectionName = sectionName.replace(/\s+/g, '_');
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="batch_report_cards_${safeClassName}_${safeSectionName}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] Batch PDF export error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate batch report cards PDF.' });
+  }
+});
+
+/**
+ * POST /api/admin/report-cards/commentary
+ * Save/update student commentary and sign-off
+ */
+router.post('/report-cards/commentary', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { studentId, classId, sectionId, remark, principalRemark, status = 'PRINCIPAL_SIGNED_OFF' } = req.body || {};
+  if (!studentId || !classId || !sectionId || !remark) {
+    return res.status(400).json({ success: false, message: 'studentId, classId, sectionId, and remark are required.' });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const commentary = await prisma.studentCommentary.upsert({
+      where: {
+        studentId_sessionId: {
+          studentId: Number(studentId),
+          sessionId
+        }
+      },
+      update: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        remark: remark.trim(),
+        reviewNotes: principalRemark ? principalRemark.trim() : undefined,
+        status,
+        reviewerId: decoded.id,
+        isEditedByHuman: true,
+        branchId: decoded.branchId
+      },
+      create: {
+        studentId: Number(studentId),
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        remark: remark.trim(),
+        reviewNotes: principalRemark ? principalRemark.trim() : undefined,
+        status,
+        reviewerId: decoded.id,
+        sessionId,
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.json({ success: true, message: 'Commentary saved to student report card.', commentary });
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] Save commentary error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save commentary.' });
+  }
+});
+
+/**
+ * POST /api/admin/report-cards/behavioral
+ * Save/update psychomotor and affective domain evaluations
+ */
+router.post('/report-cards/behavioral', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { studentId, classId, sectionId, psychomotor = {}, affective = {}, narrativeComment } = req.body || {};
+  if (!studentId || !classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'studentId, classId, and sectionId are required.' });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const exam = await prisma.exam.findFirst({
+      where: { branchId: decoded.branchId, sessionId },
+      select: { id: true }
+    });
+    const examId = exam?.id || 1;
+
+    const assessment = await prisma.montessoriAssessment.upsert({
+      where: {
+        studentId_examId_sessionId: {
+          studentId: Number(studentId),
+          examId,
+          sessionId
+        }
+      },
+      update: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        writingMastery: psychomotor.writingMastery,
+        drawingCapability: psychomotor.drawingCapability,
+        physicalCoordination: psychomotor.physicalCoordination,
+        motorSkillProgression: psychomotor.motorSkillProgression,
+        generalPunctuality: affective.generalPunctuality,
+        peerRespect: affective.peerRespect,
+        aestheticNeatness: affective.aestheticNeatness,
+        activeGroupParticipation: affective.activeGroupParticipation,
+        narrativeComment: narrativeComment ? narrativeComment.trim() : undefined,
+        branchId: decoded.branchId
+      },
+      create: {
+        studentId: Number(studentId),
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        examId,
+        sessionId,
+        writingMastery: psychomotor.writingMastery || 'AC',
+        drawingCapability: psychomotor.drawingCapability || 'AC',
+        physicalCoordination: psychomotor.physicalCoordination || 'AC',
+        motorSkillProgression: psychomotor.motorSkillProgression || 'AC',
+        generalPunctuality: affective.generalPunctuality || 'AC',
+        peerRespect: affective.peerRespect || 'AC',
+        aestheticNeatness: affective.aestheticNeatness || 'AC',
+        activeGroupParticipation: affective.activeGroupParticipation || 'AC',
+        narrativeComment: narrativeComment ? narrativeComment.trim() : undefined,
+        branchId: decoded.branchId
+      }
+    });
+
+    return res.json({ success: true, message: 'Behavioral and psychomotor ratings saved successfully.', assessment });
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] Save behavioral error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save behavioral ratings.' });
+  }
+});
+
+/**
+ * POST /api/admin/report-cards/ai-comments
+ * Intelligent contextualized AI/Smart remark generation
+ */
+router.post('/report-cards/ai-comments', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { studentName = 'The student', averageScore = 75, attendanceRate = 90, strengths = 'Academics' } = req.body || {};
+
+  try {
+    const avg = Number(averageScore) || 75;
+    let teacherComment = '';
+    let principalComment = '';
+
+    if (avg >= 80) {
+      teacherComment = `${studentName} has demonstrated exceptional intellectual mastery, intellectual curiosity, and exemplary discipline throughout this academic term. A stellar role model for classmates.`;
+      principalComment = `An outstanding academic distinction. Commended for scholastic excellence and promoted with honors!`;
+    } else if (avg >= 70) {
+      teacherComment = `${studentName} exhibits strong analytical capability and steady academic commitment. Consistently puts in commendable effort across all subjects.`;
+      principalComment = `Very good academic performance. Promoted with praise. Keep up the high standard!`;
+    } else if (avg >= 60) {
+      teacherComment = `${studentName} is a hardworking and attentive pupil who shows solid understanding of core concepts. Encouraged to participate more actively in classroom discussions.`;
+      principalComment = `Satisfactory terminal result. Has the capability to achieve even higher grades next session. Promoted.`;
+    } else if (avg >= 50) {
+      teacherComment = `${studentName} has made fair progress this term. Regular study revision and attention to homework assignments will yield stronger attainment.`;
+      principalComment = `Pass grade achieved. Advised to focus diligently on foundational subjects during the upcoming term.`;
+    } else {
+      teacherComment = `${studentName} requires closer academic guidance and targeted remedial assistance to improve overall comprehension and performance.`;
+      principalComment = `Performance falls below the expected benchmark. Recommended for structured holiday remedial support.`;
+    }
+
+    return res.json({
+      success: true,
+      teacherComment,
+      principalComment,
+      isAiGenerated: true
+    });
+  } catch (error) {
+    console.error('[ADMIN REPORT CARDS] AI comments error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate comments.' });
+  }
+});
+
+/**
+ * GET /api/admin/lesson-plans
+ * View, filter, and inspect all teacher lesson plans across the branch.
+ */
+router.get('/lesson-plans', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { classId, subjectId, teacherId, status, search } = req.query;
+
+  try {
+    const where = {
+      teacher: { branchId: decoded.branchId }
+    };
+
+    if (classId) where.classId = Number(classId);
+    if (subjectId) where.subjectId = Number(subjectId);
+    if (teacherId) where.teacherId = Number(teacherId);
+    if (status) where.status = status;
+    if (search) {
+      where.OR = [
+        { coreTopic: { contains: search, mode: 'insensitive' } },
+        { educationalObjectives: { contains: search, mode: 'insensitive' } }
+      ];
+    }
+
+    const plans = await prisma.lessonPlan.findMany({
+      where,
+      include: {
+        teacher: { select: { id: true, name: true } },
+        class: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    return res.json({ success: true, count: plans.length, plans });
+  } catch (error) {
+    console.error('[ADMIN] Fetch lesson plans error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch lesson plans.' });
+  }
+});
+
+/**
+ * GET /api/admin/lesson-plans/:id/pdf
+ * Official A4 PDF download for a lesson plan.
+ */
+router.get('/lesson-plans/:id/pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const plan = await prisma.lessonPlan.findUnique({
+      where: { id: Number(req.params.id) },
+      include: {
+        teacher: { select: { name: true, branchId: true } },
+        class: { select: { name: true } },
+        subject: { select: { name: true } }
+      }
+    });
+
+    if (!plan) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found.' });
+    }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId || 1 },
+      select: { name: true, code: true }
+    });
+
+    const pdfBuffer = await generateLessonPlanPdf({
+      schoolName: branch?.name || 'Ugbekun Group of Schools',
+      branchCode: branch?.code || 'MAIN',
+      teacherName: plan.teacher.name || 'Subject Teacher',
+      subjectName: plan.subject.name,
+      className: plan.class.name,
+      coreTopic: plan.coreTopic,
+      educationalObjectives: plan.educationalObjectives,
+      materialLists: plan.materialLists,
+      teachingGuide: plan.teachingGuide,
+      assessmentCriteria: plan.assessmentCriteria,
+      classAssignments: plan.classAssignments,
+      status: plan.status,
+      createdAt: plan.createdAt
+    });
+
+    const sanitizedTopic = (plan.coreTopic || 'Lesson_Plan').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Lesson_Plan_${sanitizedTopic}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[ADMIN] Lesson plan PDF export error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to export lesson plan PDF.' });
+  }
+});
+
+/**
+ * POST /api/admin/report-cards/batch-generate-commentary
+ * 1-Click AI Commentary Generator for an entire classroom section.
+ */
+router.post('/report-cards/batch-generate-commentary', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { classId, sectionId, tone = 'constructive', behavioralTags = [] } = req.body || {};
+  if (!classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const enrollments = await prisma.enroll.findMany({
+      where: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        branchId: decoded.branchId,
+        sessionId
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            gender: true
+          }
+        }
+      }
+    });
+
+    const studentsData = [];
+
+    for (const enr of enrollments) {
+      const st = enr.student;
+      if (!st) continue;
+
+      const marks = await prisma.mark.findMany({
+        where: { studentId: st.id, sessionId, branchId: decoded.branchId },
+        include: { subject: { select: { name: true } } }
+      });
+
+      const marksBySubject = {};
+      for (const m of marks) {
+        if (!m.mark || m.absent === '1') continue;
+        const score = parseFloat(m.mark);
+        if (!isNaN(score)) {
+          marksBySubject[m.subject.name] = score;
+        }
+      }
+
+      const scoresList = Object.values(marksBySubject);
+      const avg = scoresList.length > 0 ? Math.round(scoresList.reduce((a, b) => a + b, 0) / scoresList.length) : 70;
+
+      const att = await prisma.attendance.findMany({
+        where: { studentId: st.id, sessionId, branchId: decoded.branchId }
+      });
+      const totalDays = att.length;
+      const presentDays = att.filter(a => String(a.status || '').toLowerCase() === 'present' || String(a.status || '').toLowerCase() === 'late').length;
+      const attendanceRate = totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 100;
+
+      const existingComm = await prisma.studentCommentary.findUnique({
+        where: {
+          studentId_sessionId: {
+            studentId: st.id,
+            sessionId
+          }
+        }
+      });
+
+      studentsData.push({
+        studentId: st.id,
+        studentName: `${st.firstName} ${st.lastName}`,
+        registerNo: st.registerNo || '',
+        averageScore: avg,
+        attendanceRate,
+        marksBySubject,
+        behavioralTags,
+        existingRemark: existingComm?.remark || null
+      });
+    }
+
+    const batchGenerated = await generateBatchClassCommentary(studentsData, tone);
+
+    return res.json({
+      success: true,
+      count: batchGenerated.length,
+      commentaries: batchGenerated
+    });
+  } catch (err) {
+    console.error('[ADMIN] Batch commentary generate error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to batch generate commentary.' });
+  }
+});
+
+/**
+ * POST /api/admin/report-cards/batch-save-commentary
+ * Batch saves and authorizes commentary for an entire classroom section.
+ */
+router.post('/report-cards/batch-save-commentary', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { classId, sectionId, commentaries = [], status = 'APPROVED_BY_PRINCIPAL' } = req.body || {};
+  if (!classId || !sectionId || !Array.isArray(commentaries)) {
+    return res.status(400).json({ success: false, message: 'classId, sectionId, and commentaries array required.' });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    let savedCount = 0;
+
+    for (const item of commentaries) {
+      if (!item.studentId || !item.remark) continue;
+
+      await prisma.studentCommentary.upsert({
+        where: {
+          studentId_sessionId: {
+            studentId: Number(item.studentId),
+            sessionId
+          }
+        },
+        update: {
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          remark: item.remark.trim(),
+          reviewNotes: item.principalRemark ? item.principalRemark.trim() : undefined,
+          status,
+          reviewerId: decoded.id,
+          isEditedByHuman: true,
+          branchId: decoded.branchId
+        },
+        create: {
+          studentId: Number(item.studentId),
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          remark: item.remark.trim(),
+          reviewNotes: item.principalRemark ? item.principalRemark.trim() : undefined,
+          status,
+          reviewerId: decoded.id,
+          sessionId,
+          branchId: decoded.branchId
+        }
+      });
+
+      savedCount++;
+    }
+
+    return res.json({
+      success: true,
+      message: `Successfully saved & authorized ${savedCount} student report card remarks.`,
+      savedCount
+    });
+  } catch (err) {
+    console.error('[ADMIN] Batch commentary save error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to batch save commentaries.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MYEDURIDE BUS LOGISTICS & GATE ACCESS CONTROL API BRIDGE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/myeduride/config
+ * Fetch branch MyEduRide API credentials & connection settings
+ */
+router.get('/myeduride/config', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const config = await getMyEduRideConfig(prisma, decoded.branchId);
+    return res.json({ success: true, data: config });
+  } catch (err) {
+    console.error('[MYEDURIDE] GET config error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load MyEduRide configuration.' });
+  }
+});
+
+/**
+ * POST /api/admin/myeduride/config
+ * Save branch MyEduRide API credentials
+ */
+router.post('/myeduride/config', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const updated = await saveMyEduRideConfig(prisma, decoded.branchId, req.body || {});
+    return res.json({
+      success: true,
+      message: 'MyEduRide API configuration saved successfully.',
+      data: updated
+    });
+  } catch (err) {
+    console.error('[MYEDURIDE] POST config error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to save MyEduRide configuration.' });
+  }
+});
+
+/**
+ * POST /api/admin/myeduride/test-connection
+ * Perform live handshake test with MyEduRide API
+ */
+router.post('/myeduride/test-connection', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const currentConfig = await getMyEduRideConfig(prisma, decoded.branchId);
+    const { apiUrl = currentConfig.apiUrl, apiKey = currentConfig.apiKey } = req.body || {};
+
+    const testResult = await testMyEduRideConnection({
+      apiUrl,
+      apiKey,
+      branchCode: currentConfig.branchCode
+    });
+
+    return res.json({
+      success: true,
+      data: testResult
+    });
+  } catch (err) {
+    console.error('[MYEDURIDE] Connection test error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to test MyEduRide connection.' });
+  }
+});
+
+/**
+ * POST /api/admin/myeduride/sync-roster
+ * Sync students, parents & ID card QR tokens to MyEduRide API
+ */
+router.post('/myeduride/sync-roster', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const result = await syncStudentsToMyEduRide(prisma, decoded.branchId);
+    return res.json(result);
+  } catch (err) {
+    console.error('[MYEDURIDE] Roster sync error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to synchronize roster to MyEduRide.' });
+  }
+});
+
+/**
+ * GET /api/admin/myeduride/overview
+ * Overview stats: active fleet, gate logs today, synced students count
+ */
+router.get('/myeduride/overview', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const overview = await getTransportOverview(prisma, decoded.branchId);
+    return res.json({ success: true, data: overview });
+  } catch (err) {
+    console.error('[MYEDURIDE] Overview error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load MyEduRide overview.' });
+  }
+});
+
+/**
+ * GET /api/admin/myeduride/buses
+ * Live GPS school bus fleet & routes
+ */
+router.get('/myeduride/buses', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const fleet = await getBusFleet(prisma, decoded.branchId);
+    return res.json({ success: true, data: fleet });
+  } catch (err) {
+    console.error('[MYEDURIDE] Bus fleet error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load bus fleet.' });
+  }
+});
+
+/**
+ * GET /api/admin/myeduride/gate-logs
+ * Gate turnstile access logs stream
+ */
+router.get('/myeduride/gate-logs', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const { role, status, direction, search, limit } = req.query;
+    const logs = await getGateLogs(prisma, decoded.branchId, {
+      role,
+      status,
+      direction,
+      search,
+      limit: limit ? parseInt(limit, 10) : 50
+    });
+    return res.json({ success: true, data: logs });
+  } catch (err) {
+    console.error('[MYEDURIDE] Gate logs error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load gate access logs.' });
+  }
+});
+
+/**
+ * POST /api/admin/myeduride/gate-logs/scan
+ * Process live QR / RFID gate turnstile scan
+ */
+router.post('/myeduride/gate-logs/scan', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { code, direction = 'ENTRY', gateLocation = 'Main Front Turnstile Gate 1', verifiedBy = 'Turnstile Scanner' } = req.body || {};
+  if (!code) {
+    return res.status(400).json({ success: false, message: 'Scan code is required.' });
+  }
+
+  try {
+    const result = await processGateScan(prisma, decoded.branchId, {
+      code,
+      direction,
+      gateLocation,
+      verifiedBy
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error('[MYEDURIDE] Gate scan error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to process gate scan.' });
+  }
+});
+
+/**
+ * POST /api/admin/myeduride/manifest/board
+ * Record student bus boarding / dropoff event
+ */
+router.post('/myeduride/manifest/board', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  const { studentId, busId, status } = req.body || {};
+  if (!studentId) {
+    return res.status(400).json({ success: false, message: 'studentId is required.' });
+  }
+
+  try {
+    const result = await updateStudentBoarding(prisma, decoded.branchId, {
+      studentId,
+      busId,
+      status
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error('[MYEDURIDE] Manifest boarding error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to record student boarding.' });
+  }
+});
+
+/**
+ * GET /api/admin/myeduride/export/csv
+ * Export gate logs to CSV
+ */
+router.get('/myeduride/export/csv', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true }
+    });
+    const logs = await getGateLogs(prisma, decoded.branchId, { limit: 500 });
+    const csv = exportGateLogsCsv(logs, branch?.name || 'Ugbekun Schools');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="myeduride_gate_access_log.csv"');
+    return res.send(csv);
+  } catch (err) {
+    console.error('[MYEDURIDE] CSV export error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to export gate logs CSV.' });
+  }
+});
+
+/**
+ * GET /api/admin/myeduride/export/pdf
+ * Export gate logs to PDF
+ */
+router.get('/myeduride/export/pdf', async (req, res) => {
+  const decoded = await assertBranchAdmin(req, res);
+  if (!decoded) return;
+
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: decoded.branchId },
+      select: { name: true }
+    });
+    const logs = await getGateLogs(prisma, decoded.branchId, { limit: 150 });
+    const pdfBuffer = await exportGateLogsPdf(logs, branch?.name || 'Ugbekun International Academy');
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="myeduride_gate_access_log.pdf"');
+    return res.send(pdfBuffer);
+  } catch (err) {
+    console.error('[MYEDURIDE] PDF export error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to export gate logs PDF.' });
   }
 });
 

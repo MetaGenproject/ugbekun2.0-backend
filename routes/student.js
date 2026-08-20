@@ -4,6 +4,7 @@ const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
 const { generateReportCardPdf, generateMontessoriReportCardPdf } = require('../lib/pdfService')
+const { autoGradeCbtSubmission } = require('../lib/cbtService')
 const gamificationService = require('../lib/gamificationService')
 const companionService = require('../lib/companionService')
 const walletService = require('../lib/walletService')
@@ -857,7 +858,7 @@ router.get('/grades', async (req, res) => {
             sessionId: req.sessionId,
             branchId: req.branchId
           },
-          select: { studentId: true, mark: true }
+          select: { studentId: true, mark: true, cbtMark: true }
         })
 
         const studentAggregates = {}
@@ -866,12 +867,12 @@ router.get('/grades', async (req, res) => {
         })
 
         allMarks.forEach(m => {
-          if (m.mark && m.mark !== '{}' && m.mark !== '') {
-            const val = parseFloat(m.mark)
-            if (!isNaN(val)) {
-              studentAggregates[m.studentId].sum += val
-              studentAggregates[m.studentId].count += 1
-            }
+          const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0
+          const examVal = m.mark ? parseFloat(m.mark) : 0
+          const totalVal = testVal + examVal
+          if (m.cbtMark !== null || m.mark !== null) {
+            studentAggregates[m.studentId].sum += totalVal
+            studentAggregates[m.studentId].count += 1
           }
         })
 
@@ -1296,160 +1297,381 @@ router.post('/homeworks/:id/submit', async (req, res) => {
   }
 })
 
-// Start Online Exam
-router.post('/online-exams/:id/start', async (req, res) => {
-  const { id } = req.params
+// ── CBT ONLINE EXAM ROUTES FOR STUDENTS ──────────────────────────────
+
+// GET /api/student/cbt/active-exams
+// Lists all published CBT examinations for student's enrolled classroom
+router.get('/cbt/active-exams', async (req, res) => {
   try {
-    const exam = await prisma.onlineExam.findUnique({
-      where: { id: Number(id) }
+    const classId = req.classId
+    if (!classId) {
+      return res.json({ success: true, exams: [] })
+    }
+
+    // 1. Fetch OnlineExam models
+    const onlineExams = await prisma.onlineExam.findMany({
+      where: { classId, branchId: req.branchId },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } }
+      },
+      orderBy: { createdAt: 'desc' }
     })
-    if (!exam) {
-      return res.status(404).json({ success: false, message: 'Online exam not found.' })
-    }
 
-    if (exam.examDate && new Date(exam.examDate).getTime() > Date.now()) {
-      return res.status(400).json({ success: false, message: 'This scheduled CBT exam has not started yet.' })
-    }
-
-    // Check for existing attempt/submission
-    const existing = await prisma.onlineExamSubmission.findFirst({
+    // 2. Fetch CbtDistribution models
+    const distributions = await prisma.cbtDistribution.findMany({
       where: {
-        onlineExamId: exam.id,
-        studentId: req.studentId
-      }
+        classId,
+        branchId: req.branchId,
+        isPublished: true,
+        ...(req.sectionId ? { OR: [{ sectionId: req.sectionId }, { sectionId: null }] } : {})
+      },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        group: { select: { id: true, title: true, questionIds: true } }
+      },
+      orderBy: { createdAt: 'desc' }
     })
 
-    if (existing) {
-      // If they have already completed/submitted, deny starting again
-      if (existing.submittedAt !== null || existing.totalMark !== null) {
-        return res.status(400).json({ success: false, message: 'You have already attempted and submitted this exam. It cannot be reattempted.' })
-      }
-
-      // If they started but haven't submitted yet, check if time limit has passed
-      if (exam.duration && exam.duration > 0 && existing.startedAt) {
-        const elapsedMinutes = (Date.now() - new Date(existing.startedAt).getTime()) / 60000
-        if (elapsedMinutes > exam.duration + 1) { // 1 minute grace period
-          // Auto-submit as 0/expired
-          await prisma.onlineExamSubmission.update({
-            where: { id: existing.id },
-            data: {
-              totalMark: 0,
-              submittedAt: new Date()
-            }
-          })
-          return res.status(400).json({ success: false, message: 'Time limit for this exam has expired. It cannot be reattempted.' })
-        }
-      }
-
-      // Within duration, allow them to resume/continue
-      return res.json({
-        success: true,
-        message: 'Resuming online exam attempt.',
-        startedAt: existing.startedAt,
-        duration: exam.duration
-      })
-    }
-
-    // No existing attempt, create a new one
-    const submission = await prisma.onlineExamSubmission.create({
-      data: {
-        onlineExamId: exam.id,
+    // Find student's existing submissions
+    const allExamIds = [...onlineExams.map(e => e.id), ...distributions.map(d => d.id)]
+    const submissions = await prisma.onlineExamSubmission.findMany({
+      where: {
         studentId: req.studentId,
-        totalMark: null,
-        startedAt: new Date()
+        onlineExamId: { in: allExamIds }
       }
     })
+    const subMap = {}
+    submissions.forEach(s => {
+      subMap[s.onlineExamId] = s
+    })
 
-    res.json({
+    const formattedList = [
+      ...distributions.map(dist => {
+        const sub = subMap[dist.id]
+        const qCount = Array.isArray(dist.group?.questionIds) ? dist.group.questionIds.length : 10
+        return {
+          id: dist.id,
+          sourceType: 'distribution',
+          title: dist.title,
+          subjectName: dist.subject?.name || 'General Subject',
+          subjectCode: dist.subject?.subjectCode || 'CBT',
+          duration: dist.duration || 30,
+          passingMark: dist.passingMark || 50,
+          showResults: dist.showResults,
+          questionCount: qCount,
+          instructions: dist.instructions || 'Answer all questions within the allocated time limit.',
+          isSubmitted: Boolean(sub && sub.submittedAt),
+          totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
+          startedAt: sub?.startedAt || null,
+          submittedAt: sub?.submittedAt || null
+        }
+      }),
+      ...onlineExams.map(ex => {
+        const sub = subMap[ex.id]
+        const questions = Array.isArray(ex.questions) ? ex.questions : []
+        return {
+          id: ex.id,
+          sourceType: 'online_exam',
+          title: ex.title,
+          subjectName: ex.subject?.name || 'General Subject',
+          subjectCode: ex.subject?.subjectCode || 'CBT',
+          duration: ex.duration || 30,
+          passingMark: ex.passingMark || 50,
+          showResults: true,
+          questionCount: questions.length,
+          instructions: 'Standard CBT online examination.',
+          isSubmitted: Boolean(sub && sub.submittedAt),
+          totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
+          startedAt: sub?.startedAt || null,
+          submittedAt: sub?.submittedAt || null
+        }
+      })
+    ]
+
+    return res.json({
       success: true,
-      message: 'Online exam started successfully.',
-      startedAt: submission.startedAt,
-      duration: exam.duration
+      exams: formattedList
     })
   } catch (error) {
-    console.error('[STUDENT] Start online exam error:', error)
-    res.status(500).json({ success: false, message: 'Failed to start online exam.' })
+    console.error('[STUDENT] Active CBT exams error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to load active CBT exams.' })
   }
 })
 
-// Submit Online Exam
-router.post('/online-exams/:id/submit', async (req, res) => {
+// GET /api/student/cbt/exams/:id/take
+// Initializes examination attempt and returns sanitized questions (without leaking correct answers)
+router.get('/cbt/exams/:id/take', async (req, res) => {
   const { id } = req.params
-  const { answers } = req.body // Array of { questionId, answerText, fileUrl, audioUrl }
-  if (!answers || !Array.isArray(answers)) {
-    return res.status(400).json({ success: false, message: 'Answers array is required.' })
-  }
+  const examId = Number(id)
+
   try {
-    const exam = await prisma.onlineExam.findUnique({
-      where: { id: Number(id) }
+    let examTitle = 'CBT Examination'
+    let duration = 30
+    let passingMark = 50
+    let instructions = ''
+    let shuffleQuestions = true
+    let showResults = true
+    let rawQuestions = []
+    let targetOnlineExamId = examId
+
+    // Check CbtDistribution first
+    const dist = await prisma.cbtDistribution.findUnique({
+      where: { id: examId },
+      include: {
+        subject: { select: { name: true } },
+        group: true
+      }
     })
-    if (!exam) {
-      return res.status(404).json({ success: false, message: 'Online exam not found.' })
+
+    if (dist) {
+      examTitle = dist.title
+      duration = dist.duration || 30
+      passingMark = dist.passingMark || 50
+      instructions = dist.instructions || ''
+      shuffleQuestions = dist.shuffleQuestions
+      showResults = dist.showResults
+
+      if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
+        rawQuestions = await prisma.questionBank.findMany({
+          where: { id: { in: dist.group.questionIds.map(Number) } }
+        })
+      } else {
+        rawQuestions = await prisma.questionBank.findMany({
+          where: { branchId: req.branchId, subjectId: dist.subjectId },
+          take: 20
+        })
+      }
+
+      // Ensure matching onlineExam exists for foreign key
+      let onlineEx = await prisma.onlineExam.findFirst({
+        where: {
+          title: dist.title,
+          classId: dist.classId,
+          subjectId: dist.subjectId,
+          branchId: req.branchId
+        }
+      })
+      if (!onlineEx) {
+        onlineEx = await prisma.onlineExam.create({
+          data: {
+            title: dist.title,
+            classId: dist.classId,
+            subjectId: dist.subjectId,
+            duration: dist.duration,
+            passingMark: dist.passingMark,
+            questions: rawQuestions,
+            branchId: req.branchId,
+            sessionId: req.sessionId || 5,
+            examDate: dist.startDate || new Date()
+          }
+        })
+      }
+      targetOnlineExamId = onlineEx.id
+    } else {
+      const onlineExam = await prisma.onlineExam.findUnique({
+        where: { id: examId },
+        include: { subject: { select: { name: true } } }
+      })
+
+      if (!onlineExam) {
+        return res.status(404).json({ success: false, message: 'CBT examination not found.' })
+      }
+
+      examTitle = onlineExam.title
+      duration = onlineExam.duration || 30
+      passingMark = onlineExam.passingMark || 50
+      rawQuestions = Array.isArray(onlineExam.questions) ? onlineExam.questions : []
+      targetOnlineExamId = onlineExam.id
     }
 
-    // Find the student's active attempt
+    // Check for existing attempt
+    let submission = await prisma.onlineExamSubmission.findFirst({
+      where: { onlineExamId: targetOnlineExamId, studentId: req.studentId }
+    })
+
+    if (submission && (submission.submittedAt || submission.totalMark !== null)) {
+      return res.status(400).json({
+        success: false,
+        message: 'You have already completed and submitted this examination.'
+      })
+    }
+
+    if (!submission) {
+      submission = await prisma.onlineExamSubmission.create({
+        data: {
+          onlineExamId: targetOnlineExamId,
+          studentId: req.studentId,
+          startedAt: new Date(),
+          totalMark: null
+        }
+      })
+    }
+
+    // Shuffle questions if enabled
+    let orderedQuestions = [...rawQuestions]
+    if (shuffleQuestions) {
+      for (let i = orderedQuestions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [orderedQuestions[i], orderedQuestions[j]] = [orderedQuestions[j], orderedQuestions[i]]
+      }
+    }
+
+    // Sanitize questions: strip correctOption / correctAnswer so client cannot inspect answers!
+    const sanitizedQuestions = orderedQuestions.map((q, idx) => ({
+      id: q.id !== undefined ? q.id : idx,
+      questionText: q.questionText || q.question || `Question ${idx + 1}`,
+      questionType: q.questionType || q.type || 'mcq',
+      options: Array.isArray(q.options) ? q.options : ['A', 'B', 'C', 'D'],
+      marks: Number(q.marks || q.points || 1.0)
+    }))
+
+    return res.json({
+      success: true,
+      exam: {
+        id: examId,
+        onlineExamId: targetOnlineExamId,
+        title: examTitle,
+        duration,
+        passingMark,
+        instructions,
+        showResults,
+        startedAt: submission.startedAt,
+        questions: sanitizedQuestions
+      }
+    })
+  } catch (error) {
+    console.error('[STUDENT] Take CBT exam error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to launch CBT examination.' })
+  }
+})
+
+// POST /api/student/cbt/exams/:id/submit
+// Auto-grades submission, persists score, and returns performance summary
+router.post('/cbt/exams/:id/submit', async (req, res) => {
+  const { id } = req.params
+  const examId = Number(id)
+  const { answers = [] } = req.body
+
+  try {
+    // 1. Resolve questions and answers from database
+    let rawQuestions = []
+    let passingMark = 50
+    let showResults = true
+    let targetOnlineExamId = examId
+
+    const dist = await prisma.cbtDistribution.findUnique({
+      where: { id: examId },
+      include: { group: true }
+    })
+
+    if (dist) {
+      passingMark = dist.passingMark || 50
+      showResults = dist.showResults
+      if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
+        rawQuestions = await prisma.questionBank.findMany({
+          where: { id: { in: dist.group.questionIds.map(Number) } }
+        })
+      } else {
+        rawQuestions = await prisma.questionBank.findMany({
+          where: { branchId: req.branchId, subjectId: dist.subjectId },
+          take: 20
+        })
+      }
+
+      const onlineEx = await prisma.onlineExam.findFirst({
+        where: {
+          title: dist.title,
+          classId: dist.classId,
+          subjectId: dist.subjectId,
+          branchId: req.branchId
+        }
+      })
+      if (onlineEx) {
+        targetOnlineExamId = onlineEx.id
+      }
+    } else {
+      const onlineExam = await prisma.onlineExam.findUnique({
+        where: { id: examId }
+      })
+      if (!onlineExam) {
+        return res.status(404).json({ success: false, message: 'CBT examination not found.' })
+      }
+      passingMark = onlineExam.passingMark || 50
+      rawQuestions = Array.isArray(onlineExam.questions) ? onlineExam.questions : []
+      targetOnlineExamId = onlineExam.id
+    }
+
+    // 2. Resolve active submission
     const existing = await prisma.onlineExamSubmission.findFirst({
       where: {
-        onlineExamId: exam.id,
-        studentId: req.studentId
+        studentId: req.studentId,
+        OR: [
+          { onlineExamId: targetOnlineExamId },
+          { onlineExamId: examId }
+        ]
       }
     })
 
     if (!existing) {
-      return res.status(400).json({ success: false, message: 'No active attempt found. You must start the exam first.' })
+      return res.status(400).json({ success: false, message: 'No active attempt found for this examination.' })
     }
 
-    if (existing.submittedAt !== null || existing.totalMark !== null) {
+    if (existing.submittedAt !== null && existing.totalMark !== null) {
       return res.status(400).json({ success: false, message: 'You have already submitted this exam.' })
     }
 
-    // Verify time limit if exam is timed
-    if (exam.duration && exam.duration > 0 && existing.startedAt) {
-      const elapsedMinutes = (Date.now() - new Date(existing.startedAt).getTime()) / 60000
-      if (elapsedMinutes > exam.duration + 1) { // 1 minute buffer
-        // Mark as submitted with 0 score (time-bound restriction)
-        await prisma.onlineExamSubmission.update({
-          where: { id: existing.id },
-          data: {
-            totalMark: 0,
-            submittedAt: new Date()
-          }
-        })
-        return res.status(400).json({ success: false, message: 'Time limit exceeded. Your attempt could not be submitted and is marked as invalid.' })
-      }
-    }
+    // 3. Auto-grade submission using autoGradeCbtSubmission
+    const grading = autoGradeCbtSubmission({
+      questions: rawQuestions,
+      studentAnswers: answers,
+      passingPercentage: passingMark
+    })
 
-    // Hybrid auto-grading logic
-    const questions = (exam.questions || [])
-    let totalScore = 0
-
-    for (const q of questions) {
-      const studentAns = answers.find(a => a.questionId === q.id)
-      if (q.type === 'MCQ' || q.type === 'TF') {
-        if (studentAns && String(studentAns.answerText).trim().toLowerCase() === String(q.correctAnswer).trim().toLowerCase()) {
-          totalScore += Number(q.points || 1)
-        }
-      }
-    }
-
-    const submission = await prisma.onlineExamSubmission.update({
+    // 4. Update submission in database
+    const updated = await prisma.onlineExamSubmission.update({
       where: { id: existing.id },
       data: {
         answers,
-        totalMark: totalScore,
+        totalMark: grading.percentage,
         submittedAt: new Date()
       }
     })
 
-    // Trigger gamification online exam check
-    gamificationService.checkOnlineExamPerformance(prisma, req.studentId, submission.id, req.branchId)
-      .catch(err => console.error('[Gamification] Error in exam performance check:', err.message))
+    // 5. Trigger gamification check
+    gamificationService.checkOnlineExamPerformance(prisma, req.studentId, updated.id, req.branchId)
+      .catch(err => console.error('[Gamification] Error in CBT performance reward:', err.message))
 
-    res.json({ success: true, submission, message: 'Online exam submitted successfully.' })
+    return res.json({
+      success: true,
+      message: 'CBT examination submitted and auto-graded successfully!',
+      result: {
+        totalScore: grading.totalScore,
+        totalPossible: grading.totalPossible,
+        percentage: grading.percentage,
+        grade: grading.grade,
+        isPassed: grading.isPassed,
+        correctCount: grading.correctCount,
+        wrongCount: grading.wrongCount,
+        unansweredCount: grading.unansweredCount,
+        showResults,
+        breakdown: showResults ? grading.breakdown : []
+      }
+    })
   } catch (error) {
-    console.error('[STUDENT] Online exam submission error:', error)
-    res.status(500).json({ success: false, message: 'Failed to submit online exam.' })
+    console.error('[STUDENT] CBT Exam submission error:', error)
+    return res.status(500).json({ success: false, message: error.message || 'Failed to submit CBT exam.' })
   }
+})
+
+// Legacy endpoints for backwards compatibility
+router.post('/online-exams/:id/start', async (req, res) => {
+  req.url = `/cbt/exams/${req.params.id}/take`
+  return router.handle(req, res)
+})
+
+router.post('/online-exams/:id/submit', async (req, res) => {
+  req.url = `/cbt/exams/${req.params.id}/submit`
+  return router.handle(req, res)
 })
 
 // =============================================================================
@@ -2115,7 +2337,7 @@ router.get('/timetable', assertStudent, async (req, res) => {
         where: { classId: req.classId, sectionId: req.sectionId, branchId: req.branchId },
         include: {
           subject: { select: { name: true, subjectCode: true } },
-          hall: { select: { hallName: true } },
+          hall: { select: { name: true } },
           invigilator: { select: { name: true } }
         },
         orderBy: { examDate: 'asc' }
@@ -2143,7 +2365,7 @@ router.get('/timetable', assertStudent, async (req, res) => {
         instructions: es.instructions,
         subjectName: es.subject?.name || 'Subject',
         subjectCode: es.subject?.subjectCode || 'SUB',
-        hallName: es.hall?.hallName || 'Examination Hall',
+        hallName: es.hall?.name || 'Examination Hall',
         invigilatorName: es.invigilator?.name || 'Invigilator'
       }))
     })

@@ -9,6 +9,9 @@ const {
   hasClassAccess: originalHasClassAccess
 } = require('../lib/teacherAccess')
 const { staffMatchesBranch } = require('../lib/branchStats')
+const { generatePedagogicalLessonPlan } = require('../lib/lessonPlanService')
+const { generateStudentAiCommentary, generateBatchClassCommentary } = require('../lib/commentaryService')
+const { generateLessonPlanPdf } = require('../lib/pdfService')
 
 // Wrapper bypasses verification if request has been marked as admin-authorized (req.isAdmin)
 async function isSubjectTeacher(prisma, teacherId, classId, sectionId, subjectId, req) {
@@ -55,7 +58,7 @@ async function resolveBranchForAdmin(decoded) {
   return null
 }
 
-const { generateReportCardPdf, generateMontessoriReportCardPdf } = require('../lib/pdfService')
+const { generateReportCardPdf, generateMontessoriReportCardPdf, generateBatchClassReportCardsPdf } = require('../lib/pdfService')
 const { OpenAI } = require('openai')
 const multer = require('multer')
 const { uploadBase64Image } = require('../lib/cloudinary')
@@ -946,6 +949,16 @@ router.post('/attendance', async (req, res) => {
       }
     })
 
+    // Log teacher audit activity
+    await prisma.teacherActivity.create({
+      data: {
+        branchId: req.branchId,
+        teacherId: req.teacherId,
+        activity: 'You marked class roll call attendance',
+        type: 'ATTENDANCE'
+      }
+    }).catch(() => null)
+
     // Trigger gamification check asynchronously
     gamificationService.checkAttendanceTimeliness(prisma, req.teacherId, classId, sectionId, targetDate, req.branchId)
       .catch(err => console.error('[Gamification] Error in attendance trigger:', err.message))
@@ -1213,52 +1226,213 @@ router.post('/commentary/generate-ai', async (req, res) => {
       return `Session ${sessId}: ${Math.round(avg * 10) / 10}%`
     }).join(', ')
 
-    // 6. Call Deepseek AI
-    if (!process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY === 'your_deepseek_api_key_here') {
-      return res.status(400).json({
-        success: false,
-        message: 'Deepseek API Key is not configured. Please contact the administrator.'
-      })
-    }
+    // 6. Generate AI Qualitative Commentary
+    const scoresList = Object.values(mergedGrades)
+    const averageScore = scoresList.length > 0 ? Math.round(scoresList.reduce((a, b) => a + b, 0) / scoresList.length) : 75
 
-    const systemPrompt = `You are an expert child development assessor. Create a personalized, constructive report card narrative (max 100 words) for a student.`
-    const userPrompt = `
-      Write a single paragraph report card remark for student: ${student.firstName} ${student.lastName}.
-      
-      Performance Context:
-      - Subject Grades: ${JSON.stringify(mergedGrades)}
-      - Attendance: Attended ${presentDays} of ${totalDays} classes (${attendanceRate}% attendance)
-      - Historical Performance (Past Averages): ${historicalAverages || 'No past terms recorded'}
-      - Qualitative Behavioral Attributes Selected by Teacher: ${behavioralTags.join(', ') || 'General behavior'}
-      
-      Instructions:
-      1. Mention specific academic strengths (grades >= 70%) and subjects requiring improvement (grades < 50% or the lowest scoring subjects).
-      2. Constructively comment on attendance if it is below 85%.
-      3. Integrate the qualitative behavioral attributes smoothly.
-      4. Suggest a clear growth action.
-      5. The output MUST be a clean JSON object in this format:
-      {"commentary": "Your generated commentary goes here."}
-    `
-
-    const response = await openai.chat.completions.create({
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ],
-      temperature: 0.15,
-      response_format: { type: 'json_object' }
+    const commentaryDraft = await generateStudentAiCommentary({
+      studentName: `${student.firstName} ${student.lastName}`,
+      averageScore,
+      attendanceRate,
+      marksBySubject: mergedGrades,
+      historicalAverages,
+      behavioralTags,
+      tone: 'constructive'
     })
 
-    const result = JSON.parse(response.choices[0].message.content)
     res.json({
       success: true,
-      draft: result.commentary
+      draft: commentaryDraft
     })
-
   } catch (error) {
     console.error('[TEACHER] AI Commentary Generation Error:', error)
     res.status(500).json({ success: false, message: 'AI failed to generate narrative commentary.' })
+  }
+})
+
+/**
+ * POST /api/teacher/commentary/batch-generate-ai
+ * Generates personalized qualitative commentary for an entire classroom roster.
+ */
+router.post('/commentary/batch-generate-ai', async (req, res) => {
+  const { classId, sectionId, tone = 'constructive', behavioralTags = [] } = req.body
+  if (!classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' })
+  }
+
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
+  if (!isForm) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Only the Form Teacher can generate class report commentary.'
+    })
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    // Fetch enrolled students
+    const enrollments = await prisma.enroll.findMany({
+      where: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            gender: true
+          }
+        }
+      }
+    })
+
+    const studentsData = []
+
+    for (const enr of enrollments) {
+      const st = enr.student
+      if (!st) continue
+
+      // Fetch marks
+      const marks = await prisma.mark.findMany({
+        where: { studentId: st.id, sessionId },
+        include: { subject: { select: { name: true } } }
+      })
+
+      const marksBySubject = {}
+      for (const m of marks) {
+        if (!m.mark || m.absent === '1') continue
+        const score = parseFloat(m.mark)
+        if (!isNaN(score)) {
+          marksBySubject[m.subject.name] = score
+        }
+      }
+
+      const scoresList = Object.values(marksBySubject)
+      const avg = scoresList.length > 0 ? Math.round(scoresList.reduce((a, b) => a + b, 0) / scoresList.length) : 70
+
+      // Fetch attendance
+      const att = await prisma.attendance.findMany({
+        where: { studentId: st.id, sessionId }
+      })
+      const totalDays = att.length
+      const presentDays = att.filter(a => String(a.status || '').toLowerCase() === 'present' || String(a.status || '').toLowerCase() === 'late').length
+      const attendanceRate = totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 100
+
+      // Fetch existing commentary
+      const existingComm = await prisma.studentCommentary.findUnique({
+        where: {
+          studentId_sessionId: {
+            studentId: st.id,
+            sessionId
+          }
+        }
+      })
+
+      studentsData.push({
+        studentId: st.id,
+        studentName: `${st.firstName} ${st.lastName}`,
+        registerNo: st.registerNo || '',
+        averageScore: avg,
+        attendanceRate,
+        marksBySubject,
+        behavioralTags,
+        existingRemark: existingComm?.remark || null
+      })
+    }
+
+    const batchGenerated = await generateBatchClassCommentary(studentsData, tone)
+
+    res.json({
+      success: true,
+      count: batchGenerated.length,
+      commentaries: batchGenerated
+    })
+  } catch (err) {
+    console.error('[TEACHER] Batch commentary generate error:', err)
+    res.status(500).json({ success: false, message: 'Failed to batch generate commentary.' })
+  }
+})
+
+/**
+ * POST /api/teacher/commentary/batch-save
+ * Batch saves approved student remarks to student_commentary table.
+ */
+router.post('/commentary/batch-save', async (req, res) => {
+  const { classId, sectionId, commentaries = [] } = req.body
+  if (!classId || !sectionId || !Array.isArray(commentaries)) {
+    return res.status(400).json({ success: false, message: 'classId, sectionId, and commentaries array required.' })
+  }
+
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
+  if (!isForm) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Only the Form Teacher can save card remarks.'
+    })
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    let savedCount = 0
+
+    for (const item of commentaries) {
+      if (!item.studentId || !item.remark) continue
+
+      const existing = await prisma.studentCommentary.findUnique({
+        where: {
+          studentId_sessionId: {
+            studentId: Number(item.studentId),
+            sessionId
+          }
+        }
+      })
+
+      if (existing) {
+        await prisma.studentCommentary.update({
+          where: { id: existing.id },
+          data: {
+            remark: item.remark,
+            originalAiRemark: item.originalAiRemark || null,
+            isAiGenerated: !!item.isAiGenerated,
+            isEditedByHuman: !!item.isEditedByHuman,
+            status: item.status || 'TEACHER_APPROVED'
+          }
+        })
+      } else {
+        await prisma.studentCommentary.create({
+          data: {
+            studentId: Number(item.studentId),
+            classId: Number(classId),
+            sectionId: Number(sectionId),
+            remark: item.remark,
+            originalAiRemark: item.originalAiRemark || null,
+            isAiGenerated: !!item.isAiGenerated,
+            isEditedByHuman: !!item.isEditedByHuman,
+            status: item.status || 'TEACHER_APPROVED',
+            sessionId,
+            branchId: req.branchId || 1
+          }
+        })
+      }
+      savedCount++
+    }
+
+    res.json({
+      success: true,
+      message: `Successfully saved ${savedCount} student report remarks.`,
+      savedCount
+    })
+  } catch (err) {
+    console.error('[TEACHER] Batch commentary save error:', err)
+    res.status(500).json({ success: false, message: 'Failed to batch save commentaries.' })
   }
 })
 
@@ -1940,6 +2114,183 @@ router.get('/report-cards/export-pdf', async (req, res) => {
 })
 
 /**
+ * GET /api/teacher/report-cards/export-batch-pdf
+ * Generates an A4 multi-page Batch PDF for all students in a classroom (Form Teacher only).
+ */
+router.get('/report-cards/export-batch-pdf', async (req, res) => {
+  const { classId, sectionId, rankingType = 'full', rankingLimit = 3 } = req.query
+  if (!classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' })
+  }
+
+  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req)
+  if (!isForm) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Only the Form Teacher can export batch report cards for this class.'
+    })
+  }
+
+  try {
+    const limit = parseInt(rankingLimit, 10) || 3
+    const parsedClassId = Number(classId)
+    const parsedSectionId = Number(sectionId)
+
+    const globalSetting = await prisma.globalSettings.findFirst()
+    const sessionId = globalSetting?.sessionId || 5
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: req.branchId },
+      select: { name: true, code: true }
+    })
+
+    const cls = await prisma.class.findUnique({ where: { id: parsedClassId }, select: { name: true, isEcd: true } })
+    const sec = await prisma.section.findUnique({ where: { id: parsedSectionId }, select: { name: true } })
+    const sess = await prisma.schoolYear.findUnique({ where: { id: sessionId }, select: { schoolYear: true } })
+
+    const className = cls?.name || 'Classroom'
+    const sectionName = sec?.name || 'Main'
+    const sessionName = sess?.schoolYear || 'Active Session'
+
+    let formTeacherName = 'Form Teacher'
+    const formAllocation = await prisma.teacherAllocation.findFirst({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: req.branchId },
+      include: { teacher: { select: { name: true } } }
+    })
+    if (formAllocation?.teacher) formTeacherName = formAllocation.teacher.name
+
+    const enrolls = await prisma.enroll.findMany({
+      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId: req.branchId },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } }
+      },
+      orderBy: { student: { lastName: 'asc' } }
+    })
+
+    const studentIds = enrolls.map(e => e.studentId)
+    if (studentIds.length === 0) {
+      return res.status(404).json({ success: false, message: 'No enrolled students found.' })
+    }
+
+    const allMarks = await prisma.mark.findMany({
+      where: { studentId: { in: studentIds }, sessionId, branchId: req.branchId },
+      include: {
+        subject: { select: { name: true, subjectCode: true } },
+        exam: { select: { name: true, resumptionDate: true } }
+      }
+    })
+
+    const avgMap = {}
+    allMarks.forEach(m => {
+      const k = `${m.examId}-${m.subjectId}`
+      if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 }
+      const tot = (parseFloat(m.cbtMark || '0')) + (parseFloat(m.mark || '0'))
+      avgMap[k].sum += tot
+      avgMap[k].count += 1
+    })
+
+    const studentAggregates = {}
+    const studentMarksMap = {}
+    studentIds.forEach(id => {
+      studentAggregates[id] = { sum: 0, count: 0 }
+      studentMarksMap[id] = []
+    })
+
+    allMarks.forEach(m => {
+      const testScore = m.cbtMark ? parseFloat(m.cbtMark) : 0
+      const examScore = m.mark ? parseFloat(m.mark) : 0
+      const totalScore = testScore + examScore
+
+      if (studentMarksMap[m.studentId]) {
+        const k = `${m.examId}-${m.subjectId}`
+        const cAvg = avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : totalScore
+
+        studentMarksMap[m.studentId].push({
+          id: m.id,
+          examName: m.exam?.name || 'Evaluation',
+          subjectName: m.subject?.name || 'Subject',
+          subjectCode: m.subject?.subjectCode || 'N/A',
+          cbtMark: String(testScore),
+          theoryMark: String(examScore),
+          mark: String(totalScore),
+          absent: m.absent === '1' || m.absent === 'true',
+          classAverage: cAvg
+        })
+
+        studentAggregates[m.studentId].sum += totalScore
+        studentAggregates[m.studentId].count += 1
+      }
+    })
+
+    const rankList = studentIds.map(id => ({
+      id,
+      avg: studentAggregates[id].count > 0 ? (studentAggregates[id].sum / studentAggregates[id].count) : 0
+    })).sort((a, b) => b.avg - a.avg)
+
+    const rankMap = {}
+    rankList.forEach((item, idx) => { rankMap[item.id] = idx + 1 })
+
+    const commentaries = await prisma.studentCommentary.findMany({
+      where: { studentId: { in: studentIds }, sessionId, branchId: req.branchId }
+    })
+    const commMap = {}
+    commentaries.forEach(c => { commMap[c.studentId] = c })
+
+    const montessoriList = await prisma.montessoriAssessment.findMany({
+      where: { studentId: { in: studentIds }, sessionId, branchId: req.branchId },
+      include: { exam: { select: { name: true, resumptionDate: true } } }
+    })
+    const montMap = {}
+    montessoriList.forEach(m => { montMap[m.studentId] = m })
+
+    const batchStudents = enrolls.map(e => {
+      const st = e.student
+      const agg = studentAggregates[st.id] || { sum: 0, count: 0 }
+      const avg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0
+      const rk = rankMap[st.id] || null
+      const comm = commMap[st.id]
+      const mont = montMap[st.id]
+
+      return {
+        studentName: `${st.lastName}, ${st.firstName}`,
+        registerNo: st.registerNo || 'N/A',
+        isEcd: cls?.isEcd || false,
+        reportCard: studentMarksMap[st.id] || [],
+        overallAverage: avg,
+        commentary: comm?.remark || '',
+        rank: rk,
+        totalClassStudents: studentIds.length,
+        rankingType,
+        rankingLimit: limit,
+        resumptionDate: allMarks[0]?.exam?.resumptionDate || null,
+        formTeacherName,
+        examName: mont?.exam?.name || 'Term Evaluation',
+        assessment: mont || {}
+      }
+    })
+
+    const pdfBuffer = await generateBatchClassReportCardsPdf({
+      schoolName: branch?.name || 'Ugbekun Schools',
+      branchCode: branch?.code || 'GEN',
+      className,
+      sectionName,
+      sessionName,
+      students: batchStudents
+    })
+
+    const safeClassName = className.replace(/\s+/g, '_')
+    const safeSectionName = sectionName.replace(/\s+/g, '_')
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="batch_report_cards_${safeClassName}_${safeSectionName}.pdf"`)
+    return res.send(pdfBuffer)
+  } catch (error) {
+    console.error('[TEACHER] Batch export PDF error:', error)
+    return res.status(500).json({ success: false, message: 'Failed to generate batch report cards PDF.' })
+  }
+})
+
+/**
  * GET /api/teacher/montessori/sheet
  * Consolidates early childhood students and their Montessori & Narrative assessments.
  */
@@ -2209,6 +2560,17 @@ router.post('/homeworks', async (req, res) => {
         sessionId
       }
     })
+
+    // Log teacher audit activity
+    await prisma.teacherActivity.create({
+      data: {
+        branchId: req.branchId,
+        teacherId: req.teacherId,
+        activity: `You assigned a new homework: ${title}`,
+        type: 'HOMEWORK'
+      }
+    }).catch(() => null)
+
     res.json({ success: true, homework, message: 'Homework published successfully.' })
   } catch (error) {
     console.error('[TEACHER] Create homework error:', error)
@@ -3072,62 +3434,25 @@ router.post('/lesson-plan/generate', assertTeacher, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Class or Subject not found.' })
     }
 
-    let result
-    if (!process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY === 'your_deepseek_api_key_here' || process.env.DEEPSEEK_API_KEY === 'dummy-key') {
-      console.log('[TEACHER] Deepseek API key not set, using mock generation fallback')
-      result = {
-        objectives: `1. Understand the core concepts of ${coreTopic} in the context of ${subjectObj.name} for ${classObj.name}.\n2. Solve foundational practice problems step-by-step.`,
-        materials: `1. Textbook: Modern ${subjectObj.name} (Chapter 4).\n2. Handouts, whiteboards, and markers.`,
-        teachingGuide: `0-15m: Direct instruction introducing ${coreTopic}.\n15-30m: Guided group exercises.\n30-45m: Independent student practice.`,
-        assessments: `Students will be evaluated based on class participation (30%), interactive notebook work (30%), and the short end-of-lesson quiz (40%).`,
-        assignments: `Complete Page 54, exercises 1 through 10 from the textbook.`
-      }
-    } else {
-      try {
-        const systemPrompt = "You are an expert curriculum designer. Return a detailed, professional lesson plan in JSON format."
-        const userPrompt = `
-          Create a detailed lesson plan template for:
-          - Class Level: ${classObj.name}
-          - Subject: ${subjectObj.name}
-          - Core Topic: ${coreTopic}
-
-          The output MUST be a JSON object with these EXACT keys:
-          {
-            "objectives": "Measurable lesson objectives.",
-            "materials": "Required classroom tools/materials.",
-            "teachingGuide": "Step-by-step timeline of classroom activities.",
-            "assessments": "Rubrics/criteria for student evaluation.",
-            "assignments": "Suggested homework tasks."
-          }
-          Do not include markdown headers or extra text. Return ONLY the JSON object.
-        `
-
-        const response = await openai.chat.completions.create({
-          model: 'deepseek-chat',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-          temperature: 0.3,
-          response_format: { type: 'json_object' }
-        })
-
-        result = JSON.parse(response.choices[0].message.content)
-      } catch (apiErr) {
-        console.warn('[TEACHER] OpenAI API failed, falling back to mock curriculum generation:', apiErr)
-        result = {
-          objectives: `1. Understand the core concepts of ${coreTopic} in the context of ${subjectObj.name} for ${classObj.name}.\n2. Solve foundational practice problems step-by-step.`,
-          materials: `1. Textbook: Modern ${subjectObj.name} (Chapter 4).\n2. Handouts, whiteboards, and markers.`,
-          teachingGuide: `0-15m: Direct instruction introducing ${coreTopic}.\n15-30m: Guided group exercises.\n30-45m: Independent student practice.`,
-          assessments: `Students will be evaluated based on class participation (30%), interactive notebook work (30%), and the short end-of-lesson quiz (40%).`,
-          assignments: `Complete Page 54, exercises 1 through 10 from the textbook.`
-        }
-      }
-    }
+    const result = await generatePedagogicalLessonPlan({
+      subjectName: subjectObj.name,
+      className: classObj.name,
+      topic: coreTopic,
+      subTopic: req.body.subTopic || '',
+      duration: req.body.duration || '45 Minutes',
+      weekNo: req.body.weekNo || 'Week 3'
+    })
 
     res.json({
       success: true,
-      draft: result
+      draft: {
+        objectives: result.educationalObjectives,
+        materials: result.materialLists,
+        teachingGuide: result.teachingGuide,
+        assessments: result.assessmentCriteria,
+        assignments: result.classAssignments,
+        coreTopic: result.coreTopic
+      }
     })
   } catch (error) {
     console.error('[TEACHER] AI Lesson Plan Generation Error:', error)
@@ -3224,22 +3549,50 @@ router.put('/lesson-plan/:id', assertTeacher, async (req, res) => {
   }
 })
 
-// DELETE /api/teacher/lesson-plan/:id
-router.delete('/lesson-plan/:id', assertTeacher, async (req, res) => {
+// GET /api/teacher/lesson-plan/:id/pdf
+router.get('/lesson-plan/:id/pdf', assertTeacher, async (req, res) => {
   try {
     const plan = await prisma.lessonPlan.findUnique({
-      where: { id: Number(req.params.id) }
+      where: { id: Number(req.params.id) },
+      include: {
+        teacher: { select: { name: true, branchId: true } },
+        class: { select: { name: true } },
+        subject: { select: { name: true } }
+      }
     })
+
     if (!plan || plan.teacherId !== req.teacherId) {
       return res.status(404).json({ success: false, message: 'Lesson plan not found or access denied.' })
     }
-    await prisma.lessonPlan.delete({
-      where: { id: plan.id }
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: req.branchId || plan.teacher.branchId || 1 },
+      select: { name: true, code: true }
     })
-    res.json({ success: true, message: 'Lesson plan deleted successfully.' })
+
+    const pdfBuffer = await generateLessonPlanPdf({
+      schoolName: branch?.name || 'Ugbekun Group of Schools',
+      branchCode: branch?.code || 'MAIN',
+      teacherName: plan.teacher.name || 'Subject Teacher',
+      subjectName: plan.subject.name,
+      className: plan.class.name,
+      coreTopic: plan.coreTopic,
+      educationalObjectives: plan.educationalObjectives,
+      materialLists: plan.materialLists,
+      teachingGuide: plan.teachingGuide,
+      assessmentCriteria: plan.assessmentCriteria,
+      classAssignments: plan.classAssignments,
+      status: plan.status,
+      createdAt: plan.createdAt
+    })
+
+    const sanitizedTopic = (plan.coreTopic || 'Lesson_Plan').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30)
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="Lesson_Plan_${sanitizedTopic}.pdf"`)
+    res.send(pdfBuffer)
   } catch (error) {
-    console.error('[TEACHER] Delete lesson plan error:', error)
-    res.status(500).json({ success: false, message: 'Failed to delete lesson plan.' })
+    console.error('[TEACHER] Lesson plan PDF export error:', error)
+    res.status(500).json({ success: false, message: 'Failed to export lesson plan PDF.' })
   }
 })
 

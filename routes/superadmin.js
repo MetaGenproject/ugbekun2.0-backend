@@ -15,6 +15,11 @@ const {
   DEFAULT_PLANS,
   addMonths,
 } = require('../lib/plans')
+const {
+  getMultiBranchRevenueAnalytics,
+  exportRevenueReportCsv,
+  exportRevenueReportPdf
+} = require('../lib/revenueAnalyticsService')
 
 const router = express.Router()
 
@@ -1080,6 +1085,97 @@ router.get('/analytics', async (req, res) => {
     return res.status(500).json({
       success: false,
       message: error?.message || 'Failed to aggregate analytics statistics.',
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/revenue-analytics
+ * Consolidated multi-branch SaaS & institutional school fees revenue analytics
+ */
+router.get('/revenue-analytics', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { sessionId, branchId, period } = req.query
+    const analytics = await getMultiBranchRevenueAnalytics(prisma, {
+      sessionId,
+      branchId,
+      period
+    })
+
+    return res.json({
+      success: true,
+      data: analytics
+    })
+  } catch (error) {
+    console.error('[SUPERADMIN] GET revenue analytics error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to aggregate multi-branch revenue analytics.'
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/revenue-analytics/export/csv
+ * CSV export of consolidated multi-branch financial matrices
+ */
+router.get('/revenue-analytics/export/csv', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { sessionId, branchId, period } = req.query
+    const analytics = await getMultiBranchRevenueAnalytics(prisma, {
+      sessionId,
+      branchId,
+      period
+    })
+
+    const csv = exportRevenueReportCsv(analytics)
+    const timestamp = new Date().toISOString().slice(0, 10)
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="ugbekun-revenue-audit-${timestamp}.csv"`)
+    return res.send(csv)
+  } catch (error) {
+    console.error('[SUPERADMIN] GET revenue analytics CSV export error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to export revenue analytics CSV.'
+    })
+  }
+})
+
+/**
+ * GET /api/superadmin/revenue-analytics/export/pdf
+ * Executive PDF report export of multi-branch revenue analytics
+ */
+router.get('/revenue-analytics/export/pdf', async (req, res) => {
+  const decoded = assertSuperadmin(req, res)
+  if (!decoded) return
+
+  try {
+    const { sessionId, branchId, period } = req.query
+    const analytics = await getMultiBranchRevenueAnalytics(prisma, {
+      sessionId,
+      branchId,
+      period
+    })
+
+    const pdfBuffer = await exportRevenueReportPdf(analytics)
+    const timestamp = new Date().toISOString().slice(0, 10)
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="ugbekun-revenue-audit-${timestamp}.pdf"`)
+    return res.send(pdfBuffer)
+  } catch (error) {
+    console.error('[SUPERADMIN] GET revenue analytics PDF export error:', error)
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to export revenue analytics PDF.'
     })
   }
 })
