@@ -2,10 +2,11 @@
   "name": "ugbekun2.0-backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node dist/index.js",
+    "build": "npx prisma generate && tsc",
+    "dev": "tsx watch index.ts",
     "import:legacy": "node scripts/import-legacy-data.js",
     "import:legacy:dry": "node scripts/import-legacy-data.js --dry-run",
     "repair:branch-admins": "node scripts/repair-branch-admin-legacy-userid.js",
@@ -13,7 +14,7 @@
     "cron:attendance": "node scripts/evaluateWeeklyAttendance.js",
     "cron:attrition": "node scripts/evaluateWeeklyAttrition.js",
     "test": "node tests/run_all_tests.js",
-    "test:unit": "node tests/1-unit/revenueAnalytics.unit.test.js && node tests/1-unit/myedurideBridge.unit.test.js && node tests/1-unit/studentService.unit.test.js",
+    "test:unit": "tsx tests/1-unit/revenueAnalytics.unit.test.js && tsx tests/1-unit/myedurideBridge.unit.test.js && tsx tests/1-unit/studentService.unit.test.js && tsx tests/1-unit/domainAndCms.unit.test.js",
     "test:integration": "node tests/2-integration/auth_rbac.integration.test.js && node tests/2-integration/multitenant_isolation.test.js && node tests/2-integration/endpoints_full.integration.test.js",
     "test:e2e": "node tests/3-e2e/e2e_ui_flows.test.js",
     "test:load": "node tests/4-performance/stress_scenarios.test.js"
@@ -43,7 +44,18 @@
     "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^26.2.0",
+    "@types/nodemailer": "^8.0.1",
+    "@types/pdfkit": "^0.17.6",
+    "@types/qrcode": "^1.5.6",
     "nodemon": "^3.1.14",
-    "prisma": "^7.8.0"
+    "prisma": "^7.8.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
   }
 }

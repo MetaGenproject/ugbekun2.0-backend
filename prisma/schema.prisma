@@ -37,8 +37,19 @@ model Branch {
   idCardPrimaryColor   String?   @default("#1b5e20") @map("id_card_primary_color")
   idCardSecondaryColor String?   @default("#2e7d32") @map("id_card_secondary_color")
   idCardLayoutType     String    @default("classic") @map("id_card_layout_type")
+  // Domain and white-label settings
+  subdomain                String?   @unique
+  customDomain             String?   @unique @map("custom_domain")
+  domainStatus             String    @default("PENDING_VERIFICATION") @map("domain_status")
+  domainVerificationToken  String?   @map("domain_verification_token")
+  domainDnsTarget          String?   @default("cname.ugbekun.edu.ng") @map("domain_dns_target")
+  sslStatus                String    @default("PENDING") @map("ssl_status")
+  domainVerifiedAt         DateTime? @map("domain_verified_at")
+
   createdAt            DateTime  @default(now())
   updatedAt            DateTime? @updatedAt
+
+  landingPage          SchoolLandingPage?
 
   // Relations — every entity scoped to this branch
   students               Student[]
@@ -2197,5 +2208,43 @@ model StudentReminder {
   @@index([studentId])
   @@map("student_reminders")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHOOL PUBLIC LANDING PAGE & FRONT-CMS MODULE
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SchoolLandingPage {
+  id                  Int       @id @default(autoincrement())
+  branchId            Int       @unique @map("branch_id")
+  isEnabled           Boolean   @default(true) @map("is_enabled")
+  heroHeadline        String    @default("Nurturing Future Leaders & Scholars") @map("hero_headline")
+  heroSubheadline     String?   @db.Text @map("hero_subheadline")
+  heroBanners         Json?     @map("hero_banners")
+  welcomeTitle        String?   @default("Welcome from the Principal") @map("welcome_title")
+  welcomeMessage      String?   @db.Text @map("welcome_message")
+  welcomeAuthor       String?   @default("Principal / Head of School") @map("welcome_author")
+  welcomePhoto        String?   @map("welcome_photo")
+  aboutText           String?   @db.Text @map("about_text")
+  photoGallery        Json?     @map("photo_gallery")
+  academicPrograms    Json?     @map("academic_programs")
+  announcements       Json?     @map("announcements")
+  primaryColor        String?   @default("#003da5") @map("primary_color")
+  secondaryColor      String?   @default("#009ca6") @map("secondary_color")
+  showAdmissionCta    Boolean   @default(true) @map("show_admission_cta")
+  showPortalLoginCta  Boolean   @default(true) @map("show_portal_login_cta")
+  showGallery         Boolean   @default(true) @map("show_gallery")
+  showAnnouncements   Boolean   @default(true) @map("show_announcements")
+  facebookUrl         String?   @map("facebook_url")
+  instagramUrl        String?   @map("instagram_url")
+  youtubeUrl          String?   @map("youtube_url")
+  twitterUrl          String?   @map("twitter_url")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime? @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@map("school_landing_pages")
+}
+
 
 
