@@ -62,16 +62,21 @@ function generateBranchCode(schoolName: string): string {
 
 async function saveLogoBase64(logoBase64?: string | null, logoFileName?: string | null): Promise<string | null> {
   if (!logoBase64) return null;
-  const match = String(logoBase64).match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
-  const mime = match ? match[1] : 'image/png';
-  const data = match ? match[2] : logoBase64;
+  try {
+    const match = String(logoBase64).match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+    const mime = match ? match[1] : 'image/png';
+    const data = match ? match[2] : logoBase64;
 
-  return await uploadBase64Image({
-    base64: data,
-    mime,
-    folder: 'ugbekun2/schools/logos',
-    tags: ['ugbekun2', 'school-logo'],
-  });
+    return await uploadBase64Image({
+      base64: data,
+      mime,
+      folder: 'ugbekun2/schools/logos',
+      tags: ['ugbekun2', 'school-logo'],
+    });
+  } catch (err: any) {
+    console.warn('[ONBOARDING] Logo upload warning (continuing registration):', err.message);
+    return null;
+  }
 }
 
 /**
@@ -137,13 +142,13 @@ router.post('/register', async (req: Request, res: Response) => {
 
     const body = req.body || {};
     const planSlug = resolvePlanSlug(body.planSlug || body.plan);
-    const schoolName = (body.schoolName || '').trim();
-    const schoolAddress = (body.schoolAddress || '').trim();
+    const schoolName = (body.schoolName || body.name || body.school_name || '').trim();
+    const schoolAddress = (body.schoolAddress || body.address || body.school_address || '').trim();
     const adminName = (body.adminName || body.directorName || 'School Administrator').trim();
     const gender = (body.gender || 'not_specified').trim();
-    const contactNumber = (body.contactNumber || '').trim();
-    const contactEmail = (body.contactEmail || '').trim();
-    const username = (body.username || '').trim().replace(/\s+/g, '');
+    const contactNumber = (body.contactNumber || body.phone || body.mobileNo || body.telephone || '').trim();
+    const contactEmail = (body.contactEmail || body.email || '').trim();
+    const username = (body.username || body.adminUsername || '').trim().replace(/\s+/g, '');
     const password = body.password || '';
     const confirmPassword = body.confirmPassword || body.retypePassword || '';
     const motto = (body.motto || '').trim();

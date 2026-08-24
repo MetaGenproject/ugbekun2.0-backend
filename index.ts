@@ -63,6 +63,15 @@ app.use(cors({
   optionsSuccessStatus: 200
 }));
 
+// Normalize Content-Type headers (handles comma-separated proxy duplicates like "application/json, application/json")
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const ct = req.headers['content-type'];
+  if (typeof ct === 'string' && ct.includes('application/json')) {
+    req.headers['content-type'] = 'application/json';
+  }
+  next();
+});
+
 // Allow larger JSON payloads for base64-encoded logos
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
