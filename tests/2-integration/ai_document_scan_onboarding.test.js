@@ -74,10 +74,17 @@ async function testAiDocumentScanOnboarding() {
   const adminToken = regData.token;
   const adminHeaders = { Authorization: `Bearer ${adminToken}` };
 
+  await fetch(`${BASE_URL}/admin/classes/seed-preset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify({ category: 'primary' }),
+  });
+
   const clsRes = await fetch(`${BASE_URL}/admin/classes-sections`, { headers: { Authorization: `Bearer ${adminToken}` } });
   const clsData = await clsRes.json();
-  const primaryClass = clsData.classes.find(c => c.name.includes('Primary 2')) || clsData.classes[0];
-  const sectionObj = primaryClass.sections[0]?.section || clsData.sections[0];
+  const primaryClass = clsData.classes?.find((c) => c.name.includes('Primary 2')) || clsData.classes?.[0];
+  const sectionObj = primaryClass?.sections?.[0]?.section || clsData.sections?.[0];
+
   console.log(`✓ School branch ready (Class: ${primaryClass.name}, Section: ${sectionObj.name})`);
 
   // 2. Generate and upload Mock Physical Registration Form 1 (PDF)

@@ -65,27 +65,34 @@ async function testSchoolRegistrationLifecycle() {
   assert.equal(statsData.data.branchId, branchId, 'Stats branchId must match');
   assert.equal(statsData.data.students, 0, 'Initial student count should be 0');
   assert.equal(statsData.data.teachers, 0, 'Initial teacher count should be 0');
-  assert.ok(statsData.data.classes >= 10, `Default classes must be pre-seeded (found ${statsData.data.classes})`);
-  assert.ok(statsData.data.subjects >= 10, `Default subjects must be pre-seeded (found ${statsData.data.subjects})`);
-  console.log(`✓ Dashboard Stats verified (Classes: ${statsData.data.classes}, Subjects: ${statsData.data.subjects})`);
+  assert.equal(statsData.data.classes, 0, 'Initial classes count should be 0 (Clean Provisioning)');
+  assert.equal(statsData.data.subjects, 0, 'Initial subjects count should be 0 (Clean Provisioning)');
+  console.log(`✓ Dashboard Stats verified clean state (Classes: ${statsData.data.classes}, Subjects: ${statsData.data.subjects})`);
 
-  // 3. Test GET /api/admin/classes-sections
-  console.log('\n3. Verifying pre-seeded academic structure (Classes & Sections)...');
-  const clsRes = await fetch(`${BASE_URL}/admin/classes-sections`, { headers: authHeaders });
-  assert.equal(clsRes.status, 200, `Classes-sections endpoint should return 200 OK (got ${clsRes.status})`);
-  const clsData = await clsRes.json();
-  assert.equal(clsData.success, true);
-  assert.ok(clsData.classes.length >= 10, 'Must have pre-seeded classes');
-  assert.ok(clsData.sections.length >= 1, 'Must have pre-seeded sections');
-  const classNames = clsData.classes.map((c) => c.name);
-  assert.ok(classNames.includes('Primary 1'), 'Must include Primary 1');
-  assert.ok(classNames.includes('JSS 1'), 'Must include JSS 1');
-  assert.ok(classNames.includes('SSS 1'), 'Must include SSS 1');
-  console.log(`✓ Pre-seeded academic structure verified: ${clsData.classes.length} classes, ${clsData.sections.length} sections`);
+  // 3. Test creating a Class and Section for the newly registered school
+  console.log('\n3. Creating clean academic structure via API (Class & Section)...');
+  const classCreateRes = await fetch(`${BASE_URL}/admin/classes`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ name: 'Primary 1', nameNumeric: '1' }),
+  });
+  assert.equal(classCreateRes.status, 201, 'Class creation should return 201 Created');
+  const classCreateData = await classCreateRes.json();
+  assert.equal(classCreateData.success, true);
+  const targetClass = classCreateData.class;
+
+  const sectionCreateRes = await fetch(`${BASE_URL}/admin/sections`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ name: 'Diamond', classId: targetClass.id }),
+  });
+  assert.equal(sectionCreateRes.status, 201, 'Section creation should return 201 Created');
+  const sectionCreateData = await sectionCreateRes.json();
+  const targetSection = sectionCreateData.section;
+  console.log(`✓ Academic structure created: Class "${targetClass.name}" (ID: ${targetClass.id}), Section "${targetSection?.name || 'Diamond'}"`);
 
   // 4. Test Teacher / Staff Onboarding for this new branch
   console.log('\n4. Testing Staff & Teacher Onboarding...');
-  const targetClass = clsData.classes[0];
   const teacherPayload = {
     name: 'Mr. Emmanuel Nwosu',
     email: `nwosu_${timestamp}@crownheights.edu.ng`,
@@ -117,7 +124,7 @@ async function testSchoolRegistrationLifecycle() {
     gender: 'Female',
     dob: '2015-05-14',
     classId: targetClass.id,
-    sectionId: clsData.sections[0].id,
+    sectionId: targetSection?.id || null,
     parentName: 'Chief Adebayo Adeleke',
     parentEmail: `parent_${timestamp}@gmail.com`,
     parentPhone: '+2348011223344',
@@ -130,8 +137,8 @@ async function testSchoolRegistrationLifecycle() {
     headers: authHeaders,
     body: JSON.stringify(studentPayload),
   });
-  assert.equal(studentRes.status, 201, `Student enrollment should return 201 Created (got ${studentRes.status})`);
   const studentData = await studentRes.json();
+  assert.equal(studentRes.status, 201, `Student enrollment should return 201 Created (got ${studentRes.status}: ${studentData.message})`);
   assert.equal(studentData.success, true);
   assert.ok(studentData.data.student.id, 'Student ID must be present');
   console.log(`✓ Student admission successful (Student ID: ${studentData.data.student.id}, RegNo: ${studentData.data.student.registerNo})`);

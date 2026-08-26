@@ -180,14 +180,33 @@ export async function listStaffForBranch(prisma: any, branchId: number) {
 
   if (!branch) return [];
 
-  const users = await prisma.user.findMany({
-    where: { role: { in: STAFF_ROLES } },
-    select: { id: true, username: true, role: true, photo: true, lastLogin: true, active: true },
-    orderBy: { username: 'asc' },
+  const [users, branchTeachers, branchPayrolls] = await Promise.all([
+    prisma.user.findMany({
+      where: { role: { in: STAFF_ROLES } },
+      select: { id: true, username: true, role: true, photo: true, lastLogin: true, active: true },
+      orderBy: { username: 'asc' },
+    }),
+    prisma.teacher.findMany({
+      where: { branchId },
+      select: { userId: true, id: true },
+    }),
+    prisma.payrollComponent.findMany({
+      where: { branchId },
+      select: { staffId: true },
+    }),
+  ]);
+
+  const branchUserIds = new Set<number>();
+  branchTeachers.forEach((t: any) => {
+    if (t.userId) branchUserIds.add(t.userId);
+    branchUserIds.add(t.id);
+  });
+  branchPayrolls.forEach((p: any) => {
+    if (p.staffId) branchUserIds.add(p.staffId);
   });
 
   return users
-    .filter((user: any) => staffMatchesBranch(user.username, branch))
+    .filter((user: any) => branchUserIds.has(user.id) || staffMatchesBranch(user.username, branch))
     .map((user: any) => ({
       id: user.id,
       username: user.username,

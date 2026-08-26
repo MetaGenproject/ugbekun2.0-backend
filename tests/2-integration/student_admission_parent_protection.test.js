@@ -29,6 +29,9 @@ async function testStudentAdmissionParentProtection() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(schoolPayload),
   });
+  if (regRes.status !== 201) {
+    console.error('Registration failed payload:', await regRes.text());
+  }
   assert.equal(regRes.status, 201, `School registration should succeed (got ${regRes.status})`);
   const regData = await regRes.json();
   assert.equal(regData.success, true);
@@ -39,11 +42,30 @@ async function testStudentAdmissionParentProtection() {
     Authorization: `Bearer ${adminToken}`,
   };
 
-  // Fetch pre-seeded class & section
+  // Fetch or create academic class & section
   const clsRes = await fetch(`${BASE_URL}/admin/classes-sections`, { headers: adminHeaders });
   const clsData = await clsRes.json();
-  const testClass = clsData.classes[0];
-  const testSection = clsData.sections[0];
+  let testClass = clsData.classes?.[0];
+  let testSection = clsData.sections?.[0];
+
+  if (!testClass) {
+    const seedRes = await fetch(`${BASE_URL}/admin/classes/seed-presets`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ category: 'combined_k12' }),
+    });
+    if (seedRes.status !== 200) {
+      console.error('Seed presets failed:', await seedRes.text());
+    }
+
+    const refreshedClsRes = await fetch(`${BASE_URL}/admin/classes-sections`, { headers: adminHeaders });
+    const refreshedClsData = await refreshedClsRes.json();
+    testClass = refreshedClsData.classes?.[0];
+    testSection = refreshedClsData.sections?.[0];
+  }
+
+  assert.ok(testClass, 'Test class must be present');
+  assert.ok(testSection, 'Test section must be present');
   console.log(`✓ School branch provisioned (Branch ID: ${branchId}, Class: ${testClass.name})`);
 
   // 2. Enroll First Student with a New Parent (Photos omitted)

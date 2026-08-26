@@ -386,10 +386,10 @@ export async function getTransportOverview(prisma: any, branchId: number | strin
   const config = await getMyEduRideConfig(prisma, bId);
 
   if (!branchGateLogs[bId]) {
-    branchGateLogs[bId] = getInitialGateLogs();
+    branchGateLogs[bId] = [];
   }
   if (!branchBusFleets[bId]) {
-    branchBusFleets[bId] = getInitialFleet(config.branchCode);
+    branchBusFleets[bId] = [];
   }
 
   const logs = branchGateLogs[bId];
@@ -428,7 +428,7 @@ export async function getBusFleet(prisma: any, branchId: number | string) {
   const config = await getMyEduRideConfig(prisma, bId);
 
   if (!branchBusFleets[bId]) {
-    branchBusFleets[bId] = getInitialFleet(config.branchCode);
+    branchBusFleets[bId] = [];
   }
 
   return branchBusFleets[bId];
@@ -440,7 +440,7 @@ export async function getBusFleet(prisma: any, branchId: number | string) {
 export async function getGateLogs(prisma: any, branchId: number | string, { role, status, direction, search, limit = 50 }: any) {
   const bId = parseInt(branchId as string, 10);
   if (!branchGateLogs[bId]) {
-    branchGateLogs[bId] = getInitialGateLogs();
+    branchGateLogs[bId] = [];
   }
 
   let logs = [...branchGateLogs[bId]];
@@ -478,7 +478,7 @@ export async function processGateScan(
 ) {
   const bId = parseInt(branchId as string, 10);
   if (!branchGateLogs[bId]) {
-    branchGateLogs[bId] = getInitialGateLogs();
+    branchGateLogs[bId] = [];
   }
 
   const cleanCode = String(code || '').trim();
