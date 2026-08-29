@@ -693,6 +693,12 @@ export async function uploadStaffPhoto(req: Request, res: Response): Promise<Res
       data: { photo: photoUrl },
     });
 
+    // Also sync to teacher profile if one exists for this user
+    await prisma.teacher.updateMany({
+      where: { OR: [{ userId: id }, { id }] },
+      data: { photo: photoUrl },
+    }).catch(() => {});
+
     return res.json({
       success: true,
       message: 'Staff photo uploaded successfully.',

@@ -71,6 +71,25 @@ export async function saveLogoBase64(logoBase64?: string | null, logoFileName?: 
   }
 }
 
+export async function saveSignatureBase64(signatureBase64?: string | null, signatureFileName?: string | null): Promise<string | null> {
+  if (!signatureBase64) return null;
+  try {
+    const match = String(signatureBase64).match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+    const mime = match ? match[1] : 'image/png';
+    const data = match ? match[2] : signatureBase64;
+
+    return await uploadBase64Image({
+      base64: data,
+      mime,
+      folder: 'ugbekun2/schools/signatures',
+      tags: ['ugbekun2', 'school-signature'],
+    });
+  } catch (err: any) {
+    console.warn('[ONBOARDING] Signature upload warning (continuing registration):', err.message);
+    return null;
+  }
+}
+
 /**
  * GET /api/onboarding/plans
  */
@@ -205,9 +224,28 @@ export async function registerSchool(req: Request, res: Response): Promise<Respo
       });
     }
 
+    const existingBranch = await prisma.branch.findFirst({
+      where: {
+        name: { equals: schoolName, mode: 'insensitive' },
+        email: { equals: contactEmail, mode: 'insensitive' },
+        active: true,
+      },
+    });
+    if (existingBranch) {
+      return res.status(400).json({
+        success: false,
+        message: `A school with the name "${schoolName}" and email "${contactEmail}" already exists. Please log in or use another email.`,
+      });
+    }
+
     let logoPath: string | null = null;
     if (body.logoBase64) {
       logoPath = await saveLogoBase64(body.logoBase64, body.logoFileName);
+    }
+
+    let signaturePath: string | null = null;
+    if (body.signatureBase64) {
+      signaturePath = await saveSignatureBase64(body.signatureBase64, body.signatureFileName);
     }
 
     const startDate = new Date();
@@ -258,6 +296,8 @@ export async function registerSchool(req: Request, res: Response): Promise<Respo
           academicSession: '2025/2026',
           currentTerm: 'First Term',
           logoUrl: logoPath || undefined,
+          principalSignatureUrl: signaturePath || undefined,
+          regNoPrefix: branchCode.slice(0, 4),
         },
       });
 
@@ -305,6 +345,99 @@ export async function registerSchool(req: Request, res: Response): Promise<Respo
         },
         include: { plan: true },
       });
+
+      // 6. Automatically seed standard classes, sections, and subjects for the branch
+      const lowerCat = `${schoolCategory} ${schoolType}`.toLowerCase();
+      let presetClasses: Array<{ name: string; isEcd: boolean }> = [];
+      if (lowerCat.includes('nursery') && !lowerCat.includes('secondary') && !lowerCat.includes('combined')) {
+        presetClasses = [
+          { name: 'Nursery 1', isEcd: true },
+          { name: 'Nursery 2', isEcd: true },
+          { name: 'Primary 1', isEcd: false },
+          { name: 'Primary 2', isEcd: false },
+          { name: 'Primary 3', isEcd: false },
+          { name: 'Primary 4', isEcd: false },
+          { name: 'Primary 5', isEcd: false },
+          { name: 'Primary 6', isEcd: false },
+        ];
+      } else if (lowerCat.includes('secondary') && !lowerCat.includes('primary') && !lowerCat.includes('combined')) {
+        presetClasses = [
+          { name: 'JSS 1', isEcd: false },
+          { name: 'JSS 2', isEcd: false },
+          { name: 'JSS 3', isEcd: false },
+          { name: 'SSS 1', isEcd: false },
+          { name: 'SSS 2', isEcd: false },
+          { name: 'SSS 3', isEcd: false },
+        ];
+      } else {
+        presetClasses = [
+          { name: 'Nursery 1', isEcd: true },
+          { name: 'Nursery 2', isEcd: true },
+          { name: 'Primary 1', isEcd: false },
+          { name: 'Primary 2', isEcd: false },
+          { name: 'Primary 3', isEcd: false },
+          { name: 'Primary 4', isEcd: false },
+          { name: 'Primary 5', isEcd: false },
+          { name: 'Primary 6', isEcd: false },
+          { name: 'JSS 1', isEcd: false },
+          { name: 'JSS 2', isEcd: false },
+          { name: 'JSS 3', isEcd: false },
+          { name: 'SSS 1', isEcd: false },
+          { name: 'SSS 2', isEcd: false },
+          { name: 'SSS 3', isEcd: false },
+        ];
+      }
+
+      const defaultSections = ['A (Gold)', 'B (Silver)'];
+      const sectionMap: Record<string, number> = {};
+      for (const secName of defaultSections) {
+        const sec = await tx.section.create({
+          data: { name: secName, capacity: '40', branchId: branch.id },
+        });
+        sectionMap[secName] = sec.id;
+      }
+
+      for (const item of presetClasses) {
+        const cls = await tx.class.create({
+          data: {
+            name: item.name,
+            nameNumeric: item.name.replace(/\D/g, '') || '1',
+            isEcd: item.isEcd,
+            branchId: branch.id,
+          },
+        });
+
+        for (const secName of defaultSections) {
+          const secId = sectionMap[secName];
+          if (secId) {
+            await tx.sectionsAllocation.create({
+              data: { classId: cls.id, sectionId: secId },
+            });
+          }
+        }
+      }
+
+      // Seed core subjects
+      const defaultCoreSubjects = [
+        { name: 'Mathematics', subjectCode: 'MTH', type: 'theory' },
+        { name: 'English Language', subjectCode: 'ENG', type: 'theory' },
+        { name: 'Basic Science & Technology', subjectCode: 'BST', type: 'practical' },
+        { name: 'Social Studies & Civic Education', subjectCode: 'SOC', type: 'theory' },
+        { name: 'ICT / Computer Studies', subjectCode: 'ICT', type: 'practical' },
+        { name: 'Agricultural Science', subjectCode: 'AGR', type: 'practical' },
+      ];
+
+      for (const subj of defaultCoreSubjects) {
+        await tx.subject.create({
+          data: {
+            name: subj.name,
+            subjectCode: subj.subjectCode,
+            subjectType: subj.type,
+            subjectAuthor: 'National Curriculum',
+            branchId: branch.id,
+          },
+        });
+      }
 
       return { branch, user, subscription };
     }, { maxWait: 15000, timeout: 30000 });

@@ -116,6 +116,16 @@ export async function login(req: Request, res: Response): Promise<Response | voi
             branchInfo = branch;
           }
         }
+        if (!branchInfo) {
+          const fallbackBranch = await prisma.branch.findFirst({
+            where: { active: true },
+            orderBy: { id: 'desc' },
+            select: { id: true, name: true, code: true, logo: true },
+          });
+          if (fallbackBranch) {
+            branchInfo = fallbackBranch;
+          }
+        }
       } else if (roleId === 7) { // Student
         const student = await prisma.student.findUnique({
           where: { userId: user.id },
@@ -135,10 +145,32 @@ export async function login(req: Request, res: Response): Promise<Response | voi
       } else if (roleId === 3) { // Teacher
         const teacher = await prisma.teacher.findUnique({
           where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, code: true } } },
+          include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
         });
         if (teacher?.branch) {
           branchInfo = teacher.branch;
+        }
+      } else { // Other staff roles (Accountant, Receptionist, Librarian, etc.)
+        const [payrollStaff, teacherRecord] = await Promise.all([
+          prisma.payrollComponent.findFirst({
+            where: { staffId: user.id },
+            include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
+          }).catch(() => null),
+          prisma.teacher.findFirst({
+            where: { userId: user.id },
+            include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
+          }).catch(() => null),
+        ]);
+        if (payrollStaff?.branch) {
+          branchInfo = payrollStaff.branch;
+        } else if (teacherRecord?.branch) {
+          branchInfo = teacherRecord.branch;
+        } else if (user.legacyUserId) {
+          const fallbackBranch = await prisma.branch.findUnique({
+            where: { id: user.legacyUserId },
+            select: { id: true, name: true, code: true, logo: true },
+          }).catch(() => null);
+          if (fallbackBranch) branchInfo = fallbackBranch;
         }
       }
     } catch (branchError) {

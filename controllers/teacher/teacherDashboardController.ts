@@ -616,8 +616,10 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
  */
 export async function uploadProfilePhoto(req: Request, res: Response): Promise<Response | void> {
   try {
-    const { photoBase64, photo } = req.body || {};
-    const inputPhoto = photoBase64 || photo;
+    let inputPhoto = req.body?.photoBase64 || req.body?.photo;
+    if (!inputPhoto && req.file) {
+      inputPhoto = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    }
     if (!inputPhoto) {
       return res.status(400).json({ success: false, message: 'Photograph data is required.' });
     }

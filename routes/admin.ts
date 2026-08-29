@@ -46,10 +46,16 @@ import {
 
 import {
   getTeachersStaff,
+  getRoles,
+  createRole,
+  updateRole,
+  deleteRole,
   onboardTeacher,
   updateTeacher,
   deactivateTeacher,
+  uploadTeacherPhoto,
   uploadStaffPhoto,
+  toggleTeacherStatus,
   toggleStaffStatus,
   getStaffAttendance,
   saveStaffAttendance,
@@ -290,11 +296,16 @@ router.get('/certificates/:id/download-pdf', downloadCertificatePdf);
 // 3. TEACHERS, STAFF & HUMAN RESOURCES (HR)
 // ============================================================================
 router.get('/teachers-staff', getTeachersStaff);
+router.get('/roles', getRoles);
+router.post('/roles', createRole);
+router.put('/roles/:id', updateRole);
+router.delete('/roles/:id', deleteRole);
 router.post('/teachers/onboard', onboardTeacher);
 router.put('/teachers/:id', updateTeacher);
 router.delete('/teachers/:id', deactivateTeacher);
 router.post('/staff/:id/upload-photo', upload.single('file'), uploadStaffPhoto);
-router.post('/teachers/:id/upload-photo', upload.single('file'), uploadStaffPhoto);
+router.post('/teachers/:id/upload-photo', upload.single('file'), uploadTeacherPhoto);
+router.post('/teachers/:id/toggle-status', toggleTeacherStatus);
 router.post('/staff/:id/toggle-status', toggleStaffStatus);
 router.get('/staff/attendance', getStaffAttendance);
 router.post('/staff/attendance', saveStaffAttendance);

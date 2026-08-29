@@ -99,7 +99,7 @@ router.post('/messages', sendMessage);
 
 // Profile
 router.get('/profile', getProfile);
-router.post('/profile/upload-photo', uploadProfilePhoto);
+router.post('/profile/upload-photo', upload.single('file'), uploadProfilePhoto);
 
 // Exams & Student Rosters
 router.get('/exams', getExams);
