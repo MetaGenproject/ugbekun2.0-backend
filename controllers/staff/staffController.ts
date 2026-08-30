@@ -363,6 +363,7 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
           id: nextUserId,
           username: uniqueUsername,
           password: hashedPassword,
+          rawPassword: teacherPlainPassword,
           photo: photoUrl || null,
           role: selectedRole,
           active: true,

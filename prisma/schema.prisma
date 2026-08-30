@@ -170,6 +170,7 @@ model User {
   legacyUserId Int? // login_credential.user_id — the profile ID in the domain
   username     String    @unique
   password     String // Bcrypt-compatible hash — directly migrated
+  rawPassword  String?   @map("raw_password")
   role         Int // Legacy tinyint role code
   photo        String?   @map("photo")
   active       Boolean   @default(true)
@@ -2067,7 +2068,13 @@ model SystemSetting {
   address               String?   @db.Text
   phone                 String?   @default("+234 800 000 0000")
   email                 String?   @default("info@ugbekun.edu.ng")
+  whatsappNo            String?   @map("whatsapp_no")
   website               String?   @default("https://ugbekun.edu.ng")
+  facebookUrl           String?   @map("facebook_url")
+  instagramUrl          String?   @map("instagram_url")
+  twitterUrl            String?   @map("twitter_url")
+  linkedinUrl           String?   @map("linkedin_url")
+  youtubeUrl            String?   @map("youtube_url")
   logoUrl               String?   @map("logo_url")
   principalSignatureUrl String?   @map("principal_signature_url")
   currencySymbol        String    @default("₦") @map("currency_symbol")
@@ -2080,6 +2087,8 @@ model SystemSetting {
   autoSmsAttendance     Boolean   @default(true) @map("auto_sms_attendance")
   maxAbsentDaysAlert    Int       @default(3) @map("max_absent_days_alert")
   idCardTheme           String    @default("EMERALD_MODERN") @map("id_card_theme")
+  primaryColor          String?   @default("#0f172a") @map("primary_color")
+  secondaryColor        String?   @default("#0284c7") @map("secondary_color")
 
   maintenanceMode       Boolean   @default(false) @map("maintenance_mode")
   aiAssistanceEnabled   Boolean   @default(true) @map("ai_assistance_enabled")

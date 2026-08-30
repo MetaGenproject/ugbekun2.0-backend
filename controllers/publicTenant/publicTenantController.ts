@@ -3,11 +3,25 @@ import jwt from 'jsonwebtoken';
 import prisma from '../../lib/prisma';
 import { resolveTenantByHost, normalizeHostname } from '../../lib/domainService';
 import { getOrCreateLandingPage, formatLandingPageResponse } from '../../lib/schoolCmsService';
+import { cacheGetOrSet } from '../../lib/cacheService';
 
 /**
- * Helper to resolve branch from query or headers
+ * Helper to resolve branch from query or headers (Cached)
  */
 export async function resolveBranchContext(req: Request) {
+  const queryDomain = (req.query.domain || req.query.host) as string | undefined;
+  const querySubdomain = req.query.subdomain as string | undefined;
+  const queryBranchId = req.query.branchId ? parseInt(req.query.branchId as string, 10) : null;
+  const headerHost = (req.headers['x-tenant-host'] || req.headers['x-tenant-domain'] || req.headers.host) as string | undefined;
+
+  const cacheKey = `tenant:resolve:${queryBranchId || queryDomain || querySubdomain || headerHost || 'default'}`;
+
+  return cacheGetOrSet(cacheKey, 300, async () => {
+    return _resolveBranchContextUncached(req);
+  });
+}
+
+async function _resolveBranchContextUncached(req: Request) {
   const queryDomain = (req.query.domain || req.query.host) as string | undefined;
   const querySubdomain = req.query.subdomain as string | undefined;
   const queryBranchId = req.query.branchId ? parseInt(req.query.branchId as string, 10) : null;
@@ -261,35 +275,53 @@ export async function listPublicSchools(req: Request, res: Response): Promise<Re
  */
 export async function getPublicSchoolInfo(req: Request, res: Response): Promise<Response | void> {
   try {
-    let branch = await resolveBranchContext(req);
+    let branch: any = null;
 
-    // If no branch resolved from domain/query, check Bearer token if present
+    // 1. Direct query by Branch ID if explicitly provided in query params (?branchId=...)
+    const queryBranchId = req.query.branchId ? parseInt(req.query.branchId as string, 10) : null;
+    if (queryBranchId && !isNaN(queryBranchId)) {
+      branch = await prisma.branch.findUnique({
+        where: { id: queryBranchId },
+        include: { landingPage: true, systemSetting: true }
+      });
+    }
+
+    // 2. Check Bearer token FIRST if present, to prioritize logged-in user's enrolled branch
     if (!branch) {
       const authHeader = req.headers?.authorization;
       if (authHeader && authHeader.startsWith('Bearer ')) {
         const token = authHeader.slice('Bearer '.length);
         try {
           const decoded: any = jwt.verify(token, process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod');
-          let branchId = decoded.legacyUserId ? Number(decoded.legacyUserId) : null;
-          if (!branchId && decoded.role === 3) {
+          let branchId: number | null = decoded.branchId ? Number(decoded.branchId) : null;
+          if (!branchId && decoded.role === 7) {
+            const studentRecord = await prisma.student.findFirst({
+              where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
+              select: { branchId: true },
+            });
+            branchId = studentRecord?.branchId || null;
+          } else if (!branchId && decoded.role === 6) {
+            const parentRecord = await prisma.parent.findFirst({
+              where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
+              select: { branchId: true },
+            });
+            branchId = parentRecord?.branchId || null;
+          } else if (!branchId && decoded.role === 3) {
             const teacherRecord = await prisma.teacher.findFirst({
               where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
               select: { branchId: true },
             });
             branchId = teacherRecord?.branchId || null;
-          } else if (!branchId && decoded.role === 7) {
-            const studentRecord = await prisma.student.findUnique({
-              where: { userId: decoded.sub || decoded.id },
-              select: { branchId: true },
+          } else if (!branchId && (decoded.role === 2 || decoded.role === 1)) {
+            const adminUser = await prisma.user.findFirst({
+              where: { OR: [{ id: decoded.sub || decoded.id }, { legacyUserId: decoded.legacyUserId || decoded.sub }] },
+              select: { teacher: { select: { branchId: true } } },
             });
-            branchId = studentRecord?.branchId || null;
-          } else if (!branchId && decoded.role === 6) {
-            const parentRecord = await prisma.parent.findUnique({
-              where: { userId: decoded.sub || decoded.id },
-              select: { branchId: true },
-            });
-            branchId = parentRecord?.branchId || null;
+            branchId = adminUser?.teacher?.branchId || null;
+          } else if (!branchId && decoded.legacyUserId) {
+            branchId = Number(decoded.legacyUserId);
           }
+
           if (branchId) {
             branch = await prisma.branch.findUnique({
               where: { id: branchId },
@@ -302,6 +334,11 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
       }
     }
 
+    // 3. If no branch resolved from query or token, resolve from subdomain/host context
+    if (!branch) {
+      branch = await resolveBranchContext(req);
+    }
+
     const settings = branch?.systemSetting;
     return res.json({
       success: true,
@@ -311,7 +348,21 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
         branchName: branch?.name || 'School Dashboard',
         schoolName: settings?.schoolName || branch?.name || 'School Dashboard',
         tagline: settings?.tagline || branch?.landingPage?.heroSubtitle || 'Nurturing Excellence, Raising Leaders',
+        address: settings?.address || branch?.address || '',
+        phone: settings?.phone || branch?.phone || '',
+        email: settings?.email || branch?.email || '',
+        whatsappNo: settings?.whatsappNo || null,
+        website: settings?.website || null,
+        facebookUrl: settings?.facebookUrl || null,
+        instagramUrl: settings?.instagramUrl || null,
+        twitterUrl: settings?.twitterUrl || null,
+        linkedinUrl: settings?.linkedinUrl || null,
+        youtubeUrl: settings?.youtubeUrl || null,
         logoUrl: settings?.logoUrl || (branch as any)?.logo || null,
+        principalSignatureUrl: settings?.principalSignatureUrl || null,
+        primaryColor: settings?.primaryColor || '#0f172a',
+        secondaryColor: settings?.secondaryColor || '#0284c7',
+        idCardTheme: settings?.idCardTheme || 'EMERALD_MODERN',
         academicSession: settings?.academicSession || '2025/2026',
         currentTerm: settings?.currentTerm || 'First Term',
         currencySymbol: settings?.currencySymbol || '₦',
@@ -327,7 +378,21 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
         branchName: 'School Dashboard',
         schoolName: 'School Dashboard',
         tagline: 'Nurturing Excellence, Raising Leaders',
+        address: '',
+        phone: '',
+        email: '',
+        whatsappNo: null,
+        website: null,
+        facebookUrl: null,
+        instagramUrl: null,
+        twitterUrl: null,
+        linkedinUrl: null,
+        youtubeUrl: null,
         logoUrl: null,
+        principalSignatureUrl: null,
+        primaryColor: '#0f172a',
+        secondaryColor: '#0284c7',
+        idCardTheme: 'EMERALD_MODERN',
         academicSession: '2025/2026',
         currentTerm: 'First Term',
         currencySymbol: '₦',

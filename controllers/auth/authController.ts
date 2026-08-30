@@ -186,6 +186,7 @@ export async function login(req: Request, res: Response): Promise<Response | voi
       username: user.username,
       role: user.role,
       roleName: ROLE_NAMES[user.role] || 'user',
+      branchId: branchInfo?.id || null,
       legacyUserId: user.legacyUserId,
     };
 
@@ -200,6 +201,7 @@ export async function login(req: Request, res: Response): Promise<Response | voi
         username: user.username,
         role: user.role,
         roleName: ROLE_NAMES[user.role] || 'user',
+        branchId: branchInfo?.id || null,
         legacyUserId: user.legacyUserId,
         lastLogin: user.lastLogin,
         branch: branchInfo,

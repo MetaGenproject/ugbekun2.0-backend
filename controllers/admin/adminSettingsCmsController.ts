@@ -3,7 +3,9 @@ import fs from 'fs';
 import path from 'path';
 import jwt from 'jsonwebtoken';
 import prisma from '../../lib/prisma';
+import { cacheDel } from '../../lib/cacheService';
 import { uploadToCloudinary } from '../../lib/cloudinaryService';
+import { saveLogoBase64, saveSignatureBase64 } from '../onboarding/onboardingController';
 import {
   getMyEduRideConfig,
   saveMyEduRideConfig,
@@ -204,9 +206,21 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       address,
       phone,
       email,
+      whatsappNo,
       website,
+      facebookUrl,
+      instagramUrl,
+      twitterUrl,
+      linkedinUrl,
+      youtubeUrl,
       logoUrl,
+      logoBase64,
+      logoFileName,
       principalSignatureUrl,
+      signatureBase64,
+      signatureFileName,
+      primaryColor,
+      secondaryColor,
       currencySymbol,
       academicSession,
       currentTerm,
@@ -224,6 +238,18 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       weeklyMintLimit,
     } = req.body;
 
+    let processedLogoUrl = logoUrl;
+    if (logoBase64) {
+      const uploaded = await saveLogoBase64(logoBase64, logoFileName);
+      if (uploaded) processedLogoUrl = uploaded;
+    }
+
+    let processedSignatureUrl = principalSignatureUrl;
+    if (signatureBase64) {
+      const uploaded = await saveSignatureBase64(signatureBase64, signatureFileName);
+      if (uploaded) processedSignatureUrl = uploaded;
+    }
+
     const updated = await prisma.systemSetting.upsert({
       where: { branchId },
       update: {
@@ -232,9 +258,17 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
         ...(address !== undefined && { address }),
         ...(phone !== undefined && { phone }),
         ...(email !== undefined && { email }),
+        ...(whatsappNo !== undefined && { whatsappNo }),
         ...(website !== undefined && { website }),
-        ...(logoUrl !== undefined && { logoUrl }),
-        ...(principalSignatureUrl !== undefined && { principalSignatureUrl }),
+        ...(facebookUrl !== undefined && { facebookUrl }),
+        ...(instagramUrl !== undefined && { instagramUrl }),
+        ...(twitterUrl !== undefined && { twitterUrl }),
+        ...(linkedinUrl !== undefined && { linkedinUrl }),
+        ...(youtubeUrl !== undefined && { youtubeUrl }),
+        ...(processedLogoUrl !== undefined && { logoUrl: processedLogoUrl }),
+        ...(processedSignatureUrl !== undefined && { principalSignatureUrl: processedSignatureUrl }),
+        ...(primaryColor !== undefined && { primaryColor }),
+        ...(secondaryColor !== undefined && { secondaryColor }),
         ...(currencySymbol !== undefined && { currencySymbol }),
         ...(academicSession !== undefined && { academicSession }),
         ...(currentTerm !== undefined && { currentTerm }),
@@ -259,9 +293,17 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
         address: address || '',
         phone: phone || '+234 800 000 0000',
         email: email || 'info@ugbekun.edu.ng',
+        whatsappNo: whatsappNo || null,
         website: website || 'https://ugbekun.edu.ng',
-        logoUrl: logoUrl || null,
-        principalSignatureUrl: principalSignatureUrl || null,
+        facebookUrl: facebookUrl || null,
+        instagramUrl: instagramUrl || null,
+        twitterUrl: twitterUrl || null,
+        linkedinUrl: linkedinUrl || null,
+        youtubeUrl: youtubeUrl || null,
+        logoUrl: processedLogoUrl || null,
+        principalSignatureUrl: processedSignatureUrl || null,
+        primaryColor: primaryColor || '#0f172a',
+        secondaryColor: secondaryColor || '#0284c7',
         currencySymbol: currencySymbol || '₦',
         academicSession: academicSession || '2025/2026',
         currentTerm: currentTerm || 'First Term',
@@ -280,14 +322,24 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       },
     });
 
-    if (schoolName) {
+    if (schoolName || address || phone || email || processedLogoUrl !== undefined) {
       await prisma.branch
         .update({
           where: { id: branchId },
-          data: { name: schoolName },
+          data: {
+            ...(schoolName && { name: schoolName }),
+            ...(address && { address }),
+            ...(phone && { phone }),
+            ...(email && { email }),
+            ...(processedLogoUrl !== undefined && { logo: processedLogoUrl }),
+          },
         })
         .catch(() => {});
     }
+
+    // Invalidate Redis tenant cache for this branch
+    await cacheDel(`tenant:resolve:${branchId}`);
+    await cacheDel('tenant:resolve:default');
 
     return res.json({ success: true, message: 'System settings updated successfully.', data: updated });
   } catch (error: any) {
@@ -341,7 +393,23 @@ export async function uploadLogo(req: Request, res: Response): Promise<Response 
  */
 export async function getSchoolInfo(req: Request, res: Response): Promise<Response | void> {
   try {
-    let branchId = req.branchId || 1;
+    let branchId = req.branchId;
+
+    if (!branchId && req.userId) {
+      const userRecord = await prisma.user.findFirst({
+        where: { OR: [{ id: Number(req.userId) }, { legacyUserId: Number(req.userId) }] },
+        select: {
+          teacher: { select: { branchId: true } },
+          student: { select: { branchId: true } },
+          parent: { select: { branchId: true } },
+        },
+      });
+      branchId = userRecord?.teacher?.branchId || userRecord?.student?.branchId || userRecord?.parent?.branchId || undefined;
+    }
+
+    if (!branchId) {
+      branchId = 1;
+    }
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
@@ -1319,5 +1387,82 @@ export async function removeDomain(req: Request, res: Response): Promise<Respons
   } catch (error: any) {
     console.error('[ADMIN] Remove domain error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to remove domain.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/settings/school-info
+ * Resets optional school information and social media handles to empty state.
+ */
+export async function resetSchoolInfo(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const updated = await prisma.systemSetting.update({
+      where: { branchId },
+      data: {
+        tagline: null,
+        website: null,
+        whatsappNo: null,
+        facebookUrl: null,
+        instagramUrl: null,
+        twitterUrl: null,
+        linkedinUrl: null,
+        youtubeUrl: null,
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Optional school contact details & social media handles reset successfully.',
+      data: updated,
+    });
+  } catch (error: any) {
+    console.error('[SETTINGS] Reset school info error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to reset school information.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/settings/branding/assets/:assetType
+ * Removes school logo, principal signature, or resets theme colors.
+ */
+export async function deleteBrandingAsset(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { assetType } = req.params;
+
+  try {
+    let updateData: any = {};
+    if (assetType === 'logo') {
+      updateData = { logoUrl: null };
+      await prisma.branch.update({
+        where: { id: branchId },
+        data: { logo: null },
+      }).catch(() => {});
+    } else if (assetType === 'signature') {
+      updateData = { principalSignatureUrl: null };
+    } else if (assetType === 'colors') {
+      updateData = { primaryColor: '#0f172a', secondaryColor: '#0284c7', idCardTheme: 'EMERALD_MODERN' };
+    } else {
+      return res.status(400).json({ success: false, message: 'Invalid branding asset type specified.' });
+    }
+
+    const updated = await prisma.systemSetting.update({
+      where: { branchId },
+      data: {
+        ...updateData,
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: `Branding asset '${assetType}' removed/reset successfully.`,
+      data: updated,
+    });
+  } catch (error: any) {
+    console.error('[SETTINGS] Delete branding asset error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to remove branding asset.' });
   }
 }

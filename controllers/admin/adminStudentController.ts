@@ -401,6 +401,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
             id: nextParentUserId,
             username: uniqueUsername,
             password: hashedParentPassword,
+            rawPassword: parentPlainPassword,
             role: 6,
             active: true,
             photo: parentPhotoUrl || null,
@@ -446,6 +447,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
           id: nextStudentUserId,
           username: uniqueStudentUsername,
           password: hashedStudentPassword,
+          rawPassword: studentPlainPassword,
           role: 7,
           active: true,
           photo: studentPhotoUrl || null,
@@ -547,6 +549,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
       data: {
         student: {
           id: result.student.id,
+          userId: result.student.userId,
           registerNo: result.student.registerNo,
           firstName: result.student.firstName,
           lastName: result.student.lastName,
@@ -557,6 +560,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
         },
         parent: {
           id: result.parent.id,
+          userId: result.parent.userId,
           name: result.parent.name,
           email: result.parent.email,
           mobileno: result.parent.mobileno,
@@ -564,12 +568,14 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
         },
         credentials: {
           student: {
+            userId: result.student.userId,
             username: finalStudentUsername,
             password: studentPlainPassword,
           },
           parent: isExistingParent
             ? null
             : {
+                userId: result.parent.userId,
                 username: finalParentUsername,
                 password: parentPlainPassword,
               },
@@ -577,6 +583,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
       },
       credentials: {
         student: {
+          userId: result.student.userId,
           username: finalStudentUsername,
           password: studentPlainPassword,
         },

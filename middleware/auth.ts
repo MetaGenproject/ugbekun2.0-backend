@@ -12,10 +12,10 @@ export function getBearerToken(req: Request): string | null {
 }
 
 export async function resolveBranchForAdmin(decoded: any): Promise<number | null> {
-  const requestedBranchId = decoded.legacyUserId ? Number(decoded.legacyUserId) : null;
-  if (requestedBranchId) {
+  const tokenBranchId = decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null);
+  if (tokenBranchId) {
     const branch = await prisma.branch.findUnique({
-      where: { id: requestedBranchId },
+      where: { id: tokenBranchId },
       select: { id: true },
     });
     if (branch) {
@@ -23,18 +23,39 @@ export async function resolveBranchForAdmin(decoded: any): Promise<number | null
     }
   }
 
-  if (!decoded.username) {
-    return null;
+  // Check database User profile relations
+  const userId = decoded.sub || decoded.id;
+  if (userId) {
+    const userRecord = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { id: Number(userId) },
+          { legacyUserId: Number(userId) },
+        ],
+      },
+      select: {
+        teacher: { select: { branchId: true } },
+        student: { select: { branchId: true } },
+        parent: { select: { branchId: true } },
+      },
+    });
+
+    const dbBranchId = userRecord?.teacher?.branchId || userRecord?.student?.branchId || userRecord?.parent?.branchId;
+    if (dbBranchId) {
+      return dbBranchId;
+    }
   }
 
-  const branches = await prisma.branch.findMany({
-    where: { active: true },
-    select: { id: true, name: true, code: true },
-  });
+  if (decoded.username) {
+    const branches = await prisma.branch.findMany({
+      where: { active: true },
+      select: { id: true, name: true, code: true },
+    });
 
-  const matched = branches.find((branch: any) => staffMatchesBranch(decoded.username, branch));
-  if (matched) {
-    return matched.id;
+    const matched = branches.find((branch: any) => staffMatchesBranch(decoded.username, branch));
+    if (matched) {
+      return matched.id;
+    }
   }
 
   return null;
@@ -184,7 +205,7 @@ export async function requireTeacher(req: Request, res: Response, next: NextFunc
         select: { id: true, branchId: true },
       });
       req.teacherId = teacherRecord ? teacherRecord.id : req.userId;
-      req.branchId = decoded.legacyUserId ? Number(decoded.legacyUserId) : (teacherRecord?.branchId || null);
+      req.branchId = teacherRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null));
       next();
       return;
     }
@@ -238,7 +259,7 @@ export async function requireStudent(req: Request, res: Response, next: NextFunc
     });
 
     req.studentId = studentRecord ? studentRecord.id : req.userId;
-    req.branchId = decoded.legacyUserId ? Number(decoded.legacyUserId) : (studentRecord?.branchId || null);
+    req.branchId = studentRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null));
     next();
   } catch {
     res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
@@ -277,7 +298,7 @@ export async function requireParent(req: Request, res: Response, next: NextFunct
     });
 
     req.parentId = parentRecord ? parentRecord.id : req.userId;
-    req.branchId = decoded.legacyUserId ? Number(decoded.legacyUserId) : (parentRecord?.branchId || null);
+    req.branchId = parentRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null));
     next();
   } catch {
     res.status(401).json({ success: false, message: 'Token is invalid or expired.' });

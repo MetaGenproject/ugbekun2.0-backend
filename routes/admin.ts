@@ -204,6 +204,8 @@ import {
   deleteEvent,
   getSettings,
   updateSettings,
+  resetSchoolInfo,
+  deleteBrandingAsset,
   uploadLogo,
   getSchoolInfo,
   uploadAdminPhoto,
@@ -473,6 +475,10 @@ router.delete('/events/:id', deleteEvent);
 
 router.get('/settings', getSettings);
 router.post('/settings', updateSettings);
+router.put('/settings/school-info', updateSettings);
+router.delete('/settings/school-info', resetSchoolInfo);
+router.put('/settings/branding', updateSettings);
+router.delete('/settings/branding/assets/:assetType', deleteBrandingAsset);
 router.post('/settings/upload-logo', upload.single('file'), uploadLogo);
 
 router.get('/inventory', getInventory);
@@ -480,6 +486,11 @@ router.post('/inventory/items', createInventoryItem);
 router.post('/inventory/purchase', recordInventoryPurchase);
 router.post('/inventory/sale', recordInventorySale);
 router.delete('/inventory/items/:id', deleteInventoryItem);
+
+import {
+  getUserCredentials,
+  resetUserPassword,
+} from '../controllers/admin/adminUserController';
 
 router.get('/myeduride/config', getMyEduRideConfigHandler);
 router.post('/myeduride/config', saveMyEduRideConfigHandler);
@@ -501,5 +512,9 @@ router.get('/domain/config', getDomainConfig);
 router.post('/domain/update', updateDomain);
 router.post('/domain/verify-dns', verifyDns);
 router.delete('/domain/remove', removeDomain);
+
+// User Credential Management & Global Reset
+router.get('/users/:userId/credentials', getUserCredentials);
+router.post('/users/:userId/reset-password', resetUserPassword);
 
 export default router;
