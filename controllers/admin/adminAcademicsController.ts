@@ -1369,3 +1369,215 @@ export const getPromotionSelection = getPromotionsClassStudents;
 export const promoteStudentCohort = batchPromoteStudents;
 export const aiDraftEbookResource = aiEbookDraft;
 export const exportLessonPlanPdf = downloadLessonPlanPdf;
+
+/**
+ * PUT /api/admin/classes/:id
+ */
+export async function updateClass(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.id);
+
+  try {
+    const { name, nameNumeric, isEcd } = req.body;
+    const existing = await prisma.class.findFirst({
+      where: { id: classId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    const updated = await prisma.class.update({
+      where: { id: classId },
+      data: {
+        ...(name !== undefined && { name }),
+        ...(nameNumeric !== undefined && { nameNumeric: String(nameNumeric) }),
+        ...(isEcd !== undefined && { isEcd: !!isEcd }),
+      },
+    });
+
+    return res.json({ success: true, class: updated, message: 'Class updated successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Update class error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update class.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/classes/:id
+ */
+export async function deleteClass(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.id);
+
+  try {
+    const existing = await prisma.class.findFirst({
+      where: { id: classId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    await prisma.$transaction([
+      prisma.sectionsAllocation.deleteMany({ where: { classId } }),
+      prisma.subjectAssign.deleteMany({ where: { classId } }),
+      prisma.class.delete({ where: { id: classId } }),
+    ]);
+
+    return res.json({ success: true, message: 'Class deleted successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete class error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to delete class.' });
+  }
+}
+
+/**
+ * PUT /api/admin/sections/:id
+ */
+export async function updateSection(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const sectionId = Number(req.params.id);
+
+  try {
+    const { name, capacity } = req.body;
+    const existing = await prisma.section.findFirst({
+      where: { id: sectionId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Section not found.' });
+    }
+
+    const updated = await prisma.section.update({
+      where: { id: sectionId },
+      data: {
+        ...(name !== undefined && { name }),
+        ...(capacity !== undefined && { capacity: String(capacity) }),
+      },
+    });
+
+    return res.json({ success: true, section: updated, message: 'Section updated successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Update section error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update section.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/sections/:id
+ */
+export async function deleteSection(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const sectionId = Number(req.params.id);
+
+  try {
+    const existing = await prisma.section.findFirst({
+      where: { id: sectionId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Section not found.' });
+    }
+
+    await prisma.$transaction([
+      prisma.sectionsAllocation.deleteMany({ where: { sectionId } }),
+      prisma.subjectAssign.deleteMany({ where: { sectionId } }),
+      prisma.section.delete({ where: { id: sectionId } }),
+    ]);
+
+    return res.json({ success: true, message: 'Section deleted successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete section error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to delete section.' });
+  }
+}
+
+/**
+ * PUT /api/admin/subjects/:id
+ */
+export async function updateSubject(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const subjectId = Number(req.params.id);
+
+  try {
+    const { name, subjectCode, subjectType, subjectAuthor } = req.body;
+    const existing = await prisma.subject.findFirst({
+      where: { id: subjectId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Subject not found.' });
+    }
+
+    const updated = await prisma.subject.update({
+      where: { id: subjectId },
+      data: {
+        ...(name !== undefined && { name }),
+        ...(subjectCode !== undefined && { subjectCode }),
+        ...(subjectType !== undefined && { subjectType }),
+        ...(subjectAuthor !== undefined && { subjectAuthor }),
+      },
+    });
+
+    return res.json({ success: true, subject: updated, message: 'Subject updated successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Update subject error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update subject.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/subjects/:id
+ */
+export async function deleteSubject(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const subjectId = Number(req.params.id);
+
+  try {
+    const existing = await prisma.subject.findFirst({
+      where: { id: subjectId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Subject not found.' });
+    }
+
+    await prisma.$transaction([
+      prisma.subjectAssign.deleteMany({ where: { subjectId } }),
+      prisma.subject.delete({ where: { id: subjectId } }),
+    ]);
+
+    return res.json({ success: true, message: 'Subject deleted successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete subject error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to delete subject.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/subjects/assign/:id
+ */
+export async function deleteSubjectAssignment(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const assignmentId = Number(req.params.id);
+
+  try {
+    const existing = await prisma.subjectAssign.findFirst({
+      where: { id: assignmentId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Assignment not found.' });
+    }
+
+    await prisma.subjectAssign.delete({
+      where: { id: assignmentId },
+    });
+
+    return res.json({ success: true, message: 'Subject assignment removed successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete subject assignment error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to remove subject assignment.' });
+  }
+}

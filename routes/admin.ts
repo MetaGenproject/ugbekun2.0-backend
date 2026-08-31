@@ -83,14 +83,21 @@ import {
   getClasses,
   getClassesSections,
   createClass,
+  updateClass,
+  deleteClass,
   seedClassPresets,
   toggleClassEcd,
   createSection,
+  updateSection,
+  deleteSection,
   allocateSection,
   getSubjects,
   createSubject,
+  updateSubject,
+  deleteSubject,
   assignSubject,
   assignSubjectBulk,
+  deleteSubjectAssignment,
   getStudentAttendance,
   saveStudentAttendance,
   getPromotionSelection,
@@ -117,6 +124,8 @@ import {
 import {
   getExams,
   createExam,
+  updateExam,
+  deleteExam,
   getEvaluationMatrices,
   createEvaluationMatrix,
   updateEvaluationMatrix,
@@ -341,15 +350,22 @@ router.get('/hr/employment-letters/:id/download-pdf', downloadEmploymentLetterPd
 router.get('/classes', getClasses);
 router.get('/classes-sections', getClassesSections);
 router.post('/classes', createClass);
+router.put('/classes/:id', updateClass);
+router.delete('/classes/:id', deleteClass);
 router.post('/classes/seed-presets', seedClassPresets);
 router.post('/classes/seed-preset', seedClassPresets);
 router.post('/classes/:id/toggle-ecd', toggleClassEcd);
 router.post('/sections', createSection);
+router.put('/sections/:id', updateSection);
+router.delete('/sections/:id', deleteSection);
 router.post('/sections/allocate', allocateSection);
 router.get('/subjects', getSubjects);
 router.post('/subjects', createSubject);
+router.put('/subjects/:id', updateSubject);
+router.delete('/subjects/:id', deleteSubject);
 router.post('/subjects/assign', assignSubject);
 router.post('/subjects/assign-bulk', assignSubjectBulk);
+router.delete('/subjects/assign/:id', deleteSubjectAssignment);
 router.get('/student-attendance', getStudentAttendance);
 router.post('/student-attendance', saveStudentAttendance);
 router.get('/promotion/selection', getPromotionSelection);
@@ -380,6 +396,8 @@ router.post('/timetable/ai-generate', aiGenerateTimetable);
 // ============================================================================
 router.get('/exams', getExams);
 router.post('/exams', createExam);
+router.put('/exams/:id', updateExam);
+router.delete('/exams/:id', deleteExam);
 router.get('/evaluation-matrices', getEvaluationMatrices);
 router.post('/evaluation-matrices', createEvaluationMatrix);
 router.put('/evaluation-matrices/:id', updateEvaluationMatrix);

@@ -1481,3 +1481,65 @@ export async function syncCbtLegacy(req: Request, res: Response): Promise<Respon
     return res.status(500).json({ success: false, message: error.message || 'Failed to sync CBT records.' });
   }
 }
+
+/**
+ * PUT /api/admin/exams/:id
+ */
+export async function updateExam(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const examId = Number(req.params.id);
+
+  try {
+    const { name, remark, markDistribution } = req.body;
+    const existing = await prisma.exam.findFirst({
+      where: { id: examId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Exam not found.' });
+    }
+
+    const updated = await prisma.exam.update({
+      where: { id: examId },
+      data: {
+        ...(name !== undefined && { name: name.trim() }),
+        ...(remark !== undefined && { remark }),
+        ...(markDistribution !== undefined && {
+          markDistribution: typeof markDistribution === 'string' ? markDistribution : JSON.stringify(markDistribution),
+        }),
+      },
+    });
+
+    return res.json({ success: true, exam: updated, message: 'Exam updated successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Update exam error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update exam.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/exams/:id
+ */
+export async function deleteExam(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const examId = Number(req.params.id);
+
+  try {
+    const existing = await prisma.exam.findFirst({
+      where: { id: examId, branchId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Exam not found.' });
+    }
+
+    await prisma.exam.delete({
+      where: { id: examId },
+    });
+
+    return res.json({ success: true, message: 'Exam deleted successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete exam error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to delete exam.' });
+  }
+}

@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import prisma from '../../lib/prisma';
 import { sendMail } from '../../lib/emailService';
 import { buildPasswordResetEmail } from '../../lib/emailTemplates';
+import { staffMatchesBranch } from '../../lib/branchStats';
 
 // Role map: role code -> role name
 export const ROLE_NAMES: Record<number, string> = {
@@ -117,9 +118,32 @@ export async function login(req: Request, res: Response): Promise<Response | voi
           }
         }
         if (!branchInfo) {
+          const teacherRecord = await prisma.teacher.findFirst({
+            where: { OR: [{ userId: user.id }, { id: user.id }] },
+            select: { branchId: true },
+          });
+          if (teacherRecord?.branchId) {
+            const branch = await prisma.branch.findUnique({
+              where: { id: teacherRecord.branchId },
+              select: { id: true, name: true, code: true, logo: true },
+            });
+            if (branch) branchInfo = branch;
+          }
+        }
+        if (!branchInfo) {
+          const branches = await prisma.branch.findMany({
+            where: { active: true },
+            select: { id: true, name: true, code: true, logo: true },
+          });
+          const matched = branches.find((b: any) => staffMatchesBranch(user.username, b));
+          if (matched) {
+            branchInfo = matched;
+          }
+        }
+        if (!branchInfo) {
           const fallbackBranch = await prisma.branch.findFirst({
             where: { active: true },
-            orderBy: { id: 'desc' },
+            orderBy: { id: 'asc' },
             select: { id: true, name: true, code: true, logo: true },
           });
           if (fallbackBranch) {

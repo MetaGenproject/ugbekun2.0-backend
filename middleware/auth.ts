@@ -58,7 +58,14 @@ export async function resolveBranchForAdmin(decoded: any): Promise<number | null
     }
   }
 
-  return null;
+  // Fallback to primary active branch
+  const primaryBranch = await prisma.branch.findFirst({
+    where: { active: true },
+    orderBy: { id: 'asc' },
+    select: { id: true },
+  });
+
+  return primaryBranch ? primaryBranch.id : 1;
 }
 
 /**
