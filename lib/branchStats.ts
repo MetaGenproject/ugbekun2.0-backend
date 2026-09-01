@@ -181,10 +181,14 @@ export async function listStaffForBranch(prisma: any, branchId: number) {
   if (!branch) return [];
 
   const [users, branchTeachers, branchPayrolls] = await Promise.all([
-    prisma.user.findMany({
-      where: { role: { in: STAFF_ROLES } },
-      select: { id: true, username: true, role: true, photo: true, lastLogin: true, active: true },
-      orderBy: { username: 'asc' },
+    prisma.$queryRawUnsafe(
+      `SELECT id, username, role, photo, "lastLogin", active, email, phone, department FROM users WHERE role IN (4, 8, 9, 12, 13) ORDER BY username ASC`
+    ).catch(async () => {
+      return prisma.user.findMany({
+        where: { role: { in: STAFF_ROLES } },
+        select: { id: true, username: true, role: true, photo: true, lastLogin: true, active: true },
+        orderBy: { username: 'asc' },
+      });
     }),
     prisma.teacher.findMany({
       where: { branchId },
@@ -205,13 +209,18 @@ export async function listStaffForBranch(prisma: any, branchId: number) {
     if (p.staffId) branchUserIds.add(p.staffId);
   });
 
-  return users
+  return (users as any[])
     .filter((user: any) => branchUserIds.has(user.id) || staffMatchesBranch(user.username, branch))
     .map((user: any) => ({
       id: user.id,
       username: user.username,
+      name: user.username,
       role: user.role,
       roleLabel: STAFF_ROLE_LABELS[user.role] || 'Staff',
+      email: user.email || null,
+      phone: user.phone || null,
+      mobileno: user.phone || null,
+      department: user.department || 'General Administration',
       photo: user.photo || null,
       lastLogin: user.lastLogin,
       active: user.active,

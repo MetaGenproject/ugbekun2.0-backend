@@ -939,3 +939,117 @@ export async function toggleStaffStatus(req: Request, res: Response): Promise<Re
     return res.status(500).json({ success: false, message: error.message || 'Failed to toggle staff status.' });
   }
 }
+
+/**
+ * PUT /api/admin/staff/:id
+ */
+export async function updateStaff(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const id = Number(req.params.id);
+    const { name, username, email, phone, mobileno, department, role, roleLabel } = req.body;
+
+    const contactPhone = phone || mobileno;
+    const staffName = name || username;
+
+    const roleMapRev: Record<string, number> = {
+      'Bursar': 4,
+      'Receptionist': 8,
+      'HR Officer': 9,
+      'Librarian': 12,
+      'Staff': 13,
+      'Security Personnel': 13,
+      'Maintenance Officer': 13,
+      'Driver': 13,
+      'Laboratory Officer': 12,
+      'ICT Officer': 12,
+    };
+
+    const newRoleCode = roleLabel ? roleMapRev[roleLabel] : (typeof role === 'number' ? role : undefined);
+
+    await prisma.$executeRawUnsafe(
+      `UPDATE users SET 
+        username = COALESCE($1, username),
+        email = $2,
+        phone = $3,
+        department = $4
+        ${newRoleCode ? `, role = ${newRoleCode}` : ''}
+       WHERE id = $5`,
+      staffName || null,
+      email || null,
+      contactPhone || null,
+      department || null,
+      id
+    );
+
+    return res.json({
+      success: true,
+      message: 'Staff record updated successfully.',
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Update staff error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update staff record.' });
+  }
+}
+
+/**
+ * GET /api/admin/staff-messages
+ */
+export async function getStaffMessages(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const recipientId = req.query.recipientId ? Number(req.query.recipientId) : null;
+
+  try {
+    let sql = `SELECT id, branch_id AS "branchId", sender_id AS "senderId", sender_type AS "senderType", recipient_id AS "recipientId", target_department AS "targetDepartment", subject, message, is_memo AS "isMemo", created_at AS "createdAt" FROM staff_messages WHERE branch_id = $1`;
+    const params: any[] = [branchId];
+
+    if (recipientId) {
+      sql += ` AND (recipient_id = $2 OR is_memo = true)`;
+      params.push(recipientId);
+    }
+    sql += ` ORDER BY created_at ASC`;
+
+    const messages = await prisma.$queryRawUnsafe(sql, ...params);
+
+    return res.json({
+      success: true,
+      messages,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Get staff messages error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to fetch staff messages.' });
+  }
+}
+
+/**
+ * POST /api/admin/staff-messages
+ */
+export async function sendStaffMessage(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { recipientId, targetDepartment, subject, message, isMemo } = req.body;
+
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, message: 'Message content is required.' });
+  }
+
+  try {
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO staff_messages (branch_id, sender_id, sender_type, recipient_id, target_department, subject, message, is_memo)
+       VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7)`,
+      branchId,
+      (req as any).user?.id || 1,
+      recipientId ? Number(recipientId) : null,
+      targetDepartment || null,
+      subject || null,
+      message.trim(),
+      Boolean(isMemo)
+    );
+
+    return res.json({
+      success: true,
+      message: isMemo ? 'Staff memo dispatched successfully.' : 'Message sent successfully.',
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Send staff message error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to send message.' });
+  }
+}

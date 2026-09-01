@@ -60,6 +60,9 @@ import {
   uploadStaffPhoto,
   toggleTeacherStatus,
   toggleStaffStatus,
+  updateStaff,
+  getStaffMessages,
+  sendStaffMessage,
   getStaffAttendance,
   saveStaffAttendance,
   getLeaveCategories,
@@ -335,6 +338,9 @@ router.post('/staff/:id/upload-photo', upload.single('file'), uploadStaffPhoto);
 router.post('/teachers/:id/upload-photo', upload.single('file'), uploadTeacherPhoto);
 router.post('/teachers/:id/toggle-status', toggleTeacherStatus);
 router.post('/staff/:id/toggle-status', toggleStaffStatus);
+router.put('/staff/:id', updateStaff);
+router.get('/staff-messages', getStaffMessages);
+router.post('/staff-messages', sendStaffMessage);
 router.get('/staff/attendance', getStaffAttendance);
 router.post('/staff/attendance', saveStaffAttendance);
 
