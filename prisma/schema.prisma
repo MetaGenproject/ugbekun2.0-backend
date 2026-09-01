@@ -319,6 +319,7 @@ model Teacher {
   bankName       String?
   accountNumber  String?
   accountName    String?
+  weeklyPeriods  Int?      @default(18) @map("weekly_periods")
   active         Boolean   @default(true)
   createdAt DateTime  @default(now())
   updatedAt DateTime?

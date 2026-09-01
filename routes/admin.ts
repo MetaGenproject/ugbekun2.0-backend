@@ -30,10 +30,13 @@ import {
   getOnlineAdmissions,
   reviewOnlineAdmission,
   parseStudentDocument,
+  getIdCards,
   getIdCardsStats,
   getStudentsForIdCards,
   getStaffForIdCards,
   provisionIdCardHandler,
+  provisionStudentIdCardHandler,
+  provisionStaffIdCardHandler,
   batchProvisionIdCardsHandler,
   revokeIdCardHandler,
   downloadIdCardPdf,
@@ -284,23 +287,37 @@ router.post('/students/:id/toggle-status', toggleStudentStatus);
 router.put('/students/:id', updateStudent);
 router.delete('/students/:id', deleteStudent);
 router.post('/students/sibling-request', processSiblingRequest);
+router.get('/classroom-students', getClassroomStudents);
 router.get('/classrooms/:id/students', getClassroomStudents);
 router.get('/online-admissions', getOnlineAdmissions);
 router.post('/online-admissions/:id/review', reviewOnlineAdmission);
 router.post('/students/parse-document', upload.single('file'), parseStudentDocument);
 
+router.get('/id-cards', getIdCards);
 router.get('/id-cards/stats', getIdCardsStats);
 router.get('/id-cards/students', getStudentsForIdCards);
 router.get('/id-cards/staff', getStaffForIdCards);
 router.post('/id-cards/provision', provisionIdCardHandler);
+router.post('/id-cards/provision/student/:studentId', provisionStudentIdCardHandler);
+router.post('/id-cards/provision/staff/:userId', provisionStaffIdCardHandler);
+router.post('/id-cards/provision/batch', batchProvisionIdCardsHandler);
 router.post('/id-cards/batch-provision', batchProvisionIdCardsHandler);
 router.post('/id-cards/revoke', revokeIdCardHandler);
+router.put('/id-cards/:cardId/revoke', revokeIdCardHandler);
 router.get('/id-cards/download-pdf', downloadIdCardPdf);
+router.get('/id-cards/:cardId/download', downloadIdCardPdf);
+router.get('/id-cards/:cardId/download-pdf', downloadIdCardPdf);
 router.get('/id-cards/template-config', getIdCardTemplateConfig);
 router.post('/id-cards/template-config', saveIdCardTemplateConfig);
+router.get('/card-template', getIdCardTemplateConfig);
+router.put('/card-template', saveIdCardTemplateConfig);
+router.post('/card-template', saveIdCardTemplateConfig);
+
+router.get('/credentials-slips/class-pdf', exportCredentialSlips);
 
 router.get('/certificates', getCertificates);
 router.post('/certificates/issue', issueCertificate);
+router.get('/certificates/:id/download', downloadCertificatePdf);
 router.get('/certificates/:id/download-pdf', downloadCertificatePdf);
 
 // ============================================================================
@@ -369,8 +386,11 @@ router.delete('/subjects/assign/:id', deleteSubjectAssignment);
 router.get('/student-attendance', getStudentAttendance);
 router.post('/student-attendance', saveStudentAttendance);
 router.get('/promotion/selection', getPromotionSelection);
+router.get('/promotions/class-students', getPromotionSelection);
 router.post('/promotion/promote', promoteStudentCohort);
+router.post('/promotions/batch', promoteStudentCohort);
 router.get('/promotion/history', getPromotionHistory);
+router.get('/promotions/history', getPromotionHistory);
 
 router.get('/library/resources', getLibraryResources);
 router.post('/library/resources', createLibraryResource);

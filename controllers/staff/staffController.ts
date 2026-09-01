@@ -32,19 +32,20 @@ export async function getTeachersStaff(req: Request, res: Response): Promise<Res
       prisma.teacher.findMany({
         where: { branchId },
         orderBy: { name: 'asc' },
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          phone: true,
-          photo: true,
-          qualifications: true,
-          houseAddress: true,
-          department: true,
-          bankName: true,
-          accountNumber: true,
-          accountName: true,
-          active: true,
+        include: {
+          allocations: {
+            include: {
+              class: { select: { id: true, name: true } },
+              section: { select: { id: true, name: true } },
+            },
+          },
+          subjectAssigns: {
+            include: {
+              class: { select: { id: true, name: true } },
+              section: { select: { id: true, name: true } },
+              subject: { select: { id: true, name: true } },
+            },
+          },
           _count: { select: { allocations: true } },
         },
       }),
@@ -54,21 +55,68 @@ export async function getTeachersStaff(req: Request, res: Response): Promise<Res
     return res.json({
       success: true,
       data: {
-        teachers: teachers.map((teacher) => ({
-          id: teacher.id,
-          name: teacher.name,
-          email: teacher.email,
-          phone: teacher.phone,
-          photo: teacher.photo || null,
-          qualifications: teacher.qualifications || null,
-          houseAddress: teacher.houseAddress || null,
-          department: teacher.department || null,
-          bankName: teacher.bankName || null,
-          accountNumber: teacher.accountNumber || null,
-          accountName: teacher.accountName || null,
-          active: teacher.active,
-          classCount: teacher._count.allocations,
-        })),
+        teachers: teachers.map((teacher) => {
+          const allocationsList = teacher.allocations.map((a) => ({
+            id: a.id,
+            classId: a.classId,
+            className: a.class?.name || '',
+            sectionId: a.sectionId,
+            sectionName: a.section?.name || '',
+          }));
+
+          const subjectAssignsList = teacher.subjectAssigns.map((s) => ({
+            id: s.id,
+            subjectId: s.subjectId,
+            subjectName: s.subject?.name || '',
+            classId: s.classId,
+            className: s.class?.name || '',
+            sectionId: s.sectionId,
+            sectionName: s.section?.name || '',
+          }));
+
+          const firstAlloc = allocationsList[0];
+          const firstSubjAssign = subjectAssignsList[0];
+
+          const allocatedClassStr = allocationsList.length > 0
+            ? allocationsList.map((a) => `${a.className}${a.sectionName ? ` (${a.sectionName})` : ''}`).join(', ')
+            : null;
+
+          const assignedSubjectNames = subjectAssignsList
+            .map((s) => s.subjectName)
+            .filter(Boolean)
+            .filter((v, i, a) => a.indexOf(v) === i)
+            .join(', ');
+
+          const subjectSpecStr = assignedSubjectNames || teacher.department || null;
+
+          return {
+            id: teacher.id,
+            name: teacher.name,
+            email: teacher.email,
+            phone: teacher.phone,
+            photo: teacher.photo || null,
+            qualifications: teacher.qualifications || null,
+            houseAddress: teacher.houseAddress || null,
+            department: teacher.department || null,
+            bankName: teacher.bankName || null,
+            accountNumber: teacher.accountNumber || null,
+            accountName: teacher.accountName || null,
+            active: teacher.active,
+            classCount: teacher._count.allocations,
+            allocatedClass: allocatedClassStr || 'Unassigned',
+            allocatedClassId: firstAlloc?.classId || null,
+            allocatedSectionId: firstAlloc?.sectionId || null,
+            isClassTeacher: allocationsList.length > 0,
+            subjectSpecialization: subjectSpecStr || 'General Subject',
+            assignedSubjectId: firstSubjAssign?.subjectId || null,
+            assignedSubjectClassId: firstSubjAssign?.classId || null,
+            assignedSubjectSectionId: firstSubjAssign?.sectionId || null,
+            isSubjectTeacher: subjectAssignsList.length > 0,
+            weeklyPeriods: (teacher as any).weeklyPeriods || 18,
+            allocationsList,
+            subjectAssignsList,
+          };
+        }),
         staff,
       },
     });
@@ -534,6 +582,17 @@ export async function updateTeacher(req: Request, res: Response): Promise<Respon
       accountName,
       photo,
       photoBase64,
+      isClassTeacher,
+      classTeacherClassId,
+      classTeacherSectionId,
+      isSubjectTeacher,
+      subjectTeacherClassId,
+      subjectTeacherSectionId,
+      subjectTeacherSubjectId,
+      subjectSpecialization,
+      weeklyPeriods,
+      subjectAssignments,
+      classAllocations,
     } = req.body;
 
     const teacher = await prisma.teacher.findFirst({
@@ -550,6 +609,113 @@ export async function updateTeacher(req: Request, res: Response): Promise<Respon
       if (newPhoto) photoUrl = newPhoto;
     }
 
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    // 1. Handle Class Allocations (TeacherAllocation)
+    if (Array.isArray(classAllocations)) {
+      await prisma.teacherAllocation.deleteMany({ where: { teacherId: id } });
+      let nextId = ((await prisma.teacherAllocation.findFirst({ orderBy: { id: 'desc' } }))?.id || 0) + 1;
+      for (const item of classAllocations) {
+        if (item.classId && item.sectionId) {
+          await prisma.teacherAllocation.create({
+            data: {
+              id: nextId++,
+              teacherId: id,
+              classId: Number(item.classId),
+              sectionId: Number(item.sectionId),
+              sessionId,
+              branchId,
+            },
+          });
+        }
+      }
+    } else if (isClassTeacher === false) {
+      await prisma.teacherAllocation.deleteMany({ where: { teacherId: id } });
+    } else if (isClassTeacher === true && classTeacherClassId && classTeacherSectionId) {
+      const clsId = Number(classTeacherClassId);
+      const secId = Number(classTeacherSectionId);
+      const existingAlloc = await prisma.teacherAllocation.findFirst({ where: { teacherId: id } });
+      if (existingAlloc) {
+        await prisma.teacherAllocation.update({
+          where: { id: existingAlloc.id },
+          data: { classId: clsId, sectionId: secId, sessionId },
+        });
+      } else {
+        const lastAlloc = await prisma.teacherAllocation.findFirst({ orderBy: { id: 'desc' } });
+        const nextId = (lastAlloc?.id || 0) + 1;
+        await prisma.teacherAllocation.create({
+          data: {
+            id: nextId,
+            teacherId: id,
+            classId: clsId,
+            sectionId: secId,
+            sessionId,
+            branchId,
+          },
+        });
+      }
+    }
+
+    // 2. Handle Subject Specializations & Assignments (SubjectAssign)
+    if (Array.isArray(subjectAssignments)) {
+      await prisma.subjectAssign.deleteMany({ where: { teacherId: id } });
+      for (const item of subjectAssignments) {
+        if (item.subjectId && item.classId && item.sectionId) {
+          await prisma.subjectAssign.create({
+            data: {
+              teacherId: id,
+              subjectId: Number(item.subjectId),
+              classId: Number(item.classId),
+              sectionId: Number(item.sectionId),
+              sessionId,
+              branchId: branchId || 1,
+            },
+          });
+        }
+      }
+    } else if (isSubjectTeacher === false) {
+      await prisma.subjectAssign.deleteMany({ where: { teacherId: id } });
+    } else if (isSubjectTeacher === true && subjectTeacherSubjectId && subjectTeacherClassId && subjectTeacherSectionId) {
+      const subId = Number(subjectTeacherSubjectId);
+      const clsId = Number(subjectTeacherClassId);
+      const secId = Number(subjectTeacherSectionId);
+
+      const existingSubj = await prisma.subjectAssign.findFirst({ where: { teacherId: id } });
+      if (existingSubj) {
+        await prisma.subjectAssign.update({
+          where: { id: existingSubj.id },
+          data: { subjectId: subId, classId: clsId, sectionId: secId, sessionId, branchId: branchId || existingSubj.branchId },
+        });
+      } else {
+        await prisma.subjectAssign.create({
+          data: {
+            teacherId: id,
+            subjectId: subId,
+            classId: clsId,
+            sectionId: secId,
+            sessionId,
+            branchId: branchId || 1,
+          },
+        });
+      }
+    }
+
+    // 3. Handle Weekly Periods
+    if (weeklyPeriods !== undefined && !isNaN(Number(weeklyPeriods))) {
+      try {
+        await prisma.$executeRawUnsafe(
+          `UPDATE teachers SET weekly_periods = $1 WHERE id = $2`,
+          Number(weeklyPeriods),
+          id
+        );
+      } catch (err) {
+        console.error('[ADMIN] Failed to update weekly_periods:', err);
+      }
+    }
+
+    const updatedDept = department || subjectSpecialization || teacher.department;
+
     const updated = await prisma.teacher.update({
       where: { id },
       data: {
@@ -557,7 +723,7 @@ export async function updateTeacher(req: Request, res: Response): Promise<Respon
         ...(email !== undefined && { email: email.trim().toLowerCase() }),
         ...(phone !== undefined && { phone: phone.trim() }),
         ...(designation !== undefined && { designation: designation.trim() }),
-        ...(department !== undefined && { department: department.trim() }),
+        ...(updatedDept !== undefined && { department: updatedDept.trim() }),
         ...(qualifications !== undefined && { qualifications: qualifications.trim() }),
         ...(houseAddress !== undefined && { houseAddress: houseAddress.trim() }),
         ...(bankName !== undefined && { bankName: bankName.trim() }),
@@ -599,6 +765,8 @@ export async function deleteTeacher(req: Request, res: Response): Promise<Respon
       prisma.teacherAllocation.deleteMany({ where: { teacherId: id } }),
       prisma.subjectAssign.deleteMany({ where: { teacherId: id } }),
       prisma.staffAttendance.deleteMany({ where: { teacherId: id } }),
+      prisma.timetableSlot.deleteMany({ where: { teacherId: id } }),
+      prisma.lessonPlan.deleteMany({ where: { teacherId: id } }),
       prisma.teacher.delete({ where: { id } }),
       prisma.user.deleteMany({ where: { id: teacher.userId || id } }),
     ]);
