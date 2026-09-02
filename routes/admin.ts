@@ -27,6 +27,11 @@ import {
   deleteStudent,
   updateParent,
   deleteParent,
+  getParentMessages,
+  sendParentMessage,
+  updateParentMessage,
+  deleteParentMessage,
+  sendParentBroadcast,
   processSiblingRequest,
   getClassroomStudents,
   getOnlineAdmissions,
@@ -290,6 +295,13 @@ router.post('/students/:id/upload-photo', upload.single('file'), uploadStudentPh
 router.post('/parents/:id/upload-photo', upload.single('file'), uploadParentPhoto);
 router.put('/parents/:id', updateParent);
 router.delete('/parents/:id', deleteParent);
+
+// Parent EduChat Communication Endpoints
+router.get('/parents/:parentId/messages', getParentMessages);
+router.post('/parents/:parentId/messages', sendParentMessage);
+router.put('/parent-messages/:messageId', updateParentMessage);
+router.delete('/parent-messages/:messageId', deleteParentMessage);
+router.post('/parents/broadcast', sendParentBroadcast);
 router.post('/students/:id/toggle-status', toggleStudentStatus);
 router.put('/students/:id', updateStudent);
 router.delete('/students/:id', deleteStudent);

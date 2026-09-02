@@ -3015,3 +3015,198 @@ export async function deleteParent(req: Request, res: Response): Promise<Respons
   }
 }
 
+/**
+ * GET /api/admin/parents/:parentId/messages
+ */
+export async function getParentMessages(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const parentId = Number(req.params.parentId);
+
+  try {
+    const messages = await prisma.parentMessage.findMany({
+      where: {
+        parentId,
+        branchId,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    return res.json({
+      success: true,
+      data: messages.map((m) => ({
+        id: m.id,
+        parentId: m.parentId,
+        senderType: m.senderType,
+        recipientRole: m.recipientRole,
+        subject: m.subject,
+        message: m.message,
+        isRead: m.isRead,
+        createdAt: m.createdAt,
+        updatedAt: m.updatedAt,
+      })),
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Get parent messages error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch parent chat messages.' });
+  }
+}
+
+/**
+ * POST /api/admin/parents/:parentId/messages
+ */
+export async function sendParentMessage(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const parentId = Number(req.params.parentId);
+  const { message, subject } = req.body;
+
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, message: 'Message content is required.' });
+  }
+
+  try {
+    const parent = await prisma.parent.findUnique({
+      where: { id: parentId },
+      select: { id: true, branchId: true },
+    });
+
+    if (!parent || (parent.branchId && parent.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Parent record not found.' });
+    }
+
+    const newMessage = await prisma.parentMessage.create({
+      data: {
+        branchId,
+        parentId,
+        senderType: 'ADMIN',
+        recipientRole: 'PARENT',
+        subject: subject ? subject.trim() : 'EduChat Message',
+        message: message.trim(),
+      },
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Message sent successfully via EduChat.',
+      data: newMessage,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Send parent message error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to send chat message.' });
+  }
+}
+
+/**
+ * PUT /api/admin/parent-messages/:messageId
+ */
+export async function updateParentMessage(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const messageId = Number(req.params.messageId);
+  const { message } = req.body;
+
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, message: 'Updated message content is required.' });
+  }
+
+  try {
+    const existing = await prisma.parentMessage.findUnique({
+      where: { id: messageId },
+    });
+
+    if (!existing || existing.branchId !== branchId) {
+      return res.status(404).json({ success: false, message: 'Message not found or access denied.' });
+    }
+
+    const updated = await prisma.parentMessage.update({
+      where: { id: messageId },
+      data: {
+        message: message.trim(),
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Message updated successfully.',
+      data: updated,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Update parent message error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update message.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/parent-messages/:messageId
+ */
+export async function deleteParentMessage(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const messageId = Number(req.params.messageId);
+
+  try {
+    const existing = await prisma.parentMessage.findUnique({
+      where: { id: messageId },
+    });
+
+    if (!existing || existing.branchId !== branchId) {
+      return res.status(404).json({ success: false, message: 'Message not found or access denied.' });
+    }
+
+    await prisma.parentMessage.delete({
+      where: { id: messageId },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Message deleted successfully.',
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete parent message error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to delete message.' });
+  }
+}
+
+/**
+ * POST /api/admin/parents/broadcast
+ */
+export async function sendParentBroadcast(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { target = 'all', message, subject = 'School Announcement' } = req.body;
+
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, message: 'Broadcast message content is required.' });
+  }
+
+  try {
+    const parents = await prisma.parent.findMany({
+      where: { branchId },
+      select: { id: true },
+    });
+
+    if (parents.length === 0) {
+      return res.status(404).json({ success: false, message: 'No parents found to receive broadcast.' });
+    }
+
+    const records = parents.map((p) => ({
+      branchId,
+      parentId: p.id,
+      senderType: 'ADMIN',
+      recipientRole: 'PARENT',
+      subject,
+      message: message.trim(),
+    }));
+
+    await prisma.parentMessage.createMany({
+      data: records,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Broadcast successfully sent to ${parents.length} parents.`,
+      count: parents.length,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Parent broadcast error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to dispatch broadcast message.' });
+  }
+}
+
