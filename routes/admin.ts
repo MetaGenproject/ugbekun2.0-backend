@@ -25,6 +25,8 @@ import {
   toggleStudentStatus,
   updateStudent,
   deleteStudent,
+  updateParent,
+  deleteParent,
   processSiblingRequest,
   getClassroomStudents,
   getOnlineAdmissions,
@@ -286,6 +288,8 @@ router.get('/students/:id/profile', getStudentProfile);
 router.put('/students/:id/profile', updateStudentProfile);
 router.post('/students/:id/upload-photo', upload.single('file'), uploadStudentPhoto);
 router.post('/parents/:id/upload-photo', upload.single('file'), uploadParentPhoto);
+router.put('/parents/:id', updateParent);
+router.delete('/parents/:id', deleteParent);
 router.post('/students/:id/toggle-status', toggleStudentStatus);
 router.put('/students/:id', updateStudent);
 router.delete('/students/:id', deleteStudent);

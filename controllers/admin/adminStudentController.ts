@@ -88,18 +88,100 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
         orderBy: { name: 'asc' },
         select: {
           id: true,
+          userId: true,
           name: true,
           relation: true,
           email: true,
           mobileno: true,
           photo: true,
+          address: true,
           city: true,
           state: true,
+          occupation: true,
           active: true,
+          user: {
+            select: {
+              username: true,
+            },
+          },
+          students: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              registerNo: true,
+              enrolls: {
+                where: { sessionId },
+                select: {
+                  class: { select: { name: true } },
+                  section: { select: { name: true } },
+                },
+              },
+            },
+          },
           _count: { select: { students: true } },
         },
       }),
     ]);
+
+    // Map student parent relationships from the student query as well
+    const parentStudentsMap = new Map<number, Array<{ id: number; name: string; registerNo?: string; className?: string; sectionName?: string }>>();
+
+    students.forEach((s) => {
+      if (s.parentId) {
+        const studentName = `${s.firstName || ''} ${s.lastName || ''}`.trim() || `Student #${s.id}`;
+        const studentObj = {
+          id: s.id,
+          name: studentName,
+          registerNo: s.registerNo || '',
+          className: s.enrolls[0]?.class?.name || '',
+          sectionName: s.enrolls[0]?.section?.name || '',
+        };
+        if (!parentStudentsMap.has(s.parentId)) {
+          parentStudentsMap.set(s.parentId, []);
+        }
+        parentStudentsMap.get(s.parentId)!.push(studentObj);
+      }
+    });
+
+    const formattedParents = parents.map((parent) => {
+      const dbStudents = (parent.students || []).map((s) => ({
+        id: s.id,
+        name: `${s.firstName || ''} ${s.lastName || ''}`.trim() || `Student #${s.id}`,
+        registerNo: s.registerNo || '',
+        className: s.enrolls[0]?.class?.name || '',
+        sectionName: s.enrolls[0]?.section?.name || '',
+      }));
+
+      const mapStudents = parentStudentsMap.get(parent.id) || [];
+      const combinedMap = new Map<number, any>();
+      [...dbStudents, ...mapStudents].forEach((st) => {
+        if (st.id && st.name) combinedMap.set(st.id, st);
+      });
+      const allLinkedStudents = Array.from(combinedMap.values());
+
+      const parentEmail = parent.email || (parent.user?.username?.includes('@') ? parent.user.username : '') || '';
+      const parentPhone = parent.mobileno || (!parent.user?.username?.includes('@') ? parent.user?.username : '') || '';
+      const parentName = parent.name || 'Parent/Guardian';
+      const parentAddress = parent.address || [parent.city, parent.state].filter(Boolean).join(', ') || '';
+
+      return {
+        id: parent.id,
+        userId: parent.userId || parent.id,
+        name: parentName,
+        relation: parent.relation || 'Parent',
+        email: parentEmail,
+        mobileno: parentPhone,
+        photo: parent.photo || null,
+        address: parentAddress,
+        city: parent.city || '',
+        state: parent.state || '',
+        occupation: parent.occupation || '',
+        active: parent.active,
+        studentCount: Math.max(parent._count.students, allLinkedStudents.length),
+        students: allLinkedStudents,
+      };
+    });
 
     return res.json({
       success: true,
@@ -121,18 +203,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           className: student.enrolls[0]?.class?.name || 'Unassigned',
           sectionName: student.enrolls[0]?.section?.name || '',
         })),
-        parents: parents.map((parent) => ({
-          id: parent.id,
-          name: parent.name,
-          relation: parent.relation,
-          email: parent.email,
-          mobileno: parent.mobileno,
-          photo: parent.photo || null,
-          city: parent.city,
-          state: parent.state,
-          active: parent.active,
-          studentCount: parent._count.students,
-        })),
+        parents: formattedParents,
       },
     });
   } catch (error: any) {
@@ -2850,4 +2921,97 @@ export const provisionIdCardHandler = provisionStudentIdCardHandler;
 export const batchProvisionIdCardsHandler = batchProvisionIdCards;
 export const getIdCardTemplateConfig = getCardTemplate;
 export const saveIdCardTemplateConfig = updateCardTemplate;
+
+/**
+ * PUT /api/admin/parents/:id
+ */
+export async function updateParent(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const parentId = Number(req.params.id);
+  const { name, relation, email, mobileno, address, city, state, occupation } = req.body;
+
+  try {
+    const parent = await prisma.parent.findUnique({
+      where: { id: parentId },
+      select: { id: true, branchId: true, userId: true },
+    });
+
+    if (!parent || (parent.branchId && parent.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Parent record not found or access denied.' });
+    }
+
+    const updated = await prisma.parent.update({
+      where: { id: parentId },
+      data: {
+        ...(name !== undefined && { name }),
+        ...(relation !== undefined && { relation }),
+        ...(email !== undefined && { email }),
+        ...(mobileno !== undefined && { mobileno }),
+        ...(address !== undefined && { address }),
+        ...(city !== undefined && { city }),
+        ...(state !== undefined && { state }),
+        ...(occupation !== undefined && { occupation }),
+        updatedAt: new Date(),
+      },
+    });
+
+    if (parent.userId && email) {
+      await prisma.user.update({
+        where: { id: parent.userId },
+        data: {
+          username: email,
+        },
+      }).catch(() => {});
+    }
+
+    return res.json({ success: true, message: 'Parent details updated successfully.', data: updated });
+  } catch (error: any) {
+    console.error('[ADMIN] Update parent error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update parent record.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/parents/:id
+ */
+export async function deleteParent(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const parentId = Number(req.params.id);
+
+  try {
+    const parent = await prisma.parent.findUnique({
+      where: { id: parentId },
+      select: { id: true, branchId: true, userId: true },
+    });
+
+    if (!parent || (parent.branchId && parent.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Parent record not found or access denied.' });
+    }
+
+    // Unlink any students referencing this parent
+    await prisma.student.updateMany({
+      where: { parentId },
+      data: { parentId: null },
+    });
+
+    // Delete sibling requests & messages linked to this parent
+    await prisma.parentSiblingRequest.deleteMany({ where: { parentId } }).catch(() => {});
+    await prisma.parentMessage.deleteMany({ where: { parentId } }).catch(() => {});
+
+    // Delete parent record
+    await prisma.parent.delete({
+      where: { id: parentId },
+    });
+
+    // Delete user account if associated
+    if (parent.userId) {
+      await prisma.user.delete({ where: { id: parent.userId } }).catch(() => {});
+    }
+
+    return res.json({ success: true, message: 'Parent record deleted successfully.' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete parent error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to delete parent record.' });
+  }
+}
 
