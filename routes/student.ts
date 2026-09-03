@@ -16,6 +16,7 @@ router.get('/grades', studentController.getGrades);
 router.get('/grades/export-pdf', studentController.exportGradesPdf);
 
 // Homework Submission
+router.get('/homeworks/:id', studentController.getHomeworkDetail);
 router.post('/homeworks/:id/submit', studentController.submitHomework);
 
 // CBT / Online Exams

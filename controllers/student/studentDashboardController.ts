@@ -197,14 +197,12 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         orderBy: { dueDate: 'asc' },
         take: 6,
       });
-      const submittedHwIds = new Set(
-        (
-          await prisma.homeworkSubmission.findMany({
-            where: { studentId: req.studentId, homeworkId: { in: homeworks.map((h) => h.id) } },
-            select: { homeworkId: true },
-          })
-        ).map((s) => s.homeworkId)
-      );
+      const submissions = await prisma.homeworkSubmission.findMany({
+        where: { studentId: req.studentId, homeworkId: { in: homeworks.map((h) => h.id) } },
+        select: { homeworkId: true, score: true, feedback: true },
+      });
+      const subMap = new Map(submissions.map((s) => [s.homeworkId, s]));
+
       upcomingHomeworks = homeworks.map((hw) => {
         const dueDate = new Date(hw.dueDate);
         const diffDays = Math.ceil((dueDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
@@ -213,14 +211,21 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         else if (diffDays === 0) deadlineBadge = 'Due Today';
         else if (diffDays === 1) deadlineBadge = 'Due Tomorrow';
         else deadlineBadge = `${diffDays} Days Left`;
+        const sub = subMap.get(hw.id);
         return {
           id: hw.id,
           title: hw.title,
+          description: hw.description,
+          questions: hw.questions || [],
           subjectName: hw.subject?.name || 'General',
           dueDate: hw.dueDate,
           deadlineBadge,
           diffDays,
-          submitted: submittedHwIds.has(hw.id),
+          submitted: !!sub,
+          score: sub?.score ?? null,
+          submissionScore: sub?.score ?? null,
+          submissionStatus: sub ? (sub.score !== null ? 'GRADED' : 'SUBMITTED') : 'PENDING',
+          feedback: sub?.feedback || null,
         };
       });
     }

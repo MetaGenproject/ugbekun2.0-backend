@@ -66,6 +66,7 @@ import {
   takeAttritionAction,
   getTeacherClassesSections,
   getTeacherSubjects,
+  getSubjectStudents,
   getEvents,
 } from '../controllers/teacher';
 import { importCbtQuestions, aiGenerateCbtQuestions } from '../controllers/admin/adminExamCbtController';
@@ -86,6 +87,7 @@ router.get('/school-info', getPublicSchoolInfo);
 router.get('/classes-sections', getTeacherClassesSections);
 router.get('/classes', getTeacherClassesSections);
 router.get('/subjects', getTeacherSubjects);
+router.get('/subjects/:assignId/students', getSubjectStudents);
 
 // Reminders
 router.get('/reminders', getReminders);

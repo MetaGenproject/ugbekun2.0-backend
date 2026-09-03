@@ -1890,14 +1890,142 @@ export async function getTeacherClassesSections(req: Request, res: Response): Pr
 export async function getTeacherSubjects(req: Request, res: Response): Promise<Response | void> {
   try {
     const branchId = req.branchId;
-    const subjects = await prisma.subject.findMany({
-      where: branchId ? { branchId } : {},
-      orderBy: { name: 'asc' },
+    const teacherId = req.teacherId;
+
+    const [allBranchSubjects, teacherSubjectAssigns] = await Promise.all([
+      prisma.subject.findMany({
+        where: branchId ? { branchId } : {},
+        orderBy: { name: 'asc' },
+      }),
+      teacherId
+        ? prisma.subjectAssign.findMany({
+            where: { teacherId },
+            include: {
+              subject: true,
+              class: { select: { id: true, name: true } },
+              section: { select: { id: true, name: true } },
+            },
+            orderBy: { id: 'desc' },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    // Calculate student counts offering each subject in each class-section
+    const assignedSubjects = await Promise.all(
+      teacherSubjectAssigns.map(async (sa) => {
+        const studentCount = await prisma.enroll.count({
+          where: {
+            classId: sa.classId,
+            sectionId: sa.sectionId,
+            isAlumni: 0,
+            ...(branchId ? { branchId } : {}),
+          },
+        });
+
+        return {
+          id: sa.id,
+          subjectId: sa.subjectId,
+          subjectName: sa.subject?.name || 'Subject',
+          subjectCode: sa.subject?.subjectCode || 'N/A',
+          subjectType: sa.subject?.subjectType || 'Core',
+          subjectAuthor: sa.subject?.subjectAuthor || null,
+          classId: sa.classId,
+          className: sa.class?.name || 'Class',
+          sectionId: sa.sectionId,
+          sectionName: sa.section?.name || 'Section',
+          studentCount,
+          createdAt: sa.createdAt,
+        };
+      })
+    );
+
+    // Calculate KPI summary metrics
+    const uniqueSubjectIds = new Set(assignedSubjects.map((s) => s.subjectId));
+    const uniqueClassSectionKeys = new Set(assignedSubjects.map((s) => `${s.classId}-${s.sectionId}`));
+    const totalStudentsOffering = assignedSubjects.reduce((sum, s) => sum + s.studentCount, 0);
+
+    return res.json({
+      success: true,
+      subjects: allBranchSubjects,
+      assignedSubjects,
+      kpi: {
+        totalAssignedSubjects: uniqueSubjectIds.size,
+        totalClassesTaught: uniqueClassSectionKeys.size,
+        totalStudentsOffering,
+      },
     });
-    return res.json({ success: true, subjects });
   } catch (error) {
     console.error('[TEACHER] Get subjects error:', error);
     return res.status(500).json({ success: false, message: 'Failed to retrieve subjects.' });
+  }
+}
+
+/**
+ * GET /api/teacher/subjects/:assignId/students
+ */
+export async function getSubjectStudents(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const assignId = Number(req.params.assignId);
+    const subjectAssign = await prisma.subjectAssign.findUnique({
+      where: { id: assignId },
+      include: {
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+      },
+    });
+
+    if (!subjectAssign) {
+      return res.status(404).json({ success: false, message: 'Subject assignment not found.' });
+    }
+
+    const enrolls = await prisma.enroll.findMany({
+      where: {
+        classId: subjectAssign.classId,
+        sectionId: subjectAssign.sectionId,
+        isAlumni: 0,
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            registerNo: true,
+            firstName: true,
+            lastName: true,
+            gender: true,
+            photo: true,
+            email: true,
+            mobileno: true,
+          },
+        },
+      },
+      orderBy: {
+        student: {
+          lastName: 'asc',
+        },
+      },
+    });
+
+    const students = enrolls.map((e) => ({
+      id: e.student.id,
+      registerNo: e.student.registerNo,
+      fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
+      gender: e.student.gender || 'N/A',
+      photo: e.student.photo,
+      roll: e.roll,
+    }));
+
+    return res.json({
+      success: true,
+      subject: subjectAssign.subject,
+      class: subjectAssign.class,
+      section: subjectAssign.section,
+      totalStudents: students.length,
+      students,
+    });
+  } catch (error) {
+    console.error('[TEACHER] Get subject students error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve subject students.' });
   }
 }
 

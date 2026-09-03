@@ -46,7 +46,17 @@ export async function getAttendance(req: Request, res: Response): Promise<Respon
  * GET /api/student/tasks
  */
 export async function getTasks(req: Request, res: Response): Promise<Response | void> {
-  if (!req.classId) {
+  let targetClassId = req.classId;
+  if (!targetClassId && req.studentId) {
+    const latestEnroll = await prisma.enroll.findFirst({
+      where: { studentId: req.studentId, isAlumni: 0 },
+      orderBy: { id: 'desc' },
+      select: { classId: true },
+    });
+    targetClassId = latestEnroll?.classId || null;
+  }
+
+  if (!targetClassId) {
     return res.json({ success: true, notes: [], onlineExams: [], homeworks: [] });
   }
 
@@ -59,7 +69,7 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
     });
 
     const notes = allNotes
-      .filter((n) => n.classId.split(',').map((s) => s.trim()).includes(String(req.classId)))
+      .filter((n) => n.classId.split(',').map((s) => s.trim()).includes(String(targetClassId)))
       .map((n) => ({
         id: n.id,
         title: n.title,
@@ -72,9 +82,8 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
 
     const onlineExams = await prisma.onlineExam.findMany({
       where: {
-        classId: req.classId,
-        sessionId: req.sessionId,
-        branchId: req.branchId,
+        classId: targetClassId,
+        ...(req.branchId ? { branchId: req.branchId } : {}),
       },
       include: {
         subject: { select: { name: true } },
@@ -87,9 +96,8 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
 
     const homeworks = await prisma.homework.findMany({
       where: {
-        classId: req.classId,
-        sessionId: req.sessionId,
-        branchId: req.branchId,
+        classId: targetClassId,
+        ...(req.branchId ? { branchId: req.branchId } : {}),
       },
       include: {
         subject: { select: { name: true } },
@@ -125,6 +133,7 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
           subjectName: hw.subject?.name || 'General',
           dueDate: hw.dueDate,
           description: hw.description,
+          questions: hw.questions || [],
           submitted: !!submission,
           submissionScore: submission?.score ?? null,
           submissionStatus: submission ? (submission.score !== null ? 'GRADED' : 'SUBMITTED') : 'PENDING',
