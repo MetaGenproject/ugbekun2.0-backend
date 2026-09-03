@@ -671,18 +671,20 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSessionId = sessionId ? parseInt(sessionId, 10) : globalSetting?.sessionId || 5;
 
-    const where: any = {
+    const baseWhere: any = {
       branchId,
       classId: parseInt(classId, 10),
-      sessionId: activeSessionId,
     };
 
     if (sectionId && sectionId !== 'ALL') {
-      where.sectionId = parseInt(sectionId, 10);
+      baseWhere.sectionId = parseInt(sectionId, 10);
     }
 
-    const enrolls = await prisma.enroll.findMany({
-      where,
+    let enrolls = await prisma.enroll.findMany({
+      where: {
+        ...baseWhere,
+        sessionId: activeSessionId,
+      },
       orderBy: [{ student: { firstName: 'asc' } }, { roll: 'asc' }],
       include: {
         student: {
@@ -700,6 +702,28 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
         section: { select: { id: true, name: true } },
       },
     });
+
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
+        where: baseWhere,
+        orderBy: [{ student: { firstName: 'asc' } }, { roll: 'asc' }],
+        include: {
+          student: {
+            select: {
+              id: true,
+              registerNo: true,
+              firstName: true,
+              lastName: true,
+              gender: true,
+              photo: true,
+              active: true,
+            },
+          },
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+        },
+      });
+    }
 
     const activeStudents = enrolls
       .filter((e) => e.student && e.student.active)
@@ -779,30 +803,42 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
             },
           });
 
-          const existingTargetEnroll = await tx.enroll.findFirst({
-            where: { studentId, sessionId: tSessionId, branchId },
+          // Always update current latest enrollment so student immediately reflects target class/section
+          await tx.enroll.update({
+            where: { id: currentEnroll.id },
+            data: {
+              classId: tClassId,
+              sectionId: tSectionId,
+              updatedAt: new Date(),
+            },
           });
 
-          if (existingTargetEnroll) {
-            await tx.enroll.update({
-              where: { id: existingTargetEnroll.id },
-              data: {
-                classId: tClassId,
-                sectionId: tSectionId,
-                updatedAt: new Date(),
-              },
+          if (tSessionId !== currentEnroll.sessionId) {
+            const existingTargetEnroll = await tx.enroll.findFirst({
+              where: { studentId, sessionId: tSessionId, branchId },
             });
-          } else {
-            await tx.enroll.create({
-              data: {
-                studentId,
-                classId: tClassId,
-                sectionId: tSectionId,
-                roll: currentEnroll.roll || 0,
-                sessionId: tSessionId,
-                branchId,
-              },
-            });
+
+            if (existingTargetEnroll) {
+              await tx.enroll.update({
+                where: { id: existingTargetEnroll.id },
+                data: {
+                  classId: tClassId,
+                  sectionId: tSectionId,
+                  updatedAt: new Date(),
+                },
+              });
+            } else {
+              await tx.enroll.create({
+                data: {
+                  studentId,
+                  classId: tClassId,
+                  sectionId: tSectionId,
+                  roll: currentEnroll.roll || 0,
+                  sessionId: tSessionId,
+                  branchId,
+                },
+              });
+            }
           }
 
           await wipeEvaluationMatrix(tx, { studentId, sessionId: tSessionId }).catch(() => {});

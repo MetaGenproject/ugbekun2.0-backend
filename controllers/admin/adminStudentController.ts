@@ -75,7 +75,8 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           active: true,
           parent: { select: { name: true, photo: true, mobileno: true, email: true } },
           enrolls: {
-            where: { sessionId },
+            take: 1,
+            orderBy: { id: 'desc' },
             select: {
               class: { select: { id: true, name: true } },
               section: { select: { id: true, name: true } },
@@ -111,7 +112,8 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
               lastName: true,
               registerNo: true,
               enrolls: {
-                where: { sessionId },
+                take: 1,
+                orderBy: { id: 'desc' },
                 select: {
                   class: { select: { name: true } },
                   section: { select: { name: true } },
@@ -330,7 +332,23 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
     const motherTongue = student.motherTongue || body.motherTongue || null;
     const classId = Number(student.classId || body.classId);
     let sectionId = Number(student.sectionId || body.sectionId);
-    if (!sectionId || isNaN(sectionId)) sectionId = 1;
+
+    if (!classId || isNaN(classId) || classId <= 0) {
+      return res.status(400).json({ success: false, message: 'Class selection is required for student enrollment.' });
+    }
+
+    if (!sectionId || isNaN(sectionId) || sectionId <= 0) {
+      const classSec = await prisma.sectionsAllocation.findFirst({
+        where: { classId },
+        select: { sectionId: true },
+      });
+      if (classSec?.sectionId) {
+        sectionId = classSec.sectionId;
+      } else {
+        const firstSec = await prisma.section.findFirst({ select: { id: true } });
+        sectionId = firstSec?.id || 1;
+      }
+    }
     const currentAddress = (student.currentAddress || body.currentAddress || body.address || '').trim();
     const permanentAddress = (student.permanentAddress || body.permanentAddress || '').trim();
     const previousDetails = (student.previousDetails || body.previousDetails || '').trim();
@@ -1160,7 +1178,8 @@ export async function getStudentById(req: Request, res: Response): Promise<Respo
       include: {
         parent: true,
         enrolls: {
-          where: { sessionId },
+          take: 1,
+          orderBy: { id: 'desc' },
           include: {
             class: true,
             section: true,
@@ -1800,7 +1819,7 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
 
-    const enrollments = await prisma.enroll.findMany({
+    let enrollments = await prisma.enroll.findMany({
       where: {
         branchId,
         sessionId,
@@ -1821,6 +1840,29 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
         },
       },
     });
+
+    if (enrollments.length === 0) {
+      enrollments = await prisma.enroll.findMany({
+        where: {
+          branchId,
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          isAlumni: 0,
+        },
+        include: {
+          student: {
+            include: {
+              parent: true,
+            },
+          },
+        },
+        orderBy: {
+          student: {
+            lastName: 'asc',
+          },
+        },
+      });
+    }
 
     const formTeacherAllocation = await prisma.teacherAllocation.findFirst({
       where: {

@@ -33,6 +33,9 @@ import {
   deleteParentMessage,
   sendParentBroadcast,
   processSiblingRequest,
+  getSiblingRequests,
+  approveSiblingRequest,
+  rejectSiblingRequest,
   getClassroomStudents,
   getOnlineAdmissions,
   reviewOnlineAdmission,
@@ -306,6 +309,9 @@ router.post('/students/:id/toggle-status', toggleStudentStatus);
 router.put('/students/:id', updateStudent);
 router.delete('/students/:id', deleteStudent);
 router.post('/students/sibling-request', processSiblingRequest);
+router.get('/sibling-requests', getSiblingRequests);
+router.post('/sibling-requests/:id/approve', approveSiblingRequest);
+router.post('/sibling-requests/:id/reject', rejectSiblingRequest);
 router.get('/classroom-students', getClassroomStudents);
 router.get('/classrooms/:id/students', getClassroomStudents);
 router.get('/online-admissions', getOnlineAdmissions);

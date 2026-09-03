@@ -212,8 +212,7 @@ export async function getChildTeachers(req: Request, res: Response): Promise<Res
     const formAllocation = await prisma.teacherAllocation.findFirst({
       where: {
         classId: req.childClassId,
-        sectionId: req.childSectionId,
-        sessionId: req.childSessionId,
+        ...(req.childSectionId ? { sectionId: req.childSectionId } : {}),
         branchId: req.studentBranchId,
       },
       include: {
@@ -229,13 +228,13 @@ export async function getChildTeachers(req: Request, res: Response): Promise<Res
           },
         },
       },
+      orderBy: { id: 'desc' },
     });
 
     const subjectAssigns = await prisma.subjectAssign.findMany({
       where: {
         classId: req.childClassId,
-        sectionId: req.childSectionId,
-        sessionId: req.childSessionId,
+        ...(req.childSectionId ? { sectionId: req.childSectionId } : {}),
         branchId: req.studentBranchId,
       },
       include: {

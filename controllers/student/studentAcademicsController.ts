@@ -700,8 +700,7 @@ export async function getTeachers(req: Request, res: Response): Promise<Response
     const formAllocation = await prisma.teacherAllocation.findFirst({
       where: {
         classId: req.classId,
-        sectionId: req.sectionId,
-        sessionId: req.sessionId,
+        ...(req.sectionId ? { sectionId: req.sectionId } : {}),
         branchId: req.branchId,
       },
       include: {
@@ -717,13 +716,13 @@ export async function getTeachers(req: Request, res: Response): Promise<Response
           },
         },
       },
+      orderBy: { id: 'desc' },
     });
 
     const subjectAssigns = await prisma.subjectAssign.findMany({
       where: {
         classId: req.classId,
-        sectionId: req.sectionId,
-        sessionId: req.sessionId,
+        ...(req.sectionId ? { sectionId: req.sectionId } : {}),
         branchId: req.branchId,
       },
       include: {

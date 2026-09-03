@@ -77,9 +77,17 @@ export async function getTeachersStaff(req: Request, res: Response): Promise<Res
           const firstAlloc = allocationsList[0];
           const firstSubjAssign = subjectAssignsList[0];
 
-          const allocatedClassStr = allocationsList.length > 0
+          const formClassStr = allocationsList.length > 0
             ? allocationsList.map((a) => `${a.className}${a.sectionName ? ` (${a.sectionName})` : ''}`).join(', ')
             : null;
+
+          const subjectClassStr = subjectAssignsList.length > 0
+            ? subjectAssignsList.map((s) => `${s.className}${s.sectionName ? ` (${s.sectionName})` : ''}`).join(', ')
+            : null;
+
+          const allocatedClassStr = formClassStr
+            ? formClassStr
+            : (subjectClassStr ? `Subject Teacher: ${subjectClassStr}` : null);
 
           const assignedSubjectNames = subjectAssignsList
             .map((s) => s.subjectName)
@@ -102,7 +110,7 @@ export async function getTeachersStaff(req: Request, res: Response): Promise<Res
             accountNumber: teacher.accountNumber || null,
             accountName: teacher.accountName || null,
             active: teacher.active,
-            classCount: teacher._count.allocations,
+            classCount: teacher._count.allocations + subjectAssignsList.length,
             allocatedClass: allocatedClassStr || 'Unassigned',
             allocatedClassId: firstAlloc?.classId || null,
             allocatedSectionId: firstAlloc?.sectionId || null,

@@ -262,11 +262,30 @@ export async function requireStudent(req: Request, res: Response, next: NextFunc
           { id: req.userId },
         ],
       },
-      select: { id: true, branchId: true },
+      select: {
+        id: true,
+        branchId: true,
+        enrolls: {
+          take: 1,
+          orderBy: { id: 'desc' },
+          select: {
+            classId: true,
+            sectionId: true,
+            sessionId: true,
+          },
+        },
+      },
     });
+
+    const latestEnroll = studentRecord?.enrolls?.[0];
+    const globalSetting = await prisma.globalSettings.findFirst({ orderBy: { id: 'desc' } });
+    const activeSessionId = latestEnroll?.sessionId || globalSetting?.sessionId || 5;
 
     req.studentId = studentRecord ? studentRecord.id : req.userId;
     req.branchId = studentRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null));
+    req.classId = latestEnroll?.classId || null;
+    req.sectionId = latestEnroll?.sectionId || null;
+    req.sessionId = activeSessionId;
     next();
   } catch {
     res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
