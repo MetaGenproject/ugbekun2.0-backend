@@ -11,12 +11,14 @@ export async function getOnlineExams(req: Request, res: Response): Promise<Respo
 
     const exams = await prisma.onlineExam.findMany({
       where: {
-        branchId: req.branchId,
-        sessionId,
+        ...(req.branchId ? { branchId: req.branchId } : {}),
       },
       include: {
         class: { select: { id: true, name: true } },
         subject: { select: { id: true, name: true } },
+        submissions: {
+          select: { id: true, totalMark: true, createdAt: true },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });

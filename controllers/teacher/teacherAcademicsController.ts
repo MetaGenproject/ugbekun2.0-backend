@@ -11,6 +11,7 @@ import {
   generateBatchClassReportCardsPdf,
 } from '../../lib/pdfService';
 import gamificationService from '../../lib/gamificationService';
+import { generateRegistrationNumber } from '../../lib/studentService';
 
 const openai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
@@ -674,7 +675,7 @@ export async function getReportCards(req: Request, res: Response): Promise<Respo
  * GET /api/teacher/gradebook/sheet
  */
 export async function getGradebookSheet(req: Request, res: Response): Promise<Response | void> {
-  const { classId, sectionId, examId } = req.query;
+  const { classId, sectionId, examId, subjectId } = req.query;
   if (!classId || !sectionId || !examId) {
     return res.status(400).json({ success: false, message: 'classId, sectionId, and examId are required.' });
   }
@@ -691,13 +692,40 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
 
-    const [enrolls, subjectAssigns] = await Promise.all([
-      prisma.enroll.findMany({
+    // Fetch class, section and subject metadata
+    const [classRecord, sectionRecord, subjectRecord] = await Promise.all([
+      prisma.class.findUnique({ where: { id: Number(classId) }, select: { id: true, name: true } }),
+      prisma.section.findUnique({ where: { id: Number(sectionId) }, select: { id: true, name: true } }),
+      subjectId ? prisma.subject.findUnique({ where: { id: Number(subjectId) }, select: { id: true, name: true, subjectCode: true } }) : null,
+    ]);
+
+    let enrolls = await prisma.enroll.findMany({
+      where: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId,
+        ...(req.branchId ? { branchId: req.branchId } : {}),
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+            photo: true,
+          },
+        },
+      },
+      orderBy: { student: { lastName: 'asc' } },
+    });
+
+    // Fallback: if 0 enrolled students in current session, query across sessions for this class and section
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
         where: {
           classId: Number(classId),
           sectionId: Number(sectionId),
-          sessionId,
-          branchId: req.branchId,
         },
         include: {
           student: {
@@ -711,21 +739,71 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
           },
         },
         orderBy: { student: { lastName: 'asc' } },
-      }),
-      prisma.subjectAssign.findMany({
+      });
+    }
+
+    // Fallback 2: if 0 enrolled students for this specific section, query all students in this class
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
+        where: {
+          classId: Number(classId),
+        },
+        include: {
+          student: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              registerNo: true,
+              photo: true,
+            },
+          },
+        },
+        orderBy: { student: { lastName: 'asc' } },
+      });
+    }
+
+    // Deduplicate students
+    const seen = new Set<number>();
+    enrolls = enrolls.filter((e) => {
+      if (seen.has(e.student.id)) return false;
+      seen.add(e.student.id);
+      return true;
+    });
+
+    let subjectAssigns = await prisma.subjectAssign.findMany({
+      where: {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId,
+        ...(req.branchId ? { branchId: req.branchId } : {}),
+      },
+      include: {
+        subject: {
+          select: { id: true, name: true, subjectCode: true },
+        },
+      },
+    });
+
+    if (subjectAssigns.length === 0) {
+      subjectAssigns = await prisma.subjectAssign.findMany({
         where: {
           classId: Number(classId),
           sectionId: Number(sectionId),
-          sessionId,
-          branchId: req.branchId,
         },
         include: {
           subject: {
             select: { id: true, name: true, subjectCode: true },
           },
         },
-      }),
-    ]);
+      });
+      const seenSub = new Set<number>();
+      subjectAssigns = subjectAssigns.filter((sa) => {
+        if (seenSub.has(sa.subject.id)) return false;
+        seenSub.add(sa.subject.id);
+        return true;
+      });
+    }
 
     const studentIds = enrolls.map((e) => e.student.id);
     const marks = await prisma.mark.findMany({
@@ -734,8 +812,6 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
         sectionId: Number(sectionId),
         examId: Number(examId),
         studentId: { in: studentIds },
-        sessionId,
-        branchId: req.branchId,
       },
       select: {
         id: true,
@@ -763,6 +839,7 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
       code: sa.subject.subjectCode,
     }));
 
+    // Multi-subject matrix rows
     const rows = enrolls.map((e) => {
       const studentMarks: Record<number, any> = {};
       subjects.forEach((sub) => {
@@ -780,7 +857,63 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
       };
     });
 
-    return res.json({ success: true, subjects, rows });
+    // Single/Selected subject structured sheet for interactive data entry columns
+    const activeSubjectId = subjectId ? Number(subjectId) : (subjects[0]?.id || 0);
+    const activeSubjectName = subjectRecord?.name || subjects.find((s) => s.id === activeSubjectId)?.name || 'Subject';
+
+    const sheet = enrolls.map((e) => {
+      const markEntry = marksMap[`${e.student.id}_${activeSubjectId}`];
+      const theory = markEntry?.mark !== null && markEntry?.mark !== undefined && markEntry?.mark !== ''
+        ? Number(markEntry.mark)
+        : null;
+      const objective = markEntry?.cbtMark !== null && markEntry?.cbtMark !== undefined && markEntry?.cbtMark !== ''
+        ? Number(markEntry.cbtMark)
+        : 0;
+      const isAbsent = markEntry?.absent === '1';
+      const cumulative = isAbsent ? 0 : (theory !== null ? theory + objective : objective);
+
+      let grade = 'F';
+      let remark = 'Fail';
+      if (!isAbsent && theory !== null) {
+        if (cumulative >= 70) { grade = 'A'; remark = 'Excellent'; }
+        else if (cumulative >= 60) { grade = 'B'; remark = 'Very Good'; }
+        else if (cumulative >= 50) { grade = 'C'; remark = 'Credit'; }
+        else if (cumulative >= 40) { grade = 'D'; remark = 'Pass'; }
+        else { grade = 'F'; remark = 'Fail'; }
+      }
+
+      return {
+        studentId: e.student.id,
+        registerNo: e.student.registerNo || '',
+        firstName: e.student.firstName,
+        lastName: e.student.lastName,
+        photo: e.student.photo,
+        gender: '',
+        className: classRecord?.name || 'Class',
+        sectionName: sectionRecord?.name || 'Section',
+        subjectId: activeSubjectId,
+        subjectName: activeSubjectName,
+        theoryMark: theory,
+        objectiveMark: objective,
+        absent: isAbsent,
+        cumulative: isAbsent ? 'ABS' : cumulative,
+        grade: isAbsent ? '-' : grade,
+        remark: isAbsent ? 'Absent' : remark,
+      };
+    });
+
+    return res.json({
+      success: true,
+      sheet,
+      subjects,
+      rows,
+      meta: {
+        className: classRecord?.name,
+        sectionName: sectionRecord?.name,
+        subjectName: activeSubjectName,
+        activeSubjectId,
+      },
+    });
   } catch (error) {
     console.error('[TEACHER] Gradebook sheet error:', error);
     return res.status(500).json({ success: false, message: 'Failed to retrieve gradebook sheet.' });
@@ -791,7 +924,11 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
  * POST /api/teacher/gradebook/save-single
  */
 export async function saveSingleGrade(req: Request, res: Response): Promise<Response | void> {
-  const { studentId, subjectId, examId, classId, sectionId, mark, cbtMark, absent } = req.body;
+  const { studentId, subjectId, examId, classId, sectionId } = req.body;
+  const rawMark = req.body.mark !== undefined ? req.body.mark : req.body.theoryMark;
+  const rawCbtMark = req.body.cbtMark !== undefined ? req.body.cbtMark : req.body.objectiveMark;
+  const absent = req.body.absent;
+
   if (!studentId || !subjectId || !examId || !classId || !sectionId) {
     return res.status(400).json({ success: false, message: 'Required identifiers missing.' });
   }
@@ -815,19 +952,21 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
         examId: Number(examId),
         classId: Number(classId),
         sectionId: Number(sectionId),
-        sessionId,
-        branchId: req.branchId,
       },
     });
+
+    const markVal = rawMark !== undefined ? (rawMark !== null && rawMark !== '' ? String(rawMark) : null) : undefined;
+    const cbtVal = rawCbtMark !== undefined ? (rawCbtMark !== null && rawCbtMark !== '' ? String(rawCbtMark) : null) : undefined;
+    const absentVal = absent !== undefined ? (absent ? '1' : null) : undefined;
 
     let saved;
     if (existing) {
       saved = await prisma.mark.update({
         where: { id: existing.id },
         data: {
-          mark: mark !== undefined ? (mark !== null ? String(mark) : null) : existing.mark,
-          cbtMark: cbtMark !== undefined ? (cbtMark !== null ? String(cbtMark) : null) : existing.cbtMark,
-          absent: absent !== undefined ? (absent ? '1' : null) : existing.absent,
+          mark: markVal !== undefined ? markVal : existing.mark,
+          cbtMark: cbtVal !== undefined ? cbtVal : existing.cbtMark,
+          absent: absentVal !== undefined ? absentVal : existing.absent,
         },
       });
     } else {
@@ -838,11 +977,11 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
           examId: Number(examId),
           classId: Number(classId),
           sectionId: Number(sectionId),
-          mark: mark !== undefined && mark !== null ? String(mark) : null,
-          cbtMark: cbtMark !== undefined && cbtMark !== null ? String(cbtMark) : null,
-          absent: absent ? '1' : null,
-          sessionId,
-          branchId: req.branchId,
+          mark: markVal !== undefined ? markVal : null,
+          cbtMark: cbtVal !== undefined ? cbtVal : null,
+          absent: absentVal !== undefined ? absentVal : null,
+          sessionId: existing?.sessionId || sessionId,
+          branchId: req.branchId || null,
         },
       });
     }
@@ -851,6 +990,84 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
   } catch (error) {
     console.error('[TEACHER] Save single grade error:', error);
     return res.status(500).json({ success: false, message: 'Failed to save grade cell.' });
+  }
+}
+
+/**
+ * POST /api/teacher/gradebook/batch-save
+ */
+export async function batchSaveGradebook(req: Request, res: Response): Promise<Response | void> {
+  const { classId, sectionId, subjectId, examId, scores } = req.body;
+  if (!classId || !sectionId || !subjectId || !examId || !Array.isArray(scores)) {
+    return res.status(400).json({ success: false, message: 'Invalid batch score payload.' });
+  }
+
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req);
+  if (!isAssigned) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: You are not assigned to record grades for this subject.',
+    });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    let count = 0;
+    await prisma.$transaction(async (tx) => {
+      for (const item of scores) {
+        if (!item.studentId) continue;
+
+        const rawMark = item.theoryMark !== undefined ? item.theoryMark : item.mark;
+        const rawCbtMark = item.objectiveMark !== undefined ? item.objectiveMark : item.cbtMark;
+        const markVal = rawMark !== undefined ? (rawMark !== null && rawMark !== '' ? String(rawMark) : null) : null;
+        const cbtVal = rawCbtMark !== undefined ? (rawCbtMark !== null && rawCbtMark !== '' ? String(rawCbtMark) : null) : null;
+        const absentVal = item.absent ? '1' : null;
+
+        const existing = await tx.mark.findFirst({
+          where: {
+            studentId: Number(item.studentId),
+            subjectId: Number(subjectId),
+            examId: Number(examId),
+            classId: Number(classId),
+            sectionId: Number(sectionId),
+          },
+        });
+
+        if (existing) {
+          await tx.mark.update({
+            where: { id: existing.id },
+            data: {
+              mark: markVal,
+              cbtMark: cbtVal !== null ? cbtVal : existing.cbtMark,
+              absent: absentVal,
+            },
+          });
+        } else {
+          await tx.mark.create({
+            data: {
+              studentId: Number(item.studentId),
+              subjectId: Number(subjectId),
+              examId: Number(examId),
+              classId: Number(classId),
+              sectionId: Number(sectionId),
+              mark: markVal,
+              cbtMark: cbtVal,
+              absent: absentVal,
+              sessionId,
+              branchId: req.branchId || null,
+            },
+          });
+        }
+        count++;
+      }
+    });
+
+    return res.json({ success: true, count, message: `Successfully updated ${count} student scores.` });
+  } catch (error) {
+    console.error('[TEACHER] Batch save gradebook error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to batch save grades.' });
   }
 }
 
@@ -2028,4 +2245,214 @@ export async function getSubjectStudents(req: Request, res: Response): Promise<R
     return res.status(500).json({ success: false, message: 'Failed to retrieve subject students.' });
   }
 }
+
+/**
+ * GET /api/teacher/students/pool
+ * Search or retrieve students from database registry
+ */
+export async function getStudentPool(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const { classId, q } = req.query;
+    const where: any = {};
+    if (classId) {
+      where.enrolls = { some: { classId: Number(classId) } };
+    }
+    if (q) {
+      where.OR = [
+        { firstName: { contains: String(q), mode: 'insensitive' } },
+        { lastName: { contains: String(q), mode: 'insensitive' } },
+        { registerNo: { contains: String(q), mode: 'insensitive' } },
+      ];
+    }
+
+    const students = await prisma.student.findMany({
+      where,
+      take: 50,
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        registerNo: true,
+        photo: true,
+        enrolls: {
+          take: 1,
+          orderBy: { createdAt: 'desc' },
+          select: {
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { lastName: 'asc' },
+    });
+
+    const formatted = students.map((s) => ({
+      studentId: s.id,
+      firstName: s.firstName,
+      lastName: s.lastName,
+      registerNo: s.registerNo || `REG-${s.id}`,
+      photo: s.photo,
+      className: s.enrolls[0]?.class?.name || 'Class',
+      sectionName: s.enrolls[0]?.section?.name || 'General',
+    }));
+
+    return res.json({ success: true, students: formatted });
+  } catch (error) {
+    console.error('[TEACHER] Student pool error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve student pool.' });
+  }
+}
+
+/**
+ * POST /api/teacher/students/auto-generate
+ * Auto-generates student in database with official Registration Number
+ */
+export async function autoGenerateStudent(req: Request, res: Response): Promise<Response | void> {
+  const { classId, sectionId, firstName, lastName } = req.body;
+  if (!classId || !sectionId) {
+    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 6;
+
+    // Resolve target branch ID from teacher session, teacher profile, or class
+    let targetBranchId = req.branchId;
+    if (!targetBranchId && req.teacherId) {
+      const teacher = await prisma.teacher.findUnique({
+        where: { id: req.teacherId },
+        select: { branchId: true },
+      });
+      if (teacher?.branchId) targetBranchId = teacher.branchId;
+    }
+    if (!targetBranchId && classId) {
+      const cls = await prisma.class.findUnique({
+        where: { id: Number(classId) },
+        select: { branchId: true },
+      });
+      if (cls?.branchId) targetBranchId = cls.branchId;
+    }
+    if (!targetBranchId) {
+      const firstBranch = await prisma.branch.findFirst({
+        where: { active: true },
+        select: { id: true },
+      });
+      targetBranchId = firstBranch?.id || 1;
+    }
+
+    // Auto-generate official registration number using the school's configured prefix from registration
+    const regNumber = await generateRegistrationNumber(prisma, targetBranchId);
+
+    const maxStudent = await prisma.student.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
+    const nextStudentId = (maxStudent?.id || 0) + 1;
+
+    const studentFirstName = firstName?.trim() || `Student ${nextStudentId}`;
+    const studentLastName = lastName?.trim() || `Scholar`;
+
+    // Create student in DB
+    const student = await prisma.student.create({
+      data: {
+        id: nextStudentId,
+        registerNo: regNumber,
+        firstName: studentFirstName,
+        lastName: studentLastName,
+        branch: { connect: { id: targetBranchId } },
+      },
+    });
+
+    // Create enrollment in DB
+    await prisma.enroll.create({
+      data: {
+        studentId: student.id,
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId,
+        branchId: targetBranchId,
+      },
+    });
+
+    const [classRecord, sectionRecord] = await Promise.all([
+      prisma.class.findUnique({ where: { id: Number(classId) }, select: { name: true } }),
+      prisma.section.findUnique({ where: { id: Number(sectionId) }, select: { name: true } }),
+    ]);
+
+    return res.json({
+      success: true,
+      student: {
+        studentId: student.id,
+        registerNo: student.registerNo,
+        firstName: student.firstName,
+        lastName: student.lastName,
+        className: classRecord?.name || 'Class',
+        sectionName: sectionRecord?.name || 'Section',
+      },
+      message: `Generated student ${student.firstName} ${student.lastName} (${student.registerNo}) for ${classRecord?.name}.`,
+    });
+  } catch (error) {
+    console.error('[TEACHER] Auto-generate student error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate student in database.' });
+  }
+}
+
+/**
+ * GET /api/teacher/timetable
+ * Retrieves published timetable slots assigned to the logged-in teacher
+ */
+export async function getTeacherTimetable(req: Request, res: Response): Promise<Response | void> {
+  const teacherId = req.teacherId;
+  const branchId = req.branchId;
+
+  if (!teacherId) {
+    return res.status(400).json({ success: false, message: 'Teacher ID required from session.' });
+  }
+
+  try {
+    const { sessionId } = req.query;
+
+    const where: any = {
+      branchId,
+      teacherId: Number(teacherId),
+      isPublished: true,
+    };
+    if (sessionId) {
+      where.sessionId = Number(sessionId);
+    }
+
+    const slots = await prisma.timetableSlot.findMany({
+      where,
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+      },
+      orderBy: [{ dayOfWeek: 'asc' }, { startTime: 'asc' }],
+    });
+
+    const DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY'];
+    const grouped: Record<string, any[]> = {};
+    DAYS.forEach((d) => {
+      grouped[d] = [];
+    });
+
+    slots.forEach((s) => {
+      if (grouped[s.dayOfWeek]) {
+        grouped[s.dayOfWeek].push(s);
+      } else {
+        grouped[s.dayOfWeek] = [s];
+      }
+    });
+
+    return res.json({
+      success: true,
+      slots,
+      grouped,
+      totalWeeklyPeriods: slots.length,
+    });
+  } catch (error) {
+    console.error('[TEACHER] Fetch timetable error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve teacher timetable.' });
+  }
+}
+
 

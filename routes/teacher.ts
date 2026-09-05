@@ -14,6 +14,8 @@ import {
   uploadProfilePhoto,
   getExams,
   getStudents,
+  getStudentPool,
+  autoGenerateStudent,
   getScores,
   saveScores,
   saveAttendance,
@@ -25,6 +27,7 @@ import {
   getReportCards,
   getGradebookSheet,
   saveSingleGrade,
+  batchSaveGradebook,
   uploadGradebookCsv,
   exportReportCardPdf,
   exportBatchReportCardsPdf,
@@ -68,6 +71,7 @@ import {
   getTeacherSubjects,
   getSubjectStudents,
   getEvents,
+  getTeacherTimetable,
 } from '../controllers/teacher';
 import { importCbtQuestions, aiGenerateCbtQuestions } from '../controllers/admin/adminExamCbtController';
 import { getPublicSchoolInfo } from '../controllers/publicTenant';
@@ -106,6 +110,8 @@ router.post('/profile/upload-photo', upload.single('file'), uploadProfilePhoto);
 // Exams & Student Rosters
 router.get('/exams', getExams);
 router.get('/students', getStudents);
+router.get('/students/pool', getStudentPool);
+router.post('/students/auto-generate', autoGenerateStudent);
 
 // Scores & Attendance
 router.get('/scores', getScores);
@@ -122,6 +128,7 @@ router.post('/commentary/batch-save', batchSaveCommentary);
 // Gradebook & Score Sheets
 router.get('/gradebook/sheet', getGradebookSheet);
 router.post('/gradebook/save-single', saveSingleGrade);
+router.post('/gradebook/batch-save', batchSaveGradebook);
 router.post('/gradebook/csv-upload', uploadGradebookCsv);
 
 // Report Cards
@@ -186,5 +193,8 @@ router.get('/gamification/leaderboard', getGamificationLeaderboard);
 router.get('/attrition/dashboard', getAttritionDashboard);
 router.get('/attrition/detail/:studentId', getAttritionDetail);
 router.post('/attrition/action/:alertId', takeAttritionAction);
+
+// Timetable
+router.get('/timetable', getTeacherTimetable);
 
 export default router;

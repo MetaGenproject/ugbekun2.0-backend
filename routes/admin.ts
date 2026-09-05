@@ -135,6 +135,8 @@ import {
   deleteTimetableSlot,
   clearTimetable,
   aiGenerateTimetable,
+  publishTimetable,
+  getTimetableSessions,
 } from '../controllers/admin/adminTimetableController';
 
 import {
@@ -433,9 +435,11 @@ router.get('/lesson-plans/:id/export-pdf', exportLessonPlanPdf);
 // ============================================================================
 // 5. TIMETABLE & AI SCHEDULING
 // ============================================================================
+router.get('/timetable/sessions', getTimetableSessions);
 router.get('/timetable', getTimetable);
 router.post('/timetable/slot', createTimetableSlot);
 router.delete('/timetable/slot/:id', deleteTimetableSlot);
+router.post('/timetable/publish', publishTimetable);
 router.post('/timetable/clear', clearTimetable);
 router.post('/timetable/ai-generate', aiGenerateTimetable);
 

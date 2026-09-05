@@ -291,11 +291,12 @@ export async function getSubjects(req: Request, res: Response): Promise<Response
       orderBy: { name: 'asc' },
     });
 
+    const querySessionId = req.query.sessionId ? Number(req.query.sessionId) : undefined;
     const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = querySessionId || globalSetting?.sessionId || 6;
 
-    const assignments = await prisma.subjectAssign.findMany({
-      where: { branchId, sessionId },
+    let assignments = await prisma.subjectAssign.findMany({
+      where: { branchId, ...(sessionId ? { sessionId } : {}) },
       include: {
         class: { select: { id: true, name: true } },
         section: { select: { id: true, name: true } },
@@ -303,6 +304,18 @@ export async function getSubjects(req: Request, res: Response): Promise<Response
         teacher: { select: { id: true, name: true } },
       },
     });
+
+    if (assignments.length === 0) {
+      assignments = await prisma.subjectAssign.findMany({
+        where: { branchId },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          teacher: { select: { id: true, name: true } },
+        },
+      });
+    }
 
     return res.json({ success: true, subjects, assignments });
   } catch (error) {

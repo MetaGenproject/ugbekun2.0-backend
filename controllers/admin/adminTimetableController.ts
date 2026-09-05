@@ -2,18 +2,41 @@ import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 
 /**
+ * GET /api/admin/timetable/sessions
+ * Returns all academic sessions for timetable filtering
+ */
+export async function getTimetableSessions(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const schoolYears = await prisma.schoolYear.findMany({
+      orderBy: { id: 'desc' },
+    });
+
+    const sessions = schoolYears.map((s) => ({
+      id: s.id,
+      name: s.schoolYear.includes('Session') ? s.schoolYear : `${s.schoolYear} Academic Session`,
+    }));
+
+    return res.json({ success: true, sessions });
+  } catch (error) {
+    console.error('[ADMIN] Fetch timetable sessions error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch academic sessions.' });
+  }
+}
+
+/**
  * GET /api/admin/timetable
  */
 export async function getTimetable(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
-    const { classId, sectionId, teacherId } = req.query;
+    const { classId, sectionId, teacherId, sessionId } = req.query;
 
     const where: any = { branchId };
     if (classId) where.classId = Number(classId);
     if (sectionId) where.sectionId = Number(sectionId);
     if (teacherId) where.teacherId = Number(teacherId);
+    if (sessionId) where.sessionId = Number(sessionId);
 
     const slots = await prisma.timetableSlot.findMany({
       where,
@@ -40,7 +63,19 @@ export async function getTimetable(req: Request, res: Response): Promise<Respons
       }
     });
 
-    return res.json({ success: true, slots, grouped });
+    const isPublished = slots.length > 0 && slots.every((s: any) => s.isPublished === true);
+
+    const subjectAssignments = await prisma.subjectAssign.findMany({
+      where: { branchId },
+      include: {
+        teacher: { select: { id: true, name: true, email: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+      },
+    });
+
+    return res.json({ success: true, slots, grouped, isPublished, subjectAssignments });
   } catch (error) {
     console.error('[ADMIN] Fetch timetable error:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch timetable.' });
@@ -49,6 +84,7 @@ export async function getTimetable(req: Request, res: Response): Promise<Respons
 
 /**
  * POST /api/admin/timetable/slot
+ * Handles both Create and Update
  */
 export async function createTimetableSlot(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
@@ -58,6 +94,7 @@ export async function createTimetableSlot(req: Request, res: Response): Promise<
       id,
       classId,
       sectionId,
+      sessionId,
       dayOfWeek,
       startTime,
       endTime,
@@ -65,6 +102,7 @@ export async function createTimetableSlot(req: Request, res: Response): Promise<
       title,
       subjectId,
       teacherId,
+      isPublished,
     } = req.body;
 
     if (!classId || !dayOfWeek || !startTime || !endTime || !type) {
@@ -89,18 +127,23 @@ export async function createTimetableSlot(req: Request, res: Response): Promise<
     }
 
     if (slotType === 'SUBJECT' && teacherId) {
+      const conflictWhere: any = {
+        branchId,
+        teacherId: Number(teacherId),
+        dayOfWeek: dayOfWeek.toUpperCase(),
+        ...(id ? { id: { not: Number(id) } } : {}),
+        OR: [
+          { startTime: { lte: startTime }, endTime: { gt: startTime } },
+          { startTime: { lt: endTime }, endTime: { gte: endTime } },
+          { startTime: { gte: startTime }, endTime: { lte: endTime } },
+        ],
+      };
+      if (sessionId) {
+        conflictWhere.sessionId = Number(sessionId);
+      }
+
       const conflict = await prisma.timetableSlot.findFirst({
-        where: {
-          branchId,
-          teacherId: Number(teacherId),
-          dayOfWeek: dayOfWeek.toUpperCase(),
-          ...(id ? { id: { not: Number(id) } } : {}),
-          OR: [
-            { startTime: { lte: startTime }, endTime: { gt: startTime } },
-            { startTime: { lt: endTime }, endTime: { gte: endTime } },
-            { startTime: { gte: startTime }, endTime: { lte: endTime } },
-          ],
-        },
+        where: conflictWhere,
         include: {
           class: { select: { name: true } },
           section: { select: { name: true } },
@@ -138,6 +181,8 @@ export async function createTimetableSlot(req: Request, res: Response): Promise<
           title: defaultTitle || null,
           subjectId: subjectId ? Number(subjectId) : null,
           teacherId: teacherId ? Number(teacherId) : null,
+          sessionId: sessionId ? Number(sessionId) : undefined,
+          isPublished: isPublished !== undefined ? Boolean(isPublished) : undefined,
         },
         include: {
           class: { select: { id: true, name: true } },
@@ -152,6 +197,7 @@ export async function createTimetableSlot(req: Request, res: Response): Promise<
           branchId,
           classId: Number(classId),
           sectionId: sectionId ? Number(sectionId) : null,
+          sessionId: sessionId ? Number(sessionId) : null,
           dayOfWeek: dayOfWeek.toUpperCase(),
           startTime,
           endTime,
@@ -159,6 +205,7 @@ export async function createTimetableSlot(req: Request, res: Response): Promise<
           title: defaultTitle || null,
           subjectId: subjectId ? Number(subjectId) : null,
           teacherId: teacherId ? Number(teacherId) : null,
+          isPublished: isPublished !== undefined ? Boolean(isPublished) : true,
         },
         include: {
           class: { select: { id: true, name: true } },
@@ -194,19 +241,54 @@ export async function deleteTimetableSlot(req: Request, res: Response): Promise<
 }
 
 /**
+ * POST /api/admin/timetable/publish
+ * Publishes or unpublishes class timetable slots
+ */
+export async function publishTimetable(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const { classId, sectionId, sessionId, isPublished = true } = req.body;
+
+    const where: any = { branchId };
+    if (classId) where.classId = Number(classId);
+    if (sectionId) where.sectionId = Number(sectionId);
+    if (sessionId) where.sessionId = Number(sessionId);
+
+    const result = await prisma.timetableSlot.updateMany({
+      where,
+      data: { isPublished: Boolean(isPublished) },
+    });
+
+    return res.json({
+      success: true,
+      isPublished: Boolean(isPublished),
+      count: result.count,
+      message: isPublished
+        ? `Timetable successfully published to student, teacher, and parent portals! (${result.count} slots)`
+        : `Timetable reverted to draft mode (${result.count} slots).`,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Publish timetable error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update timetable publication status.' });
+  }
+}
+
+/**
  * POST /api/admin/timetable/clear
  */
 export async function clearTimetable(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
-    const { classId, sectionId } = req.body;
+    const { classId, sectionId, sessionId } = req.body;
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
     const where: any = { branchId, classId: Number(classId) };
     if (sectionId) where.sectionId = Number(sectionId);
+    if (sessionId) where.sessionId = Number(sessionId);
 
     await prisma.timetableSlot.deleteMany({ where });
 
@@ -227,10 +309,12 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
     const {
       classId,
       sectionId,
+      sessionId,
       assemblyStartTime = '08:00',
       assemblyEndTime = '08:30',
       breakStartTime = '11:00',
       breakEndTime = '11:30',
+      periodDuration = 45,
     } = req.body;
 
     if (!classId) {
@@ -239,6 +323,7 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
 
     const numClassId = Number(classId);
     const numSectionId = sectionId ? Number(sectionId) : null;
+    const numSessionId = sessionId ? Number(sessionId) : null;
 
     const assignedSubjects = await prisma.subjectAssign.findMany({
       where: {
@@ -254,9 +339,9 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
 
     let subjectTeacherPairs = assignedSubjects.map((sa: any) => ({
       subjectId: sa.subjectId,
-      subjectName: sa.subject.name,
+      subjectName: sa.subject?.name || 'Assigned Subject',
       teacherId: sa.teacherId,
-      teacherName: sa.teacher.name,
+      teacherName: sa.teacher?.name || null,
     }));
 
     if (subjectTeacherPairs.length === 0) {
@@ -297,6 +382,7 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
         branchId,
         classId: numClassId,
         sectionId: numSectionId,
+        sessionId: numSessionId,
         dayOfWeek: day,
         startTime: assemblyStartTime,
         endTime: assemblyEndTime,
@@ -304,12 +390,14 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
         title: 'Morning Assembly & Devotion',
         subjectId: null,
         teacherId: null,
+        isPublished: false, // Default to draft until admin publishes
       });
 
       newSlotsToCreate.push({
         branchId,
         classId: numClassId,
         sectionId: numSectionId,
+        sessionId: numSessionId,
         dayOfWeek: day,
         startTime: breakStartTime,
         endTime: breakEndTime,
@@ -317,6 +405,7 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
         title: 'Mid-Morning Recess & Break',
         subjectId: null,
         teacherId: null,
+        isPublished: false,
       });
 
       subjectTimeSlots.forEach((tSlot, pIdx) => {
@@ -327,6 +416,7 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
           branchId,
           classId: numClassId,
           sectionId: numSectionId,
+          sessionId: numSessionId,
           dayOfWeek: day,
           startTime: tSlot.startTime,
           endTime: tSlot.endTime,
@@ -334,17 +424,23 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
           title: pair.subjectName,
           subjectId: pair.subjectId,
           teacherId: pair.teacherId,
+          isPublished: false,
         });
       });
     });
 
     await prisma.$transaction(async (tx: any) => {
+      const deleteWhere: any = {
+        branchId,
+        classId: numClassId,
+        ...(numSectionId ? { sectionId: numSectionId } : {}),
+      };
+      if (numSessionId) {
+        deleteWhere.sessionId = numSessionId;
+      }
+
       await tx.timetableSlot.deleteMany({
-        where: {
-          branchId,
-          classId: numClassId,
-          ...(numSectionId ? { sectionId: numSectionId } : {}),
-        },
+        where: deleteWhere,
       });
 
       await tx.timetableSlot.createMany({
@@ -357,6 +453,7 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
         branchId,
         classId: numClassId,
         ...(numSectionId ? { sectionId: numSectionId } : {}),
+        ...(numSessionId ? { sessionId: numSessionId } : {}),
       },
       include: {
         class: { select: { id: true, name: true } },
@@ -369,11 +466,13 @@ export async function aiGenerateTimetable(req: Request, res: Response): Promise<
 
     return res.json({
       success: true,
-      message: `AI Timetable generated successfully with ${newSlotsToCreate.length} slots.`,
+      message: `AI Timetable generated successfully with ${newSlotsToCreate.length} conflict-free slots. Click "Publish Timetable" when ready to release to portals.`,
       slots: generatedSlots,
+      isPublished: false,
     });
   } catch (error: any) {
     console.error('[ADMIN] AI Timetable generation error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to generate AI timetable.' });
   }
 }
+

@@ -794,25 +794,69 @@ export async function getChildTimetable(req: Request, res: Response): Promise<Re
   }
 
   try {
-    const timetableSlots = await prisma.timetableSlot.findMany({
-      where: {
-        classId: req.childClassId,
-        branchId: req.studentBranchId,
-        ...(req.childSectionId ? { sectionId: req.childSectionId } : {}),
-      },
-      include: {
-        subject: { select: { id: true, name: true, subjectCode: true } },
-        teacher: { select: { id: true, name: true } },
-      },
-      orderBy: [{ dayOfWeek: 'asc' }, { startTime: 'asc' }],
-    });
-
-    const examScheduleSlots = await prisma.examScheduleSlot.findMany({
+    let timetableSlots = await prisma.timetableSlot.findMany({
       where: {
         classId: req.childClassId,
         branchId: req.studentBranchId,
         isPublished: true,
-        ...(req.childSectionId ? { sectionId: req.childSectionId } : {}),
+        ...(req.childSectionId
+          ? {
+              OR: [{ sectionId: req.childSectionId }, { sectionId: null }],
+            }
+          : {}),
+      },
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        teacher: { select: { id: true, name: true, phone: true, photo: true } },
+      },
+      orderBy: [{ startTime: 'asc' }],
+    });
+
+    if (timetableSlots.length === 0) {
+      timetableSlots = await prisma.timetableSlot.findMany({
+        where: {
+          classId: req.childClassId,
+          branchId: req.studentBranchId,
+          isPublished: true,
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          teacher: { select: { id: true, name: true, phone: true, photo: true } },
+        },
+        orderBy: [{ startTime: 'asc' }],
+      });
+    }
+
+    if (timetableSlots.length === 0) {
+      timetableSlots = await prisma.timetableSlot.findMany({
+        where: {
+          classId: req.childClassId,
+          branchId: req.studentBranchId,
+        },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          teacher: { select: { id: true, name: true, phone: true, photo: true } },
+        },
+        orderBy: [{ startTime: 'asc' }],
+      });
+    }
+
+    let examScheduleSlots = await prisma.examScheduleSlot.findMany({
+      where: {
+        classId: req.childClassId,
+        branchId: req.studentBranchId,
+        isPublished: true,
+        ...(req.childSectionId
+          ? {
+              OR: [{ sectionId: req.childSectionId }, { sectionId: null }],
+            }
+          : {}),
       },
       include: {
         subject: { select: { name: true, subjectCode: true } },
@@ -822,19 +866,65 @@ export async function getChildTimetable(req: Request, res: Response): Promise<Re
       orderBy: { examDate: 'asc' },
     });
 
-    return res.json({
-      success: true,
-      timetableSlots: timetableSlots.map((slot) => ({
+    if (examScheduleSlots.length === 0) {
+      examScheduleSlots = await prisma.examScheduleSlot.findMany({
+        where: {
+          classId: req.childClassId,
+          branchId: req.studentBranchId,
+          isPublished: true,
+        },
+        include: {
+          subject: { select: { name: true, subjectCode: true } },
+          hall: { select: { name: true, location: true } },
+          invigilator: { select: { name: true } },
+        },
+        orderBy: { examDate: 'asc' },
+      });
+    }
+
+    const DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
+    const grouped: Record<string, any[]> = {};
+    DAYS.forEach((d) => {
+      grouped[d] = [];
+    });
+
+    const mappedSlots = timetableSlots.map((slot) => {
+      const item = {
         id: slot.id,
         dayOfWeek: slot.dayOfWeek,
         startTime: slot.startTime,
         endTime: slot.endTime,
+        time: `${slot.startTime} - ${slot.endTime}`,
         type: slot.type,
-        title: slot.title || slot.subject?.name || 'Class Period',
+        title:
+          slot.title ||
+          slot.subject?.name ||
+          (slot.type === 'BREAK' ? 'Break / Recess' : slot.type === 'ASSEMBLY' ? 'Morning Assembly' : 'Class Period'),
+        subjectId: slot.subjectId,
         subjectName: slot.subject?.name || null,
         subjectCode: slot.subject?.subjectCode || null,
+        teacherId: slot.teacherId,
         teacherName: slot.teacher?.name || null,
-      })),
+        teacherPhone: slot.teacher?.phone || null,
+        teacherPhoto: slot.teacher?.photo || null,
+        className: slot.class?.name || null,
+        sectionName: slot.section?.name || null,
+        roomLabel: slot.section?.name || null,
+      };
+
+      if (grouped[slot.dayOfWeek]) {
+        grouped[slot.dayOfWeek].push(item);
+      } else {
+        grouped[slot.dayOfWeek] = [item];
+      }
+
+      return item;
+    });
+
+    return res.json({
+      success: true,
+      timetableSlots: mappedSlots,
+      grouped,
       examScheduleSlots: examScheduleSlots.map((slot) => ({
         id: slot.id,
         examDate: slot.examDate,

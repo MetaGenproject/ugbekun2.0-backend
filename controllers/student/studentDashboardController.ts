@@ -167,24 +167,81 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
 
     // 4. Today's Timetable
     let todayTimetable: any[] = [];
-    if (req.classId && req.sectionId) {
-      const slots = await prisma.timetableSlot.findMany({
-        where: { classId: req.classId, sectionId: req.sectionId, branchId: req.branchId, dayOfWeek: todayDayName },
+    if (req.classId) {
+      let slots = await prisma.timetableSlot.findMany({
+        where: {
+          classId: req.classId,
+          branchId: req.branchId,
+          dayOfWeek: todayDayName,
+          isPublished: true,
+          ...(req.sectionId
+            ? {
+                OR: [{ sectionId: req.sectionId }, { sectionId: null }],
+              }
+            : {}),
+        },
         include: {
-          subject: { select: { name: true } },
-          teacher: { select: { name: true } },
-          section: { select: { name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          teacher: { select: { id: true, name: true, phone: true, photo: true } },
+          section: { select: { id: true, name: true } },
+          class: { select: { id: true, name: true } },
         },
         orderBy: { startTime: 'asc' },
       });
+
+      if (slots.length === 0) {
+        slots = await prisma.timetableSlot.findMany({
+          where: {
+            classId: req.classId,
+            branchId: req.branchId,
+            dayOfWeek: todayDayName,
+            isPublished: true,
+          },
+          include: {
+            subject: { select: { id: true, name: true, subjectCode: true } },
+            teacher: { select: { id: true, name: true, phone: true, photo: true } },
+            section: { select: { id: true, name: true } },
+            class: { select: { id: true, name: true } },
+          },
+          orderBy: { startTime: 'asc' },
+        });
+      }
+
+      if (slots.length === 0) {
+        slots = await prisma.timetableSlot.findMany({
+          where: {
+            classId: req.classId,
+            branchId: req.branchId,
+            dayOfWeek: todayDayName,
+          },
+          include: {
+            subject: { select: { id: true, name: true, subjectCode: true } },
+            teacher: { select: { id: true, name: true, phone: true, photo: true } },
+            section: { select: { id: true, name: true } },
+            class: { select: { id: true, name: true } },
+          },
+          orderBy: { startTime: 'asc' },
+        });
+      }
+
       todayTimetable = slots.map((s) => ({
         id: s.id,
         startTime: s.startTime,
         endTime: s.endTime,
+        time: `${s.startTime} - ${s.endTime}`,
         type: s.type,
-        title: s.title || s.subject?.name || 'Period',
+        title:
+          s.title ||
+          s.subject?.name ||
+          (s.type === 'BREAK' ? 'Recess / Break' : s.type === 'ASSEMBLY' ? 'Morning Assembly' : 'Period'),
+        subjectName: s.subject?.name || null,
+        subjectCode: s.subject?.subjectCode || '',
         teacherName: s.teacher?.name || null,
-        roomLabel: s.section?.name || null,
+        teacher: s.teacher?.name || (s.type === 'SUBJECT' ? 'Teacher Unassigned' : null),
+        teacherPhone: s.teacher?.phone || null,
+        roomLabel: s.section?.name || s.class?.name || null,
+        className: s.class?.name || null,
+        sectionName: s.section?.name || null,
       }));
     }
 

@@ -1594,11 +1594,15 @@ model TimetableSlot {
   branchId    Int       @map("branch_id")
   branch      Branch    @relation(fields: [branchId], references: [id])
 
+  sessionId   Int?      @map("session_id")
+  isPublished Boolean   @default(true) @map("is_published")
+
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime? @updatedAt @map("updated_at")
 
   @@index([classId, sectionId, dayOfWeek])
   @@index([teacherId, dayOfWeek])
+  @@index([sessionId])
   @@index([branchId])
   @@map("timetable_slots")
 }

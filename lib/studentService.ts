@@ -52,12 +52,46 @@ export function generateSecurePassword(length = 8): string {
  * @returns {Promise<string>} Unique registration number
  */
 export async function generateRegistrationNumber(prisma: any, branchId: number): Promise<string> {
-  const branch = await prisma.branch.findUnique({
-    where: { id: branchId },
-    select: { code: true },
-  });
+  let rawPrefix = '';
 
-  const branchCode = (branch?.code || 'GEN').toUpperCase();
+  // 1. Check System Settings (which stores regNoPrefix configured during school sign up / registration)
+  if (prisma.systemSetting?.findFirst) {
+    try {
+      const setting = await prisma.systemSetting.findFirst({
+        where: { branchId },
+        select: { regNoPrefix: true },
+      });
+      if (setting?.regNoPrefix && setting.regNoPrefix.trim()) {
+        rawPrefix = setting.regNoPrefix.trim();
+      }
+    } catch {
+      // Ignore if systemSetting query fails in mock environments
+    }
+  }
+
+  // 2. If no system setting prefix, or if set to legacy 'CGS01'/'CDS01', inspect branch details
+  if (!rawPrefix || rawPrefix === 'CGS01' || rawPrefix === 'CDS01') {
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { code: true, name: true },
+    });
+    if (branch?.code && branch.code !== 'CGS01' && branch.code !== 'CDS01') {
+      rawPrefix = branch.code;
+    } else if (branch?.name) {
+      // Generate clean abbreviation from school name from registration form (e.g. Canaan Gate -> CGEC)
+      const initials = branch.name
+        .replace(/[^a-zA-Z0-9\s]/g, '')
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((w: string) => w[0])
+        .join('')
+        .toUpperCase()
+        .slice(0, 4);
+      rawPrefix = initials || 'SCH';
+    }
+  }
+
+  const branchCode = (rawPrefix || 'GEN').toUpperCase();
   const year = new Date().getFullYear();
   const prefix = `REG/${branchCode}/${year}/`;
 
