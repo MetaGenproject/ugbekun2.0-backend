@@ -1188,7 +1188,7 @@ export async function getStudentById(req: Request, res: Response): Promise<Respo
       },
     });
 
-    if (!student || student.branchId !== branchId) {
+    if (!student || (req.userRole !== 1 && branchId && student.branchId !== branchId)) {
       return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
     }
 
@@ -1381,7 +1381,7 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
       include: { parent: true },
     });
 
-    if (!existingStudent || existingStudent.branchId !== branchId) {
+    if (!existingStudent || (req.userRole !== 1 && branchId && existingStudent.branchId !== branchId)) {
       return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
     }
 
@@ -1415,14 +1415,10 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
         data: updateData,
       });
 
-      if (existingStudent.userId && (firstName || lastName || email)) {
+      if (existingStudent.userId && (photo !== undefined || active !== undefined)) {
         const userUpdate: any = {};
-        if (firstName || lastName) {
-          userUpdate.name = `${firstName || existingStudent.firstName || ''} ${
-            lastName || existingStudent.lastName || ''
-          }`.trim();
-        }
-        if (email) userUpdate.email = email;
+        if (photo !== undefined) userUpdate.photo = photo;
+        if (active !== undefined) userUpdate.active = Boolean(active);
         await tx.user.update({
           where: { id: existingStudent.userId },
           data: userUpdate,
@@ -1476,16 +1472,6 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
           where: { id: existingStudent.parentId },
           data: parentUpdate,
         });
-
-        if (existingStudent.parent?.userId && (parentName || parentEmail)) {
-          const parentUserUpdate: any = {};
-          if (parentName) parentUserUpdate.name = parentName;
-          if (parentEmail) parentUserUpdate.email = parentEmail;
-          await tx.user.update({
-            where: { id: existingStudent.parent.userId },
-            data: parentUserUpdate,
-          });
-        }
       }
     });
 

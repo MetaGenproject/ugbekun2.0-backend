@@ -18,6 +18,7 @@ import {
   bulkImportStudents,
   exportCredentialSlips,
   promoteStudents,
+  getStudentById,
   getStudentProfile,
   updateStudentProfile,
   uploadStudentPhoto,
@@ -308,6 +309,7 @@ router.put('/parent-messages/:messageId', updateParentMessage);
 router.delete('/parent-messages/:messageId', deleteParentMessage);
 router.post('/parents/broadcast', sendParentBroadcast);
 router.post('/students/:id/toggle-status', toggleStudentStatus);
+router.get('/students/:id', getStudentById);
 router.put('/students/:id', updateStudent);
 router.delete('/students/:id', deleteStudent);
 router.post('/students/sibling-request', processSiblingRequest);

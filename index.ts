@@ -72,6 +72,14 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   next();
 });
 
+// Normalize duplicate /api prefixes e.g. /api/api/* -> /api/*
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  if (req.url.startsWith('/api/api/')) {
+    req.url = req.url.replace(/^\/api\/api\//, '/api/');
+  }
+  next();
+});
+
 // Allow larger JSON payloads for base64-encoded logos
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
