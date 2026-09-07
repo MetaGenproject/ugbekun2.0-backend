@@ -106,7 +106,20 @@ export async function requireBranchAdmin(req: Request, res: Response, next: Next
       return;
     }
 
-    const branchId = await resolveBranchForAdmin(decoded);
+    let branchId = await resolveBranchForAdmin(decoded);
+
+    if (decoded.role === 1) {
+      const headerBranchRaw = req.headers['x-branch-id'];
+      const headerBranchId = Number(Array.isArray(headerBranchRaw) ? headerBranchRaw[0] : headerBranchRaw);
+      if (Number.isFinite(headerBranchId) && headerBranchId > 0) {
+        const branch = await prisma.branch.findUnique({
+          where: { id: headerBranchId },
+          select: { id: true },
+        });
+        if (branch) branchId = branch.id;
+      }
+    }
+
     if (!branchId) {
       res.status(403).json({
         success: false,

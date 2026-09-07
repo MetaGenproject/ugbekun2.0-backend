@@ -10,6 +10,8 @@ import {
   hasClassAccess as originalHasClassAccess,
 } from '../../lib/teacherAccess';
 import { uploadBase64Image } from '../../lib/cloudinary';
+import { getRegisterWithEntries, REGISTER_STATUS } from '../../lib/attendanceRegisterService';
+import { todaySchoolDateKey } from '../../lib/schoolDate';
 
 export const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -124,8 +126,7 @@ export function generateJitsiToken({ roomName, user, isModerator }: { roomName: 
  */
 export async function getDashboardOverview(req: Request, res: Response): Promise<Response | void> {
   try {
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
+    const todayKey = todaySchoolDateKey();
 
     const teacher = await prisma.teacher.findUnique({
       where: { id: req.teacherId },
@@ -186,19 +187,22 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       lateCount = 0,
       absentCount = 0;
     if (formAllocations[0]) {
-      const todayLogs = await prisma.attendance.findMany({
-        where: {
-          classId: formAllocations[0].classId,
-          sectionId: formAllocations[0].sectionId,
-          attendanceDate: { gte: new Date(todayStr) },
-        },
+      const snapshot = await getRegisterWithEntries(prisma, {
+        branchId: req.branchId,
+        sessionId: Number(req.sessionId) || 1,
+        classId: formAllocations[0].classId,
+        sectionId: formAllocations[0].sectionId,
+        dateKey: todayKey,
       });
-      if (todayLogs.length > 0) {
-        presentCount = todayLogs.filter((l) => l.status === 'Present').length;
-        lateCount = todayLogs.filter((l) => l.status === 'Late').length;
-        absentCount = todayLogs.filter((l) => l.status === 'Absent').length;
-        const total = todayLogs.length;
-        attendancePct = Math.round(((presentCount + lateCount) / total) * 100);
+      const published =
+        snapshot.register?.status === REGISTER_STATUS.SUBMITTED ||
+        snapshot.register?.status === REGISTER_STATUS.LOCKED;
+      if (published) {
+        presentCount = snapshot.summary.present;
+        lateCount = snapshot.summary.late;
+        absentCount = snapshot.summary.absent;
+        const coded = snapshot.summary.total - snapshot.summary.unmarked;
+        attendancePct = coded > 0 ? Math.round(((presentCount + lateCount) / coded) * 100) : 0;
       }
     }
 

@@ -20,6 +20,10 @@ import {
   saveScores,
   saveAttendance,
   getAttendance,
+  getAttendanceRegister,
+  patchAttendanceRegisterEntries,
+  submitAttendanceRegister,
+  getAttendanceWeek,
   saveCommentary,
   generateCommentaryAi,
   batchGenerateCommentaryAi,
@@ -116,6 +120,10 @@ router.post('/students/auto-generate', autoGenerateStudent);
 // Scores & Attendance
 router.get('/scores', getScores);
 router.post('/scores', saveScores);
+router.get('/attendance/register', getAttendanceRegister);
+router.patch('/attendance/register/entries', patchAttendanceRegisterEntries);
+router.post('/attendance/register/submit', submitAttendanceRegister);
+router.get('/attendance/week', getAttendanceWeek);
 router.post('/attendance', saveAttendance);
 router.get('/attendance', getAttendance);
 

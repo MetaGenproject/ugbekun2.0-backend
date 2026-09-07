@@ -117,6 +117,8 @@ import {
   deleteSubjectAssignment,
   getStudentAttendance,
   saveStudentAttendance,
+  getMonthlyAttendanceReport,
+  getDailyAttendanceReport,
   getPromotionSelection,
   promoteStudentCohort,
   getPromotionHistory,
@@ -129,6 +131,10 @@ import {
   getLessonPlans,
   exportLessonPlanPdf,
 } from '../controllers/admin/adminAcademicsController';
+import {
+  getAdminAttendanceRegister,
+  unlockAdminAttendanceRegister,
+} from '../controllers/admin/adminAttendanceRegisterController';
 
 import {
   getTimetable,
@@ -369,6 +375,8 @@ router.get('/staff-messages', getStaffMessages);
 router.post('/staff-messages', sendStaffMessage);
 router.get('/staff/attendance', getStaffAttendance);
 router.post('/staff/attendance', saveStaffAttendance);
+router.get('/attendance/staff', getStaffAttendance);
+router.post('/attendance/staff/batch-save', saveStaffAttendance);
 
 router.get('/hr/leave-categories', getLeaveCategories);
 router.post('/hr/leave-categories', createLeaveCategory);
@@ -417,6 +425,12 @@ router.post('/subjects/assign-bulk', assignSubjectBulk);
 router.delete('/subjects/assign/:id', deleteSubjectAssignment);
 router.get('/student-attendance', getStudentAttendance);
 router.post('/student-attendance', saveStudentAttendance);
+router.get('/attendance/students', getStudentAttendance);
+router.post('/attendance/students/batch-save', saveStudentAttendance);
+router.get('/attendance/register', getAdminAttendanceRegister);
+router.post('/attendance/register/unlock', unlockAdminAttendanceRegister);
+router.get('/attendance/monthly-report', getMonthlyAttendanceReport);
+router.get('/attendance/daily-report', getDailyAttendanceReport);
 router.get('/promotion/selection', getPromotionSelection);
 router.get('/promotions/class-students', getPromotionSelection);
 router.post('/promotion/promote', promoteStudentCohort);

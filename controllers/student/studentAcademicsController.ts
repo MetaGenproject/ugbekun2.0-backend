@@ -1,34 +1,26 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { generateReportCardPdf, generateMontessoriReportCardPdf } from '../../lib/pdfService';
+import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
 
 /**
  * GET /api/student/attendance
  */
 export async function getAttendance(req: Request, res: Response): Promise<Response | void> {
   try {
-    const logs = await prisma.attendance.findMany({
-      where: {
-        studentId: req.studentId,
-        sessionId: req.sessionId,
-        branchId: req.branchId,
-      },
-      orderBy: { attendanceDate: 'desc' },
+    const { logs, summary } = await listSubmittedAttendance(prisma, {
+      studentId: req.studentId,
+      sessionId: req.sessionId,
+      branchId: req.branchId,
     });
-
-    const totalDays = logs.length;
-    const presentCount = logs.filter((l) => l.status === 'Present').length;
-    const absentCount = logs.filter((l) => l.status === 'Absent').length;
-    const lateCount = logs.filter((l) => l.status === 'Late').length;
-    const percentage = totalDays > 0 ? ((presentCount + lateCount) / totalDays) * 100 : 100;
 
     return res.json({
       success: true,
-      percentage: Number(percentage.toFixed(1)),
-      totalDays,
-      presentCount,
-      absentCount,
-      lateCount,
+      percentage: summary.percentage,
+      totalDays: summary.totalDays,
+      presentCount: summary.presentCount,
+      absentCount: summary.absentCount,
+      lateCount: summary.lateCount,
       logs: logs.map((l) => ({
         id: l.id,
         attendanceDate: l.attendanceDate,

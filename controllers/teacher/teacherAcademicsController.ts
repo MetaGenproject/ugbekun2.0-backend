@@ -12,6 +12,7 @@ import {
 } from '../../lib/pdfService';
 import gamificationService from '../../lib/gamificationService';
 import { generateRegistrationNumber } from '../../lib/studentService';
+import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
 
 const openai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
@@ -389,19 +390,19 @@ export async function generateCommentaryAi(req: Request, res: Response): Promise
       });
     }
 
-    const [marks, attendanceLogs] = await Promise.all([
+    const [marks, { summary: attendanceSummary }] = await Promise.all([
       prisma.mark.findMany({
         where: { studentId: Number(studentId), sessionId, branchId: req.branchId },
         include: { subject: { select: { name: true } } },
       }),
-      prisma.attendance.findMany({
-        where: { studentId: Number(studentId), sessionId, branchId: req.branchId },
+      listSubmittedAttendance(prisma, {
+        studentId: Number(studentId),
+        sessionId,
+        branchId: req.branchId,
       }),
     ]);
 
-    const totalAtt = attendanceLogs.length;
-    const presentAtt = attendanceLogs.filter((a) => a.status === 'Present').length;
-    const attPct = totalAtt > 0 ? (presentAtt / totalAtt) * 100 : 100;
+    const attPct = attendanceSummary.percentage;
 
     const marksBySubject: Record<string, number> = {};
     let totalMarks = 0;
@@ -474,15 +475,18 @@ export async function batchGenerateCommentaryAi(req: Request, res: Response): Pr
 
     const studentIds = enrolls.map((e) => e.student.id);
 
-    const [allMarks, allAttendance] = await Promise.all([
+    const [allMarks, { logs: allAttendance }] = await Promise.all([
       prisma.mark.findMany({
         where: { studentId: { in: studentIds }, sessionId, branchId: req.branchId },
         include: { subject: { select: { name: true } } },
       }),
-      prisma.attendance.findMany({
-        where: { studentId: { in: studentIds }, sessionId, branchId: req.branchId },
+      listSubmittedAttendance(prisma, {
+        studentIds,
+        sessionId,
+        branchId: req.branchId,
       }),
     ]);
+    const attendanceByStudent = summarizeSubmittedAttendanceByStudent(allAttendance);
 
     const studentPayloads = enrolls.map((e) => {
       const sMarks = allMarks
@@ -492,8 +496,7 @@ export async function batchGenerateCommentaryAi(req: Request, res: Response): Pr
           score: Number(m.mark || m.cbtMark || 0),
         }));
 
-      const sAtt = allAttendance.filter((a) => a.studentId === e.student.id);
-      const attPct = sAtt.length > 0 ? (sAtt.filter((a) => a.status === 'Present').length / sAtt.length) * 100 : 100;
+      const attPct = attendanceByStudent.get(e.student.id)?.percentage ?? 100;
 
       return {
         studentId: e.student.id,

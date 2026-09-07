@@ -356,6 +356,7 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
       bloodGroup,
       houseAddress,
       qualification,
+      qualifications,
       department,
       designation,
       joiningDate,
@@ -363,6 +364,13 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
       role,
       classIds,
       subjectIds,
+      isClassTeacher,
+      classTeacherClassId,
+      classTeacherSectionId,
+      isSubjectTeacher,
+      subjectTeacherClassId,
+      subjectTeacherSectionId,
+      subjectTeacherSubjectId,
       photo,
       photoBase64,
       bankName,
@@ -435,7 +443,7 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
             email: teacherEmail || null,
             phone: teacherPhone || null,
             houseAddress: houseAddress || null,
-            qualifications: qualification || null,
+            qualifications: qualification || qualifications || null,
             department: department || designation || null,
             photo: photoUrl || null,
             bankName: bankName || null,
@@ -450,7 +458,33 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
         const globalSetting = await tx.globalSettings.findFirst();
         const sessionId = globalSetting?.sessionId || 5;
 
-        if (Array.isArray(classIds) && classIds.length > 0) {
+        const formClassId = Number(classTeacherClassId || (Array.isArray(classIds) && classIds[0]) || 0);
+        const formSectionId = Number(classTeacherSectionId || 0);
+        const wantsClassTeacher = isClassTeacher === true || isClassTeacher === 'true' || formClassId > 0;
+
+        if (wantsClassTeacher && formClassId > 0) {
+          let secId = formSectionId;
+          if (!secId) {
+            const secAlloc = await tx.sectionsAllocation.findFirst({
+              where: { classId: formClassId },
+              select: { sectionId: true },
+            });
+            secId = secAlloc?.sectionId || 0;
+          }
+          if (secId > 0) {
+            const maxAlloc = await tx.teacherAllocation.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
+            await tx.teacherAllocation.create({
+              data: {
+                id: (maxAlloc?.id || 0) + 1,
+                teacherId: teacher.id,
+                classId: formClassId,
+                sectionId: secId,
+                sessionId,
+                branchId,
+              },
+            });
+          }
+        } else if (Array.isArray(classIds) && classIds.length > 0) {
           for (const cId of classIds) {
             const secAlloc = await tx.sectionsAllocation.findFirst({
               where: { classId: Number(cId) },
@@ -468,13 +502,39 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
                 sessionId,
                 branchId,
               },
-            }).catch(() => {});
+            });
           }
         }
 
-        if (Array.isArray(subjectIds) && subjectIds.length > 0) {
+        const subjId = Number(subjectTeacherSubjectId || (Array.isArray(subjectIds) && subjectIds[0]) || 0);
+        const subjClassId = Number(subjectTeacherClassId || formClassId || (Array.isArray(classIds) && classIds[0]) || 0);
+        const subjSectionId = Number(subjectTeacherSectionId || formSectionId || 0);
+        const wantsSubjectTeacher = isSubjectTeacher === true || isSubjectTeacher === 'true' || subjId > 0;
+
+        if (wantsSubjectTeacher && subjId > 0 && subjClassId > 0) {
+          let secId = subjSectionId;
+          if (!secId) {
+            const secAlloc = await tx.sectionsAllocation.findFirst({
+              where: { classId: subjClassId },
+              select: { sectionId: true },
+            });
+            secId = secAlloc?.sectionId || 0;
+          }
+          if (secId > 0) {
+            await tx.subjectAssign.create({
+              data: {
+                teacherId: teacher.id,
+                classId: subjClassId,
+                sectionId: secId,
+                subjectId: subjId,
+                sessionId,
+                branchId,
+              },
+            });
+          }
+        } else if (Array.isArray(subjectIds) && subjectIds.length > 0) {
           for (const sId of subjectIds) {
-            const targetClassId = Array.isArray(classIds) && classIds[0] ? Number(classIds[0]) : 1;
+            const targetClassId = Array.isArray(classIds) && classIds[0] ? Number(classIds[0]) : formClassId || 1;
             const secAlloc = await tx.sectionsAllocation.findFirst({
               where: { classId: targetClassId },
               select: { sectionId: true },
@@ -489,7 +549,7 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
                 sessionId,
                 branchId,
               },
-            }).catch(() => {});
+            });
           }
         }
       } else {
@@ -572,6 +632,23 @@ export async function onboardTeacher(req: Request, res: Response): Promise<Respo
 /**
  * PUT /api/admin/teachers/:id
  */
+function asBool(value: any): boolean | undefined {
+  if (value === true || value === 'true' || value === 1 || value === '1') return true;
+  if (value === false || value === 'false' || value === 0 || value === '0') return false;
+  return undefined;
+}
+
+function asPositiveInt(value: any): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function asTrimmedString(value: any): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return '';
+  return String(value).trim();
+}
+
 export async function updateTeacher(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
@@ -581,7 +658,6 @@ export async function updateTeacher(req: Request, res: Response): Promise<Respon
       name,
       email,
       phone,
-      designation,
       department,
       qualifications,
       houseAddress,
@@ -611,134 +687,133 @@ export async function updateTeacher(req: Request, res: Response): Promise<Respon
       return res.status(404).json({ success: false, message: 'Teacher not found.' });
     }
 
+    const incomingPhoto = photo || photoBase64;
     let photoUrl = teacher.photo;
-    if (photo || photoBase64) {
-      const newPhoto = await savePhoto(photo || photoBase64, 'ugbekun2/staff/photos');
+    if (typeof incomingPhoto === 'string' && incomingPhoto.startsWith('data:image/')) {
+      const newPhoto = await savePhoto(incomingPhoto, 'ugbekun2/staff/photos');
       if (newPhoto) photoUrl = newPhoto;
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const classTeacherFlag = asBool(isClassTeacher);
+    const subjectTeacherFlag = asBool(isSubjectTeacher);
 
-    // 1. Handle Class Allocations (TeacherAllocation)
+    const classAllocItems: Array<{ classId: number; sectionId: number }> = [];
     if (Array.isArray(classAllocations)) {
-      await prisma.teacherAllocation.deleteMany({ where: { teacherId: id } });
-      let nextId = ((await prisma.teacherAllocation.findFirst({ orderBy: { id: 'desc' } }))?.id || 0) + 1;
       for (const item of classAllocations) {
-        if (item.classId && item.sectionId) {
-          await prisma.teacherAllocation.create({
-            data: {
-              id: nextId++,
-              teacherId: id,
-              classId: Number(item.classId),
-              sectionId: Number(item.sectionId),
-              sessionId,
-              branchId,
-            },
-          });
-        }
+        const clsId = asPositiveInt(item?.classId);
+        const secId = asPositiveInt(item?.sectionId);
+        if (clsId && secId) classAllocItems.push({ classId: clsId, sectionId: secId });
       }
-    } else if (isClassTeacher === false) {
-      await prisma.teacherAllocation.deleteMany({ where: { teacherId: id } });
-    } else if (isClassTeacher === true && classTeacherClassId && classTeacherSectionId) {
-      const clsId = Number(classTeacherClassId);
-      const secId = Number(classTeacherSectionId);
-      const existingAlloc = await prisma.teacherAllocation.findFirst({ where: { teacherId: id } });
-      if (existingAlloc) {
-        await prisma.teacherAllocation.update({
-          where: { id: existingAlloc.id },
-          data: { classId: clsId, sectionId: secId, sessionId },
-        });
-      } else {
-        const lastAlloc = await prisma.teacherAllocation.findFirst({ orderBy: { id: 'desc' } });
-        const nextId = (lastAlloc?.id || 0) + 1;
-        await prisma.teacherAllocation.create({
-          data: {
-            id: nextId,
-            teacherId: id,
-            classId: clsId,
-            sectionId: secId,
-            sessionId,
-            branchId,
-          },
+    } else if (classTeacherFlag === true) {
+      const clsId = asPositiveInt(classTeacherClassId);
+      const secId = asPositiveInt(classTeacherSectionId);
+      if (clsId && secId) classAllocItems.push({ classId: clsId, sectionId: secId });
+    }
+
+    const subjectAssignItems: Array<{ subjectId: number; classId: number; sectionId: number }> = [];
+    if (Array.isArray(subjectAssignments)) {
+      for (const item of subjectAssignments) {
+        const subId = asPositiveInt(item?.subjectId);
+        const clsId = asPositiveInt(item?.classId);
+        const secId = asPositiveInt(item?.sectionId);
+        if (subId && clsId && secId) subjectAssignItems.push({ subjectId: subId, classId: clsId, sectionId: secId });
+      }
+    } else if (subjectTeacherFlag === true) {
+      const subId = asPositiveInt(subjectTeacherSubjectId);
+      const clsId = asPositiveInt(subjectTeacherClassId);
+      const secId = asPositiveInt(subjectTeacherSectionId);
+      if (subId && clsId && secId) subjectAssignItems.push({ subjectId: subId, classId: clsId, sectionId: secId });
+    }
+
+    const pendingSubId = asPositiveInt(subjectTeacherSubjectId);
+    if (pendingSubId) {
+      const pendingClassId =
+        asPositiveInt(subjectTeacherClassId) ||
+        classAllocItems[0]?.classId ||
+        asPositiveInt(classTeacherClassId);
+      const pendingSectionId =
+        asPositiveInt(subjectTeacherSectionId) ||
+        classAllocItems[0]?.sectionId ||
+        asPositiveInt(classTeacherSectionId);
+      if (
+        pendingClassId &&
+        pendingSectionId &&
+        !subjectAssignItems.some(
+          (s) => s.subjectId === pendingSubId && s.classId === pendingClassId && s.sectionId === pendingSectionId
+        )
+      ) {
+        subjectAssignItems.push({
+          subjectId: pendingSubId,
+          classId: pendingClassId,
+          sectionId: pendingSectionId,
         });
       }
     }
 
-    // 2. Handle Subject Specializations & Assignments (SubjectAssign)
-    if (Array.isArray(subjectAssignments)) {
-      await prisma.subjectAssign.deleteMany({ where: { teacherId: id } });
-      for (const item of subjectAssignments) {
-        if (item.subjectId && item.classId && item.sectionId) {
-          await prisma.subjectAssign.create({
+    const shouldSyncClassAlloc =
+      Array.isArray(classAllocations) || classTeacherFlag === true || classTeacherFlag === false;
+    const shouldReplaceSubjects = subjectAssignItems.length > 0;
+    const shouldClearSubjects = subjectTeacherFlag === false && subjectAssignItems.length === 0;
+
+    const updatedDept = asTrimmedString(department ?? subjectSpecialization);
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const globalSetting = await tx.globalSettings.findFirst();
+      const sessionId = globalSetting?.sessionId || 5;
+
+      if (shouldSyncClassAlloc) {
+        await tx.teacherAllocation.deleteMany({ where: { teacherId: id } });
+        if (classAllocItems.length > 0) {
+          const lastAlloc = await tx.teacherAllocation.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
+          let nextId = (lastAlloc?.id || 0) + 1;
+          for (const item of classAllocItems) {
+            await tx.teacherAllocation.create({
+              data: {
+                id: nextId++,
+                teacherId: id,
+                classId: item.classId,
+                sectionId: item.sectionId,
+                sessionId,
+                branchId,
+              },
+            });
+          }
+        }
+      }
+
+      if (shouldReplaceSubjects || shouldClearSubjects) {
+        await tx.subjectAssign.deleteMany({ where: { teacherId: id } });
+        for (const item of subjectAssignItems) {
+          await tx.subjectAssign.create({
             data: {
               teacherId: id,
-              subjectId: Number(item.subjectId),
-              classId: Number(item.classId),
-              sectionId: Number(item.sectionId),
+              subjectId: item.subjectId,
+              classId: item.classId,
+              sectionId: item.sectionId,
               sessionId,
               branchId: branchId || 1,
             },
           });
         }
       }
-    } else if (isSubjectTeacher === false) {
-      await prisma.subjectAssign.deleteMany({ where: { teacherId: id } });
-    } else if (isSubjectTeacher === true && subjectTeacherSubjectId && subjectTeacherClassId && subjectTeacherSectionId) {
-      const subId = Number(subjectTeacherSubjectId);
-      const clsId = Number(subjectTeacherClassId);
-      const secId = Number(subjectTeacherSectionId);
 
-      const existingSubj = await prisma.subjectAssign.findFirst({ where: { teacherId: id } });
-      if (existingSubj) {
-        await prisma.subjectAssign.update({
-          where: { id: existingSubj.id },
-          data: { subjectId: subId, classId: clsId, sectionId: secId, sessionId, branchId: branchId || existingSubj.branchId },
-        });
-      } else {
-        await prisma.subjectAssign.create({
-          data: {
-            teacherId: id,
-            subjectId: subId,
-            classId: clsId,
-            sectionId: secId,
-            sessionId,
-            branchId: branchId || 1,
-          },
-        });
-      }
-    }
-
-    // 3. Handle Weekly Periods
-    if (weeklyPeriods !== undefined && !isNaN(Number(weeklyPeriods))) {
-      try {
-        await prisma.$executeRawUnsafe(
-          `UPDATE teachers SET weekly_periods = $1 WHERE id = $2`,
-          Number(weeklyPeriods),
-          id
-        );
-      } catch (err) {
-        console.error('[ADMIN] Failed to update weekly_periods:', err);
-      }
-    }
-
-    const updatedDept = department || subjectSpecialization || teacher.department;
-
-    const updated = await prisma.teacher.update({
-      where: { id },
-      data: {
-        ...(name !== undefined && { name: name.trim() }),
-        ...(email !== undefined && { email: email.trim().toLowerCase() }),
-        ...(phone !== undefined && { phone: phone.trim() }),
-        ...(designation !== undefined && { designation: designation.trim() }),
-        ...(updatedDept !== undefined && { department: updatedDept.trim() }),
-        ...(qualifications !== undefined && { qualifications: qualifications.trim() }),
-        ...(houseAddress !== undefined && { houseAddress: houseAddress.trim() }),
-        ...(bankName !== undefined && { bankName: bankName.trim() }),
-        ...(accountNumber !== undefined && { accountNumber: accountNumber.trim() }),
-        ...(accountName !== undefined && { accountName: accountName.trim() }),
-        ...(photoUrl !== undefined && { photo: photoUrl }),
-      },
+      return tx.teacher.update({
+        where: { id },
+        data: {
+          ...(name !== undefined && { name: String(name).trim() }),
+          ...(email !== undefined && { email: String(email).trim().toLowerCase() }),
+          ...(phone !== undefined && { phone: asTrimmedString(phone) }),
+          ...(updatedDept !== undefined && { department: updatedDept || null }),
+          ...(qualifications !== undefined && { qualifications: asTrimmedString(qualifications) || null }),
+          ...(houseAddress !== undefined && { houseAddress: asTrimmedString(houseAddress) || null }),
+          ...(bankName !== undefined && { bankName: asTrimmedString(bankName) || null }),
+          ...(accountNumber !== undefined && { accountNumber: asTrimmedString(accountNumber) || null }),
+          ...(accountName !== undefined && { accountName: asTrimmedString(accountName) || null }),
+          ...(photoUrl !== undefined && { photo: photoUrl }),
+          ...(weeklyPeriods !== undefined && !isNaN(Number(weeklyPeriods)) && { weeklyPeriods: Number(weeklyPeriods) }),
+          updatedAt: new Date(),
+        },
+      });
     });
 
     return res.json({

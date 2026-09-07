@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
+import { parsePagination, paginateItems } from '../../lib/pagination';
 
 /**
  * GET /api/admin/attendance/staff
@@ -9,6 +10,7 @@ export async function getStaffAttendance(req: Request, res: Response): Promise<R
 
   try {
     const { date } = req.query;
+    const { page, pageSize, q } = parsePagination(req.query);
     let targetDate;
     if (date && /^\d{4}-\d{2}-\d{2}$/.test(date as string)) {
       const [y, m, d] = (date as string).split('-').map(Number);
@@ -22,7 +24,7 @@ export async function getStaffAttendance(req: Request, res: Response): Promise<R
     nextDate.setDate(nextDate.getDate() + 1);
 
     const teachers = await prisma.teacher.findMany({
-      where: { branchId },
+      where: { branchId, active: true },
       select: { id: true, name: true, email: true, phone: true, department: true },
       orderBy: [{ name: 'asc' }],
     });
@@ -65,11 +67,18 @@ export async function getStaffAttendance(req: Request, res: Response): Promise<R
     const totalStaff = teachers.length;
     const attendanceRate =
       totalStaff > 0 ? Math.round(((presentCount + lateCount + halfDayCount) / totalStaff) * 100) : 0;
+    const filtered = q
+      ? teachers.filter((row) =>
+          [row.name, row.email, row.phone, row.department].join(' ').toLowerCase().includes(q)
+        )
+      : teachers;
+    const paged = paginateItems(filtered, page, pageSize);
 
     return res.json({
       success: true,
-      teachers,
+      teachers: paged.items,
       attendanceMap,
+      pagination: paged.pagination,
       metrics: {
         totalStaff,
         presentCount,
@@ -117,9 +126,12 @@ export async function saveStaffAttendanceBatch(req: Request, res: Response): Pro
       if (!item.teacherId) continue;
       const tId = Number(item.teacherId);
       const statusStr = item.status ? String(item.status).toUpperCase() : 'PRESENT';
-      const clockInStr = item.clockIn ? String(item.clockIn).trim() : null;
-      const clockOutStr = item.clockOut ? String(item.clockOut).trim() : null;
-      const remarkStr = item.remark ? String(item.remark).trim() : null;
+      const hasClockIn = Object.prototype.hasOwnProperty.call(item, 'clockIn');
+      const hasClockOut = Object.prototype.hasOwnProperty.call(item, 'clockOut');
+      const hasRemark = Object.prototype.hasOwnProperty.call(item, 'remark');
+      const clockInStr = hasClockIn ? (item.clockIn ? String(item.clockIn).trim() : null) : undefined;
+      const clockOutStr = hasClockOut ? (item.clockOut ? String(item.clockOut).trim() : null) : undefined;
+      const remarkStr = hasRemark ? (item.remark ? String(item.remark).trim() : null) : undefined;
 
       const existing = await prisma.staffAttendance.findFirst({
         where: {
@@ -137,9 +149,9 @@ export async function saveStaffAttendanceBatch(req: Request, res: Response): Pro
           where: { id: existing.id },
           data: {
             status: statusStr,
-            clockIn: clockInStr,
-            clockOut: clockOutStr,
-            remark: remarkStr,
+            clockIn: hasClockIn ? clockInStr : existing.clockIn,
+            clockOut: hasClockOut ? clockOutStr : existing.clockOut,
+            remark: hasRemark ? remarkStr : existing.remark,
           },
         });
       } else {
@@ -149,9 +161,9 @@ export async function saveStaffAttendanceBatch(req: Request, res: Response): Pro
             teacherId: tId,
             attendanceDate: targetDate,
             status: statusStr,
-            clockIn: clockInStr,
-            clockOut: clockOutStr,
-            remark: remarkStr,
+            clockIn: clockInStr ?? null,
+            clockOut: clockOutStr ?? null,
+            remark: remarkStr ?? null,
           },
         });
       }

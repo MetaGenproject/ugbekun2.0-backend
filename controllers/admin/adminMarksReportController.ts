@@ -7,6 +7,11 @@ import {
   generateBatchClassReportCardsPdf,
 } from '../../lib/pdfService';
 import { generateBatchClassCommentary } from '../../lib/commentaryService';
+import {
+  listSubmittedAttendance,
+  summarizeSubmittedAttendanceByStudent,
+  summarizeSubmittedLogs,
+} from '../../lib/attendanceRegisterService';
 
 /**
  * GET /api/admin/marks-entry
@@ -476,28 +481,23 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       montMap[m.studentId] = m;
     });
 
-    const attendanceRecords = await prisma.attendance.findMany({
-      where: {
-        studentId: { in: studentIds },
-        classId: parsedClassId,
-        sectionId: parsedSectionId,
-        sessionId,
-        branchId,
-      },
-      select: { studentId: true, status: true },
+    const { logs: attendanceRecords } = await listSubmittedAttendance(prisma, {
+      studentIds,
+      classId: parsedClassId,
+      sectionId: parsedSectionId,
+      sessionId,
+      branchId,
     });
-    const attMap: Record<number, any> = {};
+    const attendanceByStudent = summarizeSubmittedAttendanceByStudent(attendanceRecords);
+    const attMap: Record<number, { total: number; present: number; absent: number; late: number }> = {};
     studentIds.forEach((id) => {
-      attMap[id] = { total: 0, present: 0, absent: 0, late: 0 };
-    });
-    attendanceRecords.forEach((a) => {
-      if (attMap[a.studentId]) {
-        attMap[a.studentId].total += 1;
-        const st = (a.status || '').toLowerCase();
-        if (st === 'present' || st === '1') attMap[a.studentId].present += 1;
-        else if (st === 'absent' || st === '0') attMap[a.studentId].absent += 1;
-        else if (st === 'late') attMap[a.studentId].late += 1;
-      }
+      const summary = attendanceByStudent.get(id) || summarizeSubmittedLogs([]);
+      attMap[id] = {
+        total: summary.totalDays,
+        present: summary.inAttendance,
+        absent: summary.absentCount,
+        late: summary.lateCount,
+      };
     });
 
     const studentMarksMap: Record<number, any[]> = {};
@@ -1210,14 +1210,12 @@ export async function batchGenerateCommentary(req: Request, res: Response): Prom
           ? Math.round(scoresList.reduce((a: number, b: number) => a + b, 0) / scoresList.length)
           : 70;
 
-      const att = await prisma.attendance.findMany({
-        where: { studentId: st.id, sessionId, branchId },
+      const { summary: attSummary } = await listSubmittedAttendance(prisma, {
+        studentId: st.id,
+        sessionId,
+        branchId,
       });
-      const totalDays = att.length;
-      const presentDays = att.filter(
-        (a) => String(a.status || '').toLowerCase() === 'present' || String(a.status || '').toLowerCase() === 'late'
-      ).length;
-      const attendanceRate = totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 100;
+      const attendanceRate = Math.round(attSummary.percentage);
 
       const existingComm = await prisma.studentCommentary.findUnique({
         where: {

@@ -95,6 +95,8 @@ model Branch {
   questionGroups  QuestionGroup[]
   cbtDistributions CbtDistribution[]
   staffAttendances StaffAttendance[]
+  attendanceRegisters AttendanceRegister[]
+  attendanceAudits    AttendanceAudit[]
   leaveCategories LeaveCategory[]
   leaveRequests   LeaveRequest[]
   payrollComponents PayrollComponent[]
@@ -344,6 +346,8 @@ model Teacher {
   staffAttendances   StaffAttendance[]
   activities         TeacherActivity[]
   reminders          TeacherReminder[]
+  attendanceRegistersTaken AttendanceRegister[] @relation("AttendanceRegisterTakenBy")
+  attendanceMarks          Attendance[]         @relation("AttendanceMarkedBy")
 
   @@map("teachers")
 }
@@ -587,6 +591,7 @@ model Class {
   subjects              SubjectAssign[]
   marks                 Mark[]
   attendances           Attendance[]
+  attendanceRegisters   AttendanceRegister[]
   teacherAllocations    TeacherAllocation[]
   onlineExams           OnlineExam[]
   homeworks             Homework[]
@@ -618,6 +623,7 @@ model Section {
   subjects              SubjectAssign[]
   marks                 Mark[]
   attendances           Attendance[]
+  attendanceRegisters   AttendanceRegister[]
   teacherAllocations    TeacherAllocation[]
   montessoriAssessments MontessoriAssessment[]
   siblingRequests       ParentSiblingRequest[]
@@ -778,25 +784,84 @@ model PromotionHistory {
   @@map("promotion_history")
 }
 
+model AttendanceRegister {
+  id               Int       @id @default(autoincrement())
+  classId          Int       @map("class_id")
+  sectionId        Int       @map("section_id")
+  registerDate     DateTime  @map("register_date") @db.Date
+  sessionId        Int       @map("session_id")
+  branchId         Int       @map("branch_id")
+  status           String    @default("DRAFT") @map("status") // DRAFT | SUBMITTED | LOCKED
+  takenByTeacherId Int?      @map("taken_by_teacher_id")
+  submittedAt      DateTime? @map("submitted_at")
+  version          Int       @default(1)
+  notes            String?   @db.Text
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
+
+  class          Class     @relation(fields: [classId], references: [id])
+  section        Section   @relation(fields: [sectionId], references: [id])
+  branch         Branch    @relation(fields: [branchId], references: [id])
+  takenByTeacher Teacher?  @relation("AttendanceRegisterTakenBy", fields: [takenByTeacherId], references: [id])
+  entries        Attendance[]
+  audits         AttendanceAudit[]
+  unlockedAt         DateTime? @map("unlocked_at")
+  unlockedByUserId   Int?      @map("unlocked_by_user_id")
+  unlockedReason     String?   @map("unlocked_reason") @db.Text
+
+  @@unique([branchId, sessionId, classId, sectionId, registerDate], map: "attendance_registers_day_unique")
+  @@index([branchId, registerDate])
+  @@map("attendance_registers")
+}
+
 model Attendance {
-  id             Int       @id @default(autoincrement())
-  studentId      Int       @map("student_id")
-  classId        Int       @map("class_id")
-  sectionId      Int       @map("section_id")
-  attendanceDate DateTime  @map("attendance_date")
-  status         String    @map("status") // e.g. Present, Absent, Late
-  remark         String?   @map("remark")
-  sessionId      Int       @map("session_id")
-  branchId       Int       @map("branch_id")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime? @updatedAt @map("updated_at")
+  id                Int       @id @default(autoincrement())
+  studentId         Int       @map("student_id")
+  classId           Int       @map("class_id")
+  sectionId         Int       @map("section_id")
+  attendanceDate    DateTime  @map("attendance_date")
+  status            String    @map("status") // Present, Absent, Late, Excused, Sick
+  remark            String?   @map("remark")
+  sessionId         Int       @map("session_id")
+  branchId          Int       @map("branch_id")
+  registerId        Int?      @map("register_id")
+  markedByTeacherId Int?      @map("marked_by_teacher_id")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime? @updatedAt @map("updated_at")
 
-  student Student @relation(fields: [studentId], references: [id])
-  class   Class   @relation(fields: [classId], references: [id])
-  section Section @relation(fields: [sectionId], references: [id])
+  student         Student              @relation(fields: [studentId], references: [id])
+  class           Class                @relation(fields: [classId], references: [id])
+  section         Section              @relation(fields: [sectionId], references: [id])
+  register        AttendanceRegister?  @relation(fields: [registerId], references: [id], onDelete: SetNull)
+  markedByTeacher Teacher?             @relation("AttendanceMarkedBy", fields: [markedByTeacherId], references: [id])
 
+  @@unique([registerId, studentId], map: "attendance_register_student_key")
+  @@unique([studentId, sessionId, branchId, attendanceDate], map: "attendance_student_session_branch_date_key")
   @@index([classId, sectionId, attendanceDate])
+  @@index([registerId])
+  @@index([branchId, sessionId])
   @@map("attendance")
+}
+
+model AttendanceAudit {
+  id           Int       @id @default(autoincrement())
+  registerId   Int       @map("register_id")
+  attendanceId Int?      @map("attendance_id")
+  studentId    Int?      @map("student_id")
+  action       String    @map("action") // UNLOCK | EDIT | SUBMIT
+  fromCode     String?   @map("from_code")
+  toCode       String?   @map("to_code")
+  actorUserId  Int?      @map("actor_user_id")
+  reason       String?   @db.Text
+  branchId     Int       @map("branch_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  register AttendanceRegister @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  branch   Branch             @relation(fields: [branchId], references: [id])
+
+  @@index([registerId])
+  @@index([branchId, createdAt])
+  @@map("attendance_audits")
 }
 
 model StudentCommentary {
@@ -1546,6 +1611,7 @@ model Event {
   description String?   @db.Text
   startDate   DateTime  @map("start_date")
   endDate     DateTime? @map("end_date")
+  kind        String    @default("EVENT") @map("kind") // EVENT | HOLIDAY | CLOSURE | SCHOOL_DAY
   branchId    Int?      @map("branch_id")
   sessionId   Int?      @map("session_id")
   createdAt   DateTime  @default(now()) @map("created_at")

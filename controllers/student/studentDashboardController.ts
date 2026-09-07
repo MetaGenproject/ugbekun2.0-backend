@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import prisma from '../../lib/prisma';
+import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
 
 /**
  * GET /api/student/dashboard-overview
@@ -70,23 +71,20 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       subjects,
     };
 
-    // 2. Attendance KPI
-    const attendanceLogs = await prisma.attendance.findMany({
-      where: { studentId: req.studentId, sessionId: req.sessionId, branchId: req.branchId },
-      orderBy: { attendanceDate: 'desc' },
+    // 2. Attendance KPI — submitted registers only
+    const { logs: attendanceLogs, summary: attendanceSummary } = await listSubmittedAttendance(prisma, {
+      studentId: req.studentId,
+      sessionId: req.sessionId,
+      branchId: req.branchId,
     });
-    const totalDays = attendanceLogs.length;
-    const presentCount = attendanceLogs.filter((l) => l.status === 'Present').length;
-    const absentCount = attendanceLogs.filter((l) => l.status === 'Absent').length;
-    const lateCount = attendanceLogs.filter((l) => l.status === 'Late').length;
-    const attendancePct = totalDays > 0 ? Number((((presentCount + lateCount) / totalDays) * 100).toFixed(1)) : 100;
+    const attendancePct = attendanceSummary.percentage;
 
     const attendance = {
       percentage: attendancePct,
-      totalDays,
-      presentCount,
-      absentCount,
-      lateCount,
+      totalDays: attendanceSummary.totalDays,
+      presentCount: attendanceSummary.presentCount,
+      absentCount: attendanceSummary.absentCount,
+      lateCount: attendanceSummary.lateCount,
       logs: attendanceLogs.slice(0, 30).map((l) => ({
         id: l.id,
         attendanceDate: l.attendanceDate,

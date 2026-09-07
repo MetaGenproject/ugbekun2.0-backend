@@ -3,6 +3,18 @@ import OpenAI from 'openai';
 import prisma from '../../lib/prisma';
 import { bindEvaluationMatrix, wipeEvaluationMatrix } from '../../lib/studentService';
 import { generateLessonPlanPdf } from '../../lib/pdfService';
+import { parseSchoolDateKey, storedAttendanceDateKey, todaySchoolDateKey, parseSchoolMonthKey, todaySchoolMonthKey, schoolMonthDateKeys, schoolMonthLabel, schoolMonthStoredRange, schoolDateStoredRange, describeSchoolDate } from '../../lib/schoolDate';
+import { parsePagination, paginateItems } from '../../lib/pagination';
+import {
+  AttendanceRegisterError,
+  buildMonthlyAttendanceTables,
+  getRegisterWithEntries,
+  listSubmittedAttendance,
+  openOrGetRegister,
+  summarizeDailyPresence,
+  summarizeEntries,
+  upsertEntries,
+} from '../../lib/attendanceRegisterService';
 
 const openai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
@@ -475,27 +487,64 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
 
     const cId = Number(classId);
     const secId = sectionId ? Number(sectionId) : null;
-
-    let targetDate;
-    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date as string)) {
-      const [y, m, d] = (date as string).split('-').map(Number);
-      targetDate = new Date(y, m - 1, d, 0, 0, 0, 0);
-    } else {
-      targetDate = new Date();
-      targetDate.setHours(0, 0, 0, 0);
-    }
-
-    const nextDate = new Date(targetDate);
-    nextDate.setDate(nextDate.getDate() + 1);
+    const dateKey = parseSchoolDateKey(date) || todaySchoolDateKey();
 
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = globalSetting?.sessionId || 1;
+
+    const { page, pageSize, q } = parsePagination(req.query);
+
+    if (secId) {
+      const snapshot = await getRegisterWithEntries(prisma, {
+        branchId,
+        sessionId: activeSession,
+        classId: cId,
+        sectionId: secId,
+        dateKey,
+      });
+      const students = snapshot.roster.map((row) => ({
+        id: row.studentId,
+        name: [row.firstName, row.lastName].filter(Boolean).join(' ') || `Student #${row.studentId}`,
+        roll: row.roll != null ? String(row.roll) : null,
+        registerNo: row.registerNo,
+      }));
+      const filtered = q
+        ? students.filter((row) =>
+            [row.name, row.roll, row.registerNo].join(' ').toLowerCase().includes(q)
+          )
+        : students;
+      const paged = paginateItems(filtered, page, pageSize);
+      const attendanceMap: Record<number, { status: string; remark: string | null }> = {};
+      snapshot.entries.forEach((entry) => {
+        attendanceMap[entry.studentId] = {
+          status: String(entry.status || '').toUpperCase(),
+          remark: entry.remark,
+        };
+      });
+      const coded = snapshot.summary.total - snapshot.summary.unmarked;
+      return res.json({
+        success: true,
+        students: paged.items,
+        attendanceMap,
+        register: snapshot.register,
+        canEdit: snapshot.canEdit,
+        pagination: paged.pagination,
+        metrics: {
+          totalEnrolled: snapshot.summary.total,
+          presentCount: snapshot.summary.present,
+          absentCount: snapshot.summary.absent,
+          lateCount: snapshot.summary.late,
+          excusedCount: snapshot.summary.excused + snapshot.summary.sick,
+          unmarkedCount: snapshot.summary.unmarked,
+          attendanceRate: coded > 0 ? Math.round(((snapshot.summary.present + snapshot.summary.late) / coded) * 100) : 0,
+        },
+      });
+    }
 
     const enrolls = await prisma.enroll.findMany({
       where: {
         branchId,
         classId: cId,
-        ...(secId ? { sectionId: secId } : {}),
         sessionId: activeSession,
       },
       include: {
@@ -525,17 +574,13 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
       sectionName: e.section?.name,
     }));
 
-    const attendanceRecords = await prisma.attendance.findMany({
-      where: {
-        branchId,
-        classId: cId,
-        ...(secId ? { sectionId: secId } : {}),
-        attendanceDate: {
-          gte: targetDate,
-          lt: nextDate,
-        },
-      },
+    const { logs: attendanceRecords } = await listSubmittedAttendance(prisma, {
+      branchId,
+      sessionId: activeSession,
+      classId: cId,
+      studentIds: students.map((row) => row.id),
     });
+    const forDate = attendanceRecords.filter((att) => storedAttendanceDateKey(att.attendanceDate) === dateKey);
 
     const attendanceMap: Record<number, any> = {};
     let presentCount = 0;
@@ -543,29 +588,34 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
     let lateCount = 0;
     let excusedCount = 0;
 
-    attendanceRecords.forEach((att: any) => {
+    forDate.forEach((att) => {
+      const status = String(att.status || '').toUpperCase();
       attendanceMap[att.studentId] = {
         id: att.id,
-        status: att.status ? att.status.toUpperCase() : 'PRESENT',
+        status,
         remark: att.remark,
       };
-
-      const st = (att.status || '').toUpperCase();
-      if (st === 'PRESENT' || st === 'H' || st === '1') presentCount++;
-      else if (st === 'ABSENT' || st === 'A') absentCount++;
-      else if (st === 'LATE' || st === 'L') lateCount++;
-      else if (st === 'EXCUSED' || st === 'E') excusedCount++;
-      else presentCount++;
+      if (status === 'PRESENT') presentCount++;
+      else if (status === 'ABSENT') absentCount++;
+      else if (status === 'LATE') lateCount++;
+      else if (status === 'EXCUSED' || status === 'SICK') excusedCount++;
     });
 
     const totalEnrolled = students.length;
-    const attendanceRate =
-      totalEnrolled > 0 ? Math.round(((presentCount + lateCount) / totalEnrolled) * 100) : 0;
+    const coded = presentCount + absentCount + lateCount + excusedCount;
+    const attendanceRate = coded > 0 ? Math.round(((presentCount + lateCount) / coded) * 100) : 0;
+    const filtered = q
+      ? students.filter((row) =>
+          [row.name, row.roll, row.registerNo, row.sectionName].join(' ').toLowerCase().includes(q)
+        )
+      : students;
+    const paged = paginateItems(filtered, page, pageSize);
 
     return res.json({
       success: true,
-      students,
+      students: paged.items,
       attendanceMap,
+      pagination: paged.pagination,
       metrics: {
         totalEnrolled,
         presentCount,
@@ -595,76 +645,337 @@ export async function saveStudentAttendanceBatch(req: Request, res: Response): P
     }
 
     const cId = Number(classId);
-    const secId = sectionId ? Number(sectionId) : null;
-
-    let targetDate;
-    if (date && /^\d{4}-\d{2}-\d{2}$/.test(date as string)) {
-      const [y, m, d] = (date as string).split('-').map(Number);
-      targetDate = new Date(y, m - 1, d, 0, 0, 0, 0);
-    } else {
-      targetDate = new Date();
-      targetDate.setHours(0, 0, 0, 0);
+    const secId = sectionId ? Number(sectionId) : 1;
+    const dateKey = parseSchoolDateKey(date);
+    if (!dateKey) {
+      return res.status(400).json({ success: false, message: 'Invalid date. Use YYYY-MM-DD.' });
     }
-
-    const nextDate = new Date(targetDate);
-    nextDate.setDate(nextDate.getDate() + 1);
+    if (!secId) {
+      return res.status(400).json({ success: false, message: 'sectionId is required to save a class register.' });
+    }
 
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = globalSetting?.sessionId || 1;
 
-    let savedCount = 0;
-
-    for (const item of attendance) {
-      if (!item.studentId) continue;
-      const sId = Number(item.studentId);
-      const statusStr = item.status ? String(item.status).toUpperCase() : 'PRESENT';
-      const remarkStr = item.remark ? String(item.remark).trim() : null;
-
-      const existing = await prisma.attendance.findFirst({
-        where: {
+    const register = await openOrGetRegister(prisma, {
+      branchId,
+      sessionId: activeSession,
+      classId: cId,
+      sectionId: secId,
+      dateKey,
+    });
+    const result = await prisma.$transaction(
+      async (tx) => {
+        return upsertEntries(tx, {
+          registerId: register.id,
           branchId,
-          classId: cId,
-          studentId: sId,
-          attendanceDate: {
-            gte: targetDate,
-            lt: nextDate,
-          },
-        },
-      });
+          entries: attendance,
+          requireComplete: false,
+          mode: 'admin-save',
+        });
+      },
+      { timeout: 20000, maxWait: 10000 }
+    );
 
-      if (existing) {
-        await prisma.attendance.update({
-          where: { id: existing.id },
-          data: {
-            status: statusStr,
-            remark: remarkStr,
-          },
-        });
-      } else {
-        await prisma.attendance.create({
-          data: {
-            branchId,
-            classId: cId,
-            sectionId: secId || 1,
-            studentId: sId,
-            attendanceDate: targetDate,
-            status: statusStr,
-            remark: remarkStr,
-            sessionId: activeSession,
-          },
-        });
-      }
-      savedCount++;
-    }
+    const savedCount = result.planned.rows.length;
 
     return res.json({
       success: true,
       savedCount,
+      register: {
+        id: result.register.id,
+        status: result.register.status,
+        version: result.register.version,
+      },
       message: `Student attendance saved successfully (${savedCount} records).`,
     });
   } catch (error) {
+    if (error instanceof AttendanceRegisterError) {
+      return res.status(error.httpStatus).json({
+        success: false,
+        message: error.message,
+        code: error.code,
+        ...error.extra,
+      });
+    }
     console.error('[ADMIN] Batch save student attendance error:', error);
     return res.status(500).json({ success: false, message: 'Failed to save student attendance.' });
+  }
+}
+
+function csvCell(value: unknown) {
+  const text = value == null ? '' : String(value);
+  if (/[",\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+  return text;
+}
+
+function toCsv(headers: string[], rows: Array<Array<unknown>>) {
+  return [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\n');
+}
+
+function summarizeStaffDay(totalStaff: number, records: Array<{ teacherId: number; status?: string | null }>) {
+  const latest = new Map<number, string>();
+  for (const record of records) {
+    latest.set(record.teacherId, String(record.status || '').toUpperCase());
+  }
+  let present = 0;
+  let absent = 0;
+  let late = 0;
+  let halfDay = 0;
+  let onLeave = 0;
+  for (const status of latest.values()) {
+    if (status === 'PRESENT') present += 1;
+    else if (status === 'ABSENT') absent += 1;
+    else if (status === 'LATE') late += 1;
+    else if (status === 'HALF_DAY') halfDay += 1;
+    else if (status === 'ON_LEAVE') onLeave += 1;
+    else present += 1;
+  }
+  const marked = present + absent + late + halfDay + onLeave;
+  const inAttendance = present + late + halfDay;
+  return {
+    total: totalStaff,
+    present,
+    absent,
+    late,
+    halfDay,
+    onLeave,
+    unmarked: Math.max(0, totalStaff - marked),
+    marked,
+    inAttendance,
+    attendanceRate: totalStaff > 0 ? Number(((inAttendance / totalStaff) * 100).toFixed(1)) : 0,
+  };
+}
+
+/**
+ * GET /api/admin/attendance/daily-report
+ */
+export async function getDailyAttendanceReport(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const dateKey = parseSchoolDateKey(req.query.date) || todaySchoolDateKey();
+    const described = describeSchoolDate(dateKey);
+    const range = schoolDateStoredRange(dateKey);
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const activeSession = globalSetting?.sessionId || 1;
+
+    const enrolls = await prisma.enroll.findMany({
+      where: { branchId, sessionId: activeSession },
+      select: { studentId: true },
+    });
+    const enrolledIds = Array.from(new Set(enrolls.map((row) => row.studentId)));
+
+    const [{ logs }, staffTotal, staffRecords] = await Promise.all([
+      listSubmittedAttendance(prisma, {
+        branchId,
+        sessionId: activeSession,
+        dateFromKey: dateKey,
+        dateToKey: dateKey,
+        order: 'asc',
+      }),
+      prisma.teacher.count({ where: { branchId, active: true } }),
+      prisma.staffAttendance.findMany({
+        where: { branchId, attendanceDate: range },
+        select: { teacherId: true, status: true },
+      }),
+    ]);
+
+    const dayLogs = logs.filter((log) => storedAttendanceDateKey(log.attendanceDate) === dateKey);
+    const students = summarizeDailyPresence(summarizeEntries(enrolledIds, dayLogs));
+    const staff = summarizeStaffDay(staffTotal, staffRecords);
+
+    return res.json({
+      success: true,
+      date: dateKey,
+      weekday: described.weekday,
+      calendar: described,
+      students,
+      staff,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Daily attendance report error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load daily attendance report.' });
+  }
+}
+
+/**
+ * GET /api/admin/attendance/monthly-report
+ */
+export async function getMonthlyAttendanceReport(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const monthKey = parseSchoolMonthKey(req.query.month) || todaySchoolMonthKey();
+    const monthDays = schoolMonthDateKeys(monthKey);
+    if (monthDays.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid month. Use YYYY-MM.' });
+    }
+
+    const classId = req.query.classId ? Number(req.query.classId) : 0;
+    const sectionId = req.query.sectionId ? Number(req.query.sectionId) : 0;
+    const requestedView = String(req.query.view || '').toLowerCase();
+    const view =
+      requestedView === 'students' || requestedView === 'streams'
+        ? requestedView
+        : classId
+          ? 'students'
+          : 'streams';
+    const exporting = String(req.query.format || '').toLowerCase() === 'csv';
+    const { page, pageSize, q } = parsePagination(req.query);
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const activeSession = globalSetting?.sessionId || 1;
+
+    const enrolls = await prisma.enroll.findMany({
+      where: {
+        branchId,
+        sessionId: activeSession,
+        ...(classId ? { classId } : {}),
+        ...(sectionId ? { sectionId } : {}),
+      },
+      include: {
+        student: {
+          select: { id: true, firstName: true, lastName: true, registerNo: true },
+        },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
+    });
+
+    const { logs } = await listSubmittedAttendance(prisma, {
+      branchId,
+      sessionId: activeSession,
+      ...(classId ? { classId } : {}),
+      ...(sectionId ? { sectionId } : {}),
+      dateFromKey: monthDays[0],
+      dateToKey: monthDays[monthDays.length - 1],
+      order: 'asc',
+    });
+
+    const monthSet = new Set(monthDays);
+    const monthLogs = logs.filter((log) => monthSet.has(storedAttendanceDateKey(log.attendanceDate)));
+    const tables = buildMonthlyAttendanceTables(
+      enrolls.map((row) => ({
+        studentId: row.student.id,
+        classId: row.classId,
+        sectionId: row.sectionId,
+        className: row.class?.name || `Class ${row.classId}`,
+        sectionName: row.section?.name || `Arm ${row.sectionId}`,
+        roll: row.roll,
+        firstName: row.student.firstName,
+        lastName: row.student.lastName,
+        registerNo: row.student.registerNo,
+      })),
+      monthLogs
+    );
+
+    const staffRange = schoolMonthStoredRange(monthKey);
+    const [staffCount, staffRecords] = await Promise.all([
+      prisma.teacher.count({ where: { branchId, active: true } }),
+      prisma.staffAttendance.findMany({
+        where: { branchId, ...(staffRange ? { attendanceDate: staffRange } : {}) },
+        select: { status: true },
+      }),
+    ]);
+
+    let staffPresent = 0;
+    let staffAbsent = 0;
+    let staffLate = 0;
+    let staffHalfDay = 0;
+    let staffOnLeave = 0;
+    for (const record of staffRecords) {
+      const status = String(record.status || '').toUpperCase();
+      if (status === 'PRESENT') staffPresent += 1;
+      else if (status === 'ABSENT') staffAbsent += 1;
+      else if (status === 'LATE') staffLate += 1;
+      else if (status === 'HALF_DAY') staffHalfDay += 1;
+      else if (status === 'ON_LEAVE') staffOnLeave += 1;
+    }
+    const staffCoded = staffPresent + staffAbsent + staffLate + staffHalfDay + staffOnLeave;
+    const staffInAttendance = staffPresent + staffLate + staffHalfDay;
+    const staffMetrics = {
+      totalStaff: staffCount,
+      markedCount: staffCoded,
+      presentCount: staffPresent,
+      absentCount: staffAbsent,
+      lateCount: staffLate,
+      halfDayCount: staffHalfDay,
+      onLeaveCount: staffOnLeave,
+      attendanceRate: staffCoded > 0 ? Number(((staffInAttendance / staffCoded) * 100).toFixed(1)) : 0,
+    };
+
+    const streamRows = q
+      ? tables.streams.filter((row) =>
+          [row.streamName, row.className, row.sectionName].join(' ').toLowerCase().includes(q)
+        )
+      : tables.streams;
+    const studentRows = q
+      ? tables.students.filter((row) =>
+          [row.name, row.registerNo, row.streamName, row.roll].join(' ').toLowerCase().includes(q)
+        )
+      : tables.students;
+
+    if (exporting) {
+      const filename = `monthly-attendance-${monthKey}.csv`;
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      if (view === 'students') {
+        return res.send(
+          toCsv(
+            ['Class stream', 'Roll', 'Student', 'Admission no', 'Present', 'Late', 'Absent', 'Excused', 'Sick', 'Coded days', 'Presence %', 'Chronic'],
+            studentRows.map((row) => [
+              row.streamName,
+              row.roll,
+              row.name,
+              row.registerNo,
+              row.presentCount,
+              row.lateCount,
+              row.absentCount,
+              row.excusedCount,
+              row.sickCount,
+              row.codedDays,
+              row.percentage,
+              row.chronic ? 'Yes' : 'No',
+            ])
+          )
+        );
+      }
+      return res.send(
+        toCsv(
+          ['Class stream', 'Enrolled students', 'Coded days', 'Average presence rate', 'Chronic absentees'],
+          streamRows.map((row) => [
+            row.streamName,
+            row.enrolled,
+            row.codedDays,
+            row.averagePresenceRate,
+            row.chronicAbsenteeCount,
+          ])
+        )
+      );
+    }
+
+    const source = view === 'students' ? studentRows : streamRows;
+    const paged = paginateItems(source, page, pageSize);
+
+    return res.json({
+      success: true,
+      month: monthKey,
+      monthLabel: schoolMonthLabel(monthKey),
+      view,
+      metrics: {
+        ...tables.metrics,
+        staff: staffMetrics,
+      },
+      streams: view === 'streams' ? paged.items : streamRows,
+      students: view === 'students' ? paged.items : [],
+      pagination: paged.pagination,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Monthly attendance report error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load monthly attendance report.' });
   }
 }
 

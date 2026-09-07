@@ -29,8 +29,17 @@ import {
   formatDomainSlug,
   DEFAULT_DNS_TARGET,
 } from '../../lib/domainService';
+import { parseSchoolDateKey, schoolDateUtcMidnight } from '../../lib/schoolDate';
+import { inferEventKind } from '../../lib/schoolCalendarService';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key_here_change_in_production';
+
+function eventTimestamp(value: unknown): Date | null {
+  const key = parseSchoolDateKey(value);
+  if (key) return schoolDateUtcMidnight(key);
+  const parsed = new Date(String(value || ''));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
 
 // ============================================================================
 // EVENTS MANAGEMENT
@@ -68,10 +77,15 @@ export async function getEvents(req: Request, res: Response): Promise<Response |
  */
 export async function createEvent(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { title, description, startDate, endDate } = req.body;
+  const { title, description, startDate, endDate, kind } = req.body;
 
   if (!title || !startDate) {
     return res.status(400).json({ success: false, message: 'Title and Start Date are required.' });
+  }
+
+  const start = eventTimestamp(startDate);
+  if (!start) {
+    return res.status(400).json({ success: false, message: 'Invalid start date. Use YYYY-MM-DD.' });
   }
 
   try {
@@ -82,8 +96,9 @@ export async function createEvent(req: Request, res: Response): Promise<Response
       data: {
         title,
         description,
-        startDate: new Date(startDate),
-        endDate: endDate ? new Date(endDate) : null,
+        startDate: start,
+        endDate: endDate ? eventTimestamp(endDate) : null,
+        kind: inferEventKind(title, kind),
         branchId,
         sessionId,
       },
@@ -102,7 +117,7 @@ export async function createEvent(req: Request, res: Response): Promise<Response
 export async function updateEvent(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
   const eventId = Number(req.params.id);
-  const { title, description, startDate, endDate } = req.body;
+  const { title, description, startDate, endDate, kind } = req.body;
 
   try {
     const existing = await prisma.event.findFirst({
@@ -116,13 +131,15 @@ export async function updateEvent(req: Request, res: Response): Promise<Response
       return res.status(404).json({ success: false, message: 'Event not found or unauthorized.' });
     }
 
+    const nextTitle = title !== undefined ? title : existing.title;
     const updated = await prisma.event.update({
       where: { id: eventId },
       data: {
-        title: title !== undefined ? title : existing.title,
+        title: nextTitle,
         description: description !== undefined ? description : existing.description,
-        startDate: startDate ? new Date(startDate) : existing.startDate,
-        endDate: endDate !== undefined ? (endDate ? new Date(endDate) : null) : existing.endDate,
+        startDate: startDate ? eventTimestamp(startDate) || existing.startDate : existing.startDate,
+        endDate: endDate !== undefined ? (endDate ? eventTimestamp(endDate) : null) : existing.endDate,
+        kind: inferEventKind(nextTitle, kind !== undefined ? kind : existing.kind),
       },
     });
 
