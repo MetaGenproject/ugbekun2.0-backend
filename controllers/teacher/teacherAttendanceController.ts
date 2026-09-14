@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
+import gamificationService from '../../lib/gamificationService';
 import { isFormTeacher } from './teacherDashboardController';
 import { notifyParentsOfSubmittedAbsences } from '../../lib/attendanceAbsenceNotifier';
 import { parseSchoolDateKey, schoolDateUtcMidnight } from '../../lib/schoolDate';

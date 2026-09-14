@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { Prisma } from '@prisma/client';
+import { LessonPlanStatus, Prisma } from '@prisma/client';
 import prisma, { isDatabaseConnectivityError, retryOnConnectivity } from '../../lib/prisma';
 import { bindEvaluationMatrix, wipeEvaluationMatrix } from '../../lib/studentService';
 import { generateLessonPlanPdf } from '../../lib/pdfService';
@@ -958,9 +958,24 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
       );
     }
 
-    const source = view === 'students' ? studentRows : streamRows;
-    const paged = paginateItems(source, page, pageSize);
+    if (view === 'students') {
+      const paged = paginateItems(studentRows, page, pageSize);
+      return res.json({
+        success: true,
+        month: monthKey,
+        monthLabel: schoolMonthLabel(monthKey),
+        view,
+        metrics: {
+          ...tables.metrics,
+          staff: staffMetrics,
+        },
+        streams: streamRows,
+        students: paged.items,
+        pagination: paged.pagination,
+      });
+    }
 
+    const paged = paginateItems(streamRows, page, pageSize);
     return res.json({
       success: true,
       month: monthKey,
@@ -970,8 +985,8 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
         ...tables.metrics,
         staff: staffMetrics,
       },
-      streams: view === 'streams' ? paged.items : streamRows,
-      students: view === 'students' ? paged.items : [],
+      streams: paged.items,
+      students: [],
       pagination: paged.pagination,
     });
   } catch (error) {
@@ -1940,12 +1955,16 @@ export async function updateAdminLessonPlan(req: Request, res: Response): Promis
     }
 
     const requested = body.status ? String(body.status).toUpperCase() : plan.status;
-    const allowed = ['DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'REVISION', 'PUBLISHED'];
-    const status = allowed.includes(requested)
-      ? requested === 'PUBLISHED'
-        ? 'PENDING_APPROVAL'
-        : requested
-      : plan.status;
+    const status: LessonPlanStatus =
+      requested === 'APPROVED'
+        ? 'APPROVED'
+        : requested === 'PENDING_APPROVAL' || requested === 'PUBLISHED'
+          ? 'PENDING_APPROVAL'
+          : requested === 'REVISION'
+            ? 'REVISION'
+            : requested === 'DRAFT'
+              ? 'DRAFT'
+              : plan.status;
 
     const updated = await prisma.lessonPlan.update({
       where: { id: plan.id },
