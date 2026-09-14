@@ -1,10 +1,11 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import prisma from '../../lib/prisma';
+import prisma, { isDatabaseConnectivityError } from '../../lib/prisma';
 import { sendMail } from '../../lib/emailService';
 import { buildPasswordResetEmail } from '../../lib/emailTemplates';
 import { staffMatchesBranch } from '../../lib/branchStats';
+import { clearAuthCookie, getAccessToken, setAuthCookie } from '../../lib/authCookie';
 
 // Role map: role code -> role name
 export const ROLE_NAMES: Record<number, string> = {
@@ -22,6 +23,105 @@ export const ROLE_NAMES: Record<number, string> = {
 
 // In-memory store for password reset tokens: key: identifier -> { code, expiresAt, userId }
 const resetTokens = new Map<string, { code: string; expiresAt: number; userId: number; username: string }>();
+
+async function resolveUserBranch(user: { id: number; role: number; username: string; legacyUserId: number | null }) {
+  let branchInfo: any = null;
+  const roleId = user.role;
+
+  try {
+    if (roleId === 2) {
+      if (user.legacyUserId) {
+        const branch = await prisma.branch.findUnique({
+          where: { id: user.legacyUserId },
+          select: { id: true, name: true, code: true, logo: true },
+        });
+        if (branch) branchInfo = branch;
+      }
+      if (!branchInfo) {
+        const teacherRecord = await prisma.teacher.findFirst({
+          where: { OR: [{ userId: user.id }, { id: user.id }] },
+          select: { branchId: true },
+        });
+        if (teacherRecord?.branchId) {
+          const branch = await prisma.branch.findUnique({
+            where: { id: teacherRecord.branchId },
+            select: { id: true, name: true, code: true, logo: true },
+          });
+          if (branch) branchInfo = branch;
+        }
+      }
+      if (!branchInfo) {
+        const branches = await prisma.branch.findMany({
+          where: { active: true },
+          select: { id: true, name: true, code: true, logo: true },
+        });
+        const matched = branches.find((b: any) => staffMatchesBranch(user.username, b));
+        if (matched) branchInfo = matched;
+      }
+      if (!branchInfo) {
+        branchInfo = await prisma.branch.findFirst({
+          where: { active: true },
+          orderBy: { id: 'asc' },
+          select: { id: true, name: true, code: true, logo: true },
+        });
+      }
+    } else if (roleId === 7) {
+      const student = await prisma.student.findUnique({
+        where: { userId: user.id },
+        include: { branch: { select: { id: true, name: true, code: true } } },
+      });
+      if (student?.branch) branchInfo = student.branch;
+    } else if (roleId === 6) {
+      const parent = await prisma.parent.findUnique({
+        where: { userId: user.id },
+        include: { branch: { select: { id: true, name: true, code: true } } },
+      });
+      if (parent?.branch) branchInfo = parent.branch;
+    } else if (roleId === 3) {
+      const teacher = await prisma.teacher.findUnique({
+        where: { userId: user.id },
+        include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
+      });
+      if (teacher?.branch) branchInfo = teacher.branch;
+    } else {
+      const [payrollStaff, teacherRecord] = await Promise.all([
+        prisma.payrollComponent.findFirst({
+          where: { staffId: user.id },
+          include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
+        }).catch(() => null),
+        prisma.teacher.findFirst({
+          where: { userId: user.id },
+          include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
+        }).catch(() => null),
+      ]);
+      if (payrollStaff?.branch) branchInfo = payrollStaff.branch;
+      else if (teacherRecord?.branch) branchInfo = teacherRecord.branch;
+      else if (user.legacyUserId) {
+        branchInfo = await prisma.branch.findUnique({
+          where: { id: user.legacyUserId },
+          select: { id: true, name: true, code: true, logo: true },
+        }).catch(() => null);
+      }
+    }
+  } catch (branchError) {
+    console.error('[AUTH] Error fetching branch info:', branchError);
+  }
+
+  return branchInfo;
+}
+
+function publicAuthUser(user: { id: number; username: string; role: number; legacyUserId: number | null; lastLogin?: Date | null }, branchInfo: any) {
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    roleName: ROLE_NAMES[user.role] || 'user',
+    branchId: branchInfo?.id || null,
+    legacyUserId: user.legacyUserId,
+    lastLogin: user.lastLogin,
+    branch: branchInfo,
+  };
+}
 
 /**
  * POST /api/auth/login
@@ -49,9 +149,7 @@ export async function login(req: Request, res: Response): Promise<Response | voi
     }
 
     // Find user by username using fast B-tree index lookup (@unique username)
-    let user = await prisma.user.findUnique({
-      where: { username: trimmedUsername },
-    });
+    let user = await findUserByUsername(trimmedUsername);
 
     // Fallback to case-insensitive mode only if exact B-tree lookup yields no record
     if (!user) {
@@ -102,106 +200,8 @@ export async function login(req: Request, res: Response): Promise<Response | voi
       data: { lastLogin: new Date() },
     }).catch((err) => console.error('[AUTH] Failed to update lastLogin:', err));
 
-    // Fetch branch information for student, parent, teacher, or branch admin
-    let branchInfo: any = null;
-    const roleId = user.role;
+    const branchInfo = await resolveUserBranch(user);
 
-    try {
-      if (roleId === 2) { // Branch Admin
-        if (user.legacyUserId) {
-          const branch = await prisma.branch.findUnique({
-            where: { id: user.legacyUserId },
-            select: { id: true, name: true, code: true, logo: true },
-          });
-          if (branch) {
-            branchInfo = branch;
-          }
-        }
-        if (!branchInfo) {
-          const teacherRecord = await prisma.teacher.findFirst({
-            where: { OR: [{ userId: user.id }, { id: user.id }] },
-            select: { branchId: true },
-          });
-          if (teacherRecord?.branchId) {
-            const branch = await prisma.branch.findUnique({
-              where: { id: teacherRecord.branchId },
-              select: { id: true, name: true, code: true, logo: true },
-            });
-            if (branch) branchInfo = branch;
-          }
-        }
-        if (!branchInfo) {
-          const branches = await prisma.branch.findMany({
-            where: { active: true },
-            select: { id: true, name: true, code: true, logo: true },
-          });
-          const matched = branches.find((b: any) => staffMatchesBranch(user.username, b));
-          if (matched) {
-            branchInfo = matched;
-          }
-        }
-        if (!branchInfo) {
-          const fallbackBranch = await prisma.branch.findFirst({
-            where: { active: true },
-            orderBy: { id: 'asc' },
-            select: { id: true, name: true, code: true, logo: true },
-          });
-          if (fallbackBranch) {
-            branchInfo = fallbackBranch;
-          }
-        }
-      } else if (roleId === 7) { // Student
-        const student = await prisma.student.findUnique({
-          where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, code: true } } },
-        });
-        if (student?.branch) {
-          branchInfo = student.branch;
-        }
-      } else if (roleId === 6) { // Parent
-        const parent = await prisma.parent.findUnique({
-          where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, code: true } } },
-        });
-        if (parent?.branch) {
-          branchInfo = parent.branch;
-        }
-      } else if (roleId === 3) { // Teacher
-        const teacher = await prisma.teacher.findUnique({
-          where: { userId: user.id },
-          include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
-        });
-        if (teacher?.branch) {
-          branchInfo = teacher.branch;
-        }
-      } else { // Other staff roles (Accountant, Receptionist, Librarian, etc.)
-        const [payrollStaff, teacherRecord] = await Promise.all([
-          prisma.payrollComponent.findFirst({
-            where: { staffId: user.id },
-            include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
-          }).catch(() => null),
-          prisma.teacher.findFirst({
-            where: { userId: user.id },
-            include: { branch: { select: { id: true, name: true, code: true, logo: true } } },
-          }).catch(() => null),
-        ]);
-        if (payrollStaff?.branch) {
-          branchInfo = payrollStaff.branch;
-        } else if (teacherRecord?.branch) {
-          branchInfo = teacherRecord.branch;
-        } else if (user.legacyUserId) {
-          const fallbackBranch = await prisma.branch.findUnique({
-            where: { id: user.legacyUserId },
-            select: { id: true, name: true, code: true, logo: true },
-          }).catch(() => null);
-          if (fallbackBranch) branchInfo = fallbackBranch;
-        }
-      }
-    } catch (branchError) {
-      console.error('[AUTH] Error fetching branch info:', branchError);
-    }
-
-    // Sign JWT
     const secret = process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod';
     const expiresIn = process.env.JWT_EXPIRES_IN || '8h';
 
@@ -215,28 +215,36 @@ export async function login(req: Request, res: Response): Promise<Response | voi
     };
 
     const token = jwt.sign(payload, secret, { expiresIn } as any);
+    setAuthCookie(res, token);
 
     return res.status(200).json({
       success: true,
       message: 'Login successful.',
       token,
-      user: {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        roleName: ROLE_NAMES[user.role] || 'user',
-        branchId: branchInfo?.id || null,
-        legacyUserId: user.legacyUserId,
-        lastLogin: user.lastLogin,
-        branch: branchInfo,
-      },
+      user: publicAuthUser(user, branchInfo),
     });
   } catch (error) {
     console.error('[AUTH] Login error:', error);
+    if (isDatabaseConnectivityError(error)) {
+      return res.status(503).json({
+        success: false,
+        message: 'Cannot reach the database right now. Check your internet connection and try again in a few seconds.',
+      });
+    }
     return res.status(500).json({
       success: false,
       message: 'An internal server error occurred. Please try again.',
     });
+  }
+}
+
+async function findUserByUsername(username: string) {
+  try {
+    return await prisma.user.findUnique({ where: { username } });
+  } catch (error) {
+    if (!isDatabaseConnectivityError(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return prisma.user.findUnique({ where: { username } });
   }
 }
 
@@ -329,21 +337,44 @@ export async function register(req: Request, res: Response): Promise<Response | 
 /**
  * GET /api/auth/me
  */
-export function getMe(req: Request, res: Response): Response | void {
+export async function getMe(req: Request, res: Response): Promise<Response | void> {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    const token = getAccessToken(req);
+    if (!token) {
       return res.status(401).json({ success: false, message: 'No token provided.' });
     }
 
-    const token = authHeader.split(' ')[1];
     const secret = process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod';
-    const decoded = jwt.verify(token, secret);
+    const decoded: any = jwt.verify(token, secret);
+    const userId = Number(decoded.sub || decoded.id);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
+    }
 
-    return res.status(200).json({ success: true, user: decoded });
-  } catch (error) {
+    const user =
+      (await prisma.user.findUnique({ where: { id: userId } })) ||
+      (await prisma.user.findFirst({ where: { legacyUserId: userId } }));
+
+    if (!user || !user.active) {
+      return res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
+    }
+
+    const branchInfo = await resolveUserBranch(user);
+    return res.status(200).json({
+      success: true,
+      user: publicAuthUser(user, branchInfo),
+    });
+  } catch {
     return res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
   }
+}
+
+/**
+ * POST /api/auth/logout
+ */
+export function logout(_req: Request, res: Response): Response {
+  clearAuthCookie(res);
+  return res.status(200).json({ success: true, message: 'Signed out.' });
 }
 
 /**

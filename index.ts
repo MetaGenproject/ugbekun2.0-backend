@@ -2,55 +2,55 @@ import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
-import { PrismaClient } from '@prisma/client';
-import { PrismaPg } from '@prisma/adapter-pg';
-import { Pool } from 'pg';
+import prisma, { disconnectPrisma } from './lib/prisma';
 import redisClient from './config/redis';
 import cron from 'node-cron';
 import { execFile } from 'child_process';
 
 const app = express();
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
-
 const PORT = process.env.PORT || 5001;
 
-// Middleware
-const extraAllowedOrigins = (process.env.ALLOWED_HOSTS || process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map((o) => o.trim())
-  .filter(Boolean);
+app.set('trust proxy', 1);
+
+function isAllowedCorsOrigin(origin: string) {
+  const extraAllowedOrigins = (process.env.ALLOWED_HOSTS || process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  const allowedOrigins = new Set(
+    [
+      process.env.FRONTEND_URL,
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://localhost:3002',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:3001',
+      'http://127.0.0.1:3002',
+      'https://ugbekun-beta.vercel.app',
+      'https://www.ugbekun-beta.vercel.app',
+      ...extraAllowedOrigins,
+    ].filter(Boolean) as string[]
+  );
+
+  if (allowedOrigins.has(origin)) return true;
+
+  if (process.env.NODE_ENV !== 'production') {
+    return /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/i.test(origin);
+  }
+
+  return false;
+}
 
 app.use(cors({
   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-    // Allow non-browser client requests (curl, mobile native, Postman)
     if (!origin) {
       callback(null, true);
       return;
     }
 
-    const allowedOrigins = [
-      process.env.FRONTEND_URL || 'http://localhost:3001',
-      'http://127.0.0.1:3001',
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://127.0.0.1:3001',
-      'https://ugbekun-beta.vercel.app',
-      'https://www.ugbekun-beta.vercel.app',
-      ...extraAllowedOrigins
-    ];
-
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-      return;
-    }
-
-    // Dynamic pattern matching for local network IPs and Vercel preview domains
-    const isAllowedHostPattern = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|.*\.vercel\.app)(:\d+)?$/i.test(origin);
-
-    if (isAllowedHostPattern) {
+    if (isAllowedCorsOrigin(origin)) {
       callback(null, true);
       return;
     }
@@ -59,7 +59,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers', 'x-admin-teacher-id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'x-admin-teacher-id', 'x-branch-id'],
   optionsSuccessStatus: 200
 }));
 
@@ -110,10 +110,13 @@ import studentRouter from './routes/student';
 import parentRouter from './routes/parent';
 import verifyRouter from './routes/verify';
 import publicTenantRouter from './routes/publicTenant';
+import platformApiRouter from './routes/platformApi';
 import { uploadBase64File } from './lib/cloudinary';
+import { bootstrapPlatformSettings } from './lib/platformRuntime';
 
 app.use('/api/public/tenant', publicTenantRouter);
 app.use('/api/public', publicTenantRouter);
+app.use('/api/v1', platformApiRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/onboarding', onboardingRouter);
 app.use('/api/superadmin', superadminRouter);
@@ -211,20 +214,23 @@ console.log('[CRON] Scheduled jobs registered: Weekly Attendance (Mon 06:00) + A
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
-  await prisma.$disconnect();
+  await disconnectPrisma();
   await redisClient.quit();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  await prisma.$disconnect();
+  await disconnectPrisma();
   await redisClient.quit();
   process.exit(0);
 });
 
-// Start Server
+// Start HTTP server and overlay saved global platform settings onto runtime env.
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT} (TypeScript)`);
+  bootstrapPlatformSettings()
+    .then(() => console.log('[PLATFORM] Global settings loaded into runtime'))
+    .catch((error) => console.warn('[PLATFORM] Failed to bootstrap settings:', error?.message || error));
 });
 
 export default app;

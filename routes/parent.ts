@@ -17,6 +17,8 @@ router.get('/child/:studentId/tasks', parentController.assertChildLinked, parent
 router.get('/child/:studentId/grades', parentController.assertChildLinked, parentController.getChildGrades);
 router.get('/child/:studentId/export-pdf', parentController.assertChildLinked, parentController.exportChildReportPdf);
 router.get('/child/:studentId/invoices', parentController.assertChildLinked, parentController.getChildInvoices);
+router.post('/child/:studentId/invoices/:invoiceId/pay', parentController.assertChildLinked, parentController.initializeChildInvoicePayment);
+router.post('/payments/verify', parentController.verifyChildInvoicePayment);
 router.get('/child/:studentId/timetable', parentController.assertChildLinked, parentController.getChildTimetable);
 router.get('/child/:studentId/teachers', parentController.assertChildLinked, parentController.getChildTeachers);
 router.post('/child/:studentId/upload-photo', parentController.assertChildLinked, parentController.uploadChildPhoto);

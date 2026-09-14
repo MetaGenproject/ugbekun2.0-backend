@@ -1,11 +1,8 @@
 import { calculateStudentAttritionRisk } from './attritionEngine';
 import { awardPoints } from './gamificationService';
-import OpenAI from 'openai';
+import { getAiModel, requireDeepseekClient } from './aiClient';
 
-const openai = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
-  baseURL: 'https://api.deepseek.com',
-});
+const openai = { chat: { completions: { create: (args: any) => requireDeepseekClient().chat.completions.create({ ...args, model: args.model || getAiModel() }) } } };
 
 /**
  * Evaluates risk indicators, logs records, deducts XP, and pre-drafts parent plans.

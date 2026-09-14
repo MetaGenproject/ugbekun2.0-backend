@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import prisma from '../../lib/prisma';
 import { uploadBase64Image } from '../../lib/cloudinary';
+import { setAuthCookie } from '../../lib/authCookie';
 import {
   DEFAULT_PLANS,
   resolvePlanSlug,
@@ -452,6 +453,7 @@ export async function registerSchool(req: Request, res: Response): Promise<Respo
     };
 
     const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN } as any);
+    setAuthCookie(res, token);
 
     return res.status(201).json({
       success: true,

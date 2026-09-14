@@ -228,7 +228,13 @@ export function getInitialGateLogs(): GateLogEntry[] {
 export async function getMyEduRideConfig(prisma: any, branchId: number | string) {
   const bId = parseInt(branchId as string, 10);
   if (branchConfigs[bId]) {
-    return branchConfigs[bId];
+    return {
+      ...branchConfigs[bId],
+      apiUrl: process.env.MYEDURIDE_API_URL || branchConfigs[bId].apiUrl,
+      apiKey: process.env.MYEDURIDE_API_KEY || branchConfigs[bId].apiKey,
+      webhookSecret: process.env.MYEDURIDE_WEBHOOK_SECRET || branchConfigs[bId].webhookSecret,
+      isConnected: process.env.MYEDURIDE_ENABLED !== 'false',
+    };
   }
 
   // Fetch branch code from DB
@@ -243,9 +249,9 @@ export async function getMyEduRideConfig(prisma: any, branchId: number | string)
     branchCode,
     schoolName: branch?.name || 'Ugbekun International Academy',
     apiUrl: process.env.MYEDURIDE_API_URL || 'http://localhost:3002/api/v1',
-    apiKey: `EDURIDE-LIVE-KEY-${branchCode}-948291`,
-    webhookSecret: `WH-SEC-${branchCode}-7718`,
-    isConnected: true,
+    apiKey: process.env.MYEDURIDE_API_KEY || `EDURIDE-LIVE-KEY-${branchCode}-948291`,
+    webhookSecret: process.env.MYEDURIDE_WEBHOOK_SECRET || `WH-SEC-${branchCode}-7718`,
+    isConnected: process.env.MYEDURIDE_ENABLED !== 'false',
     lastPingAt: new Date().toISOString(),
     lastSyncedAt: new Date().toISOString(),
     syncedStudentsCount: 0,
@@ -265,9 +271,13 @@ export async function saveMyEduRideConfig(prisma: any, branchId: number | string
   const bId = parseInt(branchId as string, 10);
   const current = await getMyEduRideConfig(prisma, bId);
 
+  const { apiUrl: _apiUrl, apiKey: _apiKey, webhookSecret: _webhookSecret, ...safeUpdate } = updateData || {};
   const updated = {
     ...current,
-    ...updateData,
+    ...safeUpdate,
+    apiUrl: process.env.MYEDURIDE_API_URL || current.apiUrl,
+    apiKey: process.env.MYEDURIDE_API_KEY || current.apiKey,
+    webhookSecret: process.env.MYEDURIDE_WEBHOOK_SECRET || current.webhookSecret,
     branchId: bId,
     lastPingAt: new Date().toISOString()
   };
@@ -405,7 +415,12 @@ export async function getTransportOverview(prisma: any, branchId: number | strin
   });
 
   return {
-    config,
+    config: {
+      ...config,
+      apiKey: config.apiKey ? `${String(config.apiKey).slice(0, 8)}••••` : '',
+      webhookSecret: config.webhookSecret ? '••••••••' : '',
+      credentialsManagedGlobally: true,
+    },
     metrics: {
       activeBuses: fleet.length,
       busesInTransit,

@@ -3,3 +3,4 @@ export * from './sessionController';
 export * from './subscriptionController';
 export * from './revenueController';
 export * from './cmsDomainController';
+export * from './platformController';

@@ -356,7 +356,7 @@ export async function checkLessonPlanEarly(
     const lessonPlan = await prisma.lessonPlan.findUnique({
       where: { id: Number(lessonPlanId) },
     });
-    if (!lessonPlan || lessonPlan.status !== 'PUBLISHED') return;
+    if (!lessonPlan || (lessonPlan.status !== 'PUBLISHED' && lessonPlan.status !== 'APPROVED')) return;
 
     const publishTime = lessonPlan.updatedAt || lessonPlan.createdAt || new Date();
     if (publishTime < config.termStartDate) {

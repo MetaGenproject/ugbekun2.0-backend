@@ -6,6 +6,19 @@ import {
   parseJsonFormat,
   generateAiCurriculumQuestions,
 } from '../../lib/cbtService';
+import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
+import { generateQuestionDrafts, mapQuestionBankWrite } from '../../lib/questionDraftService';
+import { canTeacherUseClassSubject } from '../../lib/teacherAccess';
+import { parseMaybeDate } from '../../lib/examWindow';
+import { findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
+import {
+  DEFAULT_CBT_SCALE,
+  parseCbtScore,
+  recordCbtPercentageOnMarksheet,
+  resolveActiveSessionId,
+  resolveTermExamId,
+  upsertAcademicCbtMark,
+} from '../../lib/cbtMarkRecord';
 
 /**
  * GET /api/admin/exams
@@ -446,6 +459,9 @@ export async function createExamScheduleSlot(req: Request, res: Response): Promi
     if (isNaN(parsedDate.getTime())) {
       return res.status(400).json({ success: false, message: 'Invalid exam date format.' });
     }
+    if (String(endTime) <= String(startTime)) {
+      return res.status(400).json({ success: false, message: 'End time must be after start time.' });
+    }
 
     if (hallId) {
       const hallConflict = await prisma.examScheduleSlot.findFirst({
@@ -513,6 +529,12 @@ export async function createExamScheduleSlot(req: Request, res: Response): Promi
 
     let slot;
     if (id) {
+      const existingSlot = await prisma.examScheduleSlot.findFirst({
+        where: { id: Number(id), branchId },
+      });
+      if (!existingSlot) {
+        return res.status(404).json({ success: false, message: 'Exam timetable slot not found.' });
+      }
       slot = await prisma.examScheduleSlot.update({
         where: { id: Number(id) },
         data: {
@@ -560,7 +582,13 @@ export async function createExamScheduleSlot(req: Request, res: Response): Promi
       });
     }
 
-    return res.json({ success: true, slot, message: 'Exam timetable slot saved.' });
+    return res.json({
+      success: true,
+      slot,
+      message: id
+        ? 'Exam date and time updated on the existing slot.'
+        : 'Exam timetable slot saved.',
+    });
   } catch (error: any) {
     console.error('[ADMIN] Save exam schedule slot error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to save exam schedule slot.' });
@@ -768,10 +796,59 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
       subjectId,
       startDate,
       endDate,
+      questionBankIds,
     } = req.body;
 
     if (!title || !classId || !subjectId) {
       return res.status(400).json({ success: false, message: 'Title, Class, and Subject are required.' });
+    }
+    const parsedStart = parseMaybeDate(startDate);
+    const parsedEnd = parseMaybeDate(endDate);
+    if (parsedStart && parsedEnd && parsedEnd <= parsedStart) {
+      return res.status(400).json({ success: false, message: 'End date/time must be after the start date/time.' });
+    }
+
+    let resolvedGroupId = groupId ? Number(groupId) : null;
+    const bankIds = (Array.isArray(questionBankIds) ? questionBankIds : []).map(Number).filter(Boolean);
+    if (!resolvedGroupId && bankIds.length > 0) {
+      const approved = await prisma.questionBank.findMany({
+        where: { id: { in: bankIds }, branchId, status: 'APPROVED' },
+      });
+      if (!approved.length) {
+        return res.status(400).json({
+          success: false,
+          message: 'Only reviewed and approved Question Bank items can be assigned. Save drafts to the bank first.',
+        });
+      }
+      if (approved.length !== bankIds.length) {
+        return res.status(400).json({
+          success: false,
+          message: 'Some selected questions are not approved yet. Review and save them to the Question Bank first.',
+        });
+      }
+      const totalMarks = approved.reduce((sum, q) => sum + Number(q.marks || 1), 0);
+      const group = await prisma.questionGroup.create({
+        data: {
+          branchId,
+          title: `${title.trim()} paper`,
+          groupCode: `QBK-${Date.now().toString().slice(-6)}`,
+          subjectId: Number(subjectId),
+          classId: Number(classId),
+          questionIds: approved.map((q) => q.id),
+          totalMarks,
+        },
+      });
+      resolvedGroupId = group.id;
+    }
+
+    let existingDist = null;
+    if (id) {
+      existingDist = await prisma.cbtDistribution.findFirst({
+        where: { id: Number(id), branchId },
+      });
+      if (!existingDist) {
+        return res.status(404).json({ success: false, message: 'CBT examination not found.' });
+      }
     }
 
     let dist;
@@ -786,12 +863,12 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           isPublished: Boolean(isPublished),
           shuffleQuestions: Boolean(shuffleQuestions),
           showResults: Boolean(showResults),
-          groupId: groupId ? Number(groupId) : null,
+          groupId: resolvedGroupId,
           classId: Number(classId),
           sectionId: sectionId ? Number(sectionId) : null,
           subjectId: Number(subjectId),
-          startDate: startDate ? new Date(startDate) : null,
-          endDate: endDate ? new Date(endDate) : null,
+          startDate: parsedStart,
+          endDate: parsedEnd,
         },
         include: {
           class: { select: { id: true, name: true } },
@@ -811,12 +888,12 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           isPublished: Boolean(isPublished),
           shuffleQuestions: Boolean(shuffleQuestions),
           showResults: Boolean(showResults),
-          groupId: groupId ? Number(groupId) : null,
+          groupId: resolvedGroupId,
           classId: Number(classId),
           sectionId: sectionId ? Number(sectionId) : null,
           subjectId: Number(subjectId),
-          startDate: startDate ? new Date(startDate) : null,
-          endDate: endDate ? new Date(endDate) : null,
+          startDate: parsedStart,
+          endDate: parsedEnd,
         },
         include: {
           class: { select: { id: true, name: true } },
@@ -828,45 +905,62 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
     }
 
     let resolvedQuestions: any[] = [];
-    if (groupId) {
-      const grp = await prisma.questionGroup.findUnique({ where: { id: Number(groupId) } });
+    if (resolvedGroupId) {
+      const grp = await prisma.questionGroup.findUnique({ where: { id: resolvedGroupId } });
       if (grp && Array.isArray(grp.questionIds) && grp.questionIds.length > 0) {
         resolvedQuestions = await prisma.questionBank.findMany({
-          where: { id: { in: (grp.questionIds as any[]).map(Number) } },
+          where: { id: { in: (grp.questionIds as any[]).map(Number) }, status: 'APPROVED' },
         });
       }
     }
-    if (resolvedQuestions.length === 0) {
+    if (resolvedQuestions.length === 0 && bankIds.length > 0) {
       resolvedQuestions = await prisma.questionBank.findMany({
-        where: { branchId, subjectId: Number(subjectId) },
-        take: 20,
+        where: { id: { in: bankIds }, branchId, status: 'APPROVED' },
+      });
+    }
+    if (resolvedQuestions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Select approved Question Bank items for this class and subject before distributing the examination.',
       });
     }
 
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSessionId = globalSetting?.sessionId || 5;
 
-    let onlineExam = await prisma.onlineExam.findFirst({
-      where: {
-        title: title.trim(),
-        classId: Number(classId),
-        subjectId: Number(subjectId),
-        branchId,
-      },
-    });
+    const companionIdentity = existingDist
+      ? {
+          title: existingDist.title,
+          classId: existingDist.classId,
+          subjectId: existingDist.subjectId,
+          branchId,
+          onlineExamId: existingDist.onlineExamId,
+        }
+      : {
+          title: title.trim(),
+          classId: Number(classId),
+          subjectId: Number(subjectId),
+          branchId,
+        };
+
+    let onlineExam = await findCompanionOnlineExam(companionIdentity);
 
     if (onlineExam) {
       await prisma.onlineExam.update({
         where: { id: onlineExam.id },
         data: {
+          title: title.trim(),
+          classId: Number(classId),
+          subjectId: Number(subjectId),
           duration: Number(duration) || 30,
           passingMark: Number(passingMark) || 50.0,
           questions: resolvedQuestions,
           sessionId: activeSessionId,
+          examDate: parsedStart || onlineExam.examDate,
         },
       });
     } else {
-      await prisma.onlineExam.create({
+      onlineExam = await prisma.onlineExam.create({
         data: {
           title: title.trim(),
           classId: Number(classId),
@@ -876,15 +970,88 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           branchId,
           sessionId: activeSessionId,
           questions: resolvedQuestions,
-          examDate: startDate ? new Date(startDate) : new Date(),
+          examDate: parsedStart || new Date(),
         },
       });
     }
 
-    return res.json({ success: true, distribution: dist, message: 'CBT Test distributed to class successfully.' });
+    if (onlineExam && dist.onlineExamId !== onlineExam.id) {
+      dist = await prisma.cbtDistribution.update({
+        where: { id: dist.id },
+        data: { onlineExamId: onlineExam.id },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          group: { select: { id: true, title: true, groupCode: true } },
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      distribution: dist,
+      message: id
+        ? 'CBT schedule updated. Students who have not submitted can sit this same examination at the new date and time.'
+        : 'CBT Test distributed to class successfully.',
+    });
   } catch (error) {
     console.error('[ADMIN] Create CBT distribution error:', error);
     return res.status(500).json({ success: false, message: 'Failed to distribute CBT test.' });
+  }
+}
+
+/**
+ * POST /api/admin/cbt/distributions/:id/reschedule
+ * Change only the sitting window. Does not create a new examination.
+ */
+export async function rescheduleCbtDistribution(req: Request, res: Response): Promise<Response | void> {
+  const distId = Number(req.params.id);
+  const startDate = parseMaybeDate(req.body?.startDate);
+  const endDate = parseMaybeDate(req.body?.endDate);
+
+  if (!startDate || !endDate) {
+    return res.status(400).json({ success: false, message: 'A new start and end date/time are required.' });
+  }
+  if (endDate <= startDate) {
+    return res.status(400).json({ success: false, message: 'End date/time must be after the start date/time.' });
+  }
+
+  try {
+    const existing = await prisma.cbtDistribution.findFirst({
+      where: { id: distId, branchId: req.branchId },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'CBT examination not found.' });
+    }
+
+    const dist = await prisma.cbtDistribution.update({
+      where: { id: distId },
+      data: { startDate, endDate },
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        group: { select: { id: true, title: true, groupCode: true } },
+      },
+    });
+
+    const companion = await findCompanionOnlineExam(existing);
+    if (companion) {
+      await prisma.onlineExam.update({
+        where: { id: companion.id },
+        data: { examDate: startDate },
+      });
+    }
+
+    return res.json({
+      success: true,
+      distribution: dist,
+      message: 'Sitting rescheduled. Students who missed the previous sitting can take this same examination. A new exam was not created.',
+    });
+  } catch (error) {
+    console.error('[ADMIN] Reschedule CBT distribution error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to reschedule examination.' });
   }
 }
 
@@ -933,7 +1100,7 @@ export async function getCbtQuestionBank(req: Request, res: Response): Promise<R
   const branchId = req.branchId;
 
   try {
-    const { subjectId, classId, search, page = 1, limit = 50 } = req.query;
+    const { subjectId, classId, search, termName, topic, page = 1, limit = 50, status, questionType, sourceType, category } = req.query;
     const p = parseInt(page as string, 10);
     const l = parseInt(limit as string, 10);
     const skip = (p - 1) * l;
@@ -941,6 +1108,12 @@ export async function getCbtQuestionBank(req: Request, res: Response): Promise<R
     const where: any = { branchId };
     if (subjectId) where.subjectId = Number(subjectId);
     if (classId) where.classId = Number(classId);
+    if (termName) where.termName = String(termName);
+    if (topic) where.topic = { contains: String(topic), mode: 'insensitive' };
+    if (status) where.status = String(status);
+    if (questionType) where.questionType = String(questionType);
+    if (sourceType) where.sourceType = String(sourceType);
+    if (category) where.category = String(category);
     if (search) {
       where.questionText = { contains: search, mode: 'insensitive' };
     }
@@ -983,30 +1156,19 @@ export async function createCbtQuestion(req: Request, res: Response): Promise<Re
   const branchId = req.branchId;
 
   try {
-    const {
-      questionText,
-      questionType = 'mcq',
-      options = [],
-      correctOption = 'A',
-      marks = 1.0,
-      subjectId,
-      classId,
-    } = req.body;
+    const { questionText, subjectId } = req.body;
     if (!questionText || !subjectId) {
       return res.status(400).json({ success: false, message: 'Question prompt and Subject are required.' });
     }
 
+    const globalSetting = await prisma.globalSettings.findFirst();
     const item = await prisma.questionBank.create({
-      data: {
+      data: mapQuestionBankWrite(req.body, {
         branchId,
-        questionText: questionText.trim(),
-        questionType,
-        options: Array.isArray(options) ? options : [],
-        correctOption: String(correctOption).trim().toUpperCase(),
-        marks: parseFloat(marks) || 1.0,
-        subjectId: Number(subjectId),
-        classId: classId ? Number(classId) : null,
-      },
+        sessionId: globalSetting?.sessionId || null,
+        createdById: (req as any).userId || null,
+        createdByRole: 'ADMIN',
+      }),
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
         class: { select: { id: true, name: true } },
@@ -1038,6 +1200,12 @@ export async function updateCbtQuestion(req: Request, res: Response): Promise<Re
         ...(marks !== undefined ? { marks: parseFloat(marks) } : {}),
         ...(subjectId ? { subjectId: Number(subjectId) } : {}),
         ...(classId !== undefined ? { classId: classId ? Number(classId) : null } : {}),
+        ...(req.body.termName !== undefined ? { termName: req.body.termName || null } : {}),
+        ...(req.body.topic !== undefined ? { topic: req.body.topic || null } : {}),
+        ...(req.body.difficulty !== undefined ? { difficulty: req.body.difficulty || 'medium' } : {}),
+        ...(req.body.category !== undefined ? { category: req.body.category || null } : {}),
+        ...(req.body.sourceType !== undefined ? { sourceType: req.body.sourceType || null } : {}),
+        ...(req.body.status !== undefined ? { status: req.body.status } : {}),
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
@@ -1097,29 +1265,164 @@ export async function importCbtQuestions(req: Request, res: Response): Promise<R
       });
     }
 
-    const insertData = parsedQuestions.map((q: any) => ({
-      branchId,
-      subjectId: sId,
-      classId: cId,
+    if (req.teacherId) {
+      if (!cId) {
+        return res.status(400).json({ success: false, message: 'Class is required so imported questions stay classified.' });
+      }
+      const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, cId, sId);
+      if (!allowed) {
+        return res.status(403).json({ success: false, message: 'You can only import questions for your authorised class and subject.' });
+      }
+    }
+
+    const drafts = parsedQuestions.map((q: any) => ({
       questionText: q.questionText,
       questionType: q.questionType || 'mcq',
       options: q.options,
       correctOption: q.correctOption || 'A',
       marks: q.marks || 1.0,
+      category: q.category || req.body.category || null,
+      termName: req.body.termName || null,
+      topic: req.body.topic || null,
+      sourceType: 'UPLOAD',
     }));
 
-    await prisma.questionBank.createMany({
-      data: insertData,
-    });
-
-    return res.status(201).json({
+    return res.json({
       success: true,
-      count: insertData.length,
-      message: `Successfully imported ${insertData.length} question(s) into Question Bank.`,
+      drafts,
+      count: drafts.length,
+      message: `Parsed ${drafts.length} question(s). Review and edit them, then save to the Question Bank.`,
     });
   } catch (error: any) {
     console.error('[ADMIN] Import question bank error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to import questions.' });
+  }
+}
+
+/**
+ * POST /api/admin/cbt/question-bank/extract
+ * Upload/scan/paste → instruction → AI drafts. Does not save to the bank.
+ */
+export async function extractQuestionDrafts(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const subjectId = Number(req.body?.subjectId || 0);
+    const classId = Number(req.body?.classId || 0) || null;
+    if (!subjectId) {
+      return res.status(400).json({ success: false, message: 'Subject is required.' });
+    }
+    if (req.teacherId) {
+      if (!classId) {
+        return res.status(400).json({ success: false, message: 'Class is required so questions stay classified for your authorised students.' });
+      }
+      const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, classId, subjectId);
+      if (!allowed) {
+        return res.status(403).json({ success: false, message: 'You can only extract questions for your authorised class and subject.' });
+      }
+    }
+
+    const [subject, classObj] = await Promise.all([
+      prisma.subject.findUnique({ where: { id: subjectId }, select: { name: true } }),
+      classId ? prisma.class.findUnique({ where: { id: classId }, select: { name: true } }) : Promise.resolve(null),
+    ]);
+
+    const extracted = await extractLessonSourceMaterial(
+      req.body?.uploads || [],
+      req.body?.sourceMaterial || req.body?.pastedText
+    );
+    const instruction = String(req.body?.instruction || req.body?.aiInstruction || '').trim();
+    const topic = String(req.body?.topic || 'Core Concepts').trim();
+
+    const drafts = await generateQuestionDrafts({
+      subjectName: subject?.name || String(req.body?.subjectName || 'General Studies'),
+      className: classObj?.name || String(req.body?.className || 'Primary'),
+      topic,
+      termName: req.body?.termName || '',
+      instruction,
+      sourceMaterial: extracted.text,
+      questionType: req.body?.questionType || 'mcq',
+      questionCount: Number(req.body?.count || req.body?.questionCount || 5),
+    });
+
+    return res.json({
+      success: true,
+      drafts,
+      sourceMaterial: extracted.text,
+      sourceFileName: extracted.fileName,
+      message: 'Review and correct these drafts, then save them to the Question Bank before assigning.',
+    });
+  } catch (error) {
+    console.error('[ADMIN] Extract question drafts error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to extract or generate question drafts.' });
+  }
+}
+
+/**
+ * POST /api/admin/cbt/question-bank/bulk
+ * Persist reviewed drafts into the Question Bank.
+ */
+export async function bulkSaveQuestionBank(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
+  const subjectId = Number(req.body?.subjectId || 0);
+  const classId = Number(req.body?.classId || 0) || null;
+  if (!subjectId || !questions.length) {
+    return res.status(400).json({ success: false, message: 'Subject and at least one reviewed question are required.' });
+  }
+  if (req.teacherId) {
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class is required so questions stay classified for your authorised students.' });
+    }
+    const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, classId, subjectId);
+    if (!allowed) {
+      return res.status(403).json({ success: false, message: 'You can only save questions for your authorised class and subject.' });
+    }
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || null;
+    const created = [];
+    for (const q of questions) {
+      if (!String(q.questionText || '').trim()) continue;
+      const item = await prisma.questionBank.create({
+        data: mapQuestionBankWrite(
+          {
+            ...q,
+            subjectId,
+            classId,
+            termName: req.body.termName || q.termName,
+            topic: req.body.topic || q.topic,
+            difficulty: q.difficulty || req.body.difficulty || 'medium',
+            sourceType: req.body.sourceType || q.sourceType || 'AI',
+            sourceFileName: req.body.sourceFileName,
+            aiInstruction: req.body.instruction || req.body.aiInstruction,
+            category: req.body.category || q.category,
+            status: 'APPROVED',
+          },
+          {
+            branchId,
+            sessionId,
+            createdById: (req as any).userId || (req as any).teacherId || null,
+            createdByRole: req.teacherId ? 'TEACHER' : 'ADMIN',
+          }
+        ),
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          class: { select: { id: true, name: true } },
+        },
+      });
+      created.push(item);
+    }
+
+    return res.json({
+      success: true,
+      items: created,
+      count: created.length,
+      message: `${created.length} question(s) saved to the Question Bank. They can now be assigned.`,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Bulk save question bank error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save questions to the bank.' });
   }
 }
 
@@ -1137,40 +1440,34 @@ export async function aiGenerateCbtQuestions(req: Request, res: Response): Promi
 
     const sId = Number(subjectId);
     const cId = classId ? Number(classId) : null;
+    if (req.teacherId) {
+      if (!cId) {
+        return res.status(400).json({ success: false, message: 'Class is required so generated questions stay classified for your authorised students.' });
+      }
+      const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, cId, sId);
+      if (!allowed) {
+        return res.status(403).json({ success: false, message: 'You can only generate questions for your authorised class and subject.' });
+      }
+    }
+    const subject = await prisma.subject.findUnique({ where: { id: sId }, select: { name: true } });
+    const classObj = cId ? await prisma.class.findUnique({ where: { id: cId }, select: { name: true } }) : null;
 
-    const subject = await prisma.subject.findUnique({
-      where: { id: sId },
-      select: { name: true },
-    });
-
-    const generated = generateAiCurriculumQuestions({
+    const generated = await generateQuestionDrafts({
       subjectName: subject?.name || 'General Studies',
-      topic: topic.trim(),
-      classLevel: classLevel || 'Secondary',
-      questionCount: Number(count) || 5,
+      className: classObj?.name || classLevel || 'Secondary',
+      topic: String(topic).trim(),
+      termName: req.body.termName || '',
+      instruction: req.body.instruction || '',
+      sourceMaterial: req.body.sourceMaterial || '',
       questionType,
+      questionCount: Number(count) || 5,
     });
 
-    const insertData = generated.map((q: any) => ({
-      branchId,
-      subjectId: sId,
-      classId: cId,
-      questionText: q.questionText,
-      questionType: q.questionType,
-      options: q.options,
-      correctOption: q.correctOption,
-      marks: q.marks,
-    }));
-
-    await prisma.questionBank.createMany({
-      data: insertData,
-    });
-
-    return res.status(201).json({
+    return res.json({
       success: true,
-      count: insertData.length,
+      drafts: generated,
       questions: generated,
-      message: `AI generated and imported ${insertData.length} question(s) for "${topic}".`,
+      message: 'Review and edit these drafts, then save them to the Question Bank before assigning.',
     });
   } catch (error) {
     console.error('[ADMIN] AI generate question bank error:', error);
@@ -1203,11 +1500,11 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
     let questions: any[] = [];
     if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
       questions = await prisma.questionBank.findMany({
-        where: { id: { in: (dist.group.questionIds as any[]).map(Number) } },
+        where: { id: { in: (dist.group.questionIds as any[]).map(Number) }, status: 'APPROVED' },
       });
     } else {
       questions = await prisma.questionBank.findMany({
-        where: { branchId, subjectId: dist.subjectId },
+        where: { branchId, subjectId: dist.subjectId, status: 'APPROVED' },
         take: 20,
       });
     }
@@ -1230,19 +1527,51 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
     });
     const activeStudents = enrollments.filter((e) => e.student && e.student.active);
 
-    const submissions = await prisma.onlineExamSubmission.findMany({
-      where: {
-        studentId: { in: activeStudents.map((e) => e.student.id) },
-      },
-      include: {
-        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
-      },
-      orderBy: { submittedAt: 'desc' },
+    const companion = await findCompanionOnlineExam(dist);
+    const studentIds = activeStudents.map((e) => e.student.id);
+    const submissions =
+      companion && studentIds.length > 0
+        ? await prisma.onlineExamSubmission.findMany({
+            where: {
+              onlineExamId: companion.id,
+              studentId: { in: studentIds },
+            },
+            include: {
+              student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
+            },
+            orderBy: { submittedAt: 'desc' },
+          })
+        : [];
+
+    const examId = await resolveTermExamId(branchId, sessionId);
+    const markRows =
+      studentIds.length > 0
+        ? await prisma.mark.findMany({
+            where: {
+              subjectId: dist.subjectId,
+              classId: dist.classId,
+              sessionId,
+              branchId,
+              ...(examId ? { examId } : {}),
+              studentId: { in: studentIds },
+            },
+            select: {
+              studentId: true,
+              cbtMark: true,
+              cbtSource: true,
+              cbtScale: true,
+            },
+          })
+        : [];
+    const markByStudent: Record<number, (typeof markRows)[number]> = {};
+    markRows.forEach((row) => {
+      markByStudent[row.studentId] = row;
     });
 
     const studentRoster = activeStudents.map((e) => {
       const st = e.student;
       const sub = submissions.find((s) => s.studentId === st.id);
+      const recorded = markByStudent[st.id];
       return {
         studentId: st.id,
         studentName: `${st.lastName}, ${st.firstName}`,
@@ -1250,6 +1579,10 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
         isSubmitted: Boolean(sub && sub.submittedAt),
         totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
         submittedAt: sub?.submittedAt || null,
+        reportCbtMark: recorded?.cbtMark ?? null,
+        cbtSource: recorded?.cbtSource ?? null,
+        cbtScale: recorded?.cbtScale || DEFAULT_CBT_SCALE,
+        onReportCard: Boolean(recorded?.cbtMark),
       };
     });
 
@@ -1282,39 +1615,39 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
 
 /**
  * POST /api/admin/cbt/distributions/:id/sync-marks
+ * Catch-up for sittings that missed auto-record. Does not overwrite admin corrections.
  */
 export async function syncCbtMarks(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
     const distId = Number(req.params.id);
-    const { targetExamId, maxScoreBase = 40 } = req.body;
+    const maxScoreBase = Number(req.body?.maxScoreBase) || DEFAULT_CBT_SCALE;
+    const overwriteOverride = Boolean(req.body?.overwriteOverride);
 
-    const dist = await prisma.cbtDistribution.findUnique({
-      where: { id: distId },
-      include: { class: true, subject: true },
+    const dist = await prisma.cbtDistribution.findFirst({
+      where: { id: distId, branchId },
     });
 
     if (!dist) {
       return res.status(404).json({ success: false, message: 'CBT Distribution not found.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
-
-    let examId = targetExamId ? Number(targetExamId) : null;
-    if (!examId) {
-      let activeExam = await prisma.exam.findFirst({
-        where: { branchId, sessionId },
-        orderBy: { id: 'desc' },
+    const companion = await findCompanionOnlineExam(dist);
+    if (!companion) {
+      return res.status(400).json({
+        success: false,
+        message: 'No companion online examination is linked to this sitting.',
       });
-      if (!activeExam) {
-        activeExam = await prisma.exam.findFirst({
-          where: { branchId },
-          orderBy: { id: 'desc' },
-        });
-      }
-      examId = activeExam?.id || null;
+    }
+
+    const sessionId = await resolveActiveSessionId();
+    const examId = await resolveTermExamId(branchId, sessionId, req.body?.targetExamId);
+    if (!examId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Create a term examination first so CBT scores can land on report cards.',
+      });
     }
 
     const enrollWhere: any = {
@@ -1328,72 +1661,171 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
       where: enrollWhere,
       select: { studentId: true, classId: true, sectionId: true },
     });
-
     const studentIds = enrollments.map((e) => e.studentId);
+    if (studentIds.length === 0) {
+      return res.json({ success: true, syncCount: 0, skippedOverrides: 0, message: 'No enrolled students to sync.' });
+    }
 
     const submissions = await prisma.onlineExamSubmission.findMany({
       where: {
+        onlineExamId: companion.id,
         studentId: { in: studentIds },
+        submittedAt: { not: null },
+        totalMark: { not: null },
       },
       orderBy: { submittedAt: 'desc' },
     });
 
     let syncCount = 0;
+    let skippedOverrides = 0;
 
     await prisma.$transaction(async (tx: any) => {
       for (const enroll of enrollments) {
         const sub = submissions.find((s) => s.studentId === enroll.studentId);
         if (!sub || sub.totalMark === null || sub.totalMark === undefined) continue;
 
-        const scaledCbtMark = (Number(sub.totalMark) / 100) * Number(maxScoreBase);
-        const roundedCbtMark = Math.round(scaledCbtMark * 10) / 10;
-
-        const existingMark = await tx.mark.findFirst({
-          where: {
-            studentId: enroll.studentId,
-            classId: enroll.classId,
-            subjectId: dist.subjectId,
-            branchId,
-            sessionId,
-            ...(examId ? { examId } : {}),
-          },
+        const result = await recordCbtPercentageOnMarksheet({
+          studentId: enroll.studentId,
+          classId: enroll.classId,
+          sectionId: enroll.sectionId,
+          subjectId: dist.subjectId,
+          branchId,
+          sessionId,
+          examId,
+          percentage: Number(sub.totalMark),
+          source: 'CBT_SYNC',
+          submissionId: sub.id,
+          scale: maxScoreBase,
+          overwriteOverride,
+          tx,
         });
-
-        if (existingMark) {
-          await tx.mark.update({
-            where: { id: existingMark.id },
-            data: {
-              cbtMark: String(roundedCbtMark),
-            },
-          });
-        } else {
-          await tx.mark.create({
-            data: {
-              studentId: enroll.studentId,
-              classId: enroll.classId,
-              sectionId: enroll.sectionId,
-              subjectId: dist.subjectId,
-              examId: examId || 1,
-              sessionId,
-              branchId,
-              mark: '0',
-              cbtMark: String(roundedCbtMark),
-              absent: '0',
-            },
-          });
+        if (result.skipped && result.reason === 'admin_override') {
+          skippedOverrides++;
+          continue;
         }
-        syncCount++;
+        if (!result.skipped) syncCount++;
       }
     });
 
     return res.json({
       success: true,
       syncCount,
-      message: `Successfully synchronized CBT scores for ${syncCount} student(s) into official mark register.`,
+      skippedOverrides,
+      message:
+        skippedOverrides > 0
+          ? `Recorded CBT scores for ${syncCount} student(s). ${skippedOverrides} admin-corrected score(s) were left unchanged.`
+          : `CBT scores recorded for ${syncCount} student(s) on the official mark register and report cards.`,
     });
   } catch (error: any) {
     console.error('[ADMIN] Sync CBT marks error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to sync CBT marks.' });
+  }
+}
+
+/**
+ * POST /api/admin/cbt/distributions/:id/override-mark
+ * School Admin correction of the report-card CBT score. Teachers cannot do this.
+ */
+export async function overrideCbtMark(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const distId = Number(req.params.id);
+  const studentId = Number(req.body?.studentId);
+  const reason = String(req.body?.reason || '').trim();
+  const maxScoreBase = Number(req.body?.maxScoreBase) || DEFAULT_CBT_SCALE;
+  const nextScore = parseCbtScore(req.body?.cbtMark ?? req.body?.reportCbtMark);
+
+  if (!studentId || nextScore === null) {
+    return res.status(400).json({ success: false, message: 'Student and a numeric CBT score are required.' });
+  }
+  if (!reason) {
+    return res.status(400).json({ success: false, message: 'A reason is required when correcting a CBT score.' });
+  }
+  if (nextScore < 0 || nextScore > maxScoreBase) {
+    return res.status(400).json({
+      success: false,
+      message: `CBT score must be between 0 and ${maxScoreBase}.`,
+    });
+  }
+
+  try {
+    const dist = await prisma.cbtDistribution.findFirst({
+      where: { id: distId, branchId },
+    });
+    if (!dist) {
+      return res.status(404).json({ success: false, message: 'CBT examination not found.' });
+    }
+
+    const sessionId = await resolveActiveSessionId();
+    const examId = await resolveTermExamId(branchId, sessionId, req.body?.targetExamId);
+    if (!examId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Create a term examination first so the corrected score can appear on the report card.',
+      });
+    }
+
+    const enroll = await prisma.enroll.findFirst({
+      where: {
+        studentId,
+        classId: dist.classId,
+        branchId,
+        sessionId,
+        ...(dist.sectionId ? { sectionId: dist.sectionId } : {}),
+      },
+      select: { sectionId: true, classId: true },
+    });
+    if (!enroll) {
+      return res.status(404).json({ success: false, message: 'Student is not enrolled in this class for the current session.' });
+    }
+
+    const existingMark = await prisma.mark.findFirst({
+      where: {
+        studentId,
+        subjectId: dist.subjectId,
+        classId: enroll.classId,
+        examId,
+        sessionId,
+        branchId,
+      },
+      select: { cbtMark: true },
+    });
+
+    const rounded = Math.round(nextScore * 10) / 10;
+    const result = await upsertAcademicCbtMark({
+      studentId,
+      classId: enroll.classId,
+      sectionId: enroll.sectionId,
+      subjectId: dist.subjectId,
+      branchId,
+      sessionId,
+      examId,
+      cbtMark: rounded,
+      source: 'ADMIN_OVERRIDE',
+      scale: maxScoreBase,
+      overwriteOverride: true,
+    });
+
+    await prisma.markScoreCorrection.create({
+      data: {
+        markId: result.mark.id,
+        field: 'cbt_mark',
+        oldValue: existingMark?.cbtMark ?? null,
+        newValue: String(rounded),
+        reason,
+        actorUserId: req.userId ? Number(req.userId) : null,
+        actorRole: 'ADMIN',
+        branchId,
+      },
+    });
+
+    return res.json({
+      success: true,
+      mark: result.mark,
+      message: 'CBT score corrected. The report card now shows this value. Teachers cannot overwrite it.',
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Override CBT mark error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to correct CBT score.' });
   }
 }
 

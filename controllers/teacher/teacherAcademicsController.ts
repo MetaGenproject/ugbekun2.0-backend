@@ -1,8 +1,8 @@
 import { Request, Response } from 'express';
-import OpenAI from 'openai';
 import prisma from '../../lib/prisma';
 import { isSubjectTeacher, isFormTeacher, hasClassAccess } from './teacherDashboardController';
 import { generatePedagogicalLessonPlan } from '../../lib/lessonPlanService';
+import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
 import { generateStudentAiCommentary, generateBatchClassCommentary } from '../../lib/commentaryService';
 import {
   generateLessonPlanPdf,
@@ -13,11 +13,6 @@ import {
 import gamificationService from '../../lib/gamificationService';
 import { generateRegistrationNumber } from '../../lib/studentService';
 import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
-
-const openai = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
-  baseURL: 'https://api.deepseek.com',
-});
 
 let Tesseract: any;
 try {
@@ -822,6 +817,7 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
         subjectId: true,
         mark: true,
         cbtMark: true,
+        cbtSource: true,
         absent: true,
       },
     });
@@ -832,6 +828,7 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
       marksMap[key] = {
         mark: m.mark,
         cbtMark: m.cbtMark,
+        cbtSource: m.cbtSource,
         absent: m.absent,
       };
     });
@@ -898,6 +895,7 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
         subjectName: activeSubjectName,
         theoryMark: theory,
         objectiveMark: objective,
+        cbtSource: markEntry?.cbtSource || null,
         absent: isAbsent,
         cumulative: isAbsent ? 'ABS' : cumulative,
         grade: isAbsent ? '-' : grade,
@@ -929,7 +927,6 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
 export async function saveSingleGrade(req: Request, res: Response): Promise<Response | void> {
   const { studentId, subjectId, examId, classId, sectionId } = req.body;
   const rawMark = req.body.mark !== undefined ? req.body.mark : req.body.theoryMark;
-  const rawCbtMark = req.body.cbtMark !== undefined ? req.body.cbtMark : req.body.objectiveMark;
   const absent = req.body.absent;
 
   if (!studentId || !subjectId || !examId || !classId || !sectionId) {
@@ -959,7 +956,6 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
     });
 
     const markVal = rawMark !== undefined ? (rawMark !== null && rawMark !== '' ? String(rawMark) : null) : undefined;
-    const cbtVal = rawCbtMark !== undefined ? (rawCbtMark !== null && rawCbtMark !== '' ? String(rawCbtMark) : null) : undefined;
     const absentVal = absent !== undefined ? (absent ? '1' : null) : undefined;
 
     let saved;
@@ -968,7 +964,6 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
         where: { id: existing.id },
         data: {
           mark: markVal !== undefined ? markVal : existing.mark,
-          cbtMark: cbtVal !== undefined ? cbtVal : existing.cbtMark,
           absent: absentVal !== undefined ? absentVal : existing.absent,
         },
       });
@@ -981,7 +976,7 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
           classId: Number(classId),
           sectionId: Number(sectionId),
           mark: markVal !== undefined ? markVal : null,
-          cbtMark: cbtVal !== undefined ? cbtVal : null,
+          cbtMark: null,
           absent: absentVal !== undefined ? absentVal : null,
           sessionId: existing?.sessionId || sessionId,
           branchId: req.branchId || null,
@@ -1023,9 +1018,7 @@ export async function batchSaveGradebook(req: Request, res: Response): Promise<R
         if (!item.studentId) continue;
 
         const rawMark = item.theoryMark !== undefined ? item.theoryMark : item.mark;
-        const rawCbtMark = item.objectiveMark !== undefined ? item.objectiveMark : item.cbtMark;
         const markVal = rawMark !== undefined ? (rawMark !== null && rawMark !== '' ? String(rawMark) : null) : null;
-        const cbtVal = rawCbtMark !== undefined ? (rawCbtMark !== null && rawCbtMark !== '' ? String(rawCbtMark) : null) : null;
         const absentVal = item.absent ? '1' : null;
 
         const existing = await tx.mark.findFirst({
@@ -1043,7 +1036,6 @@ export async function batchSaveGradebook(req: Request, res: Response): Promise<R
             where: { id: existing.id },
             data: {
               mark: markVal,
-              cbtMark: cbtVal !== null ? cbtVal : existing.cbtMark,
               absent: absentVal,
             },
           });
@@ -1056,7 +1048,7 @@ export async function batchSaveGradebook(req: Request, res: Response): Promise<R
               classId: Number(classId),
               sectionId: Number(sectionId),
               mark: markVal,
-              cbtMark: cbtVal,
+              cbtMark: existing?.cbtMark ?? null,
               absent: absentVal,
               sessionId,
               branchId: req.branchId || null,
@@ -1108,7 +1100,6 @@ export async function uploadGradebookCsv(req: Request, res: Response): Promise<R
           where: { id: existing.id },
           data: {
             mark: row.mark !== undefined ? (row.mark !== null ? String(row.mark) : null) : existing.mark,
-            cbtMark: row.cbtMark !== undefined ? (row.cbtMark !== null ? String(row.cbtMark) : null) : existing.cbtMark,
             absent: row.absent ? '1' : null,
           },
         });
@@ -1121,7 +1112,7 @@ export async function uploadGradebookCsv(req: Request, res: Response): Promise<R
             classId: Number(classId),
             sectionId: Number(sectionId),
             mark: row.mark !== undefined && row.mark !== null ? String(row.mark) : null,
-            cbtMark: row.cbtMark !== undefined && row.cbtMark !== null ? String(row.cbtMark) : null,
+            cbtMark: null,
             absent: row.absent ? '1' : null,
             sessionId,
             branchId: req.branchId,
@@ -1712,43 +1703,74 @@ export async function commitScanRecord(req: Request, res: Response): Promise<Res
  * POST /api/teacher/lesson-plan/generate
  */
 export async function generateLessonPlan(req: Request, res: Response): Promise<Response | void> {
-  const { classId, subjectId, coreTopic } = req.body;
-  if (!classId || !subjectId || !coreTopic) {
-    return res.status(400).json({ success: false, message: 'classId, subjectId, and coreTopic are required.' });
-  }
-
   try {
-    const classObj = await prisma.class.findUnique({
-      where: { id: Number(classId) },
-      select: { name: true },
-    });
-    const subjectObj = await prisma.subject.findUnique({
-      where: { id: Number(subjectId) },
-      select: { name: true },
-    });
-
-    if (!classObj || !subjectObj) {
-      return res.status(404).json({ success: false, message: 'Class or Subject not found.' });
+    let classId = Number(req.body?.classId || 0) || null;
+    let subjectId = Number(req.body?.subjectId || 0) || null;
+    const coreTopic = String(req.body?.coreTopic || req.body?.topic || '').trim();
+    if (!coreTopic) {
+      return res.status(400).json({ success: false, message: 'A lesson topic is required.' });
     }
 
+    if (!classId && req.body?.className) {
+      const found = await prisma.class.findFirst({
+        where: { name: { equals: String(req.body.className), mode: 'insensitive' }, ...(req.branchId ? { branchId: req.branchId } : {}) },
+        select: { id: true, name: true },
+      });
+      classId = found?.id || null;
+    }
+    if (!subjectId && req.body?.subjectName) {
+      const found = await prisma.subject.findFirst({
+        where: { name: { equals: String(req.body.subjectName), mode: 'insensitive' }, ...(req.branchId ? { branchId: req.branchId } : {}) },
+        select: { id: true, name: true },
+      });
+      subjectId = found?.id || null;
+    }
+
+    const classObj = classId
+      ? await prisma.class.findUnique({ where: { id: classId }, select: { id: true, name: true } })
+      : null;
+    const subjectObj = subjectId
+      ? await prisma.subject.findUnique({ where: { id: subjectId }, select: { id: true, name: true } })
+      : null;
+
+    const extracted = await extractLessonSourceMaterial(req.body?.uploads || [], req.body?.sourceMaterial || req.body?.pastedText);
+    const instruction = String(req.body?.instruction || req.body?.aiInstruction || '').trim();
+
     const result = await generatePedagogicalLessonPlan({
-      subjectName: subjectObj.name,
-      className: classObj.name,
+      subjectName: subjectObj?.name || String(req.body?.subjectName || 'General Studies'),
+      className: classObj?.name || String(req.body?.className || 'Primary'),
       topic: coreTopic,
       subTopic: req.body.subTopic || '',
       duration: req.body.duration || '45 Minutes',
       weekNo: req.body.weekNo || 'Week 3',
+      instruction,
+      sourceMaterial: extracted.text,
     });
+
+    const draft = {
+      objectives: result.educationalObjectives,
+      materials: result.materialLists,
+      teachingGuide: result.teachingGuide,
+      assessments: result.assessmentCriteria,
+      assignments: result.classAssignments,
+      entryBehavior: result.entryBehavior,
+      coreTopic: result.coreTopic,
+      sourceMaterial: extracted.text,
+      sourceFileName: extracted.fileName,
+      aiInstruction: instruction,
+    };
 
     return res.json({
       success: true,
-      draft: {
-        objectives: result.educationalObjectives,
-        materials: result.materialLists,
-        teachingGuide: result.teachingGuide,
-        assessments: result.assessmentCriteria,
-        assignments: result.classAssignments,
-        coreTopic: result.coreTopic,
+      draft,
+      lessonPlan: {
+        educationalObjectives: draft.objectives,
+        materialLists: draft.materials,
+        teachingGuide: draft.teachingGuide,
+        assessmentCriteria: draft.assessments,
+        classAssignments: draft.assignments,
+        entryBehavior: draft.entryBehavior,
+        coreTopic: draft.coreTopic,
       },
     });
   } catch (error) {
@@ -1781,35 +1803,52 @@ export async function getLessonPlans(req: Request, res: Response): Promise<Respo
  * POST /api/teacher/lesson-plan
  */
 export async function createLessonPlan(req: Request, res: Response): Promise<Response | void> {
-  const { classId, subjectId, coreTopic, objectives, materials, teachingGuide, assessments, assignments, status } =
-    req.body;
+  const body = req.body || {};
+  const classId = Number(body.classId);
+  const subjectId = Number(body.subjectId);
+  const coreTopic = String(body.coreTopic || '').trim();
   if (!classId || !subjectId || !coreTopic) {
     return res.status(400).json({ success: false, message: 'Required fields missing.' });
   }
+
+  const requested = String(body.status || 'DRAFT').toUpperCase();
+  const status =
+    requested === 'PENDING_APPROVAL' || requested === 'PUBLISHED'
+      ? 'PENDING_APPROVAL'
+      : 'DRAFT';
 
   try {
     const plan = await prisma.lessonPlan.create({
       data: {
         teacherId: req.teacherId,
-        classId: Number(classId),
-        subjectId: Number(subjectId),
+        classId,
+        subjectId,
         coreTopic,
-        educationalObjectives: objectives || null,
-        materialLists: materials || null,
-        teachingGuide: teachingGuide || null,
-        assessmentCriteria: assessments || null,
-        classAssignments: assignments || null,
-        status: status === 'PUBLISHED' ? 'PUBLISHED' : 'DRAFT',
+        educationalObjectives: body.objectives ?? body.educationalObjectives ?? null,
+        materialLists: body.materials ?? body.materialLists ?? null,
+        teachingGuide: body.teachingGuide || null,
+        assessmentCriteria: body.assessments ?? body.assessmentCriteria ?? null,
+        classAssignments: body.assignments ?? body.classAssignments ?? null,
+        entryBehavior: body.entryBehavior || null,
+        aiInstruction: body.instruction ?? body.aiInstruction ?? null,
+        sourceMaterial: body.sourceMaterial || null,
+        sourceFileName: body.sourceFileName || null,
+        subTopic: body.subTopic || null,
+        duration: body.duration || null,
+        weekNo: body.weekNo || null,
+        status,
+      },
+      include: {
+        class: { select: { name: true } },
+        subject: { select: { name: true } },
       },
     });
 
-    if (plan.status === 'PUBLISHED') {
-      gamificationService
-        .checkLessonPlanEarly(prisma, req.teacherId, plan.id, req.branchId)
-        .catch((err: any) => console.error('[Gamification] Error in lesson plan trigger:', err.message));
-    }
-
-    return res.json({ success: true, message: 'Lesson plan saved successfully.', plan });
+    return res.json({
+      success: true,
+      message: status === 'PENDING_APPROVAL' ? 'Lesson note saved for supervisor approval.' : 'Lesson note saved as a draft. It is not an official school record yet.',
+      plan,
+    });
   } catch (error) {
     console.error('[TEACHER] Save lesson plan error:', error);
     return res.status(500).json({ success: false, message: 'Failed to save lesson plan.' });
@@ -1820,7 +1859,7 @@ export async function createLessonPlan(req: Request, res: Response): Promise<Res
  * PUT /api/teacher/lesson-plan/:id
  */
 export async function updateLessonPlan(req: Request, res: Response): Promise<Response | void> {
-  const { objectives, materials, teachingGuide, assessments, assignments, status, coreTopic } = req.body;
+  const body = req.body || {};
   try {
     const plan = await prisma.lessonPlan.findUnique({
       where: { id: Number(req.params.id) },
@@ -1828,30 +1867,62 @@ export async function updateLessonPlan(req: Request, res: Response): Promise<Res
     if (!plan || plan.teacherId !== req.teacherId) {
       return res.status(404).json({ success: false, message: 'Lesson plan not found or access denied.' });
     }
+    if (plan.status === 'APPROVED') {
+      return res.status(400).json({ success: false, message: 'Approved lesson notes cannot be edited. Ask a supervisor to send it back for revision.' });
+    }
+
+    const requested = body.status ? String(body.status).toUpperCase() : plan.status;
+    const status =
+      requested === 'PENDING_APPROVAL' || requested === 'PUBLISHED'
+        ? 'PENDING_APPROVAL'
+        : requested === 'DRAFT'
+          ? 'DRAFT'
+          : plan.status;
 
     const updated = await prisma.lessonPlan.update({
       where: { id: plan.id },
       data: {
-        coreTopic: coreTopic !== undefined ? coreTopic : plan.coreTopic,
-        educationalObjectives: objectives !== undefined ? objectives : plan.educationalObjectives,
-        materialLists: materials !== undefined ? materials : plan.materialLists,
-        teachingGuide: teachingGuide !== undefined ? teachingGuide : plan.teachingGuide,
-        assessmentCriteria: assessments !== undefined ? assessments : plan.assessmentCriteria,
-        classAssignments: assignments !== undefined ? assignments : plan.classAssignments,
-        status: status === 'PUBLISHED' ? 'PUBLISHED' : status === 'DRAFT' ? 'DRAFT' : plan.status,
+        coreTopic: body.coreTopic !== undefined ? body.coreTopic : plan.coreTopic,
+        educationalObjectives: body.objectives ?? body.educationalObjectives ?? plan.educationalObjectives,
+        materialLists: body.materials ?? body.materialLists ?? plan.materialLists,
+        teachingGuide: body.teachingGuide !== undefined ? body.teachingGuide : plan.teachingGuide,
+        assessmentCriteria: body.assessments ?? body.assessmentCriteria ?? plan.assessmentCriteria,
+        classAssignments: body.assignments ?? body.classAssignments ?? plan.classAssignments,
+        entryBehavior: body.entryBehavior !== undefined ? body.entryBehavior : plan.entryBehavior,
+        aiInstruction: body.instruction ?? body.aiInstruction ?? plan.aiInstruction,
+        sourceMaterial: body.sourceMaterial !== undefined ? body.sourceMaterial : plan.sourceMaterial,
+        sourceFileName: body.sourceFileName !== undefined ? body.sourceFileName : plan.sourceFileName,
+        subTopic: body.subTopic !== undefined ? body.subTopic : plan.subTopic,
+        duration: body.duration !== undefined ? body.duration : plan.duration,
+        weekNo: body.weekNo !== undefined ? body.weekNo : plan.weekNo,
+        status,
+      },
+      include: {
+        class: { select: { name: true } },
+        subject: { select: { name: true } },
       },
     });
 
-    if (updated.status === 'PUBLISHED') {
-      gamificationService
-        .checkLessonPlanEarly(prisma, req.teacherId, updated.id, req.branchId)
-        .catch((err: any) => console.error('[Gamification] Error in lesson plan trigger:', err.message));
-    }
-
-    return res.json({ success: true, message: 'Lesson plan updated successfully.', plan: updated });
+    return res.json({ success: true, message: 'Lesson note updated.', plan: updated });
   } catch (error) {
     console.error('[TEACHER] Update lesson plan error:', error);
     return res.status(500).json({ success: false, message: 'Failed to update lesson plan.' });
+  }
+}
+
+export async function deleteLessonPlan(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const plan = await prisma.lessonPlan.findUnique({ where: { id: Number(req.params.id) } });
+    if (!plan || plan.teacherId !== req.teacherId) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found or access denied.' });
+    }
+    if (plan.status === 'APPROVED') {
+      return res.status(400).json({ success: false, message: 'Approved lesson notes cannot be deleted.' });
+    }
+    await prisma.lessonPlan.delete({ where: { id: plan.id } });
+    return res.json({ success: true, message: 'Lesson note deleted.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to delete lesson plan.' });
   }
 }
 

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
-import OpenAI from 'openai';
-import prisma from '../../lib/prisma';
+import { Prisma } from '@prisma/client';
+import prisma, { isDatabaseConnectivityError, retryOnConnectivity } from '../../lib/prisma';
 import { bindEvaluationMatrix, wipeEvaluationMatrix } from '../../lib/studentService';
 import { generateLessonPlanPdf } from '../../lib/pdfService';
 import { parseSchoolDateKey, storedAttendanceDateKey, todaySchoolDateKey, parseSchoolMonthKey, todaySchoolMonthKey, schoolMonthDateKeys, schoolMonthLabel, schoolMonthStoredRange, schoolDateStoredRange, describeSchoolDate } from '../../lib/schoolDate';
@@ -15,11 +15,12 @@ import {
   summarizeEntries,
   upsertEntries,
 } from '../../lib/attendanceRegisterService';
+import { getAiModel, requireDeepseekClient } from '../../lib/aiClient';
+import { generatePedagogicalLessonPlan } from '../../lib/lessonPlanService';
+import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
+import gamificationService from '../../lib/gamificationService';
 
-const openai = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
-  baseURL: 'https://api.deepseek.com',
-});
+const openai = { chat: { completions: { create: (args: any) => requireDeepseekClient().chat.completions.create({ ...args, model: args.model || getAiModel() }) } } };
 
 /**
  * GET /api/admin/classes-sections
@@ -1632,40 +1633,95 @@ export async function deleteLibraryResource(req: Request, res: Response): Promis
  * GET /api/admin/lesson-plans
  */
 export async function getLessonPlans(req: Request, res: Response): Promise<Response | void> {
-  const branchId = req.branchId;
+  const branchId = Number(req.branchId || 0);
+  if (!branchId) {
+    return res.status(400).json({ success: false, message: 'Branch is required.' });
+  }
 
   const { classId, subjectId, teacherId, status, search } = (req.query || {}) as any;
 
   try {
-    const where: any = {
-      teacher: { branchId },
-    };
-
-    if (classId) where.classId = Number(classId);
-    if (subjectId) where.subjectId = Number(subjectId);
-    if (teacherId) where.teacherId = Number(teacherId);
-    if (status) where.status = status;
+    const filters: Prisma.Sql[] = [Prisma.sql`t.branch_id = ${branchId}`];
+    if (classId) filters.push(Prisma.sql`lp.class_id = ${Number(classId)}`);
+    if (subjectId) filters.push(Prisma.sql`lp.subject_id = ${Number(subjectId)}`);
+    if (teacherId) filters.push(Prisma.sql`lp.teacher_id = ${Number(teacherId)}`);
+    if (status) filters.push(Prisma.sql`lp.status::text = ${String(status)}`);
     if (search) {
-      where.OR = [
-        { coreTopic: { contains: search, mode: 'insensitive' } },
-        { educationalObjectives: { contains: search, mode: 'insensitive' } },
-      ];
+      const q = `%${String(search).trim()}%`;
+      filters.push(Prisma.sql`(lp.core_topic ILIKE ${q} OR COALESCE(lp.educational_objectives, '') ILIKE ${q})`);
     }
 
-    const plans = await prisma.lessonPlan.findMany({
-      where,
-      include: {
-        teacher: { select: { id: true, name: true } },
-        class: { select: { id: true, name: true } },
-        subject: { select: { id: true, name: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    const rows = await retryOnConnectivity(() => prisma.$queryRaw<any[]>`
+      SELECT
+        lp.id,
+        lp.teacher_id AS "teacherId",
+        lp.class_id AS "classId",
+        lp.subject_id AS "subjectId",
+        lp.core_topic AS "coreTopic",
+        lp.educational_objectives AS "educationalObjectives",
+        lp.material_lists AS "materialLists",
+        lp.teaching_guide AS "teachingGuide",
+        lp.assessment_criteria AS "assessmentCriteria",
+        lp.class_assignments AS "classAssignments",
+        lp.entry_behavior AS "entryBehavior",
+        lp.ai_instruction AS "aiInstruction",
+        lp.source_material AS "sourceMaterial",
+        lp.source_file_name AS "sourceFileName",
+        lp.sub_topic AS "subTopic",
+        lp.duration,
+        lp.week_no AS "weekNo",
+        lp.reviewer_note AS "reviewerNote",
+        lp.status,
+        lp.created_at AS "createdAt",
+        lp.updated_at AS "updatedAt",
+        t.id AS "teacherRelId",
+        t.name AS "teacherName",
+        c.id AS "classRelId",
+        c.name AS "className",
+        s.id AS "subjectRelId",
+        s.name AS "subjectName"
+      FROM lesson_plans lp
+      INNER JOIN teachers t ON t.id = lp.teacher_id
+      INNER JOIN classes c ON c.id = lp.class_id
+      INNER JOIN subjects s ON s.id = lp.subject_id
+      WHERE ${Prisma.join(filters, ' AND ')}
+      ORDER BY lp.created_at DESC
+    `);
+
+    const plans = rows.map((row) => ({
+      id: row.id,
+      teacherId: row.teacherId,
+      classId: row.classId,
+      subjectId: row.subjectId,
+      coreTopic: row.coreTopic,
+      educationalObjectives: row.educationalObjectives,
+      materialLists: row.materialLists,
+      teachingGuide: row.teachingGuide,
+      assessmentCriteria: row.assessmentCriteria,
+      classAssignments: row.classAssignments,
+      entryBehavior: row.entryBehavior,
+      aiInstruction: row.aiInstruction,
+      sourceMaterial: row.sourceMaterial,
+      sourceFileName: row.sourceFileName,
+      subTopic: row.subTopic,
+      duration: row.duration,
+      weekNo: row.weekNo,
+      reviewerNote: row.reviewerNote,
+      status: row.status,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      teacher: { id: row.teacherRelId, name: row.teacherName },
+      class: { id: row.classRelId, name: row.className },
+      subject: { id: row.subjectRelId, name: row.subjectName },
+    }));
 
     return res.json({ success: true, count: plans.length, plans });
   } catch (error) {
     console.error('[ADMIN] Fetch lesson plans error:', error);
-    return res.status(500).json({ success: false, message: 'Failed to fetch lesson plans.' });
+    const message = isDatabaseConnectivityError(error)
+      ? 'The database is busy. Please retry in a moment.'
+      : 'Failed to fetch lesson plans.';
+    return res.status(500).json({ success: false, message });
   }
 }
 
@@ -1717,6 +1773,261 @@ export async function downloadLessonPlanPdf(req: Request, res: Response): Promis
   } catch (error) {
     console.error('[ADMIN] Lesson plan PDF export error:', error);
     return res.status(500).json({ success: false, message: 'Failed to generate lesson plan PDF.' });
+  }
+}
+
+function mapLessonPlanBody(body: any, existing?: any) {
+  return {
+    coreTopic: body.coreTopic !== undefined ? String(body.coreTopic).trim() : existing?.coreTopic,
+    educationalObjectives: body.objectives ?? body.educationalObjectives ?? existing?.educationalObjectives ?? null,
+    materialLists: body.materials ?? body.materialLists ?? existing?.materialLists ?? null,
+    teachingGuide: body.teachingGuide !== undefined ? body.teachingGuide : existing?.teachingGuide ?? null,
+    assessmentCriteria: body.assessments ?? body.assessmentCriteria ?? existing?.assessmentCriteria ?? null,
+    classAssignments: body.assignments ?? body.classAssignments ?? existing?.classAssignments ?? null,
+    entryBehavior: body.entryBehavior !== undefined ? body.entryBehavior : existing?.entryBehavior ?? null,
+    aiInstruction: body.instruction ?? body.aiInstruction ?? existing?.aiInstruction ?? null,
+    sourceMaterial: body.sourceMaterial !== undefined ? body.sourceMaterial : existing?.sourceMaterial ?? null,
+    sourceFileName: body.sourceFileName !== undefined ? body.sourceFileName : existing?.sourceFileName ?? null,
+    subTopic: body.subTopic !== undefined ? body.subTopic : existing?.subTopic ?? null,
+    duration: body.duration !== undefined ? body.duration : existing?.duration ?? null,
+    weekNo: body.weekNo !== undefined ? body.weekNo : existing?.weekNo ?? null,
+  };
+}
+
+function lessonPlanInclude() {
+  return {
+    teacher: { select: { id: true, name: true, branchId: true } },
+    class: { select: { id: true, name: true } },
+    subject: { select: { id: true, name: true } },
+  };
+}
+
+/**
+ * POST /api/admin/lesson-plans/generate
+ */
+export async function generateAdminLessonPlan(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const coreTopic = String(req.body?.coreTopic || req.body?.topic || '').trim();
+    if (!coreTopic) {
+      return res.status(400).json({ success: false, message: 'A lesson topic is required.' });
+    }
+
+    const classId = Number(req.body?.classId || 0) || null;
+    const subjectId = Number(req.body?.subjectId || 0) || null;
+
+    const classObj = classId
+      ? await prisma.class.findFirst({ where: { id: classId, ...(req.branchId ? { branchId: req.branchId } : {}) }, select: { id: true, name: true } })
+      : null;
+    const subjectObj = subjectId
+      ? await prisma.subject.findFirst({ where: { id: subjectId, ...(req.branchId ? { branchId: req.branchId } : {}) }, select: { id: true, name: true } })
+      : null;
+
+    const extracted = await extractLessonSourceMaterial(req.body?.uploads || [], req.body?.sourceMaterial || req.body?.pastedText);
+    const instruction = String(req.body?.instruction || req.body?.aiInstruction || '').trim();
+
+    const result = await generatePedagogicalLessonPlan({
+      subjectName: subjectObj?.name || String(req.body?.subjectName || 'General Studies'),
+      className: classObj?.name || String(req.body?.className || 'Primary'),
+      topic: coreTopic,
+      subTopic: req.body.subTopic || '',
+      duration: req.body.duration || '45 Minutes',
+      weekNo: req.body.weekNo || 'Week 3',
+      instruction,
+      sourceMaterial: extracted.text,
+    });
+
+    const draft = {
+      objectives: result.educationalObjectives,
+      materials: result.materialLists,
+      teachingGuide: result.teachingGuide,
+      assessments: result.assessmentCriteria,
+      assignments: result.classAssignments,
+      entryBehavior: result.entryBehavior,
+      coreTopic: result.coreTopic,
+      sourceMaterial: extracted.text,
+      sourceFileName: extracted.fileName,
+      aiInstruction: instruction,
+    };
+
+    return res.json({
+      success: true,
+      draft,
+      lessonPlan: {
+        educationalObjectives: draft.objectives,
+        materialLists: draft.materials,
+        teachingGuide: draft.teachingGuide,
+        assessmentCriteria: draft.assessments,
+        classAssignments: draft.assignments,
+        entryBehavior: draft.entryBehavior,
+        coreTopic: draft.coreTopic,
+      },
+    });
+  } catch (error) {
+    console.error('[ADMIN] AI Lesson Plan Generation Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate AI lesson plan draft.' });
+  }
+}
+
+/**
+ * POST /api/admin/lesson-plans
+ */
+export async function createAdminLessonPlan(req: Request, res: Response): Promise<Response | void> {
+  const body = req.body || {};
+  const teacherId = Number(body.teacherId);
+  const classId = Number(body.classId);
+  const subjectId = Number(body.subjectId);
+  const coreTopic = String(body.coreTopic || '').trim();
+  if (!teacherId || !classId || !subjectId || !coreTopic) {
+    return res.status(400).json({ success: false, message: 'teacherId, classId, subjectId, and coreTopic are required.' });
+  }
+
+  try {
+    const teacher = await prisma.teacher.findFirst({
+      where: { id: teacherId, ...(req.branchId ? { branchId: req.branchId } : {}) },
+      select: { id: true },
+    });
+    if (!teacher) {
+      return res.status(404).json({ success: false, message: 'Teacher not found in this branch.' });
+    }
+
+    const requested = String(body.status || 'DRAFT').toUpperCase();
+    const status =
+      requested === 'APPROVED'
+        ? 'APPROVED'
+        : requested === 'PENDING_APPROVAL' || requested === 'PUBLISHED'
+          ? 'PENDING_APPROVAL'
+          : 'DRAFT';
+
+    const plan = await prisma.lessonPlan.create({
+      data: {
+        teacherId,
+        classId,
+        subjectId,
+        status,
+        ...mapLessonPlanBody({ ...body, coreTopic }),
+      },
+      include: lessonPlanInclude(),
+    });
+
+    return res.json({
+      success: true,
+      message:
+        status === 'APPROVED'
+          ? 'Lesson note saved as an official school record.'
+          : status === 'PENDING_APPROVAL'
+            ? 'Lesson note saved for approval. It is not an official school record yet.'
+            : 'Lesson note saved as a draft. It is not an official school record yet.',
+      plan,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Save lesson plan error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save lesson plan.' });
+  }
+}
+
+/**
+ * PUT /api/admin/lesson-plans/:id
+ */
+export async function updateAdminLessonPlan(req: Request, res: Response): Promise<Response | void> {
+  const body = req.body || {};
+  try {
+    const plan = await prisma.lessonPlan.findUnique({
+      where: { id: Number(req.params.id) },
+      include: { teacher: { select: { branchId: true } } },
+    });
+    if (!plan || (req.branchId && plan.teacher.branchId !== req.branchId)) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found.' });
+    }
+
+    const requested = body.status ? String(body.status).toUpperCase() : plan.status;
+    const allowed = ['DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'REVISION', 'PUBLISHED'];
+    const status = allowed.includes(requested)
+      ? requested === 'PUBLISHED'
+        ? 'PENDING_APPROVAL'
+        : requested
+      : plan.status;
+
+    const updated = await prisma.lessonPlan.update({
+      where: { id: plan.id },
+      data: {
+        ...(body.teacherId ? { teacherId: Number(body.teacherId) } : {}),
+        ...(body.classId ? { classId: Number(body.classId) } : {}),
+        ...(body.subjectId ? { subjectId: Number(body.subjectId) } : {}),
+        ...mapLessonPlanBody(body, plan),
+        status,
+        ...(body.reviewerNote !== undefined ? { reviewerNote: String(body.reviewerNote || '') } : {}),
+      },
+      include: lessonPlanInclude(),
+    });
+
+    return res.json({ success: true, message: 'Lesson note updated. Official status only changes after approval.', plan: updated });
+  } catch (error) {
+    console.error('[ADMIN] Update lesson plan error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update lesson plan.' });
+  }
+}
+
+/**
+ * POST /api/admin/lesson-plans/:id/approve
+ */
+export async function approveLessonPlan(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const plan = await prisma.lessonPlan.findUnique({
+      where: { id: Number(req.params.id) },
+      include: { teacher: { select: { branchId: true, id: true } } },
+    });
+    if (!plan || (req.branchId && plan.teacher.branchId !== req.branchId)) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found.' });
+    }
+
+    const updated = await prisma.lessonPlan.update({
+      where: { id: plan.id },
+      data: {
+        status: 'APPROVED',
+        reviewerNote: req.body?.reviewerNote ? String(req.body.reviewerNote) : plan.reviewerNote,
+      },
+      include: lessonPlanInclude(),
+    });
+
+    gamificationService
+      .checkLessonPlanEarly(prisma, plan.teacherId, plan.id, req.branchId)
+      .catch((err: any) => console.error('[Gamification] Error in lesson plan trigger:', err.message));
+
+    return res.json({ success: true, message: 'Lesson note approved as an official school record.', plan: updated });
+  } catch (error) {
+    console.error('[ADMIN] Approve lesson plan error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to approve lesson plan.' });
+  }
+}
+
+/**
+ * POST /api/admin/lesson-plans/:id/revision
+ */
+export async function requestLessonPlanRevision(req: Request, res: Response): Promise<Response | void> {
+  const reviewerNote = String(req.body?.reviewerNote || req.body?.note || '').trim();
+  if (!reviewerNote) {
+    return res.status(400).json({ success: false, message: 'A revision note is required so the teacher knows what to correct.' });
+  }
+
+  try {
+    const plan = await prisma.lessonPlan.findUnique({
+      where: { id: Number(req.params.id) },
+      include: { teacher: { select: { branchId: true } } },
+    });
+    if (!plan || (req.branchId && plan.teacher.branchId !== req.branchId)) {
+      return res.status(404).json({ success: false, message: 'Lesson plan not found.' });
+    }
+
+    const updated = await prisma.lessonPlan.update({
+      where: { id: plan.id },
+      data: { status: 'REVISION', reviewerNote },
+      include: lessonPlanInclude(),
+    });
+
+    return res.json({ success: true, message: 'Lesson note sent back for revision. It is not an official school record.', plan: updated });
+  } catch (error) {
+    console.error('[ADMIN] Lesson plan revision error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to request revision.' });
   }
 }
 

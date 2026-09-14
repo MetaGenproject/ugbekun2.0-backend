@@ -3,6 +3,7 @@ import { requireTeacher } from '../middleware/auth';
 import {
   upload,
   getDashboardOverview,
+  getSubjectTeacherDashboard,
   getRoster,
   getReminders,
   createReminder,
@@ -62,6 +63,7 @@ import {
   getLessonPlans,
   createLessonPlan,
   updateLessonPlan,
+  deleteLessonPlan,
   exportLessonPlanPdf,
   createLiveRoom,
   getLiveRooms,
@@ -77,7 +79,7 @@ import {
   getEvents,
   getTeacherTimetable,
 } from '../controllers/teacher';
-import { importCbtQuestions, aiGenerateCbtQuestions } from '../controllers/admin/adminExamCbtController';
+import { importCbtQuestions, aiGenerateCbtQuestions, extractQuestionDrafts, bulkSaveQuestionBank } from '../controllers/admin/adminExamCbtController';
 import { getPublicSchoolInfo } from '../controllers/publicTenant';
 
 const router = express.Router();
@@ -87,6 +89,7 @@ router.use(requireTeacher);
 
 // Dashboard & Overview
 router.get('/dashboard-overview', getDashboardOverview);
+router.get('/subject-dashboard', getSubjectTeacherDashboard);
 router.get('/roster', getRoster);
 router.get('/events', getEvents);
 router.get('/school-info', getPublicSchoolInfo);
@@ -167,6 +170,8 @@ router.delete('/online-exams/:id', deleteOnlineExam);
 router.get('/question-bank', getQuestionBank);
 router.post('/question-bank', createQuestionBankItem);
 router.post('/question-bank/import', importCbtQuestions);
+router.post('/question-bank/extract', extractQuestionDrafts);
+router.post('/question-bank/bulk', bulkSaveQuestionBank);
 router.post('/question-bank/ai-generate', aiGenerateCbtQuestions);
 router.put('/question-bank/:id', updateQuestionBankItem);
 router.delete('/question-bank/:id', deleteQuestionBankItem);
@@ -186,6 +191,7 @@ router.post('/lesson-plan/generate', generateLessonPlan);
 router.get('/lesson-plan', getLessonPlans);
 router.post('/lesson-plan', createLessonPlan);
 router.put('/lesson-plan/:id', updateLessonPlan);
+router.delete('/lesson-plan/:id', deleteLessonPlan);
 router.get('/lesson-plan/:id/pdf', exportLessonPlanPdf);
 
 // Live Rooms

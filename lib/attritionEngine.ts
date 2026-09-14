@@ -1,17 +1,4 @@
-import { PrismaClient } from '@prisma/client';
-import { PrismaPg } from '@prisma/adapter-pg';
-import { Pool } from 'pg';
-
-let globalPrisma: PrismaClient | null = null;
-
-function getPrismaInstance(): PrismaClient {
-  if (!globalPrisma) {
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-    const adapter = new PrismaPg(pool);
-    globalPrisma = new PrismaClient({ adapter });
-  }
-  return globalPrisma;
-}
+import sharedPrisma from './prisma';
 
 export interface AttritionRiskResult {
   studentId: number;
@@ -34,7 +21,7 @@ export async function calculateStudentAttritionRisk(
   studentId: number,
   prismaClient?: any
 ): Promise<AttritionRiskResult> {
-  const prisma = prismaClient || getPrismaInstance();
+  const prisma = prismaClient || sharedPrisma;
 
   // 1. Fetch Student details with active enrollment
   const student = await prisma.student.findUnique({

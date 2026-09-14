@@ -45,4 +45,19 @@ router.get('/domains', superadminController.getDomains);
 router.post('/domains/:branchId/force-activate', superadminController.forceActivateDomain);
 router.post('/domains/:branchId/verify-dns', superadminController.verifyBranchDomainDns);
 
+router.get('/platform', superadminController.getPlatformConfig);
+router.put('/platform', superadminController.updatePlatformConfig);
+router.post('/platform/api-keys', superadminController.createPlatformApiKey);
+router.put('/platform/api-keys/:id', superadminController.updatePlatformApiKey);
+router.delete('/platform/api-keys/:id', superadminController.deletePlatformApiKey);
+router.post('/platform/webhooks', superadminController.createPlatformWebhook);
+router.put('/platform/webhooks/:id', superadminController.updatePlatformWebhook);
+router.delete('/platform/webhooks/:id', superadminController.deletePlatformWebhook);
+router.post('/platform/webhooks/:id/test', superadminController.testPlatformWebhook);
+router.post('/platform/backups', superadminController.createSystemBackup);
+router.post('/platform/backups/:id/restore', superadminController.restoreSystemBackup);
+router.delete('/platform/backups/:id', superadminController.deleteSystemBackup);
+router.delete('/platform/audit-logs', superadminController.clearAuditLogs);
+router.delete('/platform/audit-logs/:id', superadminController.deleteAuditLog);
+
 export default router;

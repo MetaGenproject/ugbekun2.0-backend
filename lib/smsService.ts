@@ -17,6 +17,10 @@ export async function sendSms(
   text: string
 ): Promise<{ success: boolean; channel: string }> {
   const phone = normalizeNigerianPhone(to);
+  if (process.env.SMS_ENABLED === 'false') {
+    if (phone) console.info(`[SMS] skipped (disabled) ${phone}: ${text}`);
+    return { success: false, channel: 'disabled' };
+  }
   const webhook = process.env.SMS_WEBHOOK_URL;
   if (webhook && phone) {
     try {

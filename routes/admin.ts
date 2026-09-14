@@ -130,6 +130,11 @@ import {
   deleteLibraryResource,
   getLessonPlans,
   exportLessonPlanPdf,
+  generateAdminLessonPlan,
+  createAdminLessonPlan,
+  updateAdminLessonPlan,
+  approveLessonPlan,
+  requestLessonPlanRevision,
 } from '../controllers/admin/adminAcademicsController';
 import {
   getAdminAttendanceRegister,
@@ -171,6 +176,7 @@ import {
   deleteCbtGroup,
   getCbtDistributions,
   createCbtDistribution,
+  rescheduleCbtDistribution,
   togglePublishCbtDistribution,
   deleteCbtDistribution,
   getCbtQuestionBank,
@@ -179,10 +185,19 @@ import {
   deleteCbtQuestion,
   importCbtQuestions,
   aiGenerateCbtQuestions,
+  extractQuestionDrafts,
+  bulkSaveQuestionBank,
   getCbtDistributionAnalytics,
   syncCbtMarks,
+  overrideCbtMark,
   syncCbtLegacy,
 } from '../controllers/admin/adminExamCbtController';
+
+import {
+  getAdminHomeworks,
+  createAdminHomework,
+  getAdminHomeworkSubmissions,
+} from '../controllers/admin/adminHomeworkController';
 
 import {
   getMarksEntry,
@@ -266,6 +281,14 @@ import {
   verifyDns,
   removeDomain,
 } from '../controllers/admin/adminSettingsCmsController';
+
+import {
+  getAcademicSessions,
+  createAcademicSession,
+  updateAcademicSession,
+  deleteAcademicSession,
+  setCurrentAcademicSession,
+} from '../controllers/admin/adminAcademicSessionController';
 
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -446,7 +469,13 @@ router.post('/library/returns', returnLibraryBook);
 router.delete('/library/resources/:id', deleteLibraryResource);
 
 router.get('/lesson-plans', getLessonPlans);
+router.post('/lesson-plans/generate', generateAdminLessonPlan);
+router.post('/lesson-plans', createAdminLessonPlan);
+router.put('/lesson-plans/:id', updateAdminLessonPlan);
+router.post('/lesson-plans/:id/approve', approveLessonPlan);
+router.post('/lesson-plans/:id/revision', requestLessonPlanRevision);
 router.get('/lesson-plans/:id/export-pdf', exportLessonPlanPdf);
+router.get('/lesson-plans/:id/pdf', exportLessonPlanPdf);
 
 // ============================================================================
 // 5. TIMETABLE & AI SCHEDULING
@@ -487,6 +516,7 @@ router.post('/cbt/groups', createCbtGroup);
 router.delete('/cbt/groups/:id', deleteCbtGroup);
 router.get('/cbt/distributions', getCbtDistributions);
 router.post('/cbt/distributions', createCbtDistribution);
+router.post('/cbt/distributions/:id/reschedule', rescheduleCbtDistribution);
 router.post('/cbt/distributions/:id/toggle-publish', togglePublishCbtDistribution);
 router.delete('/cbt/distributions/:id', deleteCbtDistribution);
 router.get('/cbt/question-bank', getCbtQuestionBank);
@@ -494,10 +524,17 @@ router.post('/cbt/question-bank', createCbtQuestion);
 router.put('/cbt/question-bank/:id', updateCbtQuestion);
 router.delete('/cbt/question-bank/:id', deleteCbtQuestion);
 router.post('/cbt/question-bank/import', importCbtQuestions);
+router.post('/cbt/question-bank/extract', extractQuestionDrafts);
+router.post('/cbt/question-bank/bulk', bulkSaveQuestionBank);
 router.post('/cbt/question-bank/ai-generate', aiGenerateCbtQuestions);
 router.get('/cbt/distributions/:id/analytics', getCbtDistributionAnalytics);
 router.post('/cbt/distributions/:id/sync-marks', syncCbtMarks);
+router.post('/cbt/distributions/:id/override-mark', overrideCbtMark);
 router.post('/cbt/sync', syncCbtLegacy);
+
+router.get('/homeworks', getAdminHomeworks);
+router.post('/homeworks', createAdminHomework);
+router.get('/homeworks/:id/submissions', getAdminHomeworkSubmissions);
 
 // ============================================================================
 // 7. MARKS ENTRY, COMMENTARY & REPORT CARDS
@@ -558,6 +595,12 @@ router.get('/events', getEvents);
 router.post('/events', createEvent);
 router.put('/events/:id', updateEvent);
 router.delete('/events/:id', deleteEvent);
+
+router.get('/sessions', getAcademicSessions);
+router.post('/sessions', createAcademicSession);
+router.put('/sessions/:id/current', setCurrentAcademicSession);
+router.put('/sessions/:id', updateAcademicSession);
+router.delete('/sessions/:id', deleteAcademicSession);
 
 router.get('/settings', getSettings);
 router.post('/settings', updateSettings);

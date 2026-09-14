@@ -2,13 +2,12 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import prisma from '../lib/prisma';
 import { staffMatchesBranch } from '../lib/branchStats';
+import { getAccessToken } from '../lib/authCookie';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod';
 
 export function getBearerToken(req: Request): string | null {
-  const authHeader = req.headers?.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-  return authHeader.slice('Bearer '.length);
+  return getAccessToken(req);
 }
 
 export async function resolveBranchForAdmin(decoded: any): Promise<number | null> {

@@ -607,6 +607,7 @@ model Class {
   evaluationMatrix      EvaluationMatrix? @relation(fields: [evaluationMatrixId], references: [id])
 
   cbtDistributions      CbtDistribution[]
+  questionGroups        QuestionGroup[]
 
   @@index([branchId])
   @@map("class")
@@ -746,27 +747,50 @@ model ExamMarkDistribution {
 }
 
 model Mark {
-  id        Int     @id @default(autoincrement())
-  studentId Int     @map("student_id")
-  subjectId Int     @map("subject_id")
-  classId   Int     @map("class_id")
-  sectionId Int     @map("section_id")
-  examId    Int     @map("exam_id")
-  mark      String? @map("mark")
-  cbtMark   String? @map("cbt_mark")
-  absent    String? @map("absent")
-  sessionId Int     @map("session_id")
-  branchId  Int?    @map("branch_id")
+  id               Int     @id @default(autoincrement())
+  studentId        Int     @map("student_id")
+  subjectId        Int     @map("subject_id")
+  classId          Int     @map("class_id")
+  sectionId        Int     @map("section_id")
+  examId           Int     @map("exam_id")
+  mark             String? @map("mark") // theory / written exam (typically /60)
+  cbtMark          String? @map("cbt_mark") // CBT / objective (typically /40)
+  cbtSource        String? @map("cbt_source") // CBT_AUTO | CBT_SYNC | ADMIN_OVERRIDE
+  cbtSubmissionId  Int?    @map("cbt_submission_id")
+  cbtScale         Int?    @map("cbt_scale")
+  absent           String? @map("absent")
+  sessionId        Int     @map("session_id")
+  branchId         Int?    @map("branch_id")
 
-  student Student @relation(fields: [studentId], references: [id])
-  subject Subject @relation(fields: [subjectId], references: [id])
-  class   Class   @relation(fields: [classId], references: [id])
-  section Section @relation(fields: [sectionId], references: [id])
-  exam    Exam    @relation(fields: [examId], references: [id])
+  student     Student                @relation(fields: [studentId], references: [id])
+  subject     Subject                @relation(fields: [subjectId], references: [id])
+  class       Class                  @relation(fields: [classId], references: [id])
+  section     Section                @relation(fields: [sectionId], references: [id])
+  exam        Exam                   @relation(fields: [examId], references: [id])
+  corrections MarkScoreCorrection[]
 
   @@index([studentId, examId])
   @@index([classId, sectionId, sessionId])
   @@map("mark")
+}
+
+model MarkScoreCorrection {
+  id          Int      @id @default(autoincrement())
+  markId      Int      @map("mark_id")
+  field       String
+  oldValue    String?  @map("old_value")
+  newValue    String?  @map("new_value")
+  reason      String   @db.Text
+  actorUserId Int?     @map("actor_user_id")
+  actorRole   String   @map("actor_role")
+  branchId    Int?     @map("branch_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  mark Mark @relation(fields: [markId], references: [id], onDelete: Cascade)
+
+  @@index([markId])
+  @@index([branchId])
+  @@map("mark_score_corrections")
 }
 
 model PromotionHistory {
@@ -920,6 +944,7 @@ model OnlineExam {
   createdAt   DateTime               @default(now()) @map("created_at")
   updatedAt   DateTime?              @updatedAt @map("updated_at")
   submissions OnlineExamSubmission[]
+  cbtDistributions CbtDistribution[]
 
   class   Class   @relation(fields: [classId], references: [id])
   subject Subject @relation(fields: [subjectId], references: [id])
@@ -947,17 +972,21 @@ model OnlineExamSubmission {
 }
 
 model Homework {
-  id          Int       @id @default(autoincrement())
-  title       String
-  description String?   @db.Text
-  classId     Int       @map("class_id")
-  subjectId   Int       @map("subject_id")
-  dueDate     DateTime  @map("due_date")
-  branchId    Int       @map("branch_id")
-  sessionId   Int       @map("session_id")
-  questions   Json?     @map("questions")
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime? @updatedAt @map("updated_at")
+  id               Int       @id @default(autoincrement())
+  title            String
+  description      String?   @db.Text
+  classId          Int       @map("class_id")
+  subjectId        Int       @map("subject_id")
+  dueDate          DateTime  @map("due_date")
+  branchId         Int       @map("branch_id")
+  sessionId        Int       @map("session_id")
+  questions        Json?     @map("questions")
+  questionBankIds  Json?     @map("question_bank_ids")
+  termName         String?   @map("term_name")
+  createdById      Int?      @map("created_by_id")
+  createdByRole    String?   @map("created_by_role")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
 
   class       Class                @relation(fields: [classId], references: [id])
   subject     Subject              @relation(fields: [subjectId], references: [id])
@@ -1274,6 +1303,9 @@ model MediaItem {
 enum LessonPlanStatus {
   DRAFT
   PUBLISHED
+  PENDING_APPROVAL
+  APPROVED
+  REVISION
 }
 
 model LessonPlan {
@@ -1287,6 +1319,14 @@ model LessonPlan {
   teachingGuide         String?          @map("teaching_guide") @db.Text
   assessmentCriteria    String?          @map("assessment_criteria") @db.Text
   classAssignments      String?          @map("class_assignments") @db.Text
+  entryBehavior         String?          @map("entry_behavior") @db.Text
+  aiInstruction         String?          @map("ai_instruction") @db.Text
+  sourceMaterial        String?          @map("source_material") @db.Text
+  sourceFileName        String?          @map("source_file_name")
+  subTopic              String?          @map("sub_topic")
+  duration              String?
+  weekNo                String?          @map("week_no")
+  reviewerNote          String?          @map("reviewer_note") @db.Text
   status                LessonPlanStatus @default(DRAFT)
   createdAt             DateTime         @default(now()) @map("created_at")
   updatedAt             DateTime?        @updatedAt @map("updated_at")
@@ -1588,13 +1628,26 @@ model AiCompanionSession {
 model QuestionBank {
   id             Int       @id @default(autoincrement())
   questionText   String    @map("question_text") @db.Text
-  questionType   String    @default("mcq") @map("question_type") // mcq | theory
-  options        Json?     @map("options") // Array of options, e.g. ["Option A", "Option B", ...]
-  correctOption  String?   @map("correct_option") // E.g. "A", "B", etc. or index/text
+  questionType   String    @default("mcq") @map("question_type") // mcq | theory | true_false
+  options        Json?
+  correctOption  String?   @map("correct_option")
   marks          Float     @default(1.0) @map("marks")
   subjectId      Int       @map("subject_id")
-  classId        Int?      @map("class_id") // Optional target class reference
+  classId        Int?      @map("class_id")
   branchId       Int       @map("branch_id")
+  sessionId      Int?      @map("session_id")
+  termName       String?   @map("term_name")
+  topic          String?
+  difficulty     String?   @default("medium")
+  sourceType     String?   @map("source_type")
+  sourceFileName String?   @map("source_file_name")
+  aiInstruction  String?   @map("ai_instruction") @db.Text
+  createdById    Int?      @map("created_by_id")
+  createdByRole  String?   @map("created_by_role")
+  category       String?
+  status         String    @default("APPROVED") // DRAFT | APPROVED | ARCHIVED
+  approvedAt     DateTime? @map("approved_at")
+  approvedById   Int?      @map("approved_by_id")
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime? @updatedAt @map("updated_at")
 
@@ -1602,6 +1655,7 @@ model QuestionBank {
   class          Class?    @relation(fields: [classId], references: [id])
 
   @@index([subjectId, branchId])
+  @@index([classId, subjectId, termName])
   @@map("question_bank")
 }
 
@@ -1759,10 +1813,14 @@ model QuestionGroup {
   title       String
   description String?           @db.Text
   groupCode   String            @map("group_code")
-  questionIds Json              @default("[]") @map("question_ids") // Array of question IDs in this group
+  questionIds Json              @default("[]") @map("question_ids")
+  totalMarks  Float             @default(100) @map("total_marks")
 
   subjectId   Int               @map("subject_id")
   subject     Subject           @relation(fields: [subjectId], references: [id])
+
+  classId     Int?              @map("class_id")
+  class       Class?            @relation(fields: [classId], references: [id])
 
   branchId    Int               @map("branch_id")
   branch      Branch            @relation(fields: [branchId], references: [id])
@@ -1801,6 +1859,9 @@ model CbtDistribution {
   startDate        DateTime?      @map("start_date")
   endDate          DateTime?      @map("end_date")
 
+  onlineExamId     Int?           @map("online_exam_id")
+  onlineExam       OnlineExam?    @relation(fields: [onlineExamId], references: [id])
+
   branchId         Int            @map("branch_id")
   branch           Branch         @relation(fields: [branchId], references: [id])
 
@@ -1809,6 +1870,7 @@ model CbtDistribution {
 
   @@index([classId, sectionId])
   @@index([branchId])
+  @@index([onlineExamId])
   @@map("cbt_distributions")
 }
 
@@ -2324,6 +2386,92 @@ model SchoolLandingPage {
   branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
 
   @@map("school_landing_pages")
+}
+
+model PlatformSetting {
+  id                      Int       @id @default(1)
+  myedurideEnabled        Boolean   @default(false) @map("myeduride_enabled")
+  myedurideApiUrl         String?   @map("myeduride_api_url")
+  myedurideApiKey         String?   @map("myeduride_api_key") @db.Text
+  myedurideWebhookSecret  String?   @map("myeduride_webhook_secret")
+  paymentsEnabled         Boolean   @default(false) @map("payments_enabled")
+  paystackPublicKey       String?   @map("paystack_public_key")
+  paystackSecretKey       String?   @map("paystack_secret_key") @db.Text
+  flutterwavePublicKey    String?   @map("flutterwave_public_key")
+  flutterwaveSecretKey    String?   @map("flutterwave_secret_key") @db.Text
+  smsEnabled              Boolean   @default(false) @map("sms_enabled")
+  smsProvider             String    @default("webhook") @map("sms_provider")
+  smsSenderId             String?   @map("sms_sender_id")
+  smsApiKey               String?   @map("sms_api_key") @db.Text
+  smsWebhookUrl           String?   @map("sms_webhook_url")
+  emailEnabled            Boolean   @default(false) @map("email_enabled")
+  smtpHost                String?   @map("smtp_host")
+  smtpPort                Int?      @map("smtp_port")
+  smtpUser                String?   @map("smtp_user")
+  smtpPass                String?   @map("smtp_pass") @db.Text
+  smtpFrom                String?   @map("smtp_from")
+  oseEnabled              Boolean   @default(true) @map("ose_enabled")
+  oseApiKey               String?   @map("ose_api_key") @db.Text
+  oseModel                String    @default("deepseek-chat") @map("ose_model")
+  oseTemperature          String    @default("0.7") @map("ose_temperature")
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime? @updatedAt @map("updated_at")
+
+  @@map("platform_settings")
+}
+
+model PlatformApiKey {
+  id          Int       @id @default(autoincrement())
+  name        String
+  keyPrefix   String    @map("key_prefix")
+  keyHash     String    @unique @map("key_hash")
+  keyLastFour String    @map("key_last_four")
+  scopes      String?   @db.Text
+  active      Boolean   @default(true)
+  lastUsedAt  DateTime? @map("last_used_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  @@map("platform_api_keys")
+}
+
+model PlatformWebhook {
+  id         Int       @id @default(autoincrement())
+  name       String
+  url        String
+  eventTypes String    @default("platform.updated") @map("event_types")
+  secret     String?
+  active     Boolean   @default(true)
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  @@map("platform_webhooks")
+}
+
+model SystemBackup {
+  id        Int      @id @default(autoincrement())
+  label     String
+  status    String   @default("COMPLETED")
+  payload   Json?
+  notes     String?  @db.Text
+  createdBy Int?     @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("system_backups")
+}
+
+model SystemAuditLog {
+  id        Int      @id @default(autoincrement())
+  actor     String
+  actorId   Int?     @map("actor_id")
+  action    String
+  entity    String?
+  details   String?  @db.Text
+  ipAddress String?  @map("ip_address")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("system_audit_logs")
 }
 
 

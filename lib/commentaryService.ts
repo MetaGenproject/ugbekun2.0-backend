@@ -1,18 +1,7 @@
-import OpenAI from 'openai';
+import { getDeepseekClient } from './aiClient';
 
-let openaiClient: OpenAI | null = null;
-function getOpenAiClient(): OpenAI | null {
-  if (!openaiClient && process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY !== 'your_deepseek_api_key_here') {
-    try {
-      openaiClient = new OpenAI({
-        baseURL: 'https://api.deepseek.com',
-        apiKey: process.env.DEEPSEEK_API_KEY,
-      });
-    } catch (e: any) {
-      console.warn('[CommentaryService] Could not initialize DeepSeek client:', e.message);
-    }
-  }
-  return openaiClient;
+function getOpenAiClient() {
+  return getDeepseekClient();
 }
 
 export interface StudentAiCommentaryParams {

@@ -2,6 +2,9 @@ import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { autoGradeCbtSubmission } from '../../lib/cbtService';
 import gamificationService from '../../lib/gamificationService';
+import { examWindowMessage, examWindowStatus } from '../../lib/examWindow';
+import { companionExamKey, findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
+import { DEFAULT_CBT_SCALE, recordCbtPercentageOnMarksheet } from '../../lib/cbtMarkRecord';
 
 /**
  * GET /api/student/cbt/active-exams
@@ -35,13 +38,32 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
       orderBy: { createdAt: 'desc' },
     });
 
-    const allExamIds = [...onlineExams.map((e) => e.id), ...distributions.map((d) => d.id)];
-    const submissions = await prisma.onlineExamSubmission.findMany({
-      where: {
-        studentId: req.studentId,
-        onlineExamId: { in: allExamIds },
-      },
-    });
+    const companionExams = distributions.length
+      ? await prisma.onlineExam.findMany({
+          where: {
+            branchId: req.branchId,
+            OR: distributions.map((d) => ({
+              title: d.title,
+              classId: d.classId,
+              subjectId: d.subjectId,
+            })),
+          },
+        })
+      : [];
+    const companionByKey = new Map(
+      companionExams.map((e) => [companionExamKey(e.title, e.classId, e.subjectId), e])
+    );
+    const coveredKeys = new Set(distributions.map((d) => companionExamKey(d.title, d.classId, d.subjectId)));
+    const uniqueExamIds = [...new Set([...onlineExams.map((e) => e.id), ...companionExams.map((e) => e.id)])];
+    const submissions =
+      uniqueExamIds.length === 0
+        ? []
+        : await prisma.onlineExamSubmission.findMany({
+            where: {
+              studentId: req.studentId,
+              onlineExamId: { in: uniqueExamIds },
+            },
+          });
     const subMap: Record<number, any> = {};
     submissions.forEach((s) => {
       subMap[s.onlineExamId] = s;
@@ -49,8 +71,10 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
 
     const formattedList = [
       ...distributions.map((dist) => {
-        const sub = subMap[dist.id];
+        const companion = companionByKey.get(companionExamKey(dist.title, dist.classId, dist.subjectId));
+        const sub = companion ? subMap[companion.id] : undefined;
         const qCount = Array.isArray(dist.group?.questionIds) ? (dist.group.questionIds as any[]).length : 10;
+        const windowStatus = examWindowStatus(dist.startDate, dist.endDate);
         return {
           id: dist.id,
           sourceType: 'distribution',
@@ -66,11 +90,18 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
           totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
           startedAt: sub?.startedAt || null,
           submittedAt: sub?.submittedAt || null,
+          startDate: dist.startDate,
+          endDate: dist.endDate,
+          windowStatus,
+          windowMessage: examWindowMessage(windowStatus, dist.startDate, dist.endDate),
         };
       }),
-      ...onlineExams.map((ex) => {
+      ...onlineExams
+        .filter((ex) => !coveredKeys.has(companionExamKey(ex.title, ex.classId, ex.subjectId)))
+        .map((ex) => {
         const sub = subMap[ex.id];
         const questions = Array.isArray(ex.questions) ? ex.questions : [];
+        const windowStatus = examWindowStatus(ex.examDate, null);
         return {
           id: ex.id,
           sourceType: 'online_exam',
@@ -86,6 +117,10 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
           totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
           startedAt: sub?.startedAt || null,
           submittedAt: sub?.submittedAt || null,
+          startDate: ex.examDate,
+          endDate: null,
+          windowStatus,
+          windowMessage: examWindowMessage(windowStatus, ex.examDate, null),
         };
       }),
     ];
@@ -117,8 +152,12 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
     let rawQuestions: any[] = [];
     let targetOnlineExamId = examId;
 
-    const dist = await prisma.cbtDistribution.findUnique({
-      where: { id: examId },
+    const dist = await prisma.cbtDistribution.findFirst({
+      where: {
+        id: examId,
+        branchId: req.branchId,
+        ...(req.classId ? { classId: req.classId } : {}),
+      },
       include: {
         subject: { select: { name: true } },
         group: true,
@@ -126,6 +165,19 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
     });
 
     if (dist) {
+      if (!dist.isPublished) {
+        return res.status(403).json({ success: false, message: 'This examination is not published yet.' });
+      }
+      const windowStatus = examWindowStatus(dist.startDate, dist.endDate);
+      if (windowStatus !== 'open') {
+        return res.status(403).json({
+          success: false,
+          message: examWindowMessage(windowStatus, dist.startDate, dist.endDate),
+          windowStatus,
+          startDate: dist.startDate,
+          endDate: dist.endDate,
+        });
+      }
       examTitle = dist.title;
       duration = dist.duration || 30;
       passingMark = dist.passingMark || 50;
@@ -135,22 +187,20 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
 
       if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
         rawQuestions = await prisma.questionBank.findMany({
-          where: { id: { in: (dist.group.questionIds as any[]).map(Number) } },
+          where: { id: { in: (dist.group.questionIds as any[]).map(Number) }, status: 'APPROVED' },
         });
       } else {
         rawQuestions = await prisma.questionBank.findMany({
-          where: { branchId: req.branchId, subjectId: dist.subjectId },
+          where: { branchId: req.branchId, subjectId: dist.subjectId, status: 'APPROVED' },
           take: 20,
         });
       }
 
-      let onlineEx = await prisma.onlineExam.findFirst({
-        where: {
-          title: dist.title,
-          classId: dist.classId,
-          subjectId: dist.subjectId,
-          branchId: req.branchId,
-        },
+      let onlineEx = await findCompanionOnlineExam({
+        title: dist.title,
+        classId: dist.classId,
+        subjectId: dist.subjectId,
+        branchId: req.branchId,
       });
       if (!onlineEx) {
         onlineEx = await prisma.onlineExam.create({
@@ -174,8 +224,20 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
         include: { subject: { select: { name: true } } },
       });
 
-      if (!onlineExam) {
+      if (!onlineExam || onlineExam.branchId !== req.branchId) {
         return res.status(404).json({ success: false, message: 'CBT examination not found.' });
+      }
+      if (req.classId && onlineExam.classId !== req.classId) {
+        return res.status(403).json({ success: false, message: 'This examination is not assigned to your class.' });
+      }
+
+      const windowStatus = examWindowStatus(onlineExam.examDate, null);
+      if (windowStatus === 'upcoming') {
+        return res.status(403).json({
+          success: false,
+          message: examWindowMessage(windowStatus, onlineExam.examDate, null),
+          windowStatus,
+        });
       }
 
       examTitle = onlineExam.title;
@@ -267,11 +329,11 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
       showResults = dist.showResults;
       if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
         rawQuestions = await prisma.questionBank.findMany({
-          where: { id: { in: (dist.group.questionIds as any[]).map(Number) } },
+          where: { id: { in: (dist.group.questionIds as any[]).map(Number) }, status: 'APPROVED' },
         });
       } else {
         rawQuestions = await prisma.questionBank.findMany({
-          where: { branchId: req.branchId, subjectId: dist.subjectId },
+          where: { branchId: req.branchId, subjectId: dist.subjectId, status: 'APPROVED' },
           take: 20,
         });
       }
@@ -328,6 +390,31 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
         submittedAt: new Date(),
       },
     });
+
+    const onlineExamMeta =
+      dist ||
+      (await prisma.onlineExam.findUnique({
+        where: { id: targetOnlineExamId },
+        select: { classId: true, subjectId: true },
+      }));
+
+    if (onlineExamMeta && req.studentId && req.branchId) {
+      try {
+        await recordCbtPercentageOnMarksheet({
+          studentId: req.studentId,
+          classId: dist?.classId || onlineExamMeta.classId,
+          subjectId: dist?.subjectId || onlineExamMeta.subjectId,
+          branchId: req.branchId,
+          sectionId: dist?.sectionId || req.sectionId || null,
+          percentage: grading.percentage,
+          source: 'CBT_AUTO',
+          submissionId: updated.id,
+          scale: DEFAULT_CBT_SCALE,
+        });
+      } catch (markError: any) {
+        console.error('[STUDENT] CBT marksheet record error:', markError?.message || markError);
+      }
+    }
 
     gamificationService
       .checkOnlineExamPerformance(prisma, req.studentId, updated.id, req.branchId)

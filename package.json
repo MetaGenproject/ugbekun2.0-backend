@@ -14,7 +14,7 @@
     "cron:attendance": "node scripts/evaluateWeeklyAttendance.js",
     "cron:attrition": "node scripts/evaluateWeeklyAttrition.js",
     "test": "node tests/run_all_tests.js",
-    "test:unit": "tsx tests/1-unit/revenueAnalytics.unit.test.js && tsx tests/1-unit/myedurideBridge.unit.test.js && tsx tests/1-unit/studentService.unit.test.js && tsx tests/1-unit/domainAndCms.unit.test.js && tsx tests/1-unit/attendanceRegister.unit.test.js",
+    "test:unit": "tsx tests/1-unit/revenueAnalytics.unit.test.js && tsx tests/1-unit/myedurideBridge.unit.test.js && tsx tests/1-unit/studentService.unit.test.js && tsx tests/1-unit/domainAndCms.unit.test.js && tsx tests/1-unit/attendanceRegister.unit.test.js && tsx tests/1-unit/examWindow.unit.test.js && tsx tests/1-unit/cbtMarkRecord.unit.test.js",
     "backfill:attendance-registers": "tsx scripts/backfillAttendanceRegisters.ts",
     "apply:attendance-phase3": "tsx scripts/applyAttendancePhase3.ts",
     "test:integration": "node tests/2-integration/auth_rbac.integration.test.js && node tests/2-integration/multitenant_isolation.test.js && node tests/2-integration/endpoints_full.integration.test.js",

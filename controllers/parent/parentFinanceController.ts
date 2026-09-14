@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
+import { recordPayment } from '../../lib/accountingService';
+import { initializeOnlinePayment, publicPaymentConfig, verifyOnlinePayment } from '../../lib/paymentGateway';
 
 /**
  * GET /api/parent/child/:studentId/invoices
@@ -81,9 +83,98 @@ export async function getChildInvoices(req: Request, res: Response): Promise<Res
       totalFeeAmount,
       totalPaidAmount,
       totalBalance,
+      paymentGateway: publicPaymentConfig(),
     });
   } catch (error) {
     console.error('[PARENT] Get child invoices error:', error);
     return res.status(500).json({ success: false, message: 'Failed to retrieve fee invoices.' });
+  }
+}
+
+async function parentEmail(req: Request) {
+  const parent = await prisma.parent.findFirst({
+    where: {
+      OR: [{ id: Number(req.parentId) }, { userId: Number(req.userId) }],
+    },
+    select: { email: true },
+  });
+  const user = await prisma.user.findFirst({
+    where: { id: Number(req.userId) },
+    select: { username: true },
+  }).catch(() => null);
+  return parent?.email || (user?.username?.includes('@') ? user.username : '') || 'fees@ugbekun.com';
+}
+
+/**
+ * POST /api/parent/child/:studentId/invoices/:invoiceId/pay
+ */
+export async function initializeChildInvoicePayment(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const invoiceId = Number(req.params.invoiceId);
+    const invoice = await prisma.invoice.findFirst({
+      where: {
+        id: invoiceId,
+        studentId: req.studentId,
+        branchId: req.studentBranchId,
+      },
+    });
+    if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    const balance = Number(invoice.balanceAmount || 0);
+    if (balance <= 0) return res.status(400).json({ success: false, message: 'This invoice is already paid.' });
+
+    const email = await parentEmail(req);
+    const checkout = await initializeOnlinePayment({
+      email,
+      amount: balance,
+      invoiceId: invoice.id,
+      studentId: Number(req.studentId),
+      branchId: Number(req.studentBranchId),
+    });
+    return res.json({ success: true, ...checkout });
+  } catch (error: any) {
+    return res.status(400).json({ success: false, message: error.message || 'Unable to start online payment.' });
+  }
+}
+
+/**
+ * POST /api/parent/payments/verify
+ */
+export async function verifyChildInvoicePayment(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const reference = String(req.body?.reference || '').trim();
+    if (!reference) return res.status(400).json({ success: false, message: 'Payment reference is required.' });
+
+    const verified = await verifyOnlinePayment(reference);
+    const invoiceId = Number(verified.metadata.invoiceId || req.body?.invoiceId);
+    if (!invoiceId) return res.status(400).json({ success: false, message: 'Invoice metadata missing from payment.' });
+
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: invoiceId },
+      include: { student: { select: { parentId: true } } },
+    });
+    if (!invoice || invoice.student.parentId !== req.parentId) {
+      return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    const existing = await prisma.payment.findFirst({
+      where: { reference, invoiceId: invoice.id },
+    });
+    if (existing) {
+      return res.json({ success: true, message: 'Payment already recorded.', alreadyRecorded: true });
+    }
+
+    await recordPayment(prisma, {
+      invoiceId: invoice.id,
+      amount: verified.amount,
+      method: verified.provider,
+      reference,
+      receivedBy: Number(req.userId) || undefined,
+      notes: `Verified ${verified.provider} payment`,
+      branchId: invoice.branchId,
+    });
+
+    return res.json({ success: true, message: 'Payment verified and recorded.' });
+  } catch (error: any) {
+    return res.status(400).json({ success: false, message: error.message || 'Unable to verify payment.' });
   }
 }

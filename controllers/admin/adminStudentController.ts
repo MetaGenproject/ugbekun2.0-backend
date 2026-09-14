@@ -2,7 +2,6 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import pdfParse from 'pdf-parse';
-import OpenAI from 'openai';
 import prisma from '../../lib/prisma';
 import { generateRegistrationNumber, bindEvaluationMatrix, wipeEvaluationMatrix, generateSecurePassword } from '../../lib/studentService';
 import { sendOnboardingCredentials } from '../../lib/emailService';
@@ -21,11 +20,9 @@ import {
   batchProvisionStudentIdCards,
 } from '../../lib/idCardService';
 import { uploadBase64Image } from '../../lib/cloudinary';
+import { getAiModel, requireDeepseekClient } from '../../lib/aiClient';
 
-const openai = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY || 'dummy-key',
-  baseURL: 'https://api.deepseek.com',
-});
+const openai = { chat: { completions: { create: (args: any) => requireDeepseekClient().chat.completions.create({ ...args, model: args.model || getAiModel() }) } } };
 
 let Tesseract: any;
 try {

@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
 import prisma from '../../lib/prisma';
 import { uploadBase64Image } from '../../lib/cloudinary';
+import { resolveDisplaySchoolName } from '../../lib/schoolDisplayName';
 
 export async function savePhoto(photoBase64?: string | null, folder: string = 'ugbekun2/parents/photos'): Promise<string | null> {
   if (!photoBase64) return null;
@@ -117,7 +118,27 @@ export async function getChildProfile(req: Request, res: Response): Promise<Resp
     const student = await prisma.student.findUnique({
       where: { id: req.studentId },
       include: {
-        branch: { select: { name: true, code: true } },
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            logo: true,
+            systemSetting: {
+              select: {
+                schoolName: true,
+                tagline: true,
+                logoUrl: true,
+                academicSession: true,
+                currentTerm: true,
+                primaryColor: true,
+                secondaryColor: true,
+                website: true,
+                whatsappNo: true,
+              },
+            },
+          },
+        },
       },
     });
 
@@ -176,6 +197,9 @@ export async function getChildProfile(req: Request, res: Response): Promise<Resp
       }));
     }
 
+    const settings = student.branch?.systemSetting;
+    const schoolName = resolveDisplaySchoolName(settings?.schoolName, student.branch?.name);
+
     return res.json({
       success: true,
       studentId: student.id,
@@ -184,7 +208,17 @@ export async function getChildProfile(req: Request, res: Response): Promise<Resp
       registerNo: student.registerNo,
       gender: student.gender,
       photo: student.photo,
+      branchId: student.branch?.id || student.branchId,
       branchName: student.branch?.name || null,
+      schoolName,
+      schoolTagline: settings?.tagline || null,
+      schoolLogoUrl: settings?.logoUrl || student.branch?.logo || null,
+      academicSession: settings?.academicSession || null,
+      currentTerm: settings?.currentTerm || null,
+      primaryColor: settings?.primaryColor || null,
+      secondaryColor: settings?.secondaryColor || null,
+      website: settings?.website || null,
+      whatsappNo: settings?.whatsappNo || null,
       classId: req.childClassId || null,
       className: classInfo?.name || null,
       sectionId: req.childSectionId || null,

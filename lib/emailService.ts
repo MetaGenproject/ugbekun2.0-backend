@@ -26,10 +26,25 @@ export const SMTP_CONFIG = {
   from: process.env.SMTP_FROM || process.env.SMTP_USER,
 };
 
+function liveSmtp() {
+  return {
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT || '465', 10) || 465,
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+  };
+}
+
+export function isSmtpConfigured() {
+  const cfg = liveSmtp();
+  return Boolean(cfg.host && cfg.user && cfg.pass);
+}
+
 const REQUIRED_VARS: Array<keyof typeof SMTP_CONFIG> = ['host', 'user', 'pass'];
 const missingVars = REQUIRED_VARS.filter((key) => !SMTP_CONFIG[key]);
 
-export const isConfigured = missingVars.length === 0;
+export const isConfigured = isSmtpConfigured();
 
 if (!isConfigured) {
   console.warn(
@@ -44,32 +59,34 @@ if (!isConfigured) {
 
 let _transporter: nodemailer.Transporter | null = null;
 
+export function resetEmailRuntime() {
+  _transporter = null;
+}
+
 export function getTransporter(): nodemailer.Transporter {
   if (_transporter) return _transporter;
 
-  const isSecure = SMTP_CONFIG.port === 465;
+  const cfg = liveSmtp();
+  const isSecure = cfg.port === 465;
 
   _transporter = nodemailer.createTransport({
-    host: SMTP_CONFIG.host,
-    port: SMTP_CONFIG.port,
-    secure: isSecure, // true for 465 (SMTPS), false for 587 (STARTTLS — upgrades after EHLO)
+    host: cfg.host,
+    port: cfg.port,
+    secure: isSecure,
     auth: {
-      user: SMTP_CONFIG.user,
-      pass: SMTP_CONFIG.pass,
+      user: cfg.user,
+      pass: cfg.pass,
     },
-    // Connection pooling — reuses connections across sends
     pool: true,
     maxConnections: 3,
     maxMessages: 100,
-    // Timeout protection
-    connectionTimeout: 15_000, // 15s to establish connection
-    greetingTimeout: 15_000, // 15s for server greeting
-    socketTimeout: 20_000, // 20s for socket inactivity
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
     dnsTimeout: 10_000,
-    // TLS options for shared hosting / Cloudflare-proxied mail servers
     tls: {
       rejectUnauthorized: false,
-      servername: 'mail.ugbekun.com',
+      servername: cfg.host || 'mail.ugbekun.com',
     },
   } as any);
 
@@ -93,7 +110,12 @@ export async function sendMail(
   html: string,
   options: any = {}
 ): Promise<SendMailResult> {
-  if (!isConfigured) {
+  if (process.env.EMAIL_ENABLED === 'false') {
+    console.warn(`[EMAIL SERVICE] Skipping email to ${to} — email delivery is disabled globally.`);
+    return { success: false, error: 'Email delivery is disabled' };
+  }
+
+  if (!isSmtpConfigured()) {
     console.warn(`[EMAIL SERVICE] Skipping email to ${to} — SMTP not configured.`);
     return { success: false, error: 'SMTP not configured' };
   }
@@ -103,9 +125,10 @@ export async function sendMail(
   }
 
   try {
+    const cfg = liveSmtp();
     const transporter = getTransporter();
     const mailOptions = {
-      from: SMTP_CONFIG.from,
+      from: cfg.from,
       to,
       subject,
       html,

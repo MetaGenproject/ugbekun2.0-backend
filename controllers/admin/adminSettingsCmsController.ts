@@ -816,7 +816,15 @@ export async function getMyEduRideConfigHandler(req: Request, res: Response): Pr
 
   try {
     const config = await getMyEduRideConfig(prisma, branchId!);
-    return res.json({ success: true, data: config });
+    return res.json({
+      success: true,
+      data: {
+        ...config,
+        apiKey: config.apiKey ? `${String(config.apiKey).slice(0, 8)}••••` : '',
+        webhookSecret: config.webhookSecret ? '••••••••' : '',
+        credentialsManagedGlobally: true,
+      },
+    });
   } catch (err) {
     console.error('[MYEDURIDE] GET config error:', err);
     return res.status(500).json({ success: false, message: 'Failed to load MyEduRide configuration.' });
@@ -833,8 +841,13 @@ export async function saveMyEduRideConfigHandler(req: Request, res: Response): P
     const updated = await saveMyEduRideConfig(prisma, branchId!, req.body || {});
     return res.json({
       success: true,
-      message: 'MyEduRide API configuration saved successfully.',
-      data: updated,
+      message: 'MyEduRide operational settings saved. API credentials are managed in Super Admin → Global Settings.',
+      data: {
+        ...updated,
+        apiKey: updated.apiKey ? `${String(updated.apiKey).slice(0, 8)}••••` : '',
+        webhookSecret: updated.webhookSecret ? '••••••••' : '',
+        credentialsManagedGlobally: true,
+      },
     });
   } catch (err) {
     console.error('[MYEDURIDE] POST config error:', err);

@@ -1,18 +1,7 @@
-import OpenAI from 'openai';
+import { getDeepseekClient } from './aiClient';
 
-let openaiClient: OpenAI | null = null;
-function getOpenAiClient(): OpenAI | null {
-  if (!openaiClient && process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY !== 'your_deepseek_api_key_here') {
-    try {
-      openaiClient = new OpenAI({
-        baseURL: 'https://api.deepseek.com',
-        apiKey: process.env.DEEPSEEK_API_KEY,
-      });
-    } catch (e: any) {
-      console.warn('[LessonPlanService] Could not initialize DeepSeek client:', e.message);
-    }
-  }
-  return openaiClient;
+function getOpenAiClient() {
+  return getDeepseekClient();
 }
 
 export interface LessonPlanParams {
@@ -23,6 +12,8 @@ export interface LessonPlanParams {
   duration?: string;
   curriculumStandard?: string;
   weekNo?: string;
+  instruction?: string;
+  sourceMaterial?: string;
 }
 
 /**
@@ -37,13 +28,15 @@ export async function generatePedagogicalLessonPlan(params: LessonPlanParams): P
     duration = '45 Minutes',
     curriculumStandard = 'Nigerian National Curriculum (NERDC / WAEC)',
     weekNo = 'Week 3',
+    instruction = '',
+    sourceMaterial = '',
   } = params;
 
   const client = getOpenAiClient();
 
   if (client) {
     try {
-      const systemPrompt = `You are a distinguished Senior Curriculum Master and Pedagogical Inspector adhering strictly to ${curriculumStandard}. Return a detailed, highly structured, lesson plan in valid JSON format.`;
+      const systemPrompt = `You are a distinguished Senior Curriculum Master and Pedagogical Inspector adhering strictly to ${curriculumStandard}. Follow the teacher's custom instructions when they conflict with a generic template. Use uploaded or scanned source material as the primary content basis when provided. Return a detailed lesson plan in valid JSON.`;
 
       const userPrompt = `
 Generate a comprehensive, ready-to-teach Lesson Plan for:
@@ -54,15 +47,20 @@ Generate a comprehensive, ready-to-teach Lesson Plan for:
 - Duration: ${duration}
 - Term Timing: ${weekNo}
 
+Teacher / Admin instructions (must follow):
+${instruction?.trim() || 'Create a complete classroom-ready lesson note with objectives, materials, procedure, evaluation, and homework.'}
+
+${sourceMaterial?.trim() ? `Uploaded / scanned teaching material (treat as source of truth; extract, reorganize, and expand — do not ignore it):\n${sourceMaterial.trim().slice(0, 12000)}` : 'No source file was uploaded. Generate from the topic and instructions only.'}
+
 The JSON MUST have the following structure:
 {
   "coreTopic": "${topic} - ${subTopic}",
-  "educationalObjectives": "Numbered Bloom's taxonomy objectives (Cognitive, Affective, Psychomotor). By the end of this 45-minute lesson, pupils should be able to: 1. ..., 2. ..., 3. ...",
-  "materialLists": "Itemized list of instructional materials, audio-visual aids, realia, charts, textbooks, and digital learning tools.",
-  "entryBehavior": "Prerequisite knowledge and concepts pupils are assumed to already know.",
-  "teachingGuide": "Step-by-step instructional sequence with time allocations:\n- Step 1: Set Induction / Hook (5 Mins)\n- Step 2: Teacher Exploration & Concept Presentation (15 Mins)\n- Step 3: Guided Practice & Student Activity (10 Mins)\n- Step 4: Class Discussion & Formative Q&A (5 Mins)\n- Step 5: Summary & Key Takeaways (5 Mins)\n- Step 6: Conclusion (5 Mins)",
-  "assessmentCriteria": "Formative evaluation rubric, oral question checks, and in-class quiz questions to verify mastery of objectives.",
-  "classAssignments": "Specific take-home assignment and extension research challenge for pupils."
+  "educationalObjectives": "Numbered Bloom's taxonomy objectives (Cognitive, Affective, Psychomotor).",
+  "materialLists": "Itemized list of instructional materials.",
+  "entryBehavior": "Prerequisite knowledge pupils are assumed to already know.",
+  "teachingGuide": "Step-by-step instructional sequence with time allocations.",
+  "assessmentCriteria": "Formative evaluation rubric and in-class quiz questions.",
+  "classAssignments": "Take-home assignment and extension challenge."
 }
 `;
 
@@ -72,7 +70,7 @@ The JSON MUST have the following structure:
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        temperature: 0.2,
+        temperature: 0.55,
         response_format: { type: 'json_object' },
       });
 
@@ -103,6 +101,8 @@ The JSON MUST have the following structure:
     subTopic,
     duration,
     weekNo,
+    instruction,
+    sourceMaterial,
   });
 }
 
@@ -116,11 +116,19 @@ export function generatePedagogicalFallback(params: {
   subTopic?: string;
   duration: string;
   weekNo?: string;
+  instruction?: string;
+  sourceMaterial?: string;
 }) {
-  const { subjectName, className, topic = 'Topic', subTopic = '', duration } = params;
+  const { subjectName, className, topic = 'Topic', subTopic = '', duration, instruction = '', sourceMaterial = '' } = params;
+  const instructionNote = instruction.trim()
+    ? `\nTeacher instruction honoured: ${instruction.trim().slice(0, 800)}`
+    : '';
+  const sourceNote = sourceMaterial.trim()
+    ? `\nDrawn from uploaded/scanned material (${sourceMaterial.trim().slice(0, 400)}…).`
+    : '';
 
   const objectives = `By the end of this ${duration} lesson, pupils should be able to:
-1. Cognitive Mastery: Define and explain the foundational concepts of "${topic}" with specific reference to ${subTopic}.
+1. Cognitive Mastery: Define and explain the foundational concepts of "${topic}" with specific reference to ${subTopic}.${instructionNote}${sourceNote}
 2. Analytical Application: Differentiate between key components and practical applications of ${topic} in real-world scenarios.
 3. Psychomotor / Affective Skill: Demonstrate active participation by correctly solving guided illustrative exercises and collaborating respectfully in group learning.`;
 

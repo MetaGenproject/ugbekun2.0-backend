@@ -5,6 +5,7 @@ const router = express.Router();
 
 // Public Authentication & Onboarding Routes
 router.post('/login', authController.login);
+router.post('/logout', authController.logout);
 router.post('/register', authController.register);
 router.get('/me', authController.getMe);
 router.post('/forgot-password', authController.forgotPassword);

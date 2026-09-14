@@ -3,6 +3,8 @@ const { testMyEduRideBridgeUnit } = require('./1-unit/myedurideBridge.unit.test'
 const { testStudentServiceUnit } = require('./1-unit/studentService.unit.test');
 const { testDomainAndCmsUnit } = require('./1-unit/domainAndCms.unit.test');
 const { testAttendanceRegisterUnit } = require('./1-unit/attendanceRegister.unit.test');
+const { testExamWindowUnit } = require('./1-unit/examWindow.unit.test');
+const { testCbtMarkRecordUnit } = require('./1-unit/cbtMarkRecord.unit.test');
 const { testAuthRbacIntegration } = require('./2-integration/auth_rbac.integration.test');
 const { testMultitenantIsolation } = require('./2-integration/multitenant_isolation.test');
 const { testFullEndpointsIntegration } = require('./2-integration/endpoints_full.integration.test');
@@ -41,6 +43,8 @@ async function main() {
   await recordStep('Unit: Student Service & Evaluation Matrices', testStudentServiceUnit);
   await recordStep('Unit: Domain Engine & Front-CMS Serialization', testDomainAndCmsUnit);
   await recordStep('Unit: Attendance Register Dates & Planning', testAttendanceRegisterUnit);
+  await recordStep('Unit: Exam Sitting Window', testExamWindowUnit);
+  await recordStep('Unit: CBT Marksheet Scaling', testCbtMarkRecordUnit);
 
   // TIER 2: INTEGRATION TESTS
   console.log('\n======================================================');

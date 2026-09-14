@@ -4,6 +4,7 @@ import prisma from '../../lib/prisma';
 import { resolveTenantByHost, normalizeHostname } from '../../lib/domainService';
 import { getOrCreateLandingPage, formatLandingPageResponse } from '../../lib/schoolCmsService';
 import { cacheGetOrSet } from '../../lib/cacheService';
+import { resolveDisplaySchoolName } from '../../lib/schoolDisplayName';
 
 /**
  * Helper to resolve branch from query or headers (Cached)
@@ -303,9 +304,16 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
           } else if (!branchId && decoded.role === 6) {
             const parentRecord = await prisma.parent.findFirst({
               where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
-              select: { branchId: true },
+              select: { id: true, branchId: true },
             });
-            branchId = parentRecord?.branchId || null;
+            const childRecord = parentRecord
+              ? await prisma.student.findFirst({
+                  where: { parentId: parentRecord.id, active: true },
+                  select: { branchId: true },
+                  orderBy: { id: 'asc' },
+                })
+              : null;
+            branchId = childRecord?.branchId || parentRecord?.branchId || null;
           } else if (!branchId && decoded.role === 3) {
             const teacherRecord = await prisma.teacher.findFirst({
               where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
@@ -346,7 +354,7 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
         branchId: branch?.id || 1,
         branchCode: branch?.code || 'UG',
         branchName: branch?.name || 'School Dashboard',
-        schoolName: settings?.schoolName || branch?.name || 'School Dashboard',
+        schoolName: resolveDisplaySchoolName(settings?.schoolName, branch?.name),
         tagline: settings?.tagline || branch?.landingPage?.heroSubtitle || 'Nurturing Excellence, Raising Leaders',
         address: settings?.address || branch?.address || '',
         phone: settings?.phone || branch?.phone || '',
