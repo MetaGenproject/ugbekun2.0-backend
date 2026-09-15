@@ -234,14 +234,19 @@ import {
   exportFinancePdf,
   getFeeGroups,
   createFeeGroup,
+  allocateFeeGroup,
   bulkDuesPost,
   bulkPaymentsPost,
   sendParentReminder,
   getCollectionsReport,
   getVoucherHeads,
   createVoucherHead,
+  updateVoucherHead,
+  archiveVoucherHead,
   getOfficeTransactions,
   createOfficeTransaction,
+  updateOfficeTransaction,
+  voidOfficeTransaction,
   getSchoolBank,
   updateSchoolBank,
 } from '../controllers/admin/adminFinanceController';
@@ -576,14 +581,19 @@ router.get('/finances/export/csv', exportFinanceCsv);
 router.get('/finances/export/pdf', exportFinancePdf);
 router.get('/finances/fee-groups', getFeeGroups);
 router.post('/finances/fee-groups', createFeeGroup);
+router.post('/finances/fee-groups/:id/allocate', allocateFeeGroup);
 router.post('/finances/bulk-dues-post', bulkDuesPost);
 router.post('/finances/bulk-payments-post', bulkPaymentsPost);
 router.post('/finances/send-parent-reminder', sendParentReminder);
 router.get('/finances/reports/collections', getCollectionsReport);
 router.get('/finances/voucher-heads', getVoucherHeads);
 router.post('/finances/voucher-heads', createVoucherHead);
+router.put('/finances/voucher-heads/:id', updateVoucherHead);
+router.post('/finances/voucher-heads/:id/archive', archiveVoucherHead);
 router.get('/finances/office-transactions', getOfficeTransactions);
 router.post('/finances/office-transactions', createOfficeTransaction);
+router.put('/finances/office-transactions/:id', updateOfficeTransaction);
+router.post('/finances/office-transactions/:id/void', voidOfficeTransaction);
 router.get('/finances/school-bank', getSchoolBank);
 router.post('/finances/school-bank', updateSchoolBank);
 router.put('/finances/school-bank', updateSchoolBank);

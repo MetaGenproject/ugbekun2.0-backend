@@ -333,7 +333,7 @@ export async function getComprehensiveReport(req: Request, res: Response): Promi
   try {
     const [officeTxs, payments, enrolls, allClasses, attendanceRecords, marks, libraryResources, libraryIssues, invoices] =
       await Promise.all([
-        prisma.officeTransaction.findMany({ where: { branchId: bid } }),
+        prisma.officeTransaction.findMany({ where: { branchId: bid, status: { not: 'VOIDED' } } }),
         prisma.payment.findMany({ where: { branchId: bid } }),
         prisma.enroll.findMany({
           where: { branchId: bid },

@@ -83,6 +83,7 @@ export async function getMultiBranchRevenueAnalytics(prisma: any, { sessionId, b
   const officeTransactions = await prisma.officeTransaction.findMany({
     where: {
       type: 'EXPENSE',
+      status: { not: 'VOIDED' },
       ...(branchId && !isNaN(parseInt(branchId as string, 10)) ? { branchId: parseInt(branchId as string, 10) } : {})
     },
     select: {

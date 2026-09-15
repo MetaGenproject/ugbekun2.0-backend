@@ -12,6 +12,132 @@ import {
   generateBatchClassInvoicesPdf,
 } from '../../lib/pdfService';
 
+function parseJsonIdList(raw: unknown): number[] {
+  let values: unknown[] = [];
+  if (Array.isArray(raw)) {
+    values = raw;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      values = Array.isArray(parsed) ? parsed : String(raw).split(',');
+    } catch {
+      values = String(raw).split(',');
+    }
+  }
+  return [...new Set(values.map((value) => Number(value)).filter((id) => Number.isInteger(id) && id > 0))];
+}
+
+async function activeSessionId(): Promise<number> {
+  const globalSetting = await prisma.globalSettings.findFirst();
+  return globalSetting?.sessionId || 5;
+}
+
+async function hydrateFeeGroups(branchId: number, groups: Array<{ feeTypeIds: string; classIds?: string | null } & Record<string, any>>) {
+  const typeIds = [...new Set(groups.flatMap((group) => parseJsonIdList(group.feeTypeIds)))];
+  const classIds = [...new Set(groups.flatMap((group) => parseJsonIdList(group.classIds)))];
+  const [types, classes] = await Promise.all([
+    typeIds.length
+      ? prisma.feeType.findMany({
+          where: { id: { in: typeIds }, branchId },
+          select: { id: true, name: true, code: true, amount: true, frequency: true },
+        })
+      : Promise.resolve([]),
+    classIds.length
+      ? prisma.class.findMany({
+          where: { id: { in: classIds } },
+          select: { id: true, name: true },
+        })
+      : Promise.resolve([]),
+  ]);
+  const typeMap = new Map(types.map((type) => [type.id, type]));
+  const classMap = new Map(classes.map((cls) => [cls.id, cls]));
+
+  return groups.map((group) => {
+    const feeTypeIds = parseJsonIdList(group.feeTypeIds);
+    const allocatedClassIds = parseJsonIdList(group.classIds);
+    const feeTypes = feeTypeIds.map((id) => typeMap.get(id)).filter(Boolean);
+    return {
+      ...group,
+      feeTypeIds,
+      classIds: allocatedClassIds,
+      feeTypes,
+      classes: allocatedClassIds.map((id) => classMap.get(id)).filter(Boolean),
+      totalAmount: feeTypes.reduce((sum, type: any) => sum + Number(type?.amount || 0), 0),
+    };
+  });
+}
+
+async function syncFeeGroupClassAssignments(args: {
+  branchId: number;
+  sessionId: number;
+  feeTypeIds: number[];
+  nextClassIds: number[];
+  previousClassIds: number[];
+  previousFeeTypeIds?: number[];
+}) {
+  const typeIds = [...new Set(args.feeTypeIds)];
+  const nextClassIds = [...new Set(args.nextClassIds)];
+  const previousClassIds = [...new Set(args.previousClassIds)];
+  const previousTypeIds = [...new Set(args.previousFeeTypeIds || [])];
+  const removedClassIds = previousClassIds.filter((id) => !nextClassIds.includes(id));
+  const retiredTypeIds = previousTypeIds.filter((id) => !typeIds.includes(id));
+  const affectedClassIds = [...new Set([...previousClassIds, ...nextClassIds])];
+
+  await prisma.$transaction(async (tx) => {
+    if (removedClassIds.length && (typeIds.length || previousTypeIds.length)) {
+      await tx.feeAssignment.deleteMany({
+        where: {
+          branchId: args.branchId,
+          sessionId: args.sessionId,
+          classId: { in: removedClassIds },
+          feeTypeId: { in: [...new Set([...typeIds, ...previousTypeIds])] },
+        },
+      });
+    }
+
+    if (retiredTypeIds.length && nextClassIds.length) {
+      await tx.feeAssignment.deleteMany({
+        where: {
+          branchId: args.branchId,
+          sessionId: args.sessionId,
+          classId: { in: nextClassIds },
+          feeTypeId: { in: retiredTypeIds },
+        },
+      });
+    }
+
+    if (!typeIds.length || !nextClassIds.length) return;
+
+    const existing = await tx.feeAssignment.findMany({
+      where: {
+        branchId: args.branchId,
+        sessionId: args.sessionId,
+        classId: { in: nextClassIds },
+        feeTypeId: { in: typeIds },
+      },
+      select: { classId: true, feeTypeId: true },
+    });
+    const have = new Set(existing.map((row) => `${row.classId}:${row.feeTypeId}`));
+    const toCreate = nextClassIds.flatMap((classId) =>
+      typeIds
+        .filter((feeTypeId) => !have.has(`${classId}:${feeTypeId}`))
+        .map((feeTypeId) => ({
+          feeTypeId,
+          classId,
+          branchId: args.branchId,
+          sessionId: args.sessionId,
+          isOptional: false,
+          active: true,
+        }))
+    );
+    if (toCreate.length) {
+      await tx.feeAssignment.createMany({ data: toCreate });
+    }
+  });
+
+  return { affectedClassIds, typeIds, classIds: nextClassIds };
+}
+
 /**
  * GET /api/admin/finances/overview
  */
@@ -1030,7 +1156,8 @@ export async function getFeeGroups(req: Request, res: Response): Promise<Respons
       where: { branchId },
       orderBy: { createdAt: 'desc' },
     });
-    return res.json({ success: true, data: groups });
+    const data = await hydrateFeeGroups(branchId, groups);
+    return res.json({ success: true, data });
   } catch (error: any) {
     console.error('[FINANCES] Fetch fee groups error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to fetch fee groups.' });
@@ -1044,23 +1171,123 @@ export async function createFeeGroup(req: Request, res: Response): Promise<Respo
   const branchId = req.branchId;
 
   try {
-    const { name, description, feeTypeIds, totalAmount } = req.body;
+    const { name, description, feeTypeIds, classIds, totalAmount } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Fee group name is required.' });
+
+    const typeIds = parseJsonIdList(feeTypeIds);
+    const allocatedClassIds = parseJsonIdList(classIds);
+    const types = typeIds.length
+      ? await prisma.feeType.findMany({
+          where: { id: { in: typeIds }, branchId, active: true },
+          select: { id: true, amount: true },
+        })
+      : [];
+    const validTypeIds = types.map((type) => type.id);
+    const computedTotal = types.reduce((sum, type) => sum + Number(type.amount), 0);
 
     const newGroup = await prisma.feeGroup.create({
       data: {
         branchId,
-        name,
+        name: String(name).trim(),
         description: description || null,
-        feeTypeIds: Array.isArray(feeTypeIds) ? JSON.stringify(feeTypeIds) : feeTypeIds || '[]',
-        totalAmount: totalAmount ? parseFloat(totalAmount) : 0,
+        feeTypeIds: JSON.stringify(validTypeIds),
+        classIds: JSON.stringify(allocatedClassIds),
+        totalAmount: totalAmount ? parseFloat(totalAmount) : computedTotal,
       },
     });
 
-    return res.json({ success: true, message: 'Fee Group created successfully.', data: newGroup });
+    if (allocatedClassIds.length && validTypeIds.length) {
+      const sessionId = await activeSessionId();
+      await syncFeeGroupClassAssignments({
+        branchId: branchId!,
+        sessionId,
+        feeTypeIds: validTypeIds,
+        nextClassIds: allocatedClassIds,
+        previousClassIds: [],
+      });
+    }
+
+    const [hydrated] = await hydrateFeeGroups(branchId, [newGroup]);
+    return res.json({
+      success: true,
+      message: allocatedClassIds.length
+        ? 'Fee group created and allocated to the selected classes.'
+        : 'Fee group created successfully.',
+      data: hydrated,
+    });
   } catch (error: any) {
     console.error('[FINANCES] Save fee group error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to save fee group.' });
+  }
+}
+
+/**
+ * POST /api/admin/finances/fee-groups/:id/allocate
+ * Allocate an existing fee group (its bundled types) to one or more classes.
+ */
+export async function allocateFeeGroup(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const groupId = Number(req.params.id);
+
+  try {
+    const group = await prisma.feeGroup.findFirst({
+      where: { id: groupId, branchId },
+    });
+    if (!group) {
+      return res.status(404).json({ success: false, message: 'Fee group not found.' });
+    }
+
+    const nextClassIds = parseJsonIdList(req.body?.classIds ?? req.body?.classId);
+    const typeIds = parseJsonIdList(req.body?.feeTypeIds ?? group.feeTypeIds);
+    if (!typeIds.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'This fee group has no fee types to allocate. Add types to the group first.',
+      });
+    }
+
+    const types = await prisma.feeType.findMany({
+      where: { id: { in: typeIds }, branchId, active: true },
+      select: { id: true, amount: true },
+    });
+    const validTypeIds = types.map((type) => type.id);
+    if (!validTypeIds.length) {
+      return res.status(400).json({ success: false, message: 'None of the bundled fee types are active in this school.' });
+    }
+
+    const previousClassIds = parseJsonIdList(group.classIds);
+    const previousFeeTypeIds = parseJsonIdList(group.feeTypeIds);
+    const sessionId = await activeSessionId();
+
+    await syncFeeGroupClassAssignments({
+      branchId: branchId!,
+      sessionId,
+      feeTypeIds: validTypeIds,
+      nextClassIds,
+      previousClassIds,
+      previousFeeTypeIds,
+    });
+
+    const updated = await prisma.feeGroup.update({
+      where: { id: group.id },
+      data: {
+        feeTypeIds: JSON.stringify(validTypeIds),
+        classIds: JSON.stringify(nextClassIds),
+        totalAmount: types.reduce((sum, type) => sum + Number(type.amount), 0),
+      },
+    });
+
+    const [hydrated] = await hydrateFeeGroups(branchId, [updated]);
+    return res.json({
+      success: true,
+      message: nextClassIds.length
+        ? `Fee group allocated to ${nextClassIds.length} class${nextClassIds.length === 1 ? '' : 'es'}.`
+        : 'Class allocation cleared for this fee group.',
+      data: hydrated,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Allocate fee group error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to allocate fee group.' });
   }
 }
 
@@ -1299,9 +1526,22 @@ export async function getVoucherHeads(req: Request, res: Response): Promise<Resp
   const branchId = req.branchId;
 
   try {
+    const { search, includeArchived } = (req.query || {}) as any;
+    const where: any = { branchId };
+    if (String(includeArchived || '') !== '1' && String(includeArchived || '').toLowerCase() !== 'true') {
+      where.active = true;
+    }
+    if (search && String(search).trim()) {
+      const q = String(search).trim();
+      where.OR = [
+        { name: { contains: q, mode: 'insensitive' } },
+        { description: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+
     const heads = await prisma.voucherHead.findMany({
-      where: { branchId },
-      orderBy: { name: 'asc' },
+      where,
+      orderBy: [{ active: 'desc' }, { name: 'asc' }],
     });
     return res.json({ success: true, data: heads });
   } catch (error: any) {
@@ -1323,9 +1563,10 @@ export async function createVoucherHead(req: Request, res: Response): Promise<Re
     const newHead = await prisma.voucherHead.create({
       data: {
         branchId,
-        name,
+        name: String(name).trim(),
         type: type || 'EXPENSE',
         description: description || null,
+        active: true,
       },
     });
 
@@ -1337,24 +1578,104 @@ export async function createVoucherHead(req: Request, res: Response): Promise<Re
 }
 
 /**
+ * PUT /api/admin/finances/voucher-heads/:id
+ */
+export async function updateVoucherHead(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.voucherHead.findFirst({ where: { id, branchId } });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Voucher head not found.' });
+    }
+
+    const { name, type, description } = req.body;
+    const updated = await prisma.voucherHead.update({
+      where: { id },
+      data: {
+        ...(name ? { name: String(name).trim() } : {}),
+        ...(type ? { type } : {}),
+        ...(description !== undefined ? { description: description || null } : {}),
+      },
+    });
+
+    return res.json({ success: true, message: 'Voucher head updated.', data: updated });
+  } catch (error: any) {
+    console.error('[FINANCES] Update voucher head error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update voucher head.' });
+  }
+}
+
+/**
+ * POST /api/admin/finances/voucher-heads/:id/archive
+ * Soft-archive so historical vouchers keep their category. Never hard-deletes.
+ */
+export async function archiveVoucherHead(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.voucherHead.findFirst({ where: { id, branchId } });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Voucher head not found.' });
+    }
+
+    const updated = await prisma.voucherHead.update({
+      where: { id },
+      data: { active: false },
+    });
+    return res.json({
+      success: true,
+      message: 'Voucher head archived. Existing vouchers are retained.',
+      data: updated,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Archive voucher head error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to archive voucher head.' });
+  }
+}
+
+/**
  * GET /api/admin/finances/office-transactions
  */
 export async function getOfficeTransactions(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
-    const { type } = (req.query || {}) as any;
+    const { type, search, status, includeVoided } = (req.query || {}) as any;
     const where: any = { branchId };
     if (type && type !== 'ALL') {
       where.type = type;
     }
+    const showVoided = String(includeVoided || '') === '1' || String(includeVoided || '').toLowerCase() === 'true';
+    if (status && status !== 'ALL') {
+      where.status = String(status).toUpperCase();
+    } else if (!showVoided) {
+      where.status = { not: 'VOIDED' };
+    }
+    if (search && String(search).trim()) {
+      const q = String(search).trim();
+      where.OR = [
+        { voucherHeadName: { contains: q, mode: 'insensitive' } },
+        { referenceNo: { contains: q, mode: 'insensitive' } },
+        { description: { contains: q, mode: 'insensitive' } },
+        { paymentMethod: { contains: q, mode: 'insensitive' } },
+      ];
+    }
 
     const txs = await prisma.officeTransaction.findMany({
       where,
-      orderBy: { transactionDate: 'desc' },
+      orderBy: [{ transactionDate: 'desc' }, { id: 'desc' }],
     });
 
-    return res.json({ success: true, data: txs });
+    return res.json({
+      success: true,
+      data: txs.map((tx) => ({
+        ...tx,
+        voucherNo: tx.referenceNo || `VCH-${String(tx.id).padStart(5, '0')}`,
+      })),
+    });
   } catch (error: any) {
     console.error('[FINANCES] Fetch office transactions error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to fetch office transactions.' });
@@ -1380,24 +1701,166 @@ export async function createOfficeTransaction(req: Request, res: Response): Prom
     } = req.body;
     if (!amount) return res.status(400).json({ success: false, message: 'Amount is required.' });
 
+    let headName = voucherHeadName || 'General';
+    let headId = voucherHeadId ? parseInt(voucherHeadId, 10) : null;
+    if (headId) {
+      const head = await prisma.voucherHead.findFirst({ where: { id: headId, branchId } });
+      if (head) headName = head.name;
+    } else if (voucherHeadName) {
+      const head = await prisma.voucherHead.findFirst({
+        where: { branchId, name: String(voucherHeadName), active: true },
+      });
+      if (head) headId = head.id;
+    }
+
     const newTx = await prisma.officeTransaction.create({
       data: {
         branchId,
         type: type || 'EXPENSE',
-        voucherHeadId: voucherHeadId ? parseInt(voucherHeadId, 10) : null,
-        voucherHeadName: voucherHeadName || 'General',
+        voucherHeadId: headId,
+        voucherHeadName: headName,
         amount: parseFloat(amount),
         paymentMethod: paymentMethod || 'Bank Transfer',
         transactionDate: transactionDate ? new Date(transactionDate) : new Date(),
-        referenceNo: referenceNo || `REF-${Date.now()}`,
+        referenceNo: referenceNo || null,
         description: description || null,
+        status: 'POSTED',
       },
     });
 
-    return res.json({ success: true, message: 'Office financial transaction recorded.', data: newTx });
+    const voucherNo = newTx.referenceNo || `VCH-${String(newTx.id).padStart(5, '0')}`;
+    if (!newTx.referenceNo) {
+      await prisma.officeTransaction.update({
+        where: { id: newTx.id },
+        data: { referenceNo: voucherNo },
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Voucher recorded and retained in the office register.',
+      data: { ...newTx, referenceNo: voucherNo, voucherNo },
+    });
   } catch (error: any) {
     console.error('[FINANCES] Create office transaction error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to record transaction.' });
+  }
+}
+
+/**
+ * PUT /api/admin/finances/office-transactions/:id
+ * Legitimate correction. Original amount is kept. Record is never deleted.
+ */
+export async function updateOfficeTransaction(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.officeTransaction.findFirst({ where: { id, branchId } });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Voucher not found.' });
+    }
+    if (existing.status === 'VOIDED') {
+      return res.status(400).json({ success: false, message: 'Voided vouchers cannot be edited. They are retained for audit.' });
+    }
+
+    const amendmentNote = String(req.body?.amendmentNote || req.body?.correctionNote || '').trim();
+    if (!amendmentNote) {
+      return res.status(400).json({
+        success: false,
+        message: 'Add a correction note so the change is retained on the voucher record.',
+      });
+    }
+
+    const {
+      type,
+      voucherHeadId,
+      voucherHeadName,
+      amount,
+      paymentMethod,
+      transactionDate,
+      referenceNo,
+      description,
+    } = req.body;
+
+    let headName = voucherHeadName !== undefined ? voucherHeadName : existing.voucherHeadName;
+    let headId = voucherHeadId !== undefined ? (voucherHeadId ? parseInt(voucherHeadId, 10) : null) : existing.voucherHeadId;
+    if (headId) {
+      const head = await prisma.voucherHead.findFirst({ where: { id: headId, branchId } });
+      if (head) headName = head.name;
+    }
+
+    const nextAmount = amount !== undefined && amount !== '' ? parseFloat(amount) : Number(existing.amount);
+    const originalAmount = existing.originalAmount != null ? existing.originalAmount : existing.amount;
+
+    const updated = await prisma.officeTransaction.update({
+      where: { id },
+      data: {
+        type: type || existing.type,
+        voucherHeadId: headId,
+        voucherHeadName: headName || existing.voucherHeadName,
+        amount: nextAmount,
+        originalAmount,
+        paymentMethod: paymentMethod || existing.paymentMethod,
+        transactionDate: transactionDate ? new Date(transactionDate) : existing.transactionDate,
+        referenceNo: referenceNo !== undefined ? referenceNo || existing.referenceNo : existing.referenceNo,
+        description: description !== undefined ? description || null : existing.description,
+        status: 'AMENDED',
+        amendmentNote,
+        amendedAt: new Date(),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Voucher corrected. The original record is retained.',
+      data: { ...updated, voucherNo: updated.referenceNo || `VCH-${String(updated.id).padStart(5, '0')}` },
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Update office transaction error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update voucher.' });
+  }
+}
+
+/**
+ * POST /api/admin/finances/office-transactions/:id/void
+ * Soft-void for retention. Never hard-deletes.
+ */
+export async function voidOfficeTransaction(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.officeTransaction.findFirst({ where: { id, branchId } });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Voucher not found.' });
+    }
+    if (existing.status === 'VOIDED') {
+      return res.status(400).json({ success: false, message: 'This voucher is already voided and retained.' });
+    }
+
+    const voidReason = String(req.body?.voidReason || req.body?.reason || '').trim();
+    if (!voidReason) {
+      return res.status(400).json({ success: false, message: 'A void reason is required so the record can be retained for audit.' });
+    }
+
+    const updated = await prisma.officeTransaction.update({
+      where: { id },
+      data: {
+        status: 'VOIDED',
+        voidedAt: new Date(),
+        voidReason,
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Voucher voided. The record is retained and excluded from live totals.',
+      data: { ...updated, voucherNo: updated.referenceNo || `VCH-${String(updated.id).padStart(5, '0')}` },
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Void office transaction error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to void voucher.' });
   }
 }
 

@@ -2130,6 +2130,7 @@ model FeeGroup {
   name        String
   description String?   @db.Text
   feeTypeIds  String    @default("[]") @map("fee_type_ids")
+  classIds    String    @default("[]") @map("class_ids")
   totalAmount Decimal   @default(0) @map("total_amount") @db.Decimal(18, 2)
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime? @updatedAt @map("updated_at")
@@ -2146,6 +2147,7 @@ model VoucherHead {
   name        String
   type        String    @default("EXPENSE")
   description String?   @db.Text
+  active      Boolean   @default(true)
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime? @updatedAt @map("updated_at")
 
@@ -2162,16 +2164,23 @@ model OfficeTransaction {
   voucherHeadId   Int?      @map("voucher_head_id")
   voucherHeadName String?   @map("voucher_head_name")
   amount          Decimal   @db.Decimal(18, 2)
+  originalAmount  Decimal?  @map("original_amount") @db.Decimal(18, 2)
   paymentMethod   String    @default("Bank Transfer") @map("payment_method")
   transactionDate DateTime  @default(now()) @map("transaction_date")
   referenceNo     String?   @map("reference_no")
   description     String?   @db.Text
+  status          String    @default("POSTED") // POSTED | AMENDED | VOIDED
+  amendmentNote   String?   @map("amendment_note") @db.Text
+  amendedAt       DateTime? @map("amended_at")
+  voidedAt        DateTime? @map("voided_at")
+  voidReason      String?   @map("void_reason") @db.Text
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime? @updatedAt @map("updated_at")
 
   branch Branch @relation(fields: [branchId], references: [id])
 
   @@index([branchId, type])
+  @@index([branchId, status])
   @@map("office_transactions")
 }
 
