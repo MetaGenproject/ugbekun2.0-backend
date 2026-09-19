@@ -204,12 +204,10 @@ export async function getOrCreateLandingPage(prisma: any, branchId: number) {
         showPortalLoginCta: true,
         showGallery: true,
         showAnnouncements: true,
-        socials: {
-          facebook: 'https://facebook.com',
-          instagram: 'https://instagram.com',
-          youtube: 'https://youtube.com',
-          twitter: 'https://twitter.com'
-        }
+        facebookUrl: 'https://facebook.com',
+        instagramUrl: 'https://instagram.com',
+        youtubeUrl: 'https://youtube.com',
+        twitterUrl: 'https://twitter.com'
       }
     });
   }
@@ -254,7 +252,12 @@ export function formatLandingPageResponse(branch: any, landingPage: any, customS
     showPortalLoginCta: landingPage.showPortalLoginCta ?? true,
     showGallery: landingPage.showGallery ?? true,
     showAnnouncements: landingPage.showAnnouncements ?? true,
-    socials: landingPage.socials || {},
+    socials: {
+      facebook: landingPage.facebookUrl || '',
+      instagram: landingPage.instagramUrl || '',
+      youtube: landingPage.youtubeUrl || '',
+      twitter: landingPage.twitterUrl || '',
+    },
     contact: {
       address: settings.address || 'Campus Education Boulevard',
       email: settings.email || 'admissions@school.edu.ng',
