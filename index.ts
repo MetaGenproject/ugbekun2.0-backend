@@ -36,6 +36,15 @@ function isAllowedCorsOrigin(origin: string) {
 
   if (allowedOrigins.has(origin)) return true;
 
+  // Allow any PipeOps deployment or preview domain (e.g. ugbekun-frontend.abj.pipeops.app)
+  if (/^https:\/\/([a-z0-9-]+\.)*pipeops\.app(:[0-9]+)?$/i.test(origin)) return true;
+
+  // Allow any Vercel deployment or preview domain
+  if (/^https:\/\/([a-z0-9-]+\.)*vercel\.app(:[0-9]+)?$/i.test(origin)) return true;
+
+  // Allow official Ugbekun apex and subdomain hosts
+  if (/^https?:\/\/([a-z0-9-]+\.)*ugbekun\.(com|edu\.ng)(:[0-9]+)?$/i.test(origin)) return true;
+
   if (process.env.NODE_ENV !== 'production') {
     return /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/i.test(origin);
   }

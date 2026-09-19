@@ -130,10 +130,6 @@ export async function getHomeworkDetail(req: Request, res: Response): Promise<Re
         dueDate: homework.dueDate,
         questions,
         submitted: !!submission,
-        score: submission?.score ?? null,
-        submissionScore: submission?.score ?? null,
-        submissionStatus: submission ? (submission.score !== null ? 'GRADED' : 'SUBMITTED') : 'PENDING',
-        feedback: submission?.feedback || null,
         submission,
       },
     });
