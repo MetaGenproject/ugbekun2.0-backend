@@ -3,17 +3,27 @@
  * Production-Grade Database Migration & Synchronization Script
  * Target Dump: database /ugbekunc_Saas_23rd_sept_2026.sql (1)
  * 
- * Ingests and synchronizes:
+ * Ingests and synchronizes all vital tables:
  * - Branches & System Settings
  * - Classes, Sections & Subjects
+ * - Sections Allocation (sections_allocation)
+ * - Subject Assign (subject_assign)
  * - Users & Auth (Role 1 Superadmin, Role 2 School Admin, Role 3 Teacher, Role 6 Parent, Role 7 Student)
  * - Teachers, Staff & Teacher Allocations
  * - Parents & Students
  * - Student Enrollments (enroll)
- * - Attendance records (student_attendance) & backfills Attendance Registers
- * - CA Questions & Question Groups (question_bank, question_groups)
- * - CA Marks & Exams (mark)
- * - Finance: Fee Types, Fee Groups, Invoices & Payments
+ * - Promotion History (promotion_history)
+ * - Student Attendance (student_attendance) & Attendance Registers
+ * - Staff Attendance (staff_attendance)
+ * - Timetable Slots (timetable_class)
+ * - Calendar Events (event)
+ * - Question Groups & CA Question Bank (question_groups, question_bank)
+ * - Examination Profiles & Exam Mark Distributions (exam, exam_mark_distribution)
+ * - Continuous Assessment (CA) Marks (mark)
+ * - Online Exams & Submissions (online_exam, online_exam_submitted)
+ * - Homework & Submissions (homework, homework_submit)
+ * - Finance: Fee Types, Fee Groups, Invoices (fee_allocation), Invoice Items & Payments (fee_payment_history)
+ * - Accounting: Voucher Heads & Office Transactions (voucher_head, transactions)
  * - PostgreSQL Sequence Resets for all tables
  * 
  * Usage:
@@ -92,6 +102,26 @@ function extractPrefixFromSetting(value) {
   const token = cleaned.split(/[\s/]+/).find(Boolean)
   if (!token) return null
   return token.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || null
+}
+
+function parseIdFromLegacyArray(val) {
+  if (!val) return null
+  const cleaned = String(val).replace(/[\[\]"']/g, '').trim()
+  if (!cleaned) return null
+  const first = cleaned.split(',')[0].trim()
+  const num = Number(first)
+  return isNaN(num) ? null : num
+}
+
+function parseDurationMinutes(timeStr) {
+  if (!timeStr) return 0
+  const parts = String(timeStr).split(':')
+  if (parts.length >= 2) {
+    const hours = Number(parts[0]) || 0
+    const mins = Number(parts[1]) || 0
+    return hours * 60 + mins
+  }
+  return Number(timeStr) || 0
 }
 
 async function syncAllSequences() {
@@ -217,6 +247,7 @@ async function main() {
       updatedAt: parseDate(c.updated_at),
     }))
   const validClassIds = new Set(classRows.map((c) => c.id))
+  const classBranchById = new Map(classRows.map((c) => [c.id, c.branchId]))
 
   const rawSections = mapRows(sql, 'section', ['id', 'name', 'capacity', 'branch_id'])
   const sectionRows = rawSections
@@ -228,6 +259,22 @@ async function main() {
       branchId: s.branch_id,
     }))
   const validSectionIds = new Set(sectionRows.map((s) => s.id))
+
+  // Sections Allocation
+  console.log('-> Parsing Sections Allocation...')
+  const rawSectionsAllocation = mapRows(sql, 'sections_allocation', ['id', 'class_id', 'section_id'])
+  const seenClassSection = new Set()
+  const sectionsAllocationRows = []
+  for (const sa of rawSectionsAllocation) {
+    if (!validClassIds.has(sa.class_id) || !validSectionIds.has(sa.section_id)) continue
+    const key = `${sa.class_id}:${sa.section_id}`
+    if (seenClassSection.has(key)) continue
+    seenClassSection.add(key)
+    sectionsAllocationRows.push({
+      classId: sa.class_id,
+      sectionId: sa.section_id,
+    })
+  }
 
   // 3. Subjects
   console.log('-> Parsing Subjects...')
@@ -292,6 +339,30 @@ async function main() {
       sectionId: a.section_id,
       sessionId: Number(a.session_id) || 1,
       branchId: a.branch_id,
+    }))
+
+  // Subject Assign (subject_assign)
+  console.log('-> Parsing Subject Assign...')
+  const rawSubjectAssign = mapRows(sql, 'subject_assign', [
+    'id', 'class_id', 'section_id', 'subject_id', 'teacher_id', 'branch_id', 'session_id', 'created_at', 'updated_at'
+  ])
+  const subjectAssignRows = rawSubjectAssign
+    .filter((sa) => (
+      sa.branch_id && branchIds.has(sa.branch_id) &&
+      validClassIds.has(sa.class_id) &&
+      validSectionIds.has(sa.section_id) &&
+      validSubjectIds.has(sa.subject_id)
+    ))
+    .map((sa) => ({
+      id: sa.id,
+      classId: sa.class_id,
+      sectionId: sa.section_id,
+      subjectId: sa.subject_id,
+      teacherId: sa.teacher_id && validTeacherIds.has(sa.teacher_id) ? sa.teacher_id : null,
+      branchId: sa.branch_id,
+      sessionId: Number(sa.session_id) || 1,
+      createdAt: parseDate(sa.created_at) || new Date(),
+      updatedAt: parseDate(sa.updated_at),
     }))
 
   // 5. Parents & Students
@@ -407,9 +478,29 @@ async function main() {
       enrollById.set(e.id, row)
       return row
     })
-  const validEnrollIds = new Set(enrollRows.map((e) => e.id))
 
-  // 7. Attendance
+  // Promotion History (promotion_history)
+  console.log('-> Parsing Promotion History...')
+  const rawPromotion = mapRows(sql, 'promotion_history', [
+    'id', 'student_id', 'pre_class', 'pre_section', 'pre_session', 'pro_class', 'pro_section', 'pro_session', 'prev_due', 'is_leave', 'date'
+  ])
+  const defaultClassId = classRows[0]?.id || 1
+  const defaultSectionId = sectionRows[0]?.id || 1
+  const promotionHistoryRows = rawPromotion
+    .filter((ph) => validStudentIds.has(ph.student_id))
+    .map((ph) => ({
+      id: ph.id,
+      studentId: ph.student_id,
+      fromClassId: validClassIds.has(ph.pre_class) ? ph.pre_class : defaultClassId,
+      fromSectionId: validSectionIds.has(ph.pre_section) ? ph.pre_section : defaultSectionId,
+      toClassId: validClassIds.has(ph.pro_class) ? ph.pro_class : defaultClassId,
+      toSectionId: validSectionIds.has(ph.pro_section) ? ph.pro_section : defaultSectionId,
+      promotedBy: 1,
+      sessionId: Number(ph.pro_session) || Number(ph.pre_session) || 1,
+      promotedAt: parseDate(ph.date) || new Date(),
+    }))
+
+  // 7. Student Attendance
   console.log('-> Parsing Student Attendance...')
   const rawAttendance = mapRows(sql, 'student_attendance', [
     'id', 'enroll_id', 'date', 'status', 'remark', 'branch_id', 'created_at', 'updated_at'
@@ -445,56 +536,172 @@ async function main() {
     })
   }
 
-  // 8. Questions & Question Groups (CA Test Bank)
-  console.log('-> Parsing CA Questions & Question Groups...')
-  const rawGroups = mapRows(sql, 'question_group', ['id', 'name', 'branch_id'])
-  const questionGroupRows = rawGroups
-    .filter((g) => g.branch_id && branchIds.has(g.branch_id))
-    .map((g) => {
-      const bSubjects = subjectRows.filter((s) => s.branchId === g.branch_id)
+  // Staff Attendance (staff_attendance)
+  console.log('-> Parsing Staff Attendance...')
+  const rawStaffAttendance = mapRows(sql, 'staff_attendance', [
+    'id', 'staff_id', 'status', 'remark', 'date', 'branch_id'
+  ])
+  const STAFF_STATUS_MAP = { P: 'PRESENT', A: 'ABSENT', L: 'LATE', H: 'ON_LEAVE', '': 'PRESENT' }
+  const seenStaffAttKey = new Set()
+  const staffAttendanceRows = []
+  for (const sa of rawStaffAttendance) {
+    if (!validTeacherIds.has(sa.staff_id)) continue
+    const dateParsed = parseDate(sa.date)
+    if (!dateParsed) continue
+    const tRow = teacherRows.find((t) => t.id === sa.staff_id)
+    const bid = sa.branch_id && branchIds.has(sa.branch_id) ? sa.branch_id : tRow?.branchId
+    if (!bid) continue
+
+    const utcDate = new Date(Date.UTC(dateParsed.getUTCFullYear(), dateParsed.getUTCMonth(), dateParsed.getUTCDate()))
+    const key = `${sa.staff_id}-${utcDate.toISOString().split('T')[0]}`
+    if (seenStaffAttKey.has(key)) continue
+    seenStaffAttKey.add(key)
+
+    const code = String(sa.status || 'P').trim().toUpperCase()
+    staffAttendanceRows.push({
+      id: sa.id,
+      teacherId: sa.staff_id,
+      attendanceDate: utcDate,
+      status: STAFF_STATUS_MAP[code] || 'PRESENT',
+      remark: sa.remark ? String(sa.remark) : null,
+      branchId: bid,
+      createdAt: new Date(),
+      updatedAt: null,
+    })
+  }
+
+  // Timetable Slots (timetable_class)
+  console.log('-> Parsing Timetable Slots...')
+  const rawTimetable = mapRows(sql, 'timetable_class', [
+    'id', 'class_id', 'section_id', 'break', 'subject_id', 'teacher_id', 'class_room', 'time_start', 'time_end', 'day', 'session_id', 'branch_id'
+  ])
+  const timetableSlotRows = rawTimetable
+    .filter((tt) => {
+      const bid = tt.branch_id && branchIds.has(tt.branch_id) ? tt.branch_id : classBranchById.get(tt.class_id)
+      return validClassIds.has(tt.class_id) && bid && branchIds.has(bid)
+    })
+    .map((tt) => {
+      const bid = tt.branch_id && branchIds.has(tt.branch_id) ? tt.branch_id : classBranchById.get(tt.class_id)
+      const dayRaw = String(tt.day || 'MONDAY').trim().toUpperCase()
+      const isBreak = tt.break === '1' || tt.break === 'true'
       return {
-        id: g.id,
-        title: g.name || `Question Group ${g.id}`,
-        groupCode: `QGRP-${g.id}`,
-        totalMarks: 100,
-        subjectId: bSubjects[0]?.id || [...validSubjectIds][0] || 1,
-        branchId: g.branch_id,
+        id: tt.id,
+        dayOfWeek: dayRaw,
+        startTime: tt.time_start ? String(tt.time_start).slice(0, 5) : '08:00',
+        endTime: tt.time_end ? String(tt.time_end).slice(0, 5) : '08:45',
+        type: isBreak ? 'BREAK' : 'SUBJECT',
+        title: tt.class_room ? String(tt.class_room).trim() : null,
+        classId: tt.class_id,
+        sectionId: tt.section_id && validSectionIds.has(tt.section_id) ? tt.section_id : null,
+        subjectId: tt.subject_id && validSubjectIds.has(tt.subject_id) ? tt.subject_id : null,
+        teacherId: tt.teacher_id && validTeacherIds.has(tt.teacher_id) ? tt.teacher_id : null,
+        branchId: bid,
+        sessionId: Number(tt.session_id) || null,
+        isPublished: true,
         createdAt: new Date(),
+        updatedAt: null,
       }
     })
-  const validGroupIds = new Set(questionGroupRows.map((g) => g.id))
 
+  // Events & Calendar (event)
+  console.log('-> Parsing Events...')
+  const rawEvents = mapRows(sql, 'event', [
+    'id', 'title', 'remark', 'status', 'type', 'audition', 'selected_list', 'start_date', 'end_date', 'image', 'created_by', 'session_id', 'created_at', 'updated_at', 'branch_id', 'show_web'
+  ])
+  const eventRows = rawEvents.map((e) => {
+    const sDate = parseDate(e.start_date) || parseDate(e.created_at) || new Date()
+    const eDate = parseDate(e.end_date)
+    const typeStr = String(e.type || '').toLowerCase()
+    return {
+      id: e.id,
+      title: e.title ? String(e.title).trim() : `Event ${e.id}`,
+      description: e.remark ? String(e.remark).trim() : null,
+      startDate: sDate,
+      endDate: eDate,
+      kind: typeStr === 'holiday' ? 'HOLIDAY' : 'EVENT',
+      branchId: e.branch_id && branchIds.has(e.branch_id) ? e.branch_id : null,
+      sessionId: Number(e.session_id) || null,
+      createdAt: parseDate(e.created_at) || new Date(),
+      updatedAt: parseDate(e.updated_at),
+    }
+  })
+
+  // 8. Questions & Question Groups (CA Test Bank)
+  console.log('-> Parsing CA Questions & Question Groups...')
   const rawQuestions = mapRows(sql, 'questions', [
     'id', 'type', 'level', 'class_id', 'section_id', 'subject_id', 'group_id', 'question',
     'opt_1', 'opt_2', 'opt_3', 'opt_4', 'answer', 'mark', 'branch_id', 'created_by', 'created_at', 'updated_at'
   ])
 
-  const questionBankRows = rawQuestions
-    .filter((q) => q.branch_id && branchIds.has(q.branch_id) && validSubjectIds.has(q.subject_id))
-    .map((q) => {
-      const opts = [q.opt_1, q.opt_2, q.opt_3, q.opt_4].filter((opt) => opt !== null && opt !== undefined && String(opt).trim() !== '')
+  const branchDefaultSubjectMap = new Map()
+  for (const s of subjectRows) {
+    if (!branchDefaultSubjectMap.has(s.branchId)) {
+      branchDefaultSubjectMap.set(s.branchId, s.id)
+    }
+  }
+
+  const groupSubjectMap = new Map()
+  const groupClassMap = new Map()
+  for (const q of rawQuestions) {
+    if (q.group_id && q.subject_id && validSubjectIds.has(q.subject_id)) {
+      if (!groupSubjectMap.has(q.group_id)) groupSubjectMap.set(q.group_id, q.subject_id)
+    }
+    if (q.group_id && q.class_id && validClassIds.has(q.class_id)) {
+      if (!groupClassMap.has(q.group_id)) groupClassMap.set(q.group_id, q.class_id)
+    }
+  }
+
+  const rawGroups = mapRows(sql, 'question_group', ['id', 'name', 'branch_id'])
+  const questionGroupRows = rawGroups
+    .filter((g) => g.branch_id && branchIds.has(g.branch_id))
+    .map((g) => {
+      const fallbackSubject = branchDefaultSubjectMap.get(g.branch_id) || [...validSubjectIds][0]
+      const subId = groupSubjectMap.get(g.id) || fallbackSubject
       return {
-        id: q.id,
-        questionText: q.question || 'Question content',
-        questionType: Number(q.type) === 1 ? 'mcq' : 'theory',
-        options: opts.length ? opts : null,
-        correctOption: q.answer ? String(q.answer).replace(/[\[\]"']/g, '') : null,
-        marks: parseFloat(q.mark) || 1.0,
-        subjectId: q.subject_id,
-        classId: validClassIds.has(q.class_id) ? q.class_id : null,
-        branchId: q.branch_id,
-        difficulty: Number(q.level) === 1 ? 'easy' : Number(q.level) === 2 ? 'medium' : 'hard',
-        status: 'APPROVED',
-        createdAt: parseDate(q.created_at) || new Date(),
-        updatedAt: parseDate(q.updated_at),
+        id: g.id,
+        title: g.name || `Question Group ${g.id}`,
+        groupCode: `QGRP-${g.id}`,
+        subjectId: subId,
+        classId: groupClassMap.get(g.id) || null,
+        branchId: g.branch_id,
+        questionIds: [],
+        totalMarks: 100,
       }
     })
+    .filter((g) => g.subjectId && validSubjectIds.has(g.subjectId))
+  const validGroupIds = new Set(questionGroupRows.map((g) => g.id))
 
-  // 9. Examination Configurations (exam) & Missing Stub Synthesis
-  console.log('-> Parsing Examination Configurations (exam)...')
+  const questionBankRows = rawQuestions
+    .filter((q) => q.branch_id && branchIds.has(q.branch_id) && validSubjectIds.has(q.subject_id))
+    .map((q) => ({
+      id: q.id,
+      questionText: q.question || 'Untitled Question',
+      questionType: 'mcq',
+      options: [q.opt_1, q.opt_2, q.opt_3, q.opt_4].filter(Boolean),
+      correctOption: String(q.answer || '1'),
+      marks: Number(q.mark) || 1.0,
+      subjectId: q.subject_id,
+      classId: q.class_id && validClassIds.has(q.class_id) ? q.class_id : null,
+      branchId: q.branch_id,
+      status: 'APPROVED',
+      createdAt: parseDate(q.created_at) || new Date(),
+      updatedAt: parseDate(q.updated_at),
+    }))
+
+  // 9. Exams & Exam Mark Distribution
+  console.log('-> Parsing Examination Profiles & Mark Distributions...')
+  const rawExamMarkDist = mapRows(sql, 'exam_mark_distribution', ['id', 'name', 'branch_id'])
+  const examMarkDistributionRows = rawExamMarkDist.map((emd) => ({
+    id: emd.id,
+    name: emd.name || `Mark Distribution ${emd.id}`,
+    branchId: emd.branch_id && branchIds.has(emd.branch_id) ? emd.branch_id : null,
+  }))
+
   const rawExams = mapRows(sql, 'exam', [
-    'id', 'name', 'term_id', 'type_id', 'session_id', 'branch_id', 'remark', 'mark_distribution', 'status', 'publish_result', 'resumption_date', 'rank_generated', 'created_at', 'updated_at'
+    'id', 'name', 'term_id', 'type_id', 'session_id', 'branch_id', 'remark', 'mark_distribution',
+    'status', 'publish_result', 'resumption_date', 'rank_generated', 'created_at', 'updated_at'
   ])
+
   const examMap = new Map()
   for (const e of rawExams) {
     examMap.set(e.id, {
@@ -521,7 +728,6 @@ async function main() {
     'id', 'student_id', 'subject_id', 'class_id', 'section_id', 'exam_id', 'mark', 'absent', 'session_id', 'branch_id'
   ])
 
-  // Ensure all exam_ids referenced in mark exist in examMap to avoid foreign key failure
   for (const m of rawMarks) {
     if (m.exam_id && !examMap.has(m.exam_id)) {
       examMap.set(m.exam_id, {
@@ -558,7 +764,97 @@ async function main() {
       branchId: m.branch_id,
     }))
 
-  // 11. Finance & Fees
+  // 11. Online Exams & Submissions
+  console.log('-> Parsing Online Exams & Submissions...')
+  const rawOnlineExams = mapRows(sql, 'online_exam', [
+    'id', 'title', 'class_id', 'section_id', 'subject_id', 'limits_participation', 'exam_start', 'exam_end', 'duration', 'mark_type', 'passing_mark', 'instruction', 'session_id', 'publish_result', 'marks_display', 'neg_mark', 'question_type', 'publish_status', 'exam_type', 'fee', 'created_by', 'position_generated', 'branch_id', 'created_at', 'updated_at'
+  ])
+  const onlineExamRows = []
+  for (const oe of rawOnlineExams) {
+    const subId = parseIdFromLegacyArray(oe.subject_id)
+    if (!validClassIds.has(oe.class_id) || !subId || !validSubjectIds.has(subId) || !branchIds.has(oe.branch_id)) {
+      continue
+    }
+    onlineExamRows.push({
+      id: oe.id,
+      title: oe.title ? String(oe.title).trim() : `Online Exam ${oe.id}`,
+      classId: oe.class_id,
+      subjectId: subId,
+      passingMark: Number(oe.passing_mark) || 0,
+      duration: parseDurationMinutes(oe.duration),
+      branchId: oe.branch_id,
+      sessionId: Number(oe.session_id) || 1,
+      questions: null,
+      examDate: parseDate(oe.exam_start),
+      createdAt: parseDate(oe.created_at) || new Date(),
+      updatedAt: parseDate(oe.updated_at),
+    })
+  }
+  const validOnlineExamIds = new Set(onlineExamRows.map((e) => e.id))
+
+  const rawOnlineSubmissions = mapRows(sql, 'online_exam_submitted', [
+    'id', 'student_id', 'online_exam_id', 'remark', 'position', 'created_at'
+  ])
+  const onlineExamSubmissionRows = rawOnlineSubmissions
+    .filter((s) => validStudentIds.has(s.student_id) && validOnlineExamIds.has(s.online_exam_id))
+    .map((s) => ({
+      id: s.id,
+      studentId: s.student_id,
+      onlineExamId: s.online_exam_id,
+      totalMark: null,
+      answers: s.remark ? { remark: s.remark } : null,
+      submittedAt: parseDate(s.created_at) || new Date(),
+      createdAt: parseDate(s.created_at) || new Date(),
+      updatedAt: null,
+    }))
+
+  // 12. Homework & Submissions
+  console.log('-> Parsing Homework & Submissions...')
+  const rawHomework = mapRows(sql, 'homework', [
+    'id', 'class_id', 'section_id', 'session_id', 'subject_id', 'date_of_homework', 'date_of_submission', 'description', 'created_by', 'create_date', 'status', 'sms_notification', 'schedule_date', 'document', 'evaluation_date', 'evaluated_by', 'branch_id'
+  ])
+  const homeworkRows = rawHomework
+    .filter((hw) => validClassIds.has(hw.class_id) && validSubjectIds.has(hw.subject_id) && branchIds.has(hw.branch_id))
+    .map((hw) => {
+      const cleanDesc = (hw.description || '').replace(/<[^>]*>?/gm, '').trim()
+      const title = cleanDesc.slice(0, 60) || `Homework ${hw.id}`
+      return {
+        id: hw.id,
+        title,
+        description: hw.description || null,
+        classId: hw.class_id,
+        subjectId: hw.subject_id,
+        dueDate: parseDate(hw.date_of_submission) || new Date(),
+        branchId: hw.branch_id,
+        sessionId: Number(hw.session_id) || 1,
+        questions: null,
+        questionBankIds: null,
+        termName: null,
+        createdById: hw.created_by && validTeacherIds.has(hw.created_by) ? hw.created_by : null,
+        createdByRole: 'TEACHER',
+        createdAt: parseDate(hw.create_date) || new Date(),
+        updatedAt: null,
+      }
+    })
+  const validHomeworkIds = new Set(homeworkRows.map((h) => h.id))
+
+  const rawHomeworkSubmissions = mapRows(sql, 'homework_submit', [
+    'id', 'homework_id', 'student_id', 'message', 'enc_name', 'file_name', 'created_at'
+  ])
+  const homeworkSubmissionRows = rawHomeworkSubmissions
+    .filter((hs) => validHomeworkIds.has(hs.homework_id) && validStudentIds.has(hs.student_id))
+    .map((hs) => ({
+      id: hs.id,
+      homeworkId: hs.homework_id,
+      studentId: hs.student_id,
+      answers: { message: hs.message || '', encName: hs.enc_name || null, fileName: hs.file_name || null },
+      score: null,
+      feedback: null,
+      createdAt: parseDate(hs.created_at) || new Date(),
+      updatedAt: null,
+    }))
+
+  // 13. Finance: Fee Types, Fee Groups, Invoices & Payments
   console.log('-> Parsing Fees, Invoices & Payments...')
   const rawFeeTypes = mapRows(sql, 'fees_type', ['id', 'name', 'fee_code', 'description', 'branch_id', 'system', 'created_at'])
   const feeTypeSeenKey = new Set()
@@ -583,6 +879,171 @@ async function main() {
         createdAt: parseDate(ft.created_at) || new Date(),
       }
     })
+  const validFeeTypeIds = new Set(feeTypeRows.map((f) => f.id))
+  const feeTypeNameById = new Map(feeTypeRows.map((f) => [f.id, f.name]))
+
+  // Fee Groups
+  const rawFeeGroups = mapRows(sql, 'fee_groups', ['id', 'name', 'description', 'session_id', 'system', 'branch_id', 'created_at'])
+  const rawFeeGroupDetails = mapRows(sql, 'fee_groups_details', ['id', 'fee_groups_id', 'fee_type_id', 'amount', 'due_date', 'created_at'])
+  const feeGroupDetailsByGroupId = new Map()
+  for (const fgd of rawFeeGroupDetails) {
+    if (!feeGroupDetailsByGroupId.has(fgd.fee_groups_id)) {
+      feeGroupDetailsByGroupId.set(fgd.fee_groups_id, [])
+    }
+    feeGroupDetailsByGroupId.get(fgd.fee_groups_id).push(fgd)
+  }
+
+  const feeGroupRows = rawFeeGroups
+    .filter((fg) => fg.branch_id && branchIds.has(fg.branch_id))
+    .map((fg) => {
+      const details = feeGroupDetailsByGroupId.get(fg.id) || []
+      const total = details.reduce((sum, d) => sum + (Number(d.amount) || 0), 0)
+      const typeIds = details.map((d) => d.fee_type_id)
+      return {
+        id: fg.id,
+        branchId: fg.branch_id,
+        name: fg.name || `Fee Group ${fg.id}`,
+        description: fg.description || null,
+        feeTypeIds: JSON.stringify(typeIds),
+        classIds: '[]',
+        totalAmount: total,
+        createdAt: parseDate(fg.created_at) || new Date(),
+        updatedAt: null,
+      }
+    })
+  const feeGroupNameById = new Map(feeGroupRows.map((g) => [g.id, g.name]))
+
+  // Fee Allocations -> Invoices
+  const rawFeeAllocations = mapRows(sql, 'fee_allocation', [
+    'id', 'student_id', 'group_id', 'branch_id', 'session_id', 'prev_due', 'created_at'
+  ])
+  const rawFeePayments = mapRows(sql, 'fee_payment_history', [
+    'id', 'allocation_id', 'type_id', 'transport_fee_details_id', 'collect_by', 'amount', 'discount', 'fine', 'pay_via', 'remarks', 'date'
+  ])
+
+  const paymentsByAllocId = new Map()
+  for (const p of rawFeePayments) {
+    if (!paymentsByAllocId.has(p.allocation_id)) {
+      paymentsByAllocId.set(p.allocation_id, [])
+    }
+    paymentsByAllocId.get(p.allocation_id).push(p)
+  }
+
+  const invoiceRows = []
+  const invoiceItemRows = []
+  const validInvoiceIds = new Set()
+
+  for (const fa of rawFeeAllocations) {
+    if (!branchIds.has(fa.branch_id) || !validStudentIds.has(fa.student_id)) continue
+
+    const gDetails = feeGroupDetailsByGroupId.get(fa.group_id) || []
+    const groupTotal = gDetails.reduce((sum, d) => sum + (Number(d.amount) || 0), 0)
+    const prevDue = Number(fa.prev_due) || 0
+    const totalAmount = Math.max(0, groupTotal + prevDue)
+
+    const allocPayments = paymentsByAllocId.get(fa.id) || []
+    const paidAmount = allocPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0)
+    const balanceAmount = Math.max(0, totalAmount - paidAmount)
+    const status = paidAmount >= totalAmount && totalAmount > 0 ? 'paid' : (paidAmount > 0 ? 'partial' : 'unpaid')
+
+    invoiceRows.push({
+      id: fa.id,
+      invoiceNo: `INV-${String(fa.id).padStart(6, '0')}`,
+      termLabel: feeGroupNameById.get(fa.group_id) || 'Term Fee',
+      totalAmount,
+      paidAmount,
+      balanceAmount,
+      status,
+      dueDate: gDetails[0]?.due_date ? parseDate(gDetails[0].due_date) : null,
+      issuedAt: parseDate(fa.created_at) || new Date(),
+      createdAt: parseDate(fa.created_at) || new Date(),
+      updatedAt: null,
+      studentId: fa.student_id,
+      branchId: fa.branch_id,
+      sessionId: Number(fa.session_id) || 1,
+    })
+    validInvoiceIds.add(fa.id)
+
+    for (const d of gDetails) {
+      if (!validFeeTypeIds.has(d.fee_type_id)) continue
+      invoiceItemRows.push({
+        invoiceId: fa.id,
+        feeTypeId: d.fee_type_id,
+        description: feeTypeNameById.get(d.fee_type_id) || 'Fee Item',
+        amount: Number(d.amount) || 0,
+        createdAt: parseDate(d.created_at) || new Date(),
+      })
+    }
+  }
+
+  const invoiceBranchMap = new Map(invoiceRows.map((inv) => [inv.id, inv.branchId]))
+
+  // Payments
+  const paymentRows = []
+  for (const p of rawFeePayments) {
+    if (!validInvoiceIds.has(p.allocation_id)) continue
+    const amt = Math.abs(Number(p.amount) || 0)
+    if (amt === 0) continue
+    const method = p.pay_via === '15' ? 'pos' : (p.pay_via === '1' ? 'cash' : 'bank_transfer')
+    paymentRows.push({
+      id: p.id,
+      invoiceId: p.allocation_id,
+      branchId: invoiceBranchMap.get(p.allocation_id),
+      amount: amt,
+      method,
+      reference: p.remarks ? String(p.remarks).slice(0, 100) : null,
+      receivedBy: Number(p.collect_by) || null,
+      notes: p.remarks || null,
+      paidAt: parseDate(p.date) || new Date(),
+      createdAt: parseDate(p.date) || new Date(),
+    })
+  }
+
+  // 14. Voucher Heads & Transactions
+  console.log('-> Parsing Voucher Heads & Transactions...')
+  const rawVoucherHeads = mapRows(sql, 'voucher_head', ['id', 'name', 'type', 'system', 'branch_id'])
+  const voucherHeadRows = rawVoucherHeads
+    .filter((vh) => vh.branch_id && branchIds.has(vh.branch_id))
+    .map((vh) => ({
+      id: vh.id,
+      branchId: vh.branch_id,
+      name: vh.name || `Head ${vh.id}`,
+      type: String(vh.type || 'EXPENSE').toUpperCase(),
+      description: null,
+      active: true,
+      createdAt: new Date(),
+      updatedAt: null,
+    }))
+  const validVoucherHeadIds = new Set(voucherHeadRows.map((v) => v.id))
+  const voucherHeadNameById = new Map(voucherHeadRows.map((v) => [v.id, v.name]))
+
+  const rawTransactions = mapRows(sql, 'transactions', [
+    'id', 'account_id', 'voucher_head_id', 'type', 'category', 'ref', 'amount', 'dr', 'cr', 'bal', 'date', 'pay_via', 'description', 'attachments', 'branch_id', 'system', 'created_at', 'updated_at'
+  ])
+  const officeTransactionRows = rawTransactions
+    .filter((t) => t.branch_id && branchIds.has(t.branch_id))
+    .map((t) => {
+      const vhId = validVoucherHeadIds.has(t.voucher_head_id) ? t.voucher_head_id : null
+      const vhName = vhId ? voucherHeadNameById.get(vhId) : null
+      const amt = Number(t.amount) || Number(t.dr) || Number(t.cr) || 0
+      const payMethod = t.pay_via === '1' ? 'Cash' : (t.pay_via === '4' ? 'POS' : 'Bank Transfer')
+      return {
+        id: t.id,
+        branchId: t.branch_id,
+        type: String(t.type || 'EXPENSE').toUpperCase(),
+        voucherHeadId: vhId,
+        voucherHeadName: vhName,
+        amount: amt,
+        originalAmount: amt,
+        paymentMethod: payMethod,
+        transactionDate: parseDate(t.date) || parseDate(t.created_at) || new Date(),
+        referenceNo: t.ref ? String(t.ref).slice(0, 100) : null,
+        description: t.description ? String(t.description) : null,
+        status: 'POSTED',
+        createdAt: parseDate(t.created_at) || new Date(),
+        updatedAt: parseDate(t.updated_at),
+      }
+    })
 
   // Summary Report
   console.log('\n========================================================================')
@@ -591,21 +1052,38 @@ async function main() {
   console.log(`  1. Branches:                 ${branchRows.length}`)
   console.log(`  2. Classes:                  ${classRows.length}`)
   console.log(`  3. Sections:                 ${sectionRows.length}`)
-  console.log(`  4. Subjects:                 ${subjectRows.length}`)
-  console.log(`  5. User Accounts (All Roles): ${userRows.length}`)
+  console.log(`  4. Sections Allocation:      ${sectionsAllocationRows.length}`)
+  console.log(`  5. Subjects:                 ${subjectRows.length}`)
+  console.log(`  6. Subject Assign:           ${subjectAssignRows.length}`)
+  console.log(`  7. User Accounts (All Roles): ${userRows.length}`)
   console.log(`     - Superadmins:            ${credByRole(1).length}`)
   console.log(`     - School Admins:          ${branchAdmins.length}`)
   console.log(`     - Teachers:               ${teacherRows.length}`)
   console.log(`     - Parents:                ${parentRows.length}`)
   console.log(`     - Students:               ${studentRows.length}`)
-  console.log(`  6. Teacher Allocations:      ${teacherAllocationRows.length}`)
-  console.log(`  7. Student Enrollments:      ${enrollRows.length}`)
-  console.log(`  8. Student Attendance Rows:  ${attendanceRows.length}`)
-  console.log(`  9. Examination Profiles:     ${examRows.length} (${rawExams.length} explicit, ${examRows.length - rawExams.length} synthesized)`)
-  console.log(` 10. CA Question Bank:         ${questionBankRows.length}`)
-  console.log(` 11. Question Groups:          ${questionGroupRows.length}`)
-  console.log(` 12. CA Student Marks:         ${markRows.length}`)
-  console.log(` 13. Fee Heads:                ${feeTypeRows.length}`)
+  console.log(`  8. Teacher Allocations:      ${teacherAllocationRows.length}`)
+  console.log(`  9. Student Enrollments:      ${enrollRows.length}`)
+  console.log(` 10. Promotion History:        ${promotionHistoryRows.length}`)
+  console.log(` 11. Student Attendance Rows:  ${attendanceRows.length}`)
+  console.log(` 12. Staff Attendance:         ${staffAttendanceRows.length}`)
+  console.log(` 13. Timetable Slots:          ${timetableSlotRows.length}`)
+  console.log(` 14. Calendar Events:          ${eventRows.length}`)
+  console.log(` 15. Question Groups:          ${questionGroupRows.length}`)
+  console.log(` 16. CA Question Bank:         ${questionBankRows.length}`)
+  console.log(` 17. Exam Mark Distributions:  ${examMarkDistributionRows.length}`)
+  console.log(` 18. Examination Profiles:     ${examRows.length} (${rawExams.length} explicit, ${examRows.length - rawExams.length} synthesized)`)
+  console.log(` 19. CA Student Marks:         ${markRows.length}`)
+  console.log(` 20. Online Exams:             ${onlineExamRows.length}`)
+  console.log(` 21. Online Exam Submissions:  ${onlineExamSubmissionRows.length}`)
+  console.log(` 22. Homework Items:           ${homeworkRows.length}`)
+  console.log(` 23. Homework Submissions:     ${homeworkSubmissionRows.length}`)
+  console.log(` 24. Fee Heads (Fee Types):    ${feeTypeRows.length}`)
+  console.log(` 25. Fee Groups:               ${feeGroupRows.length}`)
+  console.log(` 26. Invoices:                 ${invoiceRows.length}`)
+  console.log(` 27. Invoice Items:            ${invoiceItemRows.length}`)
+  console.log(` 28. Fee Payments:             ${paymentRows.length}`)
+  console.log(` 29. Voucher Heads:            ${voucherHeadRows.length}`)
+  console.log(` 30. Office Transactions:      ${officeTransactionRows.length}`)
   console.log('========================================================================\n')
 
   if (dryRun) {
@@ -617,6 +1095,25 @@ async function main() {
   console.log('Clearing existing tenant records with TRUNCATE CASCADE to prevent foreign key conflicts...')
   await pool.query(`
     TRUNCATE TABLE 
+      "homework_submission",
+      "homework",
+      "online_exam_submission",
+      "online_exam",
+      "staff_attendance",
+      "timetable_slots",
+      "promotion_history",
+      "office_transactions",
+      "voucher_heads",
+      "payments",
+      "invoice_items",
+      "invoices",
+      "fee_groups",
+      "fee_types",
+      "fee_assignments",
+      "sections_allocation",
+      "subject_assign",
+      "exam_mark_distribution",
+      "event",
       "attendance", 
       "attendance_registers", 
       "attendance_audits",
@@ -642,12 +1139,6 @@ async function main() {
       "online_admission_fields",
       "student_admission_fields",
       "branch_subscriptions",
-      "fee_types", 
-      "fee_assignments", 
-      "fee_groups",
-      "invoices", 
-      "invoice_items", 
-      "payments", 
       "school_landing_pages",
       "exam",
       "teachers", 
@@ -660,22 +1151,39 @@ async function main() {
   `)
 
   console.log('\nWriting to PostgreSQL in strict topological order:')
-  await batchCreate('branch', branchRows, '1/16 Branches')
-  await batchCreate('class', classRows, '2/16 Classes')
-  await batchCreate('section', sectionRows, '3/16 Sections')
-  await batchCreate('subject', subjectRows, '4/16 Subjects')
-  await batchCreate('user', userRows, '5/16 Users (All Roles)')
-  await batchCreate('teacher', teacherRows, '6/16 Teachers')
-  await batchCreate('teacherAllocation', teacherAllocationRows, '7/16 Teacher Allocations')
-  await batchCreate('parent', parentRows, '8/16 Parents')
-  await batchCreate('student', studentRows, '9/16 Students')
-  await batchCreate('enroll', enrollRows, '10/16 Enrollments')
-  await batchCreate('attendance', attendanceRows, '11/16 Attendance Entries')
-  if (questionGroupRows.length) await batchCreate('questionGroup', questionGroupRows, '12/16 Question Groups')
-  await batchCreate('questionBank', questionBankRows, '13/16 CA Questions')
-  if (examRows.length) await batchCreate('exam', examRows, '14/16 Examination Profiles')
-  if (markRows.length) await batchCreate('mark', markRows, '15/16 CA Marks')
-  if (feeTypeRows.length) await batchCreate('feeType', feeTypeRows, '16/16 Fee Types')
+  await batchCreate('branch', branchRows, '1/30 Branches')
+  await batchCreate('class', classRows, '2/30 Classes')
+  await batchCreate('section', sectionRows, '3/30 Sections')
+  await batchCreate('sectionsAllocation', sectionsAllocationRows, '4/30 Sections Allocation')
+  await batchCreate('subject', subjectRows, '5/30 Subjects')
+  await batchCreate('user', userRows, '6/30 Users (All Roles)')
+  await batchCreate('teacher', teacherRows, '7/30 Teachers')
+  await batchCreate('teacherAllocation', teacherAllocationRows, '8/30 Teacher Allocations')
+  await batchCreate('subjectAssign', subjectAssignRows, '9/30 Subject Assignments')
+  await batchCreate('parent', parentRows, '10/30 Parents')
+  await batchCreate('student', studentRows, '11/30 Students')
+  await batchCreate('enroll', enrollRows, '12/30 Enrollments')
+  await batchCreate('promotionHistory', promotionHistoryRows, '13/30 Promotion History')
+  await batchCreate('attendance', attendanceRows, '14/30 Attendance Entries')
+  await batchCreate('staffAttendance', staffAttendanceRows, '15/30 Staff Attendance')
+  await batchCreate('timetableSlot', timetableSlotRows, '16/30 Timetable Slots')
+  await batchCreate('event', eventRows, '17/30 Calendar Events')
+  await batchCreate('examMarkDistribution', examMarkDistributionRows, '18/30 Exam Mark Distributions')
+  if (questionGroupRows.length) await batchCreate('questionGroup', questionGroupRows, '19/30 Question Groups')
+  await batchCreate('questionBank', questionBankRows, '20/30 CA Questions')
+  if (examRows.length) await batchCreate('exam', examRows, '21/30 Examination Profiles')
+  if (markRows.length) await batchCreate('mark', markRows, '22/30 CA Marks')
+  if (onlineExamRows.length) await batchCreate('onlineExam', onlineExamRows, '23/30 Online Exams')
+  if (onlineExamSubmissionRows.length) await batchCreate('onlineExamSubmission', onlineExamSubmissionRows, '24/30 Online Exam Submissions')
+  if (homeworkRows.length) await batchCreate('homework', homeworkRows, '25/30 Homework Items')
+  if (homeworkSubmissionRows.length) await batchCreate('homeworkSubmission', homeworkSubmissionRows, '26/30 Homework Submissions')
+  if (feeTypeRows.length) await batchCreate('feeType', feeTypeRows, '27/30 Fee Types')
+  if (feeGroupRows.length) await batchCreate('feeGroup', feeGroupRows, '28/30 Fee Groups')
+  if (invoiceRows.length) await batchCreate('invoice', invoiceRows, '29a/30 Invoices')
+  if (invoiceItemRows.length) await batchCreate('invoiceItem', invoiceItemRows, '29b/30 Invoice Items')
+  if (paymentRows.length) await batchCreate('payment', paymentRows, '29c/30 Fee Payments')
+  if (voucherHeadRows.length) await batchCreate('voucherHead', voucherHeadRows, '30a/30 Voucher Heads')
+  if (officeTransactionRows.length) await batchCreate('officeTransaction', officeTransactionRows, '30b/30 Office Transactions')
 
   // Run Sequence Resets
   await syncAllSequences()
@@ -715,7 +1223,7 @@ async function main() {
   `)
   console.log(`✓ Daily class registers backfilled. Created: ${regRes.rowCount || 0}, Linked: ${linkRes.rowCount || 0} records.`)
 
-  // Run Sequence Resets for all tables including registers
+  // Run Final Sequence Resets for all tables including registers
   await syncAllSequences()
 
   console.log('\n========================================================================')
