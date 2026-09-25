@@ -13,6 +13,7 @@ import {
 import gamificationService from '../../lib/gamificationService';
 import { generateRegistrationNumber } from '../../lib/studentService';
 import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
+import { parseMarkScore } from '../../lib/markParser';
 
 let Tesseract: any;
 try {
@@ -863,18 +864,15 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
 
     const sheet = enrolls.map((e) => {
       const markEntry = marksMap[`${e.student.id}_${activeSubjectId}`];
-      const theory = markEntry?.mark !== null && markEntry?.mark !== undefined && markEntry?.mark !== ''
-        ? Number(markEntry.mark)
-        : null;
-      const objective = markEntry?.cbtMark !== null && markEntry?.cbtMark !== undefined && markEntry?.cbtMark !== ''
-        ? Number(markEntry.cbtMark)
-        : 0;
+      const parsed = parseMarkScore(markEntry?.mark, markEntry?.cbtMark);
       const isAbsent = markEntry?.absent === '1';
-      const cumulative = isAbsent ? 0 : (theory !== null ? theory + objective : objective);
+      const theory = parsed.examScore > 0 ? parsed.examScore : (parsed.hasValidScore ? parsed.total : null);
+      const objective = parsed.testScore > 0 ? parsed.testScore : 0;
+      const cumulative = isAbsent ? 0 : (parsed.hasValidScore ? parsed.total : 0);
 
       let grade = 'F';
       let remark = 'Fail';
-      if (!isAbsent && theory !== null) {
+      if (!isAbsent && parsed.hasValidScore) {
         if (cumulative >= 70) { grade = 'A'; remark = 'Excellent'; }
         else if (cumulative >= 60) { grade = 'B'; remark = 'Very Good'; }
         else if (cumulative >= 50) { grade = 'C'; remark = 'Credit'; }
@@ -1234,23 +1232,22 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     let marksCount = 0;
 
     const reportCard = studentMarks.map((m) => {
-      const testScore = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-      const examScore = m.mark ? parseFloat(m.mark) : 0;
-      const total = testScore + examScore;
-
-      totalScoreSum += total;
-      marksCount++;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      if (parsed.hasValidScore) {
+        totalScoreSum += parsed.total;
+        marksCount++;
+      }
 
       return {
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: m.cbtMark ? String(testScore) : null,
-        theoryMark: m.mark ? String(examScore) : null,
-        mark: String(total),
+        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+        mark: parsed.hasValidScore ? String(parsed.total) : null,
         absent: m.absent === '1',
-        classAverage: total,
+        classAverage: parsed.total,
       };
     });
 
@@ -1349,18 +1346,20 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
 
       let sum = 0;
       const rc = marks.map((m) => {
-        const val = Number(m.mark || m.cbtMark || 0);
-        sum += val;
+        const parsed = parseMarkScore(m.mark, m.cbtMark);
+        if (parsed.hasValidScore) {
+          sum += parsed.total;
+        }
         return {
           id: m.id,
           examName: m.exam.name,
           subjectName: m.subject.name,
           subjectCode: m.subject.subjectCode,
-          cbtMark: m.cbtMark,
-          theoryMark: m.mark,
-          mark: String(val),
+          cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+          theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+          mark: parsed.hasValidScore ? String(parsed.total) : null,
           absent: m.absent === '1',
-          classAverage: val,
+          classAverage: parsed.total,
         };
       });
 

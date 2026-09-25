@@ -367,6 +367,47 @@ export async function createSubject(req: Request, res: Response): Promise<Respon
 }
 
 /**
+ * Helper to resolve the active session for an admin query.
+ * Priority: explicit param > global_settings > most recent session with enrollments for the branch/class.
+ */
+async function resolveAdminSession(
+  branchId?: number,
+  classId?: number,
+  requestedSession?: number | null
+): Promise<number> {
+  if (requestedSession) return requestedSession;
+  const globalSetting = await prisma.globalSettings.findFirst();
+  const defaultSession = globalSetting?.sessionId || 4;
+  if (!branchId) return defaultSession;
+
+  const where: any = { branchId, sessionId: defaultSession };
+  if (classId) where.classId = classId;
+  const sessionCheck = await prisma.enroll.count({ where });
+  if (sessionCheck > 0) return defaultSession;
+
+  const fallbackWhere: any = { branchId };
+  if (classId) fallbackWhere.classId = classId;
+  const latestEnroll = await prisma.enroll.findFirst({
+    where: fallbackWhere,
+    orderBy: { sessionId: 'desc' },
+    select: { sessionId: true },
+  });
+  if (latestEnroll) return latestEnroll.sessionId;
+
+  // Try branch-wide latest session if class-specific had nothing
+  if (classId) {
+    const branchLatest = await prisma.enroll.findFirst({
+      where: { branchId },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (branchLatest) return branchLatest.sessionId;
+  }
+
+  return defaultSession;
+}
+
+/**
  * POST /api/admin/subjects/assign
  */
 export async function assignSubject(req: Request, res: Response): Promise<Response | void> {
@@ -378,8 +419,11 @@ export async function assignSubject(req: Request, res: Response): Promise<Respon
       return res.status(400).json({ success: false, message: 'Class, Section, Subject and Teacher are required.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveAdminSession(
+      branchId,
+      Number(classId),
+      req.body.sessionId ? Number(req.body.sessionId) : null
+    );
 
     const existing = await prisma.subjectAssign.findFirst({
       where: {
@@ -429,8 +473,11 @@ export async function assignSubjectBulk(req: Request, res: Response): Promise<Re
       return res.status(400).json({ success: false, message: 'Class, Section, and Assignments are required.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveAdminSession(
+      branchId,
+      Number(classId),
+      req.body.sessionId ? Number(req.body.sessionId) : null
+    );
 
     await prisma.$transaction(async (tx: any) => {
       for (const item of assignments) {
@@ -490,8 +537,8 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
     const secId = sectionId ? Number(sectionId) : null;
     const dateKey = parseSchoolDateKey(date) || todaySchoolDateKey();
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSession = globalSetting?.sessionId || 1;
+    const requestedSession = req.query.sessionId ? Number(req.query.sessionId) : null;
+    const activeSession = await resolveAdminSession(branchId, cId, requestedSession);
 
     const { page, pageSize, q } = parsePagination(req.query);
 
@@ -511,7 +558,7 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
       }));
       const filtered = q
         ? students.filter((row) =>
-            [row.name, row.roll, row.registerNo].join(' ').toLowerCase().includes(q)
+            [row.name, row.roll, row.registerNo].join(' ').toLowerCase().includes(q as string)
           )
         : students;
       const paged = paginateItems(filtered, page, pageSize);
@@ -530,6 +577,7 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
         register: snapshot.register,
         canEdit: snapshot.canEdit,
         pagination: paged.pagination,
+        activeSessionId: activeSession,
         metrics: {
           totalEnrolled: snapshot.summary.total,
           presentCount: snapshot.summary.present,
@@ -607,7 +655,7 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
     const attendanceRate = coded > 0 ? Math.round(((presentCount + lateCount) / coded) * 100) : 0;
     const filtered = q
       ? students.filter((row) =>
-          [row.name, row.roll, row.registerNo, row.sectionName].join(' ').toLowerCase().includes(q)
+          [row.name, row.roll, row.registerNo, row.sectionName].join(' ').toLowerCase().includes(q as string)
         )
       : students;
     const paged = paginateItems(filtered, page, pageSize);
@@ -617,6 +665,7 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
       students: paged.items,
       attendanceMap,
       pagination: paged.pagination,
+      activeSessionId: activeSession,
       metrics: {
         totalEnrolled,
         presentCount,
@@ -631,6 +680,7 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
     return res.status(500).json({ success: false, message: 'Failed to fetch student attendance.' });
   }
 }
+
 
 /**
  * POST /api/admin/attendance/students/batch-save
@@ -655,8 +705,8 @@ export async function saveStudentAttendanceBatch(req: Request, res: Response): P
       return res.status(400).json({ success: false, message: 'sectionId is required to save a class register.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSession = globalSetting?.sessionId || 1;
+    const requestedSession = req.body.sessionId ? Number(req.body.sessionId) : null;
+    const activeSession = await resolveAdminSession(branchId, cId, requestedSession);
 
     const register = await openOrGetRegister(prisma, {
       branchId,
@@ -665,6 +715,7 @@ export async function saveStudentAttendanceBatch(req: Request, res: Response): P
       sectionId: secId,
       dateKey,
     });
+
     const result = await prisma.$transaction(
       async (tx) => {
         return upsertEntries(tx, {
@@ -759,8 +810,8 @@ export async function getDailyAttendanceReport(req: Request, res: Response): Pro
     const described = describeSchoolDate(dateKey);
     const range = schoolDateStoredRange(dateKey);
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSession = globalSetting?.sessionId || 1;
+    const requestedSession = req.query.sessionId ? Number(req.query.sessionId) : null;
+    const activeSession = await resolveAdminSession(branchId, undefined, requestedSession);
 
     const enrolls = await prisma.enroll.findMany({
       where: { branchId, sessionId: activeSession },
@@ -775,6 +826,7 @@ export async function getDailyAttendanceReport(req: Request, res: Response): Pro
         dateFromKey: dateKey,
         dateToKey: dateKey,
         order: 'asc',
+        includeDrafts: true,
       }),
       prisma.teacher.count({ where: { branchId, active: true } }),
       prisma.staffAttendance.findMany({
@@ -826,8 +878,8 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
     const exporting = String(req.query.format || '').toLowerCase() === 'csv';
     const { page, pageSize, q } = parsePagination(req.query);
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSession = globalSetting?.sessionId || 1;
+    const requestedSession = req.query.sessionId ? Number(req.query.sessionId) : null;
+    const activeSession = await resolveAdminSession(branchId, classId || undefined, requestedSession);
 
     const enrolls = await prisma.enroll.findMany({
       where: {
@@ -854,6 +906,7 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
       dateFromKey: monthDays[0],
       dateToKey: monthDays[monthDays.length - 1],
       order: 'asc',
+      includeDrafts: true,
     });
 
     const monthSet = new Set(monthDays);
@@ -1008,8 +1061,11 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSessionId = sessionId ? parseInt(sessionId, 10) : globalSetting?.sessionId || 5;
+    const activeSessionId = await resolveAdminSession(
+      branchId,
+      parseInt(classId, 10),
+      sessionId ? parseInt(sessionId, 10) : null
+    );
 
     const baseWhere: any = {
       branchId,

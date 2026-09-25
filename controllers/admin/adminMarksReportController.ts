@@ -12,6 +12,7 @@ import {
   summarizeSubmittedAttendanceByStudent,
   summarizeSubmittedLogs,
 } from '../../lib/attendanceRegisterService';
+import { parseMarkScore } from '../../lib/markParser';
 
 /**
  * GET /api/admin/marks-entry
@@ -254,14 +255,48 @@ export async function aiDistributeMarks(req: Request, res: Response): Promise<Re
 }
 
 /**
+ * Helper to resolve the correct academic session ID for report cards.
+ * If a session is requested by the client, use it.
+ * Otherwise, fall back to global settings, and if that session has 0 enrollments
+ * for this branch, intelligently detect the latest session with enrollments.
+ */
+async function resolveReportCardSession(branchId?: number, requestedSessionId?: any): Promise<number> {
+  if (requestedSessionId && !isNaN(Number(requestedSessionId)) && Number(requestedSessionId) > 0) {
+    return Number(requestedSessionId);
+  }
+
+  const globalSetting = await prisma.globalSettings.findFirst();
+  const defaultSessionId = globalSetting?.sessionId || 5;
+
+  if (branchId) {
+    const enrollCount = await prisma.enroll.count({
+      where: { sessionId: defaultSessionId, branchId },
+    });
+    if (enrollCount > 0) {
+      return defaultSessionId;
+    }
+
+    const latestWithStudents = await prisma.enroll.findFirst({
+      where: { branchId },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (latestWithStudents?.sessionId) {
+      return latestWithStudents.sessionId;
+    }
+  }
+
+  return defaultSessionId;
+}
+
+/**
  * GET /api/admin/commentary/pending
  */
 export async function getPendingCommentary(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveReportCardSession(branchId, req.query.sessionId);
 
     const commentaries = await prisma.studentCommentary.findMany({
       where: {
@@ -345,8 +380,12 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
   const branchId = req.branchId;
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveReportCardSession(branchId, req.query.sessionId);
+
+    const sessions = await prisma.schoolYear.findMany({
+      orderBy: { id: 'desc' },
+      select: { id: true, schoolYear: true },
+    });
 
     const classes = await prisma.class.findMany({
       where: { branchId },
@@ -391,7 +430,12 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
       };
     });
 
-    return res.json({ success: true, classes: formatted });
+    return res.json({
+      success: true,
+      sessionId,
+      sessions: sessions.map((s) => ({ id: s.id, name: s.schoolYear })),
+      classes: formatted,
+    });
   } catch (error) {
     console.error('[ADMIN REPORT CARDS] Get classes error:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch classes.' });
@@ -403,7 +447,7 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
  */
 export async function getReportCardStudents(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId } = (req.query || {}) as any;
+  const { classId, sectionId, sessionId: reqSessionId } = (req.query || {}) as any;
 
   if (!classId || !sectionId) {
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
@@ -413,15 +457,14 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
     const parsedClassId = Number(classId);
     const parsedSectionId = Number(sectionId);
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let sessionId = await resolveReportCardSession(branchId, reqSessionId);
 
     const cls = await prisma.class.findUnique({
       where: { id: parsedClassId },
       select: { name: true, isEcd: true },
     });
 
-    const enrolls = await prisma.enroll.findMany({
+    let enrolls = await prisma.enroll.findMany({
       where: {
         classId: parsedClassId,
         sectionId: parsedSectionId,
@@ -442,6 +485,80 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       },
       orderBy: { student: { lastName: 'asc' } },
     });
+
+    // Fallback: If 0 students in the given session, look for the latest session with enrollments for this class & section
+    if (enrolls.length === 0) {
+      const fallbackEnroll = await prisma.enroll.findFirst({
+        where: {
+          classId: parsedClassId,
+          sectionId: parsedSectionId,
+          branchId,
+        },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+
+      if (fallbackEnroll?.sessionId) {
+        sessionId = fallbackEnroll.sessionId;
+        enrolls = await prisma.enroll.findMany({
+          where: {
+            classId: parsedClassId,
+            sectionId: parsedSectionId,
+            sessionId,
+            branchId,
+          },
+          include: {
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true,
+                gender: true,
+                photo: true,
+              },
+            },
+          },
+          orderBy: { student: { lastName: 'asc' } },
+        });
+      }
+    }
+
+    // Fallback 2: If still 0, check if students are enrolled in this class regardless of section
+    if (enrolls.length === 0) {
+      const fallbackClassEnroll = await prisma.enroll.findFirst({
+        where: {
+          classId: parsedClassId,
+          branchId,
+        },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+
+      if (fallbackClassEnroll?.sessionId) {
+        sessionId = fallbackClassEnroll.sessionId;
+        enrolls = await prisma.enroll.findMany({
+          where: {
+            classId: parsedClassId,
+            sessionId,
+            branchId,
+          },
+          include: {
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true,
+                gender: true,
+                photo: true,
+              },
+            },
+          },
+          orderBy: { student: { lastName: 'asc' } },
+        });
+      }
+    }
 
     const studentIds = enrolls.map((e) => e.studentId);
 
@@ -508,23 +625,23 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
     });
 
     marks.forEach((m) => {
-      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-      const examVal = m.mark ? parseFloat(m.mark) : 0;
-      const totalVal = testVal + examVal;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
       if (studentMarksMap[m.studentId]) {
         studentMarksMap[m.studentId].push({
           id: m.id,
           examName: m.exam?.name || 'Evaluation',
           subjectName: m.subject?.name || 'Subject',
           subjectCode: m.subject?.subjectCode || 'N/A',
-          cbtMark: m.cbtMark !== null ? String(testVal) : null,
-          theoryMark: m.mark !== null ? String(examVal) : null,
-          mark: String(totalVal),
+          cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+          theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+          mark: parsed.hasValidScore ? String(parsed.total) : null,
           absent: m.absent === '1' || m.absent === 'true',
         });
-        studentAggregates[m.studentId].sum += totalVal;
-        studentAggregates[m.studentId].count += 1;
-        studentAggregates[m.studentId].totalMarks += totalVal;
+        if (parsed.hasValidScore) {
+          studentAggregates[m.studentId].sum += parsed.total;
+          studentAggregates[m.studentId].count += 1;
+          studentAggregates[m.studentId].totalMarks += parsed.total;
+        }
       }
     });
 
@@ -609,6 +726,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
 
     return res.json({
       success: true,
+      sessionId,
       className: cls?.name || 'Classroom',
       isEcd: cls?.isEcd || false,
       totalStudents: studentList.length,
@@ -625,7 +743,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
  */
 export async function exportReportCardPdf(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, studentId, rankingType = 'full', rankingLimit = 3 } = (req.query || {}) as any;
+  const { classId, sectionId, studentId, rankingType = 'full', rankingLimit = 3, sessionId: reqSessionId } = (req.query || {}) as any;
 
   if (!classId || !sectionId || !studentId) {
     return res.status(400).json({ success: false, message: 'classId, sectionId, and studentId are required.' });
@@ -636,8 +754,19 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     const parsedClassId = Number(classId);
     const parsedSectionId = Number(sectionId);
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const studentEnroll = await prisma.enroll.findFirst({
+      where: {
+        studentId: parsedStudentId,
+        classId: parsedClassId,
+        ...(branchId ? { branchId } : {}),
+      },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+
+    const sessionId = reqSessionId
+      ? Number(reqSessionId)
+      : (studentEnroll?.sessionId || (await resolveReportCardSession(branchId)));
 
     const student = await prisma.student.findUnique({
       where: { id: parsedStudentId },
@@ -713,32 +842,34 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     allClassMarks.forEach((m) => {
       const k = `${m.examId}-${m.subjectId}`;
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
-      const tot = parseFloat(m.cbtMark || '0') + parseFloat(m.mark || '0');
-      avgMap[k].sum += tot;
-      avgMap[k].count += 1;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      if (parsed.hasValidScore) {
+        avgMap[k].sum += parsed.total;
+        avgMap[k].count += 1;
+      }
     });
 
     let totalSum = 0;
     let marksCount = 0;
     const reportCard = marks.map((m) => {
-      const testScore = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-      const examScore = m.mark ? parseFloat(m.mark) : 0;
-      const totalScore = testScore + examScore;
-      totalSum += totalScore;
-      marksCount += 1;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      if (parsed.hasValidScore) {
+        totalSum += parsed.total;
+        marksCount += 1;
+      }
 
       const k = `${m.examId}-${m.subjectId}`;
       const cAvg =
-        avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : totalScore;
+        avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : parsed.total;
 
       return {
         id: m.id,
         examName: m.exam?.name || 'Term Evaluation',
         subjectName: m.subject?.name || 'Subject',
         subjectCode: m.subject?.subjectCode || 'N/A',
-        cbtMark: String(testScore),
-        theoryMark: String(examScore),
-        mark: String(totalScore),
+        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+        mark: parsed.hasValidScore ? String(parsed.total) : null,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage: cAvg,
       };
@@ -757,8 +888,11 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     });
     allClassMarks.forEach((m) => {
       if (aggMap[m.studentId]) {
-        aggMap[m.studentId].sum += parseFloat(m.cbtMark || '0') + parseFloat(m.mark || '0');
-        aggMap[m.studentId].count += 1;
+        const parsed = parseMarkScore(m.mark, m.cbtMark);
+        if (parsed.hasValidScore) {
+          aggMap[m.studentId].sum += parsed.total;
+          aggMap[m.studentId].count += 1;
+        }
       }
     });
     const scoreRankList = studentIds
@@ -811,7 +945,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
  */
 export async function exportBatchReportCardsPdf(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, rankingType = 'full', rankingLimit = 3 } = (req.query || {}) as any;
+  const { classId, sectionId, rankingType = 'full', rankingLimit = 3, sessionId: reqSessionId } = (req.query || {}) as any;
 
   if (!classId || !sectionId) {
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
@@ -821,8 +955,15 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     const parsedClassId = Number(classId);
     const parsedSectionId = Number(sectionId);
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let sessionId = reqSessionId ? Number(reqSessionId) : 0;
+    if (!sessionId) {
+      const classEnroll = await prisma.enroll.findFirst({
+        where: { classId: parsedClassId, sectionId: parsedSectionId, branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      sessionId = classEnroll?.sessionId || (await resolveReportCardSession(branchId));
+    }
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
@@ -844,13 +985,31 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     });
     if (formAllocation?.teacher) formTeacherName = formAllocation.teacher.name;
 
-    const enrolls = await prisma.enroll.findMany({
+    let enrolls = await prisma.enroll.findMany({
       where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId },
       include: {
         student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
       },
       orderBy: { student: { lastName: 'asc' } },
     });
+
+    if (enrolls.length === 0) {
+      const fallbackEnroll = await prisma.enroll.findFirst({
+        where: { classId: parsedClassId, sectionId: parsedSectionId, branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      if (fallbackEnroll?.sessionId) {
+        sessionId = fallbackEnroll.sessionId;
+        enrolls = await prisma.enroll.findMany({
+          where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId },
+          include: {
+            student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
+          },
+          orderBy: { student: { lastName: 'asc' } },
+        });
+      }
+    }
 
     const studentIds = enrolls.map((e) => e.studentId);
 
@@ -870,9 +1029,11 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     allMarks.forEach((m) => {
       const k = `${m.examId}-${m.subjectId}`;
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
-      const tot = parseFloat(m.cbtMark || '0') + parseFloat(m.mark || '0');
-      avgMap[k].sum += tot;
-      avgMap[k].count += 1;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      if (parsed.hasValidScore) {
+        avgMap[k].sum += parsed.total;
+        avgMap[k].count += 1;
+      }
     });
 
     const studentAggregates: Record<number, any> = {};
@@ -883,29 +1044,29 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     });
 
     allMarks.forEach((m) => {
-      const testScore = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-      const examScore = m.mark ? parseFloat(m.mark) : 0;
-      const totalScore = testScore + examScore;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
 
       if (studentMarksMap[m.studentId]) {
         const k = `${m.examId}-${m.subjectId}`;
         const cAvg =
-          avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : totalScore;
+          avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : parsed.total;
 
         studentMarksMap[m.studentId].push({
           id: m.id,
           examName: m.exam?.name || 'Evaluation',
           subjectName: m.subject?.name || 'Subject',
           subjectCode: m.subject?.subjectCode || 'N/A',
-          cbtMark: String(testScore),
-          theoryMark: String(examScore),
-          mark: String(totalScore),
+          cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+          theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+          mark: parsed.hasValidScore ? String(parsed.total) : null,
           absent: m.absent === '1' || m.absent === 'true',
           classAverage: cAvg,
         });
 
-        studentAggregates[m.studentId].sum += totalScore;
-        studentAggregates[m.studentId].count += 1;
+        if (parsed.hasValidScore) {
+          studentAggregates[m.studentId].sum += parsed.total;
+          studentAggregates[m.studentId].count += 1;
+        }
       }
     });
 
@@ -993,15 +1154,22 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
  */
 export async function saveReportCardCommentary(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { studentId, classId, sectionId, remark, principalRemark, status = 'PRINCIPAL_SIGNED_OFF' } = req.body || {};
+  const { studentId, classId, sectionId, remark, principalRemark, status = 'PRINCIPAL_SIGNED_OFF', sessionId: reqSessionId } = req.body || {};
 
   if (!studentId || !classId || !sectionId || !remark) {
     return res.status(400).json({ success: false, message: 'studentId, classId, sectionId, and remark are required.' });
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let sessionId = reqSessionId ? Number(reqSessionId) : 0;
+    if (!sessionId) {
+      const studentEnroll = await prisma.enroll.findFirst({
+        where: { studentId: Number(studentId), classId: Number(classId), branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      sessionId = studentEnroll?.sessionId || (await resolveReportCardSession(branchId));
+    }
 
     const commentary = await prisma.studentCommentary.upsert({
       where: {
@@ -1045,15 +1213,22 @@ export async function saveReportCardCommentary(req: Request, res: Response): Pro
  */
 export async function saveReportCardBehavioral(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { studentId, classId, sectionId, psychomotor = {}, affective = {}, narrativeComment } = req.body || {};
+  const { studentId, classId, sectionId, psychomotor = {}, affective = {}, narrativeComment, sessionId: reqSessionId } = req.body || {};
 
   if (!studentId || !classId || !sectionId) {
     return res.status(400).json({ success: false, message: 'studentId, classId, and sectionId are required.' });
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let sessionId = reqSessionId ? Number(reqSessionId) : 0;
+    if (!sessionId) {
+      const studentEnroll = await prisma.enroll.findFirst({
+        where: { studentId: Number(studentId), classId: Number(classId), branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      sessionId = studentEnroll?.sessionId || (await resolveReportCardSession(branchId));
+    }
 
     const exam = await prisma.exam.findFirst({
       where: { branchId, sessionId },
@@ -1154,15 +1329,22 @@ export async function generateAiComments(req: Request, res: Response): Promise<R
  */
 export async function batchGenerateCommentary(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, tone = 'constructive', behavioralTags = [] } = req.body || {};
+  const { classId, sectionId, tone = 'constructive', behavioralTags = [], sessionId: reqSessionId } = req.body || {};
 
   if (!classId || !sectionId) {
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let sessionId = reqSessionId ? Number(reqSessionId) : 0;
+    if (!sessionId) {
+      const classEnroll = await prisma.enroll.findFirst({
+        where: { classId: Number(classId), sectionId: Number(sectionId), branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      sessionId = classEnroll?.sessionId || (await resolveReportCardSession(branchId));
+    }
 
     const enrollments = await prisma.enroll.findMany({
       where: {
@@ -1198,9 +1380,9 @@ export async function batchGenerateCommentary(req: Request, res: Response): Prom
       const marksBySubject: any = {};
       for (const m of marks) {
         if (!m.mark || m.absent === '1') continue;
-        const score = parseFloat(m.mark);
-        if (!isNaN(score)) {
-          marksBySubject[m.subject.name] = score;
+        const parsed = parseMarkScore(m.mark, m.cbtMark);
+        if (parsed.hasValidScore) {
+          marksBySubject[m.subject.name] = parsed.total;
         }
       }
 
@@ -1256,15 +1438,22 @@ export async function batchGenerateCommentary(req: Request, res: Response): Prom
  */
 export async function batchSaveCommentary(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, commentaries = [], status = 'APPROVED_BY_PRINCIPAL' } = req.body || {};
+  const { classId, sectionId, commentaries = [], status = 'APPROVED_BY_PRINCIPAL', sessionId: reqSessionId } = req.body || {};
 
   if (!classId || !sectionId || !Array.isArray(commentaries)) {
     return res.status(400).json({ success: false, message: 'classId, sectionId, and commentaries array required.' });
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let sessionId = reqSessionId ? Number(reqSessionId) : 0;
+    if (!sessionId) {
+      const classEnroll = await prisma.enroll.findFirst({
+        where: { classId: Number(classId), sectionId: Number(sectionId), branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      sessionId = classEnroll?.sessionId || (await resolveReportCardSession(branchId));
+    }
 
     let savedCount = 0;
 

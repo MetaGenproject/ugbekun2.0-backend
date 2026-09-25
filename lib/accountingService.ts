@@ -259,8 +259,8 @@ export async function getFinancialOverview(
   const mappedOutstanding = outstandingStudents.map((inv: any) => ({
     invoiceId: inv.id,
     invoiceNo: inv.invoiceNo,
-    studentName: `${inv.student.firstName} ${inv.student.lastName}`,
-    registerNo: inv.student.registerNo,
+    studentName: inv.student ? `${inv.student.firstName || ''} ${inv.student.lastName || ''}`.trim() : 'Student',
+    registerNo: inv.student?.registerNo || 'N/A',
     total: parseFloat(inv.totalAmount.toString()),
     paid: parseFloat(inv.paidAmount.toString()),
     balance: parseFloat(inv.balanceAmount.toString()),

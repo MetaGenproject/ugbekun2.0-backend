@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import prisma from '../../lib/prisma';
 import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
+import { parseMarkScore } from '../../lib/markParser';
 
 /**
  * GET /api/student/dashboard-overview
@@ -110,15 +111,13 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       const subjectMap: Record<string, any> = {};
 
       studentMarks.forEach((m) => {
-        const testScore = m.cbtMark !== null ? parseFloat(m.cbtMark) : 0;
-        const examScore = m.mark !== null ? parseFloat(m.mark) : 0;
-        const total = testScore + examScore;
-        if (m.cbtMark !== null || m.mark !== null) {
-          totalScoreSum += total;
+        const parsed = parseMarkScore(m.mark, m.cbtMark);
+        if (parsed.hasValidScore) {
+          totalScoreSum += parsed.total;
           marksCount++;
           const sName = m.subject?.name || 'Unknown';
           if (!subjectMap[sName]) subjectMap[sName] = { sum: 0, count: 0 };
-          subjectMap[sName].sum += total;
+          subjectMap[sName].sum += parsed.total;
           subjectMap[sName].count++;
         }
       });
@@ -148,9 +147,9 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
             agg[id] = { sum: 0, count: 0 };
           });
           allMarks.forEach((m) => {
-            const v = (parseFloat(m.cbtMark || '0') || 0) + (parseFloat(m.mark || '0') || 0);
-            if (m.mark || m.cbtMark) {
-              agg[m.studentId].sum += v;
+            const parsed = parseMarkScore(m.mark, m.cbtMark);
+            if (parsed.hasValidScore) {
+              agg[m.studentId].sum += parsed.total;
               agg[m.studentId].count++;
             }
           });

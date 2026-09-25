@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { getBranchStats } from '../../lib/branchStats';
+import { parseMarkScore } from '../../lib/markParser';
 
 /**
  * GET /api/admin/stats
@@ -436,9 +437,11 @@ export async function getComprehensiveReport(req: Request, res: Response): Promi
       .sort((a: any, b: any) => parseFloat(b.rate) - parseFloat(a.rate));
 
     // 5. Examinations
-    const marksWithValues = marks.filter((m: any) => m.mark && !isNaN(parseFloat(m.mark)));
-    const totalMarksRecorded = marksWithValues.length;
-    const allScores = marksWithValues.map((m: any) => parseFloat(m.mark));
+    const marksWithParsed = marks
+      .map((m: any) => ({ ...m, parsed: parseMarkScore(m.mark, m.cbtMark) }))
+      .filter((m: any) => m.parsed.hasValidScore);
+    const totalMarksRecorded = marksWithParsed.length;
+    const allScores = marksWithParsed.map((m: any) => m.parsed.total);
     const avgScore =
       allScores.length > 0 ? (allScores.reduce((a: number, b: number) => a + b, 0) / allScores.length).toFixed(1) : '0.0';
 
@@ -456,12 +459,12 @@ export async function getComprehensiveReport(req: Request, res: Response): Promi
     }
 
     const classMarkMap: Record<string, any> = {};
-    for (const m of marksWithValues) {
+    for (const m of marksWithParsed) {
       const c = allClasses.find((cl: any) => cl.id === m.classId);
       const key = c ? c.name : 'Unknown';
       if (!classMarkMap[key]) classMarkMap[key] = { total: 0, sum: 0 };
       classMarkMap[key].total += 1;
-      classMarkMap[key].sum += parseFloat(m.mark);
+      classMarkMap[key].sum += m.parsed.total;
     }
     const classByClassExam = Object.entries(classMarkMap)
       .map(([className, d]: [string, any]) => ({

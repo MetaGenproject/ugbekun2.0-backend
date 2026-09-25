@@ -41,9 +41,24 @@ async function forbidUnlessFormTeacher(
   return false;
 }
 
-async function activeSessionId(): Promise<number> {
+async function activeSessionId(branchId?: number, classId?: number): Promise<number> {
   const globalSetting = await prisma.globalSettings.findFirst();
-  return globalSetting?.sessionId || 5;
+  const globalSession = globalSetting?.sessionId || 4;
+  if (!branchId) return globalSession;
+
+  const where: any = { branchId, sessionId: globalSession };
+  if (classId) where.classId = classId;
+  const count = await prisma.enroll.count({ where });
+  if (count > 0) return globalSession;
+
+  const fallbackWhere: any = { branchId };
+  if (classId) fallbackWhere.classId = classId;
+  const latest = await prisma.enroll.findFirst({
+    where: fallbackWhere,
+    orderBy: { sessionId: 'desc' },
+    select: { sessionId: true },
+  });
+  return latest?.sessionId ?? globalSession;
 }
 
 async function fireAbsenceAlerts(
@@ -95,7 +110,9 @@ export async function saveAttendance(req: Request, res: Response): Promise<Respo
   }
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.body.sessionId
+      ? Number(req.body.sessionId)
+      : await activeSessionId(req.branchId, ids.classId);
     const register = await openOrGetRegister(prisma, {
       branchId: req.branchId,
       sessionId,
@@ -184,7 +201,9 @@ export async function getAttendance(req: Request, res: Response): Promise<Respon
   }
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await activeSessionId(req.branchId, ids.classId);
     const snapshot = await getRegisterWithEntries(prisma, {
       branchId: req.branchId,
       sessionId,
@@ -223,7 +242,9 @@ export async function getAttendanceRegister(req: Request, res: Response): Promis
   if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await activeSessionId(req.branchId, ids.classId);
     const snapshot = await getRegisterWithEntries(prisma, {
       branchId: req.branchId,
       sessionId,
@@ -254,7 +275,9 @@ export async function patchAttendanceRegisterEntries(req: Request, res: Response
   if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.body.sessionId
+      ? Number(req.body.sessionId)
+      : await activeSessionId(req.branchId, ids.classId);
     const register = await openOrGetRegister(prisma, {
       branchId: req.branchId,
       sessionId,
@@ -306,7 +329,9 @@ export async function submitAttendanceRegister(req: Request, res: Response): Pro
   if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.body.sessionId
+      ? Number(req.body.sessionId)
+      : await activeSessionId(req.branchId, ids.classId);
     const register = registerId
       ? await prisma.attendanceRegister.findFirst({
           where: { id: Number(registerId), branchId: req.branchId },
@@ -399,7 +424,9 @@ export async function getAttendanceWeek(req: Request, res: Response): Promise<Re
   if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await activeSessionId(req.branchId, ids.classId);
     const week = await getWeekMatrix(prisma, {
       branchId: req.branchId,
       sessionId,

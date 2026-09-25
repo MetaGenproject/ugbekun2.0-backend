@@ -209,8 +209,12 @@ export function summarizeDailyPresence(summary: {
 }
 
 export function submittedAttendanceWhere(
-  extra: Prisma.AttendanceWhereInput = {}
+  extra: Prisma.AttendanceWhereInput = {},
+  includeDrafts: boolean = false
 ): Prisma.AttendanceWhereInput {
+  if (includeDrafts) {
+    return extra;
+  }
   return {
     AND: [
       extra,
@@ -380,6 +384,7 @@ export async function listSubmittedAttendance(
     dateFromKey?: string;
     dateToKey?: string;
     order?: 'asc' | 'desc';
+    includeDrafts?: boolean;
   }
 ) {
   if (args.studentIds && args.studentIds.length === 0) {
@@ -397,15 +402,18 @@ export async function listSubmittedAttendance(
       : {};
 
   const logs = await db.attendance.findMany({
-    where: submittedAttendanceWhere({
-      branchId: args.branchId,
-      ...(args.sessionId ? { sessionId: args.sessionId } : {}),
-      ...(args.studentId ? { studentId: args.studentId } : {}),
-      ...(args.studentIds ? { studentId: { in: args.studentIds } } : {}),
-      ...(args.classId ? { classId: args.classId } : {}),
-      ...(args.sectionId ? { sectionId: args.sectionId } : {}),
-      ...dateRange,
-    }),
+    where: submittedAttendanceWhere(
+      {
+        branchId: args.branchId,
+        ...(args.sessionId ? { sessionId: args.sessionId } : {}),
+        ...(args.studentId ? { studentId: args.studentId } : {}),
+        ...(args.studentIds ? { studentId: { in: args.studentIds } } : {}),
+        ...(args.classId ? { classId: args.classId } : {}),
+        ...(args.sectionId ? { sectionId: args.sectionId } : {}),
+        ...dateRange,
+      },
+      args.includeDrafts
+    ),
     orderBy: { attendanceDate: args.order ?? 'desc' },
     select: {
       id: true,
@@ -817,9 +825,11 @@ export async function upsertEntries(
     });
   }
 
-  const bumpVersion = mode === 'submit' || mode === 'legacy-save';
+  const bumpVersion = mode === 'submit' || mode === 'legacy-save' || mode === 'admin-save';
   const nextStatus =
-    mode === 'submit' || mode === 'legacy-save' ? REGISTER_STATUS.SUBMITTED : register.status;
+    mode === 'submit' || mode === 'legacy-save' || mode === 'admin-save'
+      ? REGISTER_STATUS.SUBMITTED
+      : register.status;
 
   const updated = await db.attendanceRegister.update({
     where: { id: register.id },

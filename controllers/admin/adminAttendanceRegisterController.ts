@@ -20,9 +20,31 @@ function registerErrorResponse(res: Response, error: unknown) {
   return null;
 }
 
-async function activeSessionId(): Promise<number> {
+/**
+ * Resolve the active session ID for a branch/class.
+ * Priority: explicit param > global_settings > most recent enrolled session for the branch/class.
+ */
+async function activeSessionId(branchId?: number, classId?: number): Promise<number> {
   const globalSetting = await prisma.globalSettings.findFirst();
-  return globalSetting?.sessionId || 1;
+  const globalSession = globalSetting?.sessionId || 4;
+
+  if (!branchId) return globalSession;
+
+  // Verify this session actually has enrollment data for this branch+class
+  const where: any = { branchId, sessionId: globalSession };
+  if (classId) where.classId = classId;
+  const sessionCheck = await prisma.enroll.count({ where });
+  if (sessionCheck > 0) return globalSession;
+
+  // Smart fallback: find the most recent session with enrollment data for this branch+class
+  const fallbackWhere: any = { branchId };
+  if (classId) fallbackWhere.classId = classId;
+  const latest = await prisma.enroll.findFirst({
+    where: fallbackWhere,
+    orderBy: { sessionId: 'desc' },
+    select: { sessionId: true },
+  });
+  return latest?.sessionId ?? globalSession;
 }
 
 /**
@@ -37,7 +59,10 @@ export async function getAdminAttendanceRegister(req: Request, res: Response): P
   }
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await activeSessionId(req.branchId, classId);
+
     const snapshot = await getRegisterWithEntries(prisma, {
       branchId: req.branchId,
       sessionId,
@@ -48,7 +73,7 @@ export async function getAdminAttendanceRegister(req: Request, res: Response): P
     const audits = snapshot.register
       ? await listRegisterAudits(prisma, { branchId: req.branchId, registerId: snapshot.register.id })
       : [];
-    return res.json({ success: true, ...snapshot, audits });
+    return res.json({ success: true, ...snapshot, audits, activeSessionId: sessionId });
   } catch (error) {
     const handled = registerErrorResponse(res, error);
     if (handled) return handled;
@@ -65,7 +90,10 @@ export async function unlockAdminAttendanceRegister(req: Request, res: Response)
   const dateKey = date ? parseSchoolDateKey(date) : null;
 
   try {
-    const sessionId = await activeSessionId();
+    const sessionId = req.body.sessionId
+      ? Number(req.body.sessionId)
+      : await activeSessionId(req.branchId, classId ? Number(classId) : undefined);
+
     const updated = await prisma.$transaction(async (tx) => {
       return unlockRegister(tx, {
         branchId: req.branchId,

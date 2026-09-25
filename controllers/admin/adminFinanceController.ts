@@ -27,9 +27,43 @@ function parseJsonIdList(raw: unknown): number[] {
   return [...new Set(values.map((value) => Number(value)).filter((id) => Number.isInteger(id) && id > 0))];
 }
 
-async function activeSessionId(): Promise<number> {
+export async function resolveFinanceSession(branchId?: number, requestedSessionId?: any): Promise<number> {
+  if (requestedSessionId && !isNaN(Number(requestedSessionId)) && Number(requestedSessionId) > 0) {
+    return Number(requestedSessionId);
+  }
   const globalSetting = await prisma.globalSettings.findFirst();
-  return globalSetting?.sessionId || 5;
+  const defaultSessionId = globalSetting?.sessionId || 5;
+  if (branchId) {
+    const count = await prisma.invoice.count({ where: { sessionId: defaultSessionId, branchId } });
+    if (count > 0) return defaultSessionId;
+
+    const latestWithInvoices = await prisma.invoice.findFirst({
+      where: { branchId },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (latestWithInvoices?.sessionId) return latestWithInvoices.sessionId;
+
+    const latestWithEnrolls = await prisma.enroll.findFirst({
+      where: { branchId },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (latestWithEnrolls?.sessionId) return latestWithEnrolls.sessionId;
+  }
+  return defaultSessionId;
+}
+
+export async function getAvailableFinanceSessions() {
+  const sessions = await prisma.schoolYear.findMany({
+    select: { id: true, schoolYear: true },
+    orderBy: { id: 'desc' },
+  });
+  return sessions;
+}
+
+async function activeSessionId(branchId?: number, requestedSessionId?: any): Promise<number> {
+  return resolveFinanceSession(branchId, requestedSessionId);
 }
 
 async function hydrateFeeGroups(branchId: number, groups: Array<{ feeTypeIds: string; classIds?: string | null } & Record<string, any>>) {
@@ -145,17 +179,26 @@ export async function getFinanceOverview(req: Request, res: Response): Promise<R
   const branchId = req.branchId;
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, req.query?.sessionId);
 
-    const data = await getFinancialOverview(prisma, {
-      branchId,
-      sessionId,
-    });
+    const [data, sessions] = await Promise.all([
+      getFinancialOverview(prisma, {
+        branchId,
+        sessionId,
+      }),
+      getAvailableFinanceSessions(),
+    ]);
+
+    const activeSchoolYear = sessions.find((s) => s.id === sessionId);
 
     return res.json({
       success: true,
-      data,
+      data: {
+        ...data,
+        sessionId,
+        sessionName: activeSchoolYear?.schoolYear || 'Academic Session',
+        sessions,
+      },
     });
   } catch (error) {
     console.error('[ADMIN] Financial overview error:', error);
@@ -302,22 +345,29 @@ export async function getFeeAssignments(req: Request, res: Response): Promise<Re
   const branchId = req.branchId;
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, req.query?.sessionId);
 
-    const assignments = await prisma.feeAssignment.findMany({
-      where: {
-        branchId,
-        sessionId,
-      },
-      include: {
-        feeType: true,
-        class: { select: { id: true, name: true } },
-      },
-    });
+    const [assignments, sessions] = await Promise.all([
+      prisma.feeAssignment.findMany({
+        where: {
+          branchId,
+          sessionId,
+        },
+        include: {
+          feeType: true,
+          class: { select: { id: true, name: true } },
+        },
+      }),
+      getAvailableFinanceSessions(),
+    ]);
+
+    const activeSchoolYear = sessions.find((s) => s.id === sessionId);
 
     return res.json({
       success: true,
+      sessionId,
+      sessionName: activeSchoolYear?.schoolYear || 'Academic Session',
+      sessions,
       data: assignments,
     });
   } catch (error) {
@@ -333,14 +383,13 @@ export async function saveFeeAssignments(req: Request, res: Response): Promise<R
   const branchId = req.branchId;
 
   try {
-    const { classId, allocations } = req.body;
+    const { classId, allocations, sessionId: bodySessionId } = req.body;
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
     const parsedClassId = parseInt(classId, 10);
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, bodySessionId);
 
     await prisma.$transaction(async (tx) => {
       await tx.feeAssignment.deleteMany({
@@ -385,7 +434,7 @@ export async function previewBatchInvoices(req: Request, res: Response): Promise
   const branchId = req.branchId;
 
   try {
-    const { classId, sectionId, termLabel, feeTypeIds } = (req.query || {}) as any;
+    const { classId, sectionId, termLabel, feeTypeIds, sessionId: querySessionId } = (req.query || {}) as any;
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
@@ -394,8 +443,7 @@ export async function previewBatchInvoices(req: Request, res: Response): Promise
     const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
     const term = (termLabel || 'First Term').trim();
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, querySessionId || (req.body && req.body.sessionId));
 
     const cls = await prisma.class.findUnique({
       where: { id: parsedClassId },
@@ -537,7 +585,7 @@ export async function generateBatchInvoices(req: Request, res: Response): Promis
   const branchId = req.branchId;
 
   try {
-    const { classId, sectionId, termLabel, dueDate, feeTypeIds, studentIds, overwriteExisting } = req.body;
+    const { classId, sectionId, termLabel, dueDate, feeTypeIds, studentIds, overwriteExisting, sessionId: bodySessionId } = req.body;
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
@@ -546,8 +594,7 @@ export async function generateBatchInvoices(req: Request, res: Response): Promis
     const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
     const term = (termLabel || 'First Term').trim();
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, bodySessionId);
 
     let targetFeeTypeIds: number[] = [];
     if (Array.isArray(feeTypeIds) && feeTypeIds.length > 0) {
@@ -710,8 +757,7 @@ export async function getSingleInvoicePdf(req: Request, res: Response): Promise<
     const className = enroll?.class?.name || 'Classroom';
     const sectionName = enroll?.section?.name || '';
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = invoice.sessionId || (await resolveFinanceSession(branchId));
     const schoolYear = await prisma.schoolYear.findUnique({ where: { id: sessionId }, select: { schoolYear: true } });
     const sessionName = schoolYear?.schoolYear || 'Active Session';
 
@@ -763,7 +809,7 @@ export async function getBatchInvoicesPdf(req: Request, res: Response): Promise<
   const branchId = req.branchId;
 
   try {
-    const { classId, sectionId, termLabel } = (req.query || {}) as any;
+    const { classId, sectionId, termLabel, sessionId: querySessionId } = (req.query || {}) as any;
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
@@ -772,8 +818,7 @@ export async function getBatchInvoicesPdf(req: Request, res: Response): Promise<
     const parsedSectionId = sectionId ? parseInt(sectionId, 10) : null;
     const term = termLabel ? String(termLabel).trim() : undefined;
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, querySessionId);
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
@@ -898,17 +943,20 @@ export async function getInvoices(req: Request, res: Response): Promise<Response
   const branchId = req.branchId;
 
   try {
-    const { status, search, classId, sectionId, termLabel, page = 1, limit = 50 } = (req.query || {}) as any;
+    const { status, search, classId, sectionId, termLabel, sessionId: querySessionId, page = 1, limit = 50 } = (req.query || {}) as any;
     const p = parseInt(page as string, 10);
     const l = parseInt(limit as string, 10);
     const skip = (p - 1) * l;
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, querySessionId);
 
     const where: any = {
       branchId,
     };
+
+    if (querySessionId !== 'all') {
+      where.sessionId = sessionId;
+    }
 
     if (status && status !== 'all') where.status = status;
     if (termLabel && termLabel !== 'all') where.termLabel = termLabel;
@@ -942,7 +990,7 @@ export async function getInvoices(req: Request, res: Response): Promise<Response
       ];
     }
 
-    const [invoices, total] = await Promise.all([
+    const [invoices, total, sessions] = await Promise.all([
       prisma.invoice.findMany({
         where,
         include: {
@@ -954,6 +1002,7 @@ export async function getInvoices(req: Request, res: Response): Promise<Response
               registerNo: true,
               enrolls: {
                 take: 1,
+                where: { branchId, sessionId },
                 orderBy: { createdAt: 'desc' },
                 include: {
                   class: { select: { id: true, name: true } },
@@ -970,7 +1019,10 @@ export async function getInvoices(req: Request, res: Response): Promise<Response
         take: l,
       }),
       prisma.invoice.count({ where }),
+      getAvailableFinanceSessions(),
     ]);
+
+    const activeSchoolYear = sessions.find((s) => s.id === sessionId);
 
     const formattedInvoices = invoices.map((inv) => {
       const enroll = inv.student?.enrolls?.[0];
@@ -984,14 +1036,23 @@ export async function getInvoices(req: Request, res: Response): Promise<Response
         status: inv.status,
         dueDate: inv.dueDate,
         issuedAt: inv.issuedAt,
-        student: {
-          id: inv.student.id,
-          firstName: inv.student.firstName,
-          lastName: inv.student.lastName,
-          registerNo: inv.student.registerNo,
-          className: enroll?.class?.name || 'N/A',
-          sectionName: enroll?.section?.name || 'N/A',
-        },
+        student: inv.student
+          ? {
+              id: inv.student.id,
+              firstName: inv.student.firstName,
+              lastName: inv.student.lastName,
+              registerNo: inv.student.registerNo,
+              className: enroll?.class?.name || 'Classroom',
+              sectionName: enroll?.section?.name || '',
+            }
+          : {
+              id: 0,
+              firstName: 'Unknown',
+              lastName: 'Student',
+              registerNo: 'N/A',
+              className: 'Classroom',
+              sectionName: '',
+            },
         items: inv.items.map((it) => ({
           id: it.id,
           description: it.description,
@@ -1010,6 +1071,9 @@ export async function getInvoices(req: Request, res: Response): Promise<Response
     return res.json({
       success: true,
       data: formattedInvoices,
+      sessionId,
+      sessionName: activeSchoolYear?.schoolYear || 'Academic Session',
+      sessions,
       pagination: {
         page: p,
         limit: l,
@@ -1030,13 +1094,12 @@ export async function createInvoice(req: Request, res: Response): Promise<Respon
   const branchId = req.branchId;
 
   try {
-    const { studentId, termLabel, feeTypeIds, dueDate } = req.body;
+    const { studentId, termLabel, feeTypeIds, dueDate, sessionId: bodySessionId } = req.body;
     if (!studentId || !Array.isArray(feeTypeIds) || feeTypeIds.length === 0) {
       return res.status(400).json({ success: false, message: 'Student ID and at least one Fee Type selection are required.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, bodySessionId);
 
     const invoice = await generateInvoice(prisma, {
       studentId: parseInt(studentId, 10),
@@ -1098,8 +1161,7 @@ export async function exportFinanceCsv(req: Request, res: Response): Promise<Res
   const branchId = req.branchId;
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, req.query?.sessionId);
 
     const csvContent = await exportFinancialReportCsv(prisma, {
       branchId,
@@ -1122,8 +1184,7 @@ export async function exportFinancePdf(req: Request, res: Response): Promise<Res
   const branchId = req.branchId;
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveFinanceSession(branchId, req.query?.sessionId);
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
@@ -1197,7 +1258,7 @@ export async function createFeeGroup(req: Request, res: Response): Promise<Respo
     });
 
     if (allocatedClassIds.length && validTypeIds.length) {
-      const sessionId = await activeSessionId();
+      const sessionId = await activeSessionId(branchId, req.body?.sessionId);
       await syncFeeGroupClassAssignments({
         branchId: branchId!,
         sessionId,
@@ -1257,7 +1318,7 @@ export async function allocateFeeGroup(req: Request, res: Response): Promise<Res
 
     const previousClassIds = parseJsonIdList(group.classIds);
     const previousFeeTypeIds = parseJsonIdList(group.feeTypeIds);
-    const sessionId = await activeSessionId();
+    const sessionId = await activeSessionId(branchId, req.body?.sessionId);
 
     await syncFeeGroupClassAssignments({
       branchId: branchId!,
@@ -1304,7 +1365,7 @@ export async function bulkDuesPost(req: Request, res: Response): Promise<Respons
     }
 
     const cId = parseInt(classId, 10);
-    const activeSessionId = sessionId ? parseInt(sessionId, 10) : 5;
+    const activeSessionId = await resolveFinanceSession(branchId, sessionId);
 
     const selectedFeeTypes = await prisma.feeType.findMany({
       where: { id: { in: feeTypeIds.map((id: any) => parseInt(id, 10)) } },
@@ -1476,14 +1537,25 @@ export async function getCollectionsReport(req: Request, res: Response): Promise
   const branchId = req.branchId;
 
   try {
-    const invoices = await prisma.invoice.findMany({
-      where: { branchId },
-      include: {
-        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
-        items: true,
-        payments: true,
-      },
-    });
+    const sessionId = await resolveFinanceSession(branchId, req.query?.sessionId);
+    const where: any = { branchId };
+    if (req.query?.sessionId !== 'all') {
+      where.sessionId = sessionId;
+    }
+
+    const [invoices, sessions] = await Promise.all([
+      prisma.invoice.findMany({
+        where,
+        include: {
+          student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
+          items: true,
+          payments: true,
+        },
+      }),
+      getAvailableFinanceSessions(),
+    ]);
+
+    const activeSchoolYear = sessions.find((s) => s.id === sessionId);
 
     const totalInvoiced = invoices.reduce((acc, inv) => acc + Number(inv.totalAmount), 0);
     const totalCollected = invoices.reduce((acc, inv) => acc + Number(inv.paidAmount), 0);
@@ -1505,6 +1577,9 @@ export async function getCollectionsReport(req: Request, res: Response): Promise
 
     return res.json({
       success: true,
+      sessionId,
+      sessionName: activeSchoolYear?.schoolYear || 'Academic Session',
+      sessions,
       summary: {
         totalInvoiced,
         totalCollected,

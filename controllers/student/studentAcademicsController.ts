@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { generateReportCardPdf, generateMontessoriReportCardPdf } from '../../lib/pdfService';
 import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
+import { parseMarkScore } from '../../lib/markParser';
 
 /**
  * GET /api/student/attendance
@@ -217,11 +218,9 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 };
       }
-      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-      const examVal = m.mark ? parseFloat(m.mark) : 0;
-      const totalVal = testVal + examVal;
-      if (m.cbtMark !== null || m.mark !== null) {
-        classAverageMap[key].sum += totalVal;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      if (parsed.hasValidScore) {
+        classAverageMap[key].sum += parsed.total;
         classAverageMap[key].count += 1;
       }
     });
@@ -239,19 +238,10 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
     let marksCount = 0;
 
     const reportCard = studentMarks.map((m) => {
-      const testScore = m.cbtMark !== null ? parseFloat(m.cbtMark) : 0;
-      const examScore = m.mark !== null ? parseFloat(m.mark) : 0;
-      const totalScore = testScore + examScore;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
 
-      let markValue = null;
-      let studentScore = NaN;
-      if (m.cbtMark !== null || m.mark !== null) {
-        studentScore = totalScore;
-        markValue = String(totalScore);
-      }
-
-      if (!isNaN(studentScore)) {
-        totalScoreSum += studentScore;
+      if (parsed.hasValidScore) {
+        totalScoreSum += parsed.total;
         marksCount++;
       }
 
@@ -260,18 +250,18 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       const classAverage =
         avgData && avgData.count > 0
           ? Number((avgData.sum / avgData.count).toFixed(1))
-          : isNaN(studentScore)
-          ? 0
-          : studentScore;
+          : parsed.hasValidScore
+          ? parsed.total
+          : 0;
 
       return {
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: m.cbtMark !== null ? String(testScore) : null,
-        theoryMark: m.mark !== null ? String(examScore) : null,
-        mark: markValue,
+        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+        mark: parsed.hasValidScore ? String(parsed.total) : null,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage,
       };
@@ -311,11 +301,9 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         });
 
         allMarks.forEach((m) => {
-          const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-          const examVal = m.mark ? parseFloat(m.mark) : 0;
-          const totalVal = testVal + examVal;
-          if (m.cbtMark !== null || m.mark !== null) {
-            studentAggregates[m.studentId].sum += totalVal;
+          const parsed = parseMarkScore(m.mark, m.cbtMark);
+          if (parsed.hasValidScore) {
+            studentAggregates[m.studentId].sum += parsed.total;
             studentAggregates[m.studentId].count += 1;
           }
         });
@@ -517,11 +505,9 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 };
       }
-      const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-      const examVal = m.mark ? parseFloat(m.mark) : 0;
-      const totalVal = testVal + examVal;
-      if (m.cbtMark !== null || m.mark !== null) {
-        classAverageMap[key].sum += totalVal;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      if (parsed.hasValidScore) {
+        classAverageMap[key].sum += parsed.total;
         classAverageMap[key].count += 1;
       }
     });
@@ -530,19 +516,10 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
     let marksCount = 0;
 
     const reportCard = studentMarks.map((m) => {
-      const testScore = m.cbtMark !== null ? parseFloat(m.cbtMark) : 0;
-      const examScore = m.mark !== null ? parseFloat(m.mark) : 0;
-      const totalScore = testScore + examScore;
+      const parsed = parseMarkScore(m.mark, m.cbtMark);
 
-      let markValue = null;
-      let studentScore = NaN;
-      if (m.cbtMark !== null || m.mark !== null) {
-        studentScore = totalScore;
-        markValue = String(totalScore);
-      }
-
-      if (!isNaN(studentScore)) {
-        totalScoreSum += studentScore;
+      if (parsed.hasValidScore) {
+        totalScoreSum += parsed.total;
         marksCount++;
       }
 
@@ -551,18 +528,18 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       const classAverage =
         avgData && avgData.count > 0
           ? Number((avgData.sum / avgData.count).toFixed(1))
-          : isNaN(studentScore)
-          ? 0
-          : studentScore;
+          : parsed.hasValidScore
+          ? parsed.total
+          : 0;
 
       return {
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: m.cbtMark !== null ? String(testScore) : null,
-        theoryMark: m.mark !== null ? String(examScore) : null,
-        mark: markValue,
+        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+        mark: parsed.hasValidScore ? String(parsed.total) : null,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage,
       };
@@ -602,11 +579,9 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
         });
 
         allMarks.forEach((m) => {
-          const testVal = m.cbtMark ? parseFloat(m.cbtMark) : 0;
-          const examVal = m.mark ? parseFloat(m.mark) : 0;
-          const totalVal = testVal + examVal;
-          if (m.cbtMark !== null || m.mark !== null) {
-            studentAggregates[m.studentId].sum += totalVal;
+          const parsed = parseMarkScore(m.mark, m.cbtMark);
+          if (parsed.hasValidScore) {
+            studentAggregates[m.studentId].sum += parsed.total;
             studentAggregates[m.studentId].count += 1;
           }
         });
