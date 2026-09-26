@@ -21,14 +21,11 @@ async function main() {
   // Step 2: Push Prisma Schema to Target to create all tables, enums, indexes
   console.log("2. Ensuring all tables & schema exist on PipeOps database via Prisma...");
   try {
-    let prismaBin = "./node_modules/.bin/prisma";
-    try {
-      require('fs').accessSync(prismaBin);
-    } catch {
-      prismaBin = "npx prisma";
-    }
-    execSync(`${prismaBin} db push --schema=./prisma/schema.prisma --accept-data-loss --url="${TARGET_URL}"`, {
-      env: { ...process.env, DATABASE_URL: TARGET_URL },
+    const nodeBin = process.execPath;
+    const prismaJs = "./node_modules/prisma/build/index.js";
+    const nodeDir = require('path').dirname(nodeBin);
+    execSync(`"${nodeBin}" "${prismaJs}" db push --schema=./prisma/schema.prisma --accept-data-loss --url="${TARGET_URL}"`, {
+      env: { ...process.env, PATH: `${nodeDir}:${process.env.PATH}`, DATABASE_URL: TARGET_URL },
       stdio: 'inherit'
     });
     console.log("   ✅ Prisma schema pushed successfully to PipeOps!\n");
