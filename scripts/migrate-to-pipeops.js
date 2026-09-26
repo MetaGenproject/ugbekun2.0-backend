@@ -27,7 +27,7 @@ async function main() {
     } catch {
       prismaBin = "npx prisma";
     }
-    execSync(`${prismaBin} db push --schema=./prisma/schema.prisma --accept-data-loss --skip-generate`, {
+    execSync(`${prismaBin} db push --schema=./prisma/schema.prisma --accept-data-loss --url="${TARGET_URL}"`, {
       env: { ...process.env, DATABASE_URL: TARGET_URL },
       stdio: 'inherit'
     });
