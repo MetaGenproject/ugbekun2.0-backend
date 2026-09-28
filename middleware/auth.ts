@@ -100,7 +100,7 @@ export async function requireBranchAdmin(req: Request, res: Response, next: Next
 
   try {
     const decoded: any = jwt.verify(token, JWT_SECRET);
-    if (!decoded || (decoded.role !== 2 && decoded.role !== 1)) {
+    if (!decoded || (decoded.role !== 2 && decoded.role !== 1 && decoded.role !== 9)) {
       res.status(403).json({ success: false, message: 'Forbidden. Branch admin privileges required.' });
       return;
     }
@@ -150,7 +150,7 @@ export async function assertBranchAdmin(req: Request, res: Response): Promise<an
 
   try {
     const decoded: any = jwt.verify(token, JWT_SECRET);
-    if (!decoded || (decoded.role !== 2 && decoded.role !== 1)) {
+    if (!decoded || (decoded.role !== 2 && decoded.role !== 1 && decoded.role !== 9)) {
       res.status(403).json({ success: false, message: 'Forbidden.' });
       return null;
     }
@@ -230,7 +230,7 @@ export async function requireTeacher(req: Request, res: Response, next: NextFunc
     }
 
     // Admin acting as teacher support via x-admin-teacher-id
-    if (decoded.role === 2 || decoded.role === 1) {
+    if (decoded.role === 2 || decoded.role === 1 || decoded.role === 9) {
       const headerTeacherId = req.headers['x-admin-teacher-id'];
       if (headerTeacherId) {
         req.teacherId = Number(headerTeacherId);

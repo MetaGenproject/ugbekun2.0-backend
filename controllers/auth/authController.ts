@@ -29,7 +29,7 @@ async function resolveUserBranch(user: { id: number; role: number; username: str
   const roleId = user.role;
 
   try {
-    if (roleId === 2) {
+    if (roleId === 2 || roleId === 9) {
       if (user.legacyUserId) {
         const branch = await prisma.branch.findUnique({
           where: { id: user.legacyUserId },

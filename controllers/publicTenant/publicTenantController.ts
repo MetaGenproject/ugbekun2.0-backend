@@ -320,7 +320,7 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
               select: { branchId: true },
             });
             branchId = teacherRecord?.branchId || null;
-          } else if (!branchId && (decoded.role === 2 || decoded.role === 1)) {
+          } else if (!branchId && (decoded.role === 2 || decoded.role === 1 || decoded.role === 9)) {
             const adminUser = await prisma.user.findFirst({
               where: { OR: [{ id: decoded.sub || decoded.id }, { legacyUserId: decoded.legacyUserId || decoded.sub }] },
               select: { teacher: { select: { branchId: true } } },
