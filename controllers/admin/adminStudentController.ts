@@ -45,6 +45,15 @@ export async function savePhoto(photoBase64?: string | null, folder: string = 'u
   return null;
 }
 
+export function sanitizePhotoUrl(photo?: string | null): string | null {
+  if (!photo) return null;
+  const p = String(photo).trim();
+  if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:image/')) {
+    return p;
+  }
+  return null;
+}
+
 /**
  * GET /api/admin/students-parents
  */
@@ -171,7 +180,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
         relation: parent.relation || 'Parent',
         email: parentEmail,
         mobileno: parentPhone,
-        photo: parent.photo || null,
+        photo: sanitizePhotoUrl(parent.photo),
         address: parentAddress,
         city: parent.city || '',
         state: parent.state || '',
@@ -193,10 +202,10 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           gender: student.gender,
           mobileno: student.mobileno,
           email: student.email,
-          photo: student.photo || null,
+          photo: sanitizePhotoUrl(student.photo),
           active: student.active,
           parentName: student.parent?.name || null,
-          parentPhoto: student.parent?.photo || null,
+          parentPhoto: sanitizePhotoUrl(student.parent?.photo),
           parentPhone: student.parent?.mobileno || null,
           parentEmail: student.parent?.email || null,
           className: student.enrolls[0]?.class?.name || 'Unassigned',
@@ -282,14 +291,14 @@ export async function searchParents(req: Request, res: Response): Promise<Respon
       mobileno: p.mobileno,
       address: p.address,
       occupation: p.occupation,
-      photo: p.photo,
+      photo: sanitizePhotoUrl(p.photo),
       active: p.active,
       enrolledChildrenCount: p.students.length,
       children: p.students.map((s) => ({
         id: s.id,
         name: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
         registerNo: s.registerNo,
-        photo: s.photo,
+        photo: sanitizePhotoUrl(s.photo),
         className: s.enrolls[0]?.class?.name || 'Unassigned',
         sectionName: s.enrolls[0]?.section?.name || '',
       })),
@@ -1211,7 +1220,7 @@ export async function getStudentById(req: Request, res: Response): Promise<Respo
         mobileno: student.mobileno || '',
         email: student.email || '',
         previousDetails: student.previousDetails || '',
-        photo: student.photo || '',
+        photo: sanitizePhotoUrl(student.photo) || '',
         active: student.active,
         classId: currentEnroll?.classId || '',
         sectionId: currentEnroll?.sectionId || '',
@@ -2255,7 +2264,7 @@ export async function getIdCards(req: Request, res: Response): Promise<Response 
 
       if (c.entityType === 'student' && c.student) {
         name = `${c.student.firstName} ${c.student.lastName}`;
-        photo = c.student.photo;
+        photo = sanitizePhotoUrl(c.student.photo);
         role = 'Student';
       } else if (c.entityType === 'staff' && c.user) {
         name = c.user.username;
