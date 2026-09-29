@@ -396,17 +396,47 @@ export async function gradeOnlineExamSubmission(req: Request, res: Response): Pr
  */
 export async function updateOnlineExam(req: Request, res: Response): Promise<Response | void> {
   const { id } = req.params;
-  const { title, passingMark, duration, examDate } = req.body;
+  const {
+    title,
+    passingMark,
+    duration,
+    examDate,
+    startDate,
+    endDate,
+    shuffleQuestions,
+    showResults,
+    classId,
+    subjectId,
+  } = req.body;
   try {
     const exam = await prisma.onlineExam.update({
       where: { id: Number(id) },
       data: {
-        title,
-        passingMark: passingMark !== undefined ? Number(passingMark) : undefined,
-        duration: duration !== undefined ? Number(duration) : undefined,
-        examDate: examDate ? new Date(examDate) : null,
+        title: title !== undefined ? String(title).trim() : undefined,
+        passingMark: passingMark !== undefined && passingMark !== '' ? Number(passingMark) : undefined,
+        duration: duration !== undefined && duration !== '' ? Number(duration) : undefined,
+        examDate: examDate ? new Date(examDate) : undefined,
+        classId: classId ? Number(classId) : undefined,
+        subjectId: subjectId ? Number(subjectId) : undefined,
       },
     });
+
+    // Also update any linked CbtDistribution records so student portal and admin portal stay synced
+    await prisma.cbtDistribution.updateMany({
+      where: { onlineExamId: Number(id) },
+      data: {
+        title: title !== undefined ? String(title).trim() : undefined,
+        passingMark: passingMark !== undefined && passingMark !== '' ? Number(passingMark) : undefined,
+        duration: duration !== undefined && duration !== '' ? Number(duration) : undefined,
+        startDate: startDate ? new Date(startDate) : undefined,
+        endDate: endDate ? new Date(endDate) : undefined,
+        shuffleQuestions: shuffleQuestions !== undefined ? Boolean(shuffleQuestions) : undefined,
+        showResults: showResults !== undefined ? Boolean(showResults) : undefined,
+        classId: classId ? Number(classId) : undefined,
+        subjectId: subjectId ? Number(subjectId) : undefined,
+      },
+    });
+
     return res.json({ success: true, exam, message: 'Online exam updated successfully.' });
   } catch (error) {
     console.error('[TEACHER] Update online exam error:', error);

@@ -197,6 +197,8 @@ import {
   getAdminHomeworks,
   createAdminHomework,
   getAdminHomeworkSubmissions,
+  gradeAdminHomeworkSubmission,
+  deleteAdminHomework,
 } from '../controllers/admin/adminHomeworkController';
 
 import {
@@ -521,6 +523,7 @@ router.post('/cbt/groups', createCbtGroup);
 router.delete('/cbt/groups/:id', deleteCbtGroup);
 router.get('/cbt/distributions', getCbtDistributions);
 router.post('/cbt/distributions', createCbtDistribution);
+router.put('/cbt/distributions/:id', createCbtDistribution);
 router.post('/cbt/distributions/:id/reschedule', rescheduleCbtDistribution);
 router.post('/cbt/distributions/:id/toggle-publish', togglePublishCbtDistribution);
 router.delete('/cbt/distributions/:id', deleteCbtDistribution);
@@ -540,6 +543,8 @@ router.post('/cbt/sync', syncCbtLegacy);
 router.get('/homeworks', getAdminHomeworks);
 router.post('/homeworks', createAdminHomework);
 router.get('/homeworks/:id/submissions', getAdminHomeworkSubmissions);
+router.post('/homeworks/submissions/:id/grade', gradeAdminHomeworkSubmission);
+router.delete('/homeworks/:id', deleteAdminHomework);
 
 // ============================================================================
 // 7. MARKS ENTRY, COMMENTARY & REPORT CARDS

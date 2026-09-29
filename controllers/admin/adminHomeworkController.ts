@@ -120,21 +120,90 @@ export async function getAdminHomeworkSubmissions(req: Request, res: Response): 
   try {
     const homework = await prisma.homework.findFirst({
       where: { id: Number(req.params.id), branchId: req.branchId },
-      select: { id: true },
+      include: {
+        class: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true } },
+      },
     });
     if (!homework) {
       return res.status(404).json({ success: false, message: 'Homework not found.' });
     }
+
     const submissions = await prisma.homeworkSubmission.findMany({
       where: { homeworkId: homework.id },
       include: {
-        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true, photo: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
-    return res.json({ success: true, submissions });
+
+    const enrollments = await prisma.enroll.findMany({
+      where: {
+        classId: homework.classId,
+        sessionId: homework.sessionId,
+        branchId: req.branchId,
+        isAlumni: 0,
+      },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true, photo: true } },
+      },
+      orderBy: [{ student: { lastName: 'asc' } }, { student: { firstName: 'asc' } }],
+    });
+
+    const enrolledStudents = enrollments.map((e) => e.student).filter(Boolean);
+
+    return res.json({
+      success: true,
+      homework,
+      submissions,
+      enrolledStudents,
+    });
   } catch (error) {
+    console.error('[ADMIN] Get homework submissions error:', error);
     return res.status(500).json({ success: false, message: 'Failed to retrieve submissions.' });
+  }
+}
+
+export async function gradeAdminHomeworkSubmission(req: Request, res: Response): Promise<Response | void> {
+  const { id } = req.params;
+  const { score, feedback } = req.body;
+  try {
+    const submission = await prisma.homeworkSubmission.update({
+      where: { id: Number(id) },
+      data: {
+        score: score !== null && score !== undefined && score !== '' ? Number(score) : null,
+        feedback: feedback !== undefined ? feedback : null,
+      },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
+      },
+    });
+    return res.json({ success: true, submission, message: 'Homework graded successfully.' });
+  } catch (error) {
+    console.error('[ADMIN] Grade homework submission error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save grade.' });
+  }
+}
+
+export async function deleteAdminHomework(req: Request, res: Response): Promise<Response | void> {
+  const { id } = req.params;
+  try {
+    const homework = await prisma.homework.findFirst({
+      where: { id: Number(id), branchId: req.branchId },
+    });
+    if (!homework) {
+      return res.status(404).json({ success: false, message: 'Homework not found.' });
+    }
+    await prisma.homeworkSubmission.deleteMany({
+      where: { homeworkId: homework.id },
+    });
+    await prisma.homework.delete({
+      where: { id: homework.id },
+    });
+    return res.json({ success: true, message: 'Homework assignment deleted successfully.' });
+  } catch (error) {
+    console.error('[ADMIN] Delete homework error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to delete homework.' });
   }
 }
 
