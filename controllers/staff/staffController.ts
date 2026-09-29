@@ -99,10 +99,11 @@ export async function getTeachersStaff(req: Request, res: Response): Promise<Res
 
           return {
             id: teacher.id,
+            userId: teacher.userId || null,
             name: teacher.name,
             email: teacher.email,
             phone: teacher.phone,
-            photo: teacher.photo || null,
+            photo: (teacher.photo && (String(teacher.photo).startsWith('http://') || String(teacher.photo).startsWith('https://') || String(teacher.photo).startsWith('data:image/'))) ? teacher.photo : null,
             qualifications: teacher.qualifications || null,
             houseAddress: teacher.houseAddress || null,
             department: teacher.department || null,

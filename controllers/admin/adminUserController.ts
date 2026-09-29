@@ -24,15 +24,111 @@ function generateSecurePassword(length = 10): string {
   return password;
 }
 
-async function resolveUserWithBranch(targetId: number) {
-  // 1. Search by direct User ID or legacyUserId first
+async function resolveUserWithBranch(targetId: number, adminBranchId?: number) {
+  // 1. If adminBranchId is provided, first prioritize resolving within this branch
+  if (adminBranchId) {
+    // 1a. Check if targetId is a teacher in this branch (by teacher id or user id)
+    const teacher = await prisma.teacher.findFirst({
+      where: {
+        branchId: adminBranchId,
+        OR: [
+          { id: targetId },
+          { userId: targetId },
+        ],
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (teacher?.user) {
+      return {
+        ...teacher.user,
+        resolvedBranchId: adminBranchId,
+        displayName: teacher.name,
+      };
+    }
+
+    // 1b. Check if targetId is a student in this branch
+    const student = await prisma.student.findFirst({
+      where: {
+        branchId: adminBranchId,
+        OR: [
+          { id: targetId },
+          { userId: targetId },
+        ],
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (student?.user) {
+      return {
+        ...student.user,
+        resolvedBranchId: adminBranchId,
+        displayName: `${student.firstName} ${student.lastName}`.trim(),
+      };
+    }
+
+    // 1c. Check if targetId is a parent in this branch
+    const parent = await prisma.parent.findFirst({
+      where: {
+        branchId: adminBranchId,
+        OR: [
+          { id: targetId },
+          { userId: targetId },
+        ],
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (parent?.user) {
+      return {
+        ...parent.user,
+        resolvedBranchId: adminBranchId,
+        displayName: parent.name,
+      };
+    }
+
+    // 1d. Check direct user record in this branch
+    const branchUser = await prisma.user.findFirst({
+      where: {
+        id: targetId,
+        OR: [
+          { legacyUserId: adminBranchId },
+          { teacher: { branchId: adminBranchId } },
+          { student: { branchId: adminBranchId } },
+          { parent: { branchId: adminBranchId } },
+        ],
+      },
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, branchId: true } },
+        parent: { select: { id: true, name: true, branchId: true } },
+        teacher: { select: { id: true, name: true, branchId: true } },
+      },
+    });
+
+    if (branchUser) {
+      const displayName =
+        branchUser.teacher?.name ||
+        (branchUser.student ? `${branchUser.student.firstName} ${branchUser.student.lastName}`.trim() : null) ||
+        branchUser.parent?.name ||
+        branchUser.username;
+
+      return {
+        ...branchUser,
+        resolvedBranchId: adminBranchId,
+        displayName,
+      };
+    }
+  }
+
+  // 2. Fallback: Search by direct User ID
   let user = await prisma.user.findFirst({
-    where: {
-      OR: [
-        { id: targetId },
-        { legacyUserId: targetId },
-      ],
-    },
+    where: { id: targetId },
     include: {
       student: { select: { id: true, firstName: true, lastName: true, branchId: true } },
       parent: { select: { id: true, name: true, branchId: true } },
@@ -40,14 +136,15 @@ async function resolveUserWithBranch(targetId: number) {
     },
   });
 
-  // 2. Fallback to profile record IDs if not matched by User ID
+  // 3. Fallback: Search by profile record IDs or legacyUserId
   if (!user) {
     user = await prisma.user.findFirst({
       where: {
         OR: [
+          { teacher: { id: targetId } },
           { student: { id: targetId } },
           { parent: { id: targetId } },
-          { teacher: { id: targetId } },
+          { legacyUserId: targetId },
         ],
       },
       include: {
@@ -60,11 +157,11 @@ async function resolveUserWithBranch(targetId: number) {
 
   if (!user) return null;
 
-  const branchId = user.student?.branchId || user.parent?.branchId || user.teacher?.branchId || null;
+  const branchId = user.teacher?.branchId || user.student?.branchId || user.parent?.branchId || null;
   const displayName =
+    user.teacher?.name ||
     (user.student ? `${user.student.firstName} ${user.student.lastName}`.trim() : null) ||
     user.parent?.name ||
-    user.teacher?.name ||
     user.username;
 
   return {
@@ -87,7 +184,7 @@ export async function getUserCredentials(req: Request, res: Response): Promise<R
       return res.status(400).json({ success: false, message: 'Invalid target user ID.' });
     }
 
-    const targetUser = await resolveUserWithBranch(targetUserId);
+    const targetUser = await resolveUserWithBranch(targetUserId, adminBranchId);
 
     if (!targetUser) {
       return res.status(404).json({ success: false, message: 'User record not found.' });
@@ -134,7 +231,7 @@ export async function resetUserPassword(req: Request, res: Response): Promise<Re
       return res.status(400).json({ success: false, message: 'Invalid target user ID.' });
     }
 
-    const targetUser = await resolveUserWithBranch(targetUserId);
+    const targetUser = await resolveUserWithBranch(targetUserId, adminBranchId);
 
     if (!targetUser) {
       return res.status(404).json({ success: false, message: 'User record not found.' });

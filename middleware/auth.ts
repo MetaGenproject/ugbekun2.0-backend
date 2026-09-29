@@ -33,11 +33,24 @@ export async function resolveBranchForAdmin(decoded: any): Promise<number | null
         ],
       },
       select: {
+        legacyUserId: true,
+        username: true,
+        role: true,
         teacher: { select: { branchId: true } },
         student: { select: { branchId: true } },
         parent: { select: { branchId: true } },
       },
     });
+
+    if (userRecord?.legacyUserId) {
+      const branch = await prisma.branch.findUnique({
+        where: { id: userRecord.legacyUserId },
+        select: { id: true },
+      });
+      if (branch) {
+        return branch.id;
+      }
+    }
 
     const dbBranchId = userRecord?.teacher?.branchId || userRecord?.student?.branchId || userRecord?.parent?.branchId;
     if (dbBranchId) {

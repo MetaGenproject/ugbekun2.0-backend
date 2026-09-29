@@ -221,7 +221,7 @@ export async function listStaffForBranch(prisma: any, branchId: number) {
       phone: user.phone || null,
       mobileno: user.phone || null,
       department: user.department || 'General Administration',
-      photo: user.photo || null,
+      photo: (user.photo && (String(user.photo).startsWith('http://') || String(user.photo).startsWith('https://') || String(user.photo).startsWith('data:image/'))) ? user.photo : null,
       lastLogin: user.lastLogin,
       active: user.active,
     }));
