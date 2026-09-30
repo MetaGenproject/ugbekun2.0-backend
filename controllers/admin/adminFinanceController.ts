@@ -339,6 +339,112 @@ export async function bulkCreateFeeTypes(req: Request, res: Response): Promise<R
 }
 
 /**
+ * PUT /api/admin/finances/fee-types/:id
+ */
+export async function updateFeeType(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const { name, code, amount, frequency, active } = req.body;
+    const existing = await prisma.feeType.findFirst({
+      where: { id, branchId },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Fee type not found.' });
+    }
+
+    let cleanCode = existing.code;
+    if (code && code.trim().toUpperCase() !== existing.code) {
+      cleanCode = code.trim().toUpperCase();
+      const duplicate = await prisma.feeType.findUnique({
+        where: {
+          branchId_code: {
+            branchId: branchId!,
+            code: cleanCode,
+          },
+        },
+      });
+      if (duplicate) {
+        return res.status(400).json({ success: false, message: `Fee code '${cleanCode}' is already registered.` });
+      }
+    }
+
+    const updated = await prisma.feeType.update({
+      where: { id },
+      data: {
+        ...(name && { name: String(name).trim() }),
+        ...(code && { code: cleanCode }),
+        ...(amount !== undefined && { amount: parseFloat(amount) }),
+        ...(frequency && { frequency }),
+        ...(active !== undefined && { active: Boolean(active) }),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Fee type updated successfully.',
+      data: updated,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Update fee type error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update fee type.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/finances/fee-types/:id
+ */
+export async function deleteFeeType(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.feeType.findFirst({
+      where: { id, branchId },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Fee type not found.' });
+    }
+
+    // Check if referenced in invoice items
+    const usedInInvoices = await prisma.invoiceItem.count({
+      where: { feeTypeId: id },
+    });
+
+    if (usedInInvoices > 0) {
+      // Safely deactivate so existing financial ledgers remain intact
+      await prisma.feeType.update({
+        where: { id },
+        data: { active: false },
+      });
+      return res.json({
+        success: true,
+        message: 'Fee type is referenced in issued invoices and has been deactivated.',
+      });
+    }
+
+    // Delete assignments for this feeType
+    await prisma.feeAssignment.deleteMany({
+      where: { feeTypeId: id, branchId },
+    });
+
+    // Delete fee type
+    await prisma.feeType.delete({
+      where: { id },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Fee type deleted successfully.',
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Delete fee type error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete fee type.' });
+  }
+}
+
+/**
  * GET /api/admin/finances/fee-assignments
  */
 export async function getFeeAssignments(req: Request, res: Response): Promise<Response | void> {
@@ -1143,10 +1249,38 @@ export async function recordInvoicePayment(req: Request, res: Response): Promise
       branchId,
     });
 
+    const fullPayment = await prisma.payment.findUnique({
+      where: { id: payment.id },
+      include: {
+        invoice: {
+          include: {
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true,
+                photo: true,
+                enrolls: {
+                  select: {
+                    class: { select: { id: true, name: true } },
+                    section: { select: { id: true, name: true } },
+                  },
+                  orderBy: { id: 'desc' },
+                  take: 1,
+                },
+                parent: { select: { id: true, name: true, mobileno: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+
     return res.status(201).json({
       success: true,
       message: 'Payment recorded and invoice balance updated successfully.',
-      payment,
+      payment: fullPayment || payment,
     });
   } catch (error) {
     console.error('[ADMIN] Record payment error:', error);
@@ -1353,6 +1487,97 @@ export async function allocateFeeGroup(req: Request, res: Response): Promise<Res
 }
 
 /**
+ * PUT /api/admin/finances/fee-groups/:id
+ */
+export async function updateFeeGroup(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.feeGroup.findFirst({
+      where: { id, branchId },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Fee group not found.' });
+    }
+
+    const { name, description, feeTypeIds, classIds, totalAmount } = req.body;
+    const typeIds = feeTypeIds !== undefined ? parseJsonIdList(feeTypeIds) : parseJsonIdList(existing.feeTypeIds);
+    const allocatedClassIds = classIds !== undefined ? parseJsonIdList(classIds) : parseJsonIdList(existing.classIds);
+
+    const types = typeIds.length
+      ? await prisma.feeType.findMany({
+          where: { id: { in: typeIds }, branchId, active: true },
+          select: { id: true, amount: true },
+        })
+      : [];
+    const validTypeIds = types.map((type) => type.id);
+    const computedTotal = types.reduce((sum, type) => sum + Number(type.amount), 0);
+
+    const updated = await prisma.feeGroup.update({
+      where: { id },
+      data: {
+        ...(name && { name: String(name).trim() }),
+        ...(description !== undefined && { description: description || null }),
+        feeTypeIds: JSON.stringify(validTypeIds),
+        classIds: JSON.stringify(allocatedClassIds),
+        totalAmount: totalAmount !== undefined ? parseFloat(totalAmount) : computedTotal,
+      },
+    });
+
+    if (allocatedClassIds.length && validTypeIds.length) {
+      const sessionId = await activeSessionId(branchId, req.body?.sessionId);
+      await syncFeeGroupClassAssignments({
+        branchId: branchId!,
+        sessionId,
+        feeTypeIds: validTypeIds,
+        nextClassIds: allocatedClassIds,
+        previousClassIds: parseJsonIdList(existing.classIds),
+      });
+    }
+
+    const [hydrated] = await hydrateFeeGroups(branchId, [updated]);
+    return res.json({
+      success: true,
+      message: 'Fee group updated successfully.',
+      data: hydrated,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Update fee group error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update fee group.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/finances/fee-groups/:id
+ */
+export async function deleteFeeGroup(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const id = Number(req.params.id);
+
+  try {
+    const existing = await prisma.feeGroup.findFirst({
+      where: { id, branchId },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Fee group not found.' });
+    }
+
+    await prisma.feeGroup.delete({
+      where: { id },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Fee group deleted successfully.',
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Delete fee group error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete fee group.' });
+  }
+}
+
+/**
  * POST /api/admin/finances/bulk-dues-post
  */
 export async function bulkDuesPost(req: Request, res: Response): Promise<Response | void> {
@@ -1527,6 +1752,195 @@ export async function sendParentReminder(req: Request, res: Response): Promise<R
   } catch (error: any) {
     console.error('[FINANCES] Send parent reminder error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to send fee reminder.' });
+  }
+}
+
+/**
+ * GET /api/admin/finances/recent-payments
+ */
+export async function getRecentPayments(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+
+  try {
+    const payments = await prisma.payment.findMany({
+      where: { branchId },
+      orderBy: { paidAt: 'desc' },
+      take: limit,
+      include: {
+        invoice: {
+          select: {
+            id: true,
+            invoiceNo: true,
+            termLabel: true,
+            totalAmount: true,
+            paidAmount: true,
+            balanceAmount: true,
+            status: true,
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true,
+                photo: true,
+                enrolls: {
+                  select: {
+                    class: { select: { id: true, name: true } },
+                    section: { select: { id: true, name: true } },
+                  },
+                  orderBy: { id: 'desc' },
+                  take: 1,
+                },
+                parent: { select: { id: true, name: true, mobileno: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return res.json({
+      success: true,
+      data: payments,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Get recent payments error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch recent payments.' });
+  }
+}
+
+/**
+ * GET /api/admin/finances/student-fee-summaries
+ */
+export async function getStudentFeeSummaries(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const search = req.query.search ? String(req.query.search).trim() : '';
+  const classId = req.query.classId ? Number(req.query.classId) : undefined;
+  const statusFilter = req.query.status ? String(req.query.status) : undefined;
+
+  try {
+    const sessionId = await resolveFinanceSession(branchId, req.query?.sessionId);
+
+    const where: any = {
+      branchId,
+      active: true,
+    };
+    if (classId) {
+      where.enrolls = { some: { classId } };
+    }
+    if (search) {
+      where.OR = [
+        { firstName: { contains: search, mode: 'insensitive' } },
+        { lastName: { contains: search, mode: 'insensitive' } },
+        { registerNo: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+
+    const students = await prisma.student.findMany({
+      where,
+      orderBy: [{ firstName: 'asc' }],
+      take: 150,
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        registerNo: true,
+        photo: true,
+        gender: true,
+        enrolls: {
+          select: {
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+          },
+          orderBy: { id: 'desc' },
+          take: 1,
+        },
+        parent: { select: { id: true, name: true, mobileno: true, email: true } },
+        invoices: {
+          where: {
+            branchId,
+            ...(req.query?.sessionId !== 'all' ? { sessionId } : {}),
+          },
+          select: {
+            id: true,
+            invoiceNo: true,
+            termLabel: true,
+            totalAmount: true,
+            paidAmount: true,
+            balanceAmount: true,
+            status: true,
+            dueDate: true,
+            issuedAt: true,
+            items: {
+              select: {
+                id: true,
+                description: true,
+                amount: true,
+              },
+            },
+            payments: {
+              select: {
+                id: true,
+                amount: true,
+                method: true,
+                reference: true,
+                paidAt: true,
+              },
+              orderBy: { paidAt: 'desc' },
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+    });
+
+    const results = students.map((s) => {
+      const totalInvoiced = s.invoices.reduce((sum, inv) => sum + Number(inv.totalAmount), 0);
+      const totalPaid = s.invoices.reduce((sum, inv) => sum + Number(inv.paidAmount), 0);
+      const totalBalance = s.invoices.reduce((sum, inv) => sum + Number(inv.balanceAmount), 0);
+      const status = totalBalance <= 0 && totalInvoiced > 0 ? 'paid' : totalPaid > 0 ? 'partial' : totalInvoiced > 0 ? 'unpaid' : 'no_invoice';
+      const currentEnroll = s.enrolls && s.enrolls.length ? s.enrolls[0] : null;
+
+      return {
+        id: s.id,
+        firstName: s.firstName,
+        lastName: s.lastName,
+        fullName: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
+        registerNo: s.registerNo,
+        photo: s.photo,
+        gender: s.gender,
+        classId: currentEnroll?.class?.id || null,
+        className: currentEnroll?.class?.name || 'Unassigned',
+        sectionName: currentEnroll?.section?.name || '',
+        parentName: s.parent?.name || '—',
+        parentMobile: s.parent?.mobileno || '—',
+        totalInvoiced,
+        totalPaid,
+        totalBalance,
+        status,
+        invoicesCount: s.invoices.length,
+        invoices: s.invoices,
+      };
+    });
+
+    let filtered = results;
+    if (statusFilter && statusFilter !== 'all') {
+      if (statusFilter === 'due') {
+        filtered = results.filter((r) => r.totalBalance > 0);
+      } else {
+        filtered = results.filter((r) => r.status === statusFilter);
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: filtered,
+      totalCount: filtered.length,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Get student fee summaries error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch student fee summaries.' });
   }
 }
 

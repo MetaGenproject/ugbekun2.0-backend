@@ -222,6 +222,8 @@ import {
   getFinanceOverview,
   getFeeTypes,
   createFeeType,
+  updateFeeType,
+  deleteFeeType,
   bulkCreateFeeTypes,
   getFeeAssignments,
   saveFeeAssignments,
@@ -232,10 +234,14 @@ import {
   getInvoices,
   createInvoice,
   recordInvoicePayment,
+  getRecentPayments,
+  getStudentFeeSummaries,
   exportFinanceCsv,
   exportFinancePdf,
   getFeeGroups,
   createFeeGroup,
+  updateFeeGroup,
+  deleteFeeGroup,
   allocateFeeGroup,
   bulkDuesPost,
   bulkPaymentsPost,
@@ -570,6 +576,8 @@ router.post('/report-cards/batch-save-commentary', batchSaveCommentary);
 router.get('/finances/overview', getFinanceOverview);
 router.get('/finances/fee-types', getFeeTypes);
 router.post('/finances/fee-types', createFeeType);
+router.put('/finances/fee-types/:id', updateFeeType);
+router.delete('/finances/fee-types/:id', deleteFeeType);
 router.post('/finances/fee-types/bulk', bulkCreateFeeTypes);
 router.get('/finances/fee-assignments', getFeeAssignments);
 router.post('/finances/fee-assignments', saveFeeAssignments);
@@ -582,10 +590,14 @@ router.get('/finances/invoices/batch-pdf', getBatchInvoicesPdf);
 router.get('/finances/invoices', getInvoices);
 router.post('/finances/invoices', createInvoice);
 router.post('/finances/payments', recordInvoicePayment);
+router.get('/finances/recent-payments', getRecentPayments);
+router.get('/finances/student-fee-summaries', getStudentFeeSummaries);
 router.get('/finances/export/csv', exportFinanceCsv);
 router.get('/finances/export/pdf', exportFinancePdf);
 router.get('/finances/fee-groups', getFeeGroups);
 router.post('/finances/fee-groups', createFeeGroup);
+router.put('/finances/fee-groups/:id', updateFeeGroup);
+router.delete('/finances/fee-groups/:id', deleteFeeGroup);
 router.post('/finances/fee-groups/:id/allocate', allocateFeeGroup);
 router.post('/finances/bulk-dues-post', bulkDuesPost);
 router.post('/finances/bulk-payments-post', bulkPaymentsPost);

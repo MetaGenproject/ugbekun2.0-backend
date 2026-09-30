@@ -191,6 +191,11 @@ export async function getSettings(req: Request, res: Response): Promise<Response
   const branchId = req.branchId;
 
   try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { id: true, name: true, address: true, phone: true, email: true, logo: true, code: true },
+    });
+
     let settings = await prisma.systemSetting.findUnique({
       where: { branchId },
     });
@@ -198,12 +203,35 @@ export async function getSettings(req: Request, res: Response): Promise<Response
     if (!settings) {
       settings = await prisma.systemSetting.create({
         data: {
-          branchId,
+          branchId: branchId!,
+          schoolName: branch?.name || 'School Name',
+          tagline: 'Excellence in Knowledge & Character',
+          address: branch?.address || '',
+          phone: branch?.phone || '',
+          email: branch?.email || '',
+          logoUrl: branch?.logo || null,
+          website: '',
+          regNoPrefix: branch?.code || 'SCH',
         },
       });
+    } else {
+      // If settings still has generic placeholder and branch has a distinct name, auto-align with branch
+      const genericNames = ['ugbekun international academy', 'school dashboard', 'ugbekun'];
+      if (genericNames.includes(settings.schoolName?.toLowerCase() || '') && branch?.name && !genericNames.includes(branch.name.toLowerCase())) {
+        settings = await prisma.systemSetting.update({
+          where: { branchId },
+          data: {
+            schoolName: branch.name,
+            address: settings.address || branch.address,
+            phone: settings.phone === '+234 800 000 0000' ? (branch.phone || '') : settings.phone,
+            email: settings.email === 'info@ugbekun.edu.ng' ? (branch.email || '') : settings.email,
+            logoUrl: settings.logoUrl || branch.logo,
+          },
+        });
+      }
     }
 
-    return res.json({ success: true, data: settings });
+    return res.json({ success: true, data: settings, branchName: branch?.name });
   } catch (error: any) {
     console.error('[SETTINGS] Fetch settings error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to fetch settings.' });
@@ -305,13 +333,13 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       },
       create: {
         branchId: branchId!,
-        schoolName: schoolName || 'Ugbekun International Academy',
+        schoolName: schoolName || 'School Name',
         tagline: tagline || 'Excellence in Knowledge & Character',
         address: address || '',
-        phone: phone || '+234 800 000 0000',
-        email: email || 'info@ugbekun.edu.ng',
+        phone: phone || '',
+        email: email || '',
         whatsappNo: whatsappNo || null,
-        website: website || 'https://ugbekun.edu.ng',
+        website: website || '',
         facebookUrl: facebookUrl || null,
         instagramUrl: instagramUrl || null,
         twitterUrl: twitterUrl || null,
@@ -324,7 +352,7 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
         currencySymbol: currencySymbol || '₦',
         academicSession: academicSession || '2025/2026',
         currentTerm: currentTerm || 'First Term',
-        regNoPrefix: regNoPrefix || 'UGB',
+        regNoPrefix: regNoPrefix || 'SCH',
         regNoDigits: regNoDigits ? parseInt(regNoDigits, 10) : 4,
         defaultStudentPassword: defaultStudentPassword || 'student123',
         autoSmsAttendance: autoSmsAttendance !== undefined ? Boolean(autoSmsAttendance) : true,

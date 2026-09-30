@@ -1252,7 +1252,11 @@ export async function uploadStudentPhoto(req: Request, res: Response): Promise<R
 
   try {
     const { photoBase64, photo } = req.body || {};
-    const inputPhoto = photoBase64 || photo;
+    let inputPhoto = photoBase64 || photo;
+    if (!inputPhoto && (req as any).file) {
+      const f = (req as any).file;
+      inputPhoto = `data:${f.mimetype};base64,${f.buffer.toString('base64')}`;
+    }
     if (!inputPhoto) {
       return res.status(400).json({ success: false, message: 'Photograph data is required.' });
     }
