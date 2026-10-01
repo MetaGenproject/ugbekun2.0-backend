@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * One-time repair script to fix branch admin legacyUserId mappings.
+ * Repair script to fix school admin (role 2 and role 9) legacyUserId mappings.
  *
  * Usage:
  *   node scripts/repair-branch-admin-legacy-userid.js
@@ -11,18 +11,89 @@ require('dotenv').config()
 const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
 const { Pool } = require('pg')
-const { staffMatchesBranch } = require('../lib/branchStats')
+function extractCodePrefix(code) {
+  if (!code) return '';
+  const match = String(code).match(/^([A-Za-z]+)/);
+  return match ? match[1] : '';
+}
+
+function staffMatchesBranch(username, branch) {
+  const normalized = String(username || '').trim();
+  if (!normalized) return false;
+
+  const lowerUsername = normalized.toLowerCase();
+  const prefix = extractCodePrefix(branch.code);
+  if (prefix && lowerUsername.startsWith(`${prefix.toLowerCase()}/`)) {
+    return true;
+  }
+
+  const branchName = String(branch.name || '').trim();
+  if (!branchName) return false;
+
+  const lowerBranchName = branchName.toLowerCase();
+  if (lowerUsername === lowerBranchName) return true;
+
+  const branchSlug = lowerBranchName.split(/\s+/)[0];
+  if (branchSlug && (lowerUsername === branchSlug || lowerBranchName.includes(lowerUsername))) {
+    return true;
+  }
+
+  const cleanUser = lowerUsername.replace(/[^a-z0-9]/g, '');
+  const cleanBranch = lowerBranchName.replace(/[^a-z0-9]/g, '');
+  if (cleanUser.length >= 4 && cleanBranch.length >= 4) {
+    if (cleanBranch.includes(cleanUser) || cleanUser.includes(cleanBranch)) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 const dryRun = process.argv.includes('--dry-run')
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 const adapter = new PrismaPg(pool)
 const prisma = new PrismaClient({ adapter })
 
+// Explicit overrides verified by domain name & branch registry
+const EXPLICIT_OVERRIDES = {
+  'FortuneSprings': 11,    // Fortune Springs Montessori School (FSMS)
+  'Fortunescholars': 43,   // FORTUNE SCHOLARS SCHOOL (001)
+  'Greatrisingstars': 22,  // Great Legacy Rising Stars (BR22)
+  'BISNIY': 12,            // BISNIY PRIVATE SCHOOL (BR12)
+  'Nita-angel': 14,        // NITA ANGELS ACADEMY (BR14)
+  'Gracious': 15,          // Gracious Daystar International Academy (GDSI15)
+  'igbinovia': 16,         // Igbinovia Group of Schools (IGBS00116)
+  'Bryte': 17,             // BRYTE STAR DIVINE ACADEMY (BSDA)
+  'Ojomoh': 20,            // OJOMOH EDUCATION CENTRE (OJO)
+  'Solidstone': 21,        // Solid Stone Kiddies Academy (SSKAS)
+  'newera': 23,            // New Era International Schools (BR23)
+  'scholastica': 25,       // Scholastica International Schools (BR25)
+  'Psalm 23': 26,          // Psalm 23 international Academy (P2326)
+  'Standardfresh': 27,     // ROYAL STANDARD FRESH ACADEMY (RSDF27)
+  'hercleus': 28,          // Hercleus Academy (HERC)
+  'Absiza': 29,            // Absiza International College (BR29)
+  'Mayor': 30,             // MAYOR SCHOOL (Stud00130)
+  'Mayor school': 30,      // MAYOR SCHOOL (Stud00130)
+  'Joshdan': 31,           // JOSHDAN INTERNATIONAL ACADEMY (JIAS31)
+  'Canaan Gate': 33,       // Canaan Gate Schools (CGS01)
+  'Rufai': 34,             // CANAAN GATE SCHOOLS (RUFAI BRANCH) (CGSS)
+  'Canaan Ilogbo': 35,     // CANAAN GATE SCHOOL (ILOGBO) (CLSIS00135)
+  'Ilogbo': 35,            // CANAAN GATE SCHOOL (ILOGBO) (CLSIS00135)
+  'Shadeb': 36,            // SHADEB COLLEGE (BR36)
+  'Cradle': 37,            // CRADLE HOME CHILDREN SCHOOL (CHCSS00)
+  'He Lives': 38,          // HE LIVES SCHOOL (HLSS00138)
+  'Merit': 39,             // Merit Futures Academy (BR39)
+  'ELCINTAR': 40,          // EL CINTAR CITY ACADEMY (ELCCAS)
+  'Provident': 41,         // PROVIDENT DIRECTION SCHOOL (PDSS00)
+  'Damzy': 42,             // DAMZY SCHOOLS (DAM001)
+}
+
 async function main() {
-  console.log('Repairing branch-admin legacyUserId mappings...')
+  console.log(`Starting branch-admin legacyUserId repair (dryRun: ${dryRun})...\n`)
   const branchAdmins = await prisma.user.findMany({
-    where: { role: 2 },
-    select: { id: true, username: true, legacyUserId: true, active: true },
+    where: { role: { in: [2, 9] } },
+    select: { id: true, username: true, role: true, legacyUserId: true, active: true },
+    orderBy: { id: 'asc' }
   })
 
   const branches = await prisma.branch.findMany({
@@ -36,42 +107,61 @@ async function main() {
   let noMatch = 0
 
   for (const user of branchAdmins) {
-    const hasValidBranch = user.legacyUserId && branchById.has(user.legacyUserId)
-    if (hasValidBranch) {
-      unchanged += 1
-      continue
-    }
-
     const username = String(user.username || '').trim()
     if (!username) {
       noMatch += 1
-      console.warn(`[SKIP] user id=${user.id} has no username`) // impossible, but defend.
       continue
     }
 
-    const matches = branches.filter((branch) => staffMatchesBranch(username, branch))
-    if (matches.length === 1) {
-      const branch = matches[0]
-      console.log(`[FIX] user id=${user.id} username=${username} -> branch id=${branch.id} name="${branch.name}" code="${branch.code}"`)
+    let targetBranch = null
+
+    // 1. Check explicit overrides first (for known mismatches)
+    if (EXPLICIT_OVERRIDES[username]) {
+      targetBranch = branchById.get(EXPLICIT_OVERRIDES[username])
+    } else if (user.legacyUserId && branchById.has(user.legacyUserId)) {
+      // Already has a valid existing branch mapping, do not touch unless in EXPLICIT_OVERRIDES
+      const currentBranch = branchById.get(user.legacyUserId)
+      unchanged += 1
+      console.log(`[VALID MAPPING] user id=${user.id} username="${username}" already points to valid branch id=${currentBranch.id} (${currentBranch.name})`)
+      continue
+    } else {
+      // 2. Try staffMatchesBranch for unmapped or invalid legacyUserIds
+      const matches = branches.filter((branch) => staffMatchesBranch(username, branch))
+      if (matches.length === 1) {
+        targetBranch = matches[0]
+      } else if (matches.length > 1) {
+        console.warn(`[AMBIGUOUS] user id=${user.id} username="${username}" matched multiple branches: ${matches.map(b => b.name).join(', ')}`)
+      }
+    }
+
+    // 3. If target branch resolved:
+    if (targetBranch) {
+      if (user.legacyUserId === targetBranch.id) {
+        unchanged += 1
+        console.log(`[OK] user id=${user.id} username="${username}" already mapped to branch id=${targetBranch.id} (${targetBranch.name})`)
+        continue
+      }
+
+      console.log(`[FIX] user id=${user.id} username="${username}" legacyUserId: ${user.legacyUserId} -> ${targetBranch.id} ("${targetBranch.name}")`)
       if (!dryRun) {
         await prisma.user.update({
           where: { id: user.id },
-          data: { legacyUserId: branch.id },
+          data: { legacyUserId: targetBranch.id },
         })
       }
       fixed += 1
       continue
     }
 
-    if (matches.length > 1) {
-      const matchList = matches.map((b) => `${b.id}:${b.code || b.name}`).join(', ')
-      console.warn(`[AMBIGUOUS] user id=${user.id} username=${username} matched multiple branches: ${matchList}`)
+    // If no target branch found, check if current legacyUserId is valid
+    if (user.legacyUserId && branchById.has(user.legacyUserId)) {
+      const currentBranch = branchById.get(user.legacyUserId)
+      unchanged += 1
+      console.log(`[UNMATCHED BUT VALID] user id=${user.id} username="${username}" retains branch id=${currentBranch.id} (${currentBranch.name})`)
+    } else {
       noMatch += 1
-      continue
+      console.warn(`[NO MATCH & INVALID] user id=${user.id} username="${username}" legacyUserId=${user.legacyUserId}`)
     }
-
-    console.warn(`[NO MATCH] user id=${user.id} username=${username} legacyUserId=${user.legacyUserId}`)
-    noMatch += 1
   }
 
   console.log('\nRepair summary:')

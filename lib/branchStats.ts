@@ -29,6 +29,15 @@ export function staffMatchesBranch(username: string | null | undefined, branch: 
     return true;
   }
 
+  // Robust normalized matching (e.g. "fortunescholars" <-> "FORTUNE SCHOLARS SCHOOL", "fortunesprings" <-> "Fortune Springs Montessori School")
+  const cleanUser = lowerUsername.replace(/[^a-z0-9]/g, '');
+  const cleanBranch = lowerBranchName.replace(/[^a-z0-9]/g, '');
+  if (cleanUser.length >= 4 && cleanBranch.length >= 4) {
+    if (cleanBranch.includes(cleanUser) || cleanUser.includes(cleanBranch)) {
+      return true;
+    }
+  }
+
   return false;
 }
 
