@@ -56,6 +56,9 @@ import {
   getCertificates,
   issueCertificate,
   downloadCertificatePdf,
+  moveToAlumni,
+  restoreFromAlumni,
+  getAlumniStudents,
 } from '../controllers/admin/adminStudentController';
 
 import {
@@ -351,9 +354,12 @@ router.put('/parent-messages/:messageId', updateParentMessage);
 router.delete('/parent-messages/:messageId', deleteParentMessage);
 router.post('/parents/broadcast', sendParentBroadcast);
 router.post('/students/:id/toggle-status', toggleStudentStatus);
+router.post('/students/:id/move-to-alumni', moveToAlumni);
+router.post('/students/:id/restore-from-alumni', restoreFromAlumni);
 router.get('/students/:id', getStudentById);
 router.put('/students/:id', updateStudent);
 router.delete('/students/:id', deleteStudent);
+router.get('/alumni', getAlumniStudents);
 router.post('/students/sibling-request', processSiblingRequest);
 router.get('/sibling-requests', getSiblingRequests);
 router.post('/sibling-requests/:id/approve', approveSiblingRequest);

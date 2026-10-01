@@ -3248,3 +3248,201 @@ export async function sendParentBroadcast(req: Request, res: Response): Promise<
   }
 }
 
+/**
+ * POST /api/admin/students/:id/move-to-alumni
+ * Moves a student to Alumni status instead of deleting them.
+ * - Sets enroll.isAlumni = 1 for their enrollments in this branch
+ * - Keeps student.active = true and user.active = true so they can still log in to view results/transcripts
+ * - Removes student from active classroom roster automatically
+ */
+export async function moveToAlumni(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const studentId = Number(req.params.id);
+
+  try {
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: { user: true },
+    });
+
+    if (!student || student.branchId !== branchId) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
+    }
+
+    // 1. Update all enrollments for this student in this branch to isAlumni = 1
+    const updateResult = await prisma.enroll.updateMany({
+      where: {
+        studentId,
+        branchId,
+      },
+      data: {
+        isAlumni: 1,
+        updatedAt: new Date(),
+      },
+    });
+
+    // If student had no enrollment in branch, create an alumni enrollment entry with latest session
+    if (updateResult.count === 0) {
+      const globalSetting = await prisma.globalSettings.findFirst({ orderBy: { id: 'desc' } });
+      const sessionId = globalSetting?.sessionId || 5;
+      const anyClass = await prisma.class.findFirst({ where: { branchId } });
+      const anySection = anyClass ? await prisma.section.findFirst({ where: { branchId } }) : null;
+      if (anyClass && anySection) {
+        const maxEnroll = await prisma.enroll.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
+        await prisma.enroll.create({
+          data: {
+            id: maxEnroll ? maxEnroll.id + 1 : 1,
+            studentId,
+            classId: anyClass.id,
+            sectionId: anySection.id,
+            sessionId,
+            branchId,
+            isAlumni: 1,
+          },
+        });
+      }
+    }
+
+    // 2. Ensure the student record and user credentials remain active
+    // so they can log into their portal to view results/transcripts
+    await prisma.student.update({
+      where: { id: studentId },
+      data: { active: true, updatedAt: new Date() },
+    });
+
+    if (student.userId) {
+      await prisma.user.update({
+        where: { id: student.userId },
+        data: { active: true },
+      }).catch((e: any) => console.warn('[ALUMNI] Sync user active warning:', e.message));
+    }
+
+    return res.json({
+      success: true,
+      message: `${student.firstName || ''} ${student.lastName || ''} has been moved to Alumni. Account remains active for student portal access.`,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Move to alumni error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to move student to alumni.' });
+  }
+}
+
+/**
+ * POST /api/admin/students/:id/restore-from-alumni
+ * Restores an alumni student back to active classroom roster.
+ */
+export async function restoreFromAlumni(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const studentId = Number(req.params.id);
+
+  try {
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+    });
+
+    if (!student || student.branchId !== branchId) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
+    }
+
+    await prisma.enroll.updateMany({
+      where: {
+        studentId,
+        branchId,
+      },
+      data: {
+        isAlumni: 0,
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: `${student.firstName || ''} ${student.lastName || ''} has been restored to active student roster.`,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Restore from alumni error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to restore student from alumni.' });
+  }
+}
+
+/**
+ * GET /api/admin/alumni
+ * Retrieves all alumni students for this school branch.
+ */
+export async function getAlumniStudents(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const enrollments = await prisma.enroll.findMany({
+      where: {
+        branchId,
+        isAlumni: 1,
+      },
+      include: {
+        student: {
+          include: {
+            parent: true,
+            user: {
+              select: {
+                id: true,
+                username: true,
+                active: true,
+                lastLogin: true,
+              },
+            },
+          },
+        },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: {
+        updatedAt: 'desc',
+      },
+    });
+
+    const studentMap = new Map<number, any>();
+    for (const e of enrollments) {
+      if (e.student && !studentMap.has(e.studentId)) {
+        studentMap.set(e.studentId, {
+          id: e.student.id,
+          studentId: e.student.id,
+          userId: e.student.userId || e.student.user?.id || null,
+          registerNo: e.student.registerNo || '—',
+          name: [e.student.firstName, e.student.lastName].filter(Boolean).join(' ') || 'Student',
+          firstName: e.student.firstName,
+          lastName: e.student.lastName,
+          gender: e.student.gender || '—',
+          photo: e.student.photo,
+          className: e.class?.name || 'Class',
+          sectionName: e.section?.name || '',
+          classId: e.classId,
+          sectionId: e.sectionId,
+          gradYear: e.updatedAt ? new Date(e.updatedAt).getFullYear().toString() : new Date().getFullYear().toString(),
+          exitDate: e.updatedAt || e.createdAt,
+          active: e.student.active, // true = can access portal, false = blocked by school
+          userActive: e.student.user ? e.student.user.active : e.student.active,
+          username: e.student.user?.username || null,
+          lastLogin: e.student.user?.lastLogin || null,
+          parentName: e.student.parent?.name || '—',
+          parentMobile: e.student.parent?.mobileno || e.student.mobileno || '—',
+          parentEmail: e.student.parent?.email || e.student.email || '—',
+        });
+      }
+    }
+
+    const alumni = Array.from(studentMap.values());
+
+    return res.json({
+      success: true,
+      alumni,
+      total: alumni.length,
+      activeCount: alumni.filter(a => a.active).length,
+      blockedCount: alumni.filter(a => !a.active).length,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Get alumni students error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load alumni records.' });
+  }
+}
+
+

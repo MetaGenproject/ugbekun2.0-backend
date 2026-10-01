@@ -42,7 +42,7 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
   let targetClassId = req.classId;
   if (!targetClassId && req.studentId) {
     const latestEnroll = await prisma.enroll.findFirst({
-      where: { studentId: req.studentId, isAlumni: 0 },
+      where: { studentId: req.studentId },
       orderBy: { id: 'desc' },
       select: { classId: true },
     });
@@ -186,10 +186,11 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       });
     }
 
-    const studentMarks = await prisma.mark.findMany({
+    let activeSessionId = req.sessionId;
+    let studentMarks = await prisma.mark.findMany({
       where: {
         studentId: req.studentId,
-        sessionId: req.sessionId,
+        sessionId: activeSessionId,
         branchId: req.branchId,
       },
       include: {
@@ -197,6 +198,30 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         exam: { select: { id: true, name: true } },
       },
     });
+
+    // Fallback: If no marks in current session (e.g. alumni student who graduated in a past session),
+    // find their latest available session marks
+    if (studentMarks.length === 0) {
+      const pastMark = await prisma.mark.findFirst({
+        where: { studentId: req.studentId, branchId: req.branchId },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      if (pastMark?.sessionId) {
+        activeSessionId = pastMark.sessionId;
+        studentMarks = await prisma.mark.findMany({
+          where: {
+            studentId: req.studentId,
+            sessionId: activeSessionId,
+            branchId: req.branchId,
+          },
+          include: {
+            subject: { select: { id: true, name: true, subjectCode: true } },
+            exam: { select: { id: true, name: true } },
+          },
+        });
+      }
+    }
 
     if (studentMarks.length === 0) {
       return res.json({ success: true, reportCard: [], overallAverage: 0, commentary: null });
@@ -207,7 +232,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       where: {
         classId: req.classId,
         sectionId: req.sectionId,
-        sessionId: req.sessionId,
+        sessionId: activeSessionId,
         subjectId: { in: subjectIds },
       },
     });
@@ -228,7 +253,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
     const commentary = await prisma.studentCommentary.findFirst({
       where: {
         studentId: req.studentId,
-        sessionId: req.sessionId,
+        sessionId: activeSessionId,
         status: 'PRINCIPAL_SIGNED_OFF',
       },
       select: { remark: true },
