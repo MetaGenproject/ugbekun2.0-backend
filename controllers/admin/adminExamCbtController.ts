@@ -1343,12 +1343,16 @@ export async function extractQuestionDrafts(req: Request, res: Response): Promis
       questionCount: Number(req.body?.count || req.body?.questionCount || 5),
     });
 
+    const message = drafts.length > 0
+      ? `Successfully prepared ${drafts.length} question draft${drafts.length === 1 ? '' : 's'} based on your instructions. Review and edit them before saving.`
+      : 'No question drafts could be generated. Please verify your source material and try again.';
+
     return res.json({
       success: true,
       drafts,
       sourceMaterial: extracted.text,
       sourceFileName: extracted.fileName,
-      message: 'Review and correct these drafts, then save them to the Question Bank before assigning.',
+      message,
     });
   } catch (error) {
     console.error('[ADMIN] Extract question drafts error:', error);

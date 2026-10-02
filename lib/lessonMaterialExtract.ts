@@ -48,32 +48,54 @@ export async function extractLessonSourceMaterial(
     if (buffer.length > 8 * 1024 * 1024) continue;
     names.push(name);
 
-    if (mime.includes('pdf') && pdfParse) {
+    // PDF extraction
+    if ((mime.includes('pdf') || name.toLowerCase().endsWith('.pdf')) && pdfParse) {
       try {
         const parsed = await pdfParse(buffer);
-        if (parsed?.text?.trim()) chunks.push(`--- ${name} ---\n${parsed.text.trim()}`);
+        if (parsed?.text?.trim()) {
+          chunks.push(`--- ${name} ---\n${parsed.text.trim()}`);
+        }
       } catch (error: any) {
         console.warn('[LESSON OCR] PDF parse failed:', error?.message || error);
       }
       continue;
     }
 
-    if (mime.startsWith('text/') || name.endsWith('.txt') || name.endsWith('.md')) {
-      chunks.push(`--- ${name} ---\n${buffer.toString('utf8').trim()}`);
+    // Text, Markdown, CSV, JSON extraction
+    if (
+      mime.startsWith('text/') ||
+      mime.includes('json') ||
+      mime.includes('csv') ||
+      /\.(txt|md|csv|json|tsv)$/i.test(name)
+    ) {
+      try {
+        const decoded = buffer.toString('utf8').trim();
+        if (decoded) chunks.push(`--- ${name} ---\n${decoded}`);
+      } catch (error: any) {
+        console.warn('[LESSON OCR] Text decode failed:', error?.message || error);
+      }
       continue;
     }
 
-    if ((mime.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(name)) && Tesseract) {
+    // Image OCR with timeout protection
+    if ((mime.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(name)) && Tesseract) {
       try {
-        const result = await Tesseract.recognize(buffer, 'eng');
-        const text = String(result?.data?.text || '').trim();
-        if (text) chunks.push(`--- ${name} (scanned) ---\n${text}`);
+        const ocrPromise = Tesseract.recognize(buffer, 'eng').then(
+          (result: any) => String(result?.data?.text || '').trim()
+        );
+        const timeoutPromise = new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error('OCR recognition timeout')), 12000)
+        );
+        const text = await Promise.race([ocrPromise, timeoutPromise]);
+        if (text) {
+          chunks.push(`--- ${name} (scanned document) ---\n${text}`);
+        }
       } catch (error: any) {
-        console.warn('[LESSON OCR] Image scan failed:', error?.message || error);
+        console.warn('[LESSON OCR] Image scan failed or timed out:', error?.message || error);
       }
     }
   }
 
-  const text = chunks.join('\n\n').slice(0, 20000);
+  const text = chunks.join('\n\n').slice(0, 25000);
   return { text, fileName: names[0] || null };
 }
