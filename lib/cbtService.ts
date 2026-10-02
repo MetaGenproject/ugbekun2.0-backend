@@ -11,6 +11,8 @@ export interface ParsedQuestion {
   correctOption: string;
   marks: number;
   explanation?: string;
+  topic?: string;
+  category?: string;
 }
 
 /**
@@ -93,7 +95,12 @@ export function parseCsvFormat(csvText?: string | null): ParsedQuestion[] {
     for (let i = 0; i < str.length; i++) {
       const c = str[i];
       if (c === '"') {
-        insideQuote = !insideQuote;
+        if (insideQuote && str[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          insideQuote = !insideQuote;
+        }
       } else if (c === ',' && !insideQuote) {
         result.push(cur.trim());
         cur = '';
@@ -116,6 +123,9 @@ export function parseCsvFormat(csvText?: string | null): ParsedQuestion[] {
   const optDIdx = headers.findIndex((h) => h.includes('optiond') || h === 'd');
   const ansIdx = headers.findIndex((h) => h.includes('correct') || h.includes('answer') || h === 'ans');
   const marksIdx = headers.findIndex((h) => h.includes('mark') || h.includes('point') || h.includes('score'));
+  const expIdx = headers.findIndex((h) => h.includes('explanation') || h.includes('rationale') || h.includes('reason'));
+  const topicIdx = headers.findIndex((h) => h.includes('topic') || h.includes('lesson'));
+  const catIdx = headers.findIndex((h) => h.includes('category') || h.includes('section'));
 
   if (qIdx === -1) return [];
 
@@ -141,6 +151,9 @@ export function parseCsvFormat(csvText?: string | null): ParsedQuestion[] {
     if (correctOption === 'FALSE') correctOption = 'B';
 
     const marks = marksIdx !== -1 && !isNaN(parseFloat(row[marksIdx])) ? parseFloat(row[marksIdx]) : 1.0;
+    const explanation = expIdx !== -1 && row[expIdx] ? row[expIdx] : undefined;
+    const topic = topicIdx !== -1 && row[topicIdx] ? row[topicIdx] : undefined;
+    const category = catIdx !== -1 && row[catIdx] ? row[catIdx] : undefined;
 
     questions.push({
       questionText: qText,
@@ -148,6 +161,9 @@ export function parseCsvFormat(csvText?: string | null): ParsedQuestion[] {
       options: options.length > 0 ? options : ['Option A', 'Option B', 'Option C', 'Option D'],
       correctOption,
       marks,
+      explanation,
+      topic,
+      category,
     });
   }
 

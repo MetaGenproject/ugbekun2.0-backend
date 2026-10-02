@@ -116,13 +116,21 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
       });
     }
 
+    const calculatedTotal = Array.isArray(components)
+      ? components.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0)
+      : 100;
+
+    const finalTotalMarks = totalMarks !== undefined && totalMarks !== null && !isNaN(Number(totalMarks)) && Number(totalMarks) > 0
+      ? Number(totalMarks)
+      : (calculatedTotal > 0 ? calculatedTotal : 100);
+
     const matrix = await prisma.evaluationMatrix.create({
       data: {
         branchId,
         name: name.trim(),
         code: code.trim().toUpperCase(),
         description: description ? description.trim() : null,
-        totalMarks: totalMarks ? Number(totalMarks) : 100,
+        totalMarks: finalTotalMarks,
         isDefault: Boolean(isDefault),
         components: components,
       },
@@ -160,13 +168,21 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
       });
     }
 
+    const calculatedTotal = Array.isArray(components)
+      ? components.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0)
+      : undefined;
+
+    const finalTotalMarks = totalMarks !== undefined && totalMarks !== null && !isNaN(Number(totalMarks)) && Number(totalMarks) > 0
+      ? Number(totalMarks)
+      : (calculatedTotal !== undefined && calculatedTotal > 0 ? calculatedTotal : existing.totalMarks);
+
     const updated = await prisma.evaluationMatrix.update({
       where: { id: matrixId },
       data: {
         name: name ? name.trim() : existing.name,
         code: code ? code.trim().toUpperCase() : existing.code,
         description: description !== undefined ? (description ? description.trim() : null) : existing.description,
-        totalMarks: totalMarks !== undefined ? Number(totalMarks) : existing.totalMarks,
+        totalMarks: finalTotalMarks,
         isDefault: isDefault !== undefined ? Boolean(isDefault) : existing.isDefault,
         components: components !== undefined ? components : existing.components,
       },
@@ -1283,7 +1299,8 @@ export async function importCbtQuestions(req: Request, res: Response): Promise<R
       marks: q.marks || 1.0,
       category: q.category || req.body.category || null,
       termName: req.body.termName || null,
-      topic: req.body.topic || null,
+      topic: q.topic || req.body.topic || null,
+      explanation: q.explanation || null,
       sourceType: 'UPLOAD',
     }));
 
