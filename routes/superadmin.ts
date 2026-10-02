@@ -60,4 +60,8 @@ router.delete('/platform/backups/:id', superadminController.deleteSystemBackup);
 router.delete('/platform/audit-logs', superadminController.clearAuditLogs);
 router.delete('/platform/audit-logs/:id', superadminController.deleteAuditLog);
 
+// Remote System Logs Inspection & Maintenance
+router.get('/system/logs', superadminController.getSystemLogs);
+router.delete('/system/logs', superadminController.clearSystemLogs);
+
 export default router;

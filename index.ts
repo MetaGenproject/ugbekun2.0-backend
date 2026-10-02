@@ -6,6 +6,14 @@ import prisma, { disconnectPrisma } from './lib/prisma';
 import redisClient from './config/redis';
 import cron from 'node-cron';
 import { execFile } from 'child_process';
+import logger, {
+  httpLoggerMiddleware,
+  globalErrorMiddleware,
+  registerProcessErrorHandlers,
+} from './lib/logger';
+
+// Register global crash and rejection traps early
+registerProcessErrorHandlers();
 
 const app = express();
 
@@ -93,6 +101,9 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
+// HTTP Request Logger Middleware (Writes to combined.log & error.log)
+app.use(httpLoggerMiddleware);
+
 // Global Cache-Control middleware for API endpoints to prevent stale response caching
 app.use('/api', (req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -145,8 +156,32 @@ app.post('/api/upload', async (req: Request, res: Response) => {
     const url = await uploadBase64File({ base64, mime, folder: folder || 'ugbekun_tasks' });
     return res.json({ success: true, url });
   } catch (err: any) {
-    console.error('[UPLOAD ERROR]', err);
+    logger.error('UPLOAD', 'Failed to upload media:', err);
     return res.status(500).json({ success: false, message: err.message || 'Failed to upload media.' });
+  }
+});
+
+// Client Telemetry Ingestion (Persists client-side frontend errors from user browsers)
+app.post('/api/telemetry/client-error', (req: Request, res: Response) => {
+  try {
+    const { message, stack, url, route, componentStack, userId, role, userAgent } = req.body || {};
+    if (!message) {
+      return res.status(400).json({ success: false, message: 'Message is required.' });
+    }
+    logger.clientError({
+      message: String(message),
+      stack: stack ? String(stack) : undefined,
+      url: url ? String(url) : undefined,
+      route: route ? String(route) : undefined,
+      componentStack: componentStack ? String(componentStack) : undefined,
+      userId,
+      role,
+      userAgent: userAgent || req.headers['user-agent'] || '',
+    });
+    return res.json({ success: true });
+  } catch (err: any) {
+    logger.error('TELEMETRY', 'Failed to process client error report:', err);
+    return res.status(500).json({ success: false, message: 'Telemetry error' });
   }
 });
 
@@ -187,6 +222,9 @@ app.get('/', (req: Request, res: Response) => {
   res.send('Welcome to Ugbekun 2.0 Backend API (TypeScript Engine)');
 });
 
+// Global Express Error Middleware (Catches unhandled route exceptions & logs to error.log)
+app.use(globalErrorMiddleware);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SCHEDULED CRON JOBS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,10 +232,10 @@ app.get('/', (req: Request, res: Response) => {
 // 1. Weekly Attendance Gamification Evaluator
 //    Runs every Monday at 06:00 AM server time
 cron.schedule('0 6 * * 1', () => {
-  console.log('[CRON] Running weekly attendance gamification evaluation...');
+  logger.info('CRON', 'Running weekly attendance gamification evaluation...');
   execFile('node', ['scripts/evaluateWeeklyAttendance.js'], { cwd: __dirname }, (err, stdout, stderr) => {
     if (err) {
-      console.error('[CRON] Weekly attendance evaluation failed:', err.message);
+      logger.error('CRON', 'Weekly attendance evaluation failed:', err);
     } else {
       if (stdout) process.stdout.write(stdout);
       if (stderr) process.stderr.write(stderr);
@@ -208,10 +246,10 @@ cron.schedule('0 6 * * 1', () => {
 // 2. Weekly Attrition Radar Evaluator
 //    Runs every Monday at 06:30 AM server time
 cron.schedule('30 6 * * 1', () => {
-  console.log('[CRON] Running weekly AI predictive attrition radar...');
+  logger.info('CRON', 'Running weekly AI predictive attrition radar...');
   execFile('node', ['scripts/evaluateWeeklyAttrition.js'], { cwd: __dirname }, (err, stdout, stderr) => {
     if (err) {
-      console.error('[CRON] Weekly attrition radar failed:', err.message);
+      logger.error('CRON', 'Weekly attrition radar failed:', err);
     } else {
       if (stdout) process.stdout.write(stdout);
       if (stderr) process.stderr.write(stderr);
@@ -219,16 +257,18 @@ cron.schedule('30 6 * * 1', () => {
   });
 }, { timezone: 'Africa/Lagos' });
 
-console.log('[CRON] Scheduled jobs registered: Weekly Attendance (Mon 06:00) + Attrition Radar (Mon 06:30) [Africa/Lagos]');
+logger.info('CRON', 'Scheduled jobs registered: Weekly Attendance (Mon 06:00) + Attrition Radar (Mon 06:30) [Africa/Lagos]');
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
+  logger.info('SHUTDOWN', 'SIGINT received. Disconnecting database and redis...');
   await disconnectPrisma();
   await redisClient.quit();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
+  logger.info('SHUTDOWN', 'SIGTERM received. Disconnecting database and redis...');
   await disconnectPrisma();
   await redisClient.quit();
   process.exit(0);
@@ -236,10 +276,10 @@ process.on('SIGTERM', async () => {
 
 // Start HTTP server and overlay saved global platform settings onto runtime env.
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT} (TypeScript)`);
+  logger.info('SERVER', `Server is running on port ${PORT} (TypeScript Engine)`);
   bootstrapPlatformSettings()
-    .then(() => console.log('[PLATFORM] Global settings loaded into runtime'))
-    .catch((error) => console.warn('[PLATFORM] Failed to bootstrap settings:', error?.message || error));
+    .then(() => logger.info('PLATFORM', 'Global settings loaded into runtime'))
+    .catch((error) => logger.warn('PLATFORM', 'Failed to bootstrap settings:', { error: error?.message || error }));
 });
 
 export default app;

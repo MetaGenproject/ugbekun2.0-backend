@@ -8,6 +8,7 @@ import {
   publicPlatformSettings,
   writeAuditLog,
 } from '../../lib/platformRuntime';
+import { readLogLines, clearLogFile } from '../../lib/logger';
 
 function actorFrom(req: Request) {
   const user: any = req.user || {};
@@ -425,3 +426,26 @@ export async function testPlatformWebhook(req: Request, res: Response): Promise<
     return res.status(500).json({ success: false, message: error.message || 'Failed to test webhook.' });
   }
 }
+
+export async function getSystemLogs(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const type = (req.query.type as any) || 'error';
+    const lines = Number(req.query.lines) || 100;
+    const search = String(req.query.search || '');
+    const data = await readLogLines(type, lines, search);
+    return res.json({ success: true, ...data });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: error.message || 'Failed to read logs.' });
+  }
+}
+
+export async function clearSystemLogs(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const type = (req.query.type as any) || 'error';
+    const success = await clearLogFile(type);
+    return res.json({ success, message: success ? `Cleared ${type} logs.` : 'Log file not found.' });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: error.message || 'Failed to clear logs.' });
+  }
+}
+
