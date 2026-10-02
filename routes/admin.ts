@@ -236,7 +236,9 @@ import {
   getBatchInvoicesPdf,
   getInvoices,
   createInvoice,
+  deleteInvoice,
   recordInvoicePayment,
+  deleteInvoicePayment,
   getRecentPayments,
   getStudentFeeSummaries,
   exportFinanceCsv,
@@ -595,7 +597,9 @@ router.get('/finances/invoices/:id/pdf', getSingleInvoicePdf);
 router.get('/finances/invoices/batch-pdf', getBatchInvoicesPdf);
 router.get('/finances/invoices', getInvoices);
 router.post('/finances/invoices', createInvoice);
+router.delete('/finances/invoices/:id', deleteInvoice);
 router.post('/finances/payments', recordInvoicePayment);
+router.delete('/finances/payments/:id', deleteInvoicePayment);
 router.get('/finances/recent-payments', getRecentPayments);
 router.get('/finances/student-fee-summaries', getStudentFeeSummaries);
 router.get('/finances/export/csv', exportFinanceCsv);

@@ -2410,3 +2410,129 @@ export async function updateSchoolBank(req: Request, res: Response): Promise<Res
     return res.status(500).json({ success: false, message: error.message || 'Failed to save school bank details.' });
   }
 }
+
+/**
+ * DELETE /api/admin/finances/payments/:id
+ * Deletes a recorded payment collection and reverts the invoice balances
+ */
+export async function deleteInvoicePayment(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const paymentId = Number(req.params.id);
+
+  if (!paymentId || isNaN(paymentId)) {
+    return res.status(400).json({ success: false, message: 'Valid payment ID is required.' });
+  }
+
+  try {
+    const payment = await prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: { invoice: true },
+    });
+
+    if (!payment) {
+      return res.status(404).json({ success: false, message: 'Payment record not found.' });
+    }
+
+    if (branchId && payment.branchId && payment.branchId !== branchId) {
+      return res.status(403).json({ success: false, message: 'Access denied: payment belongs to another branch.' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete payment
+      await tx.payment.delete({
+        where: { id: paymentId },
+      });
+
+      // 2. Revert invoice balances if invoice exists
+      if (payment.invoice) {
+        const remainingPayments = await tx.payment.findMany({
+          where: { invoiceId: payment.invoiceId },
+          select: { amount: true },
+        });
+
+        const newPaid = remainingPayments.reduce((sum, p) => sum + Number(p.amount), 0);
+        const total = Number(payment.invoice.totalAmount);
+        const newBalance = Math.max(0, total - newPaid);
+
+        let status = 'partial';
+        if (newPaid === 0) {
+          status = 'unpaid';
+        } else if (newBalance <= 0) {
+          status = 'paid';
+        }
+
+        await tx.invoice.update({
+          where: { id: payment.invoiceId },
+          data: {
+            paidAmount: newPaid,
+            balanceAmount: newBalance,
+            status,
+            updatedAt: new Date(),
+          },
+        });
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: `Fee payment of ₦${Number(payment.amount).toLocaleString()} deleted successfully.`,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Delete payment error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete payment.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/finances/invoices/:id
+ * Deletes an issued fee invoice, its line items, and any linked payments
+ */
+export async function deleteInvoice(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const invoiceId = Number(req.params.id);
+
+  if (!invoiceId || isNaN(invoiceId)) {
+    return res.status(400).json({ success: false, message: 'Valid invoice ID is required.' });
+  }
+
+  try {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: { payments: true, items: true },
+    });
+
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    if (branchId && invoice.branchId && invoice.branchId !== branchId) {
+      return res.status(403).json({ success: false, message: 'Access denied: invoice belongs to another branch.' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete associated payments
+      await tx.payment.deleteMany({
+        where: { invoiceId },
+      });
+
+      // 2. Delete invoice line items
+      await tx.invoiceItem.deleteMany({
+        where: { invoiceId },
+      });
+
+      // 3. Delete invoice
+      await tx.invoice.delete({
+        where: { id: invoiceId },
+      });
+    });
+
+    return res.json({
+      success: true,
+      message: `Fee invoice #${invoice.invoiceNo} deleted successfully.`,
+    });
+  } catch (error: any) {
+    console.error('[FINANCES] Delete invoice error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete fee invoice.' });
+  }
+}
+
