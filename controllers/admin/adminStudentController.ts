@@ -1494,29 +1494,104 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
 
 /**
  * DELETE /api/admin/students/:id
+ * Permanently deletes or expunges a student or alumni account:
+ * - Deletes all class and alumni enrollments
+ * - Deactivates or removes portal login credentials
+ * - Cleans auxiliary student tables
+ * - Deletes or marks student record inactive so they are completely removed from directories
  */
 export async function deleteStudent(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
   const studentId = Number(req.params.id);
 
+  if (!studentId || isNaN(studentId)) {
+    return res.status(400).json({ success: false, message: 'Valid student ID is required.' });
+  }
+
   try {
     const student = await prisma.student.findUnique({
       where: { id: studentId },
+      include: { enrolls: true, user: true },
     });
 
-    if (!student || student.branchId !== branchId) {
-      return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student not found.' });
     }
 
-    await prisma.student.update({
-      where: { id: studentId },
-      data: { active: false, updatedAt: new Date() },
+    if (branchId && student.branchId && student.branchId !== branchId) {
+      return res.status(403).json({ success: false, message: 'Access denied: student belongs to another branch.' });
+    }
+
+    const studentName = [student.firstName, student.lastName].filter(Boolean).join(' ') || 'Student';
+    const userId = student.userId;
+
+    // 1. Delete all enrollments for this student (instantly removes them from both active classroom rosters AND alumni lists)
+    await prisma.enroll.deleteMany({
+      where: { studentId },
     });
 
-    return res.json({ success: true, message: 'Student record deactivated successfully.' });
+    // 2. Deactivate portal login credential so student can no longer sign in
+    if (userId) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { active: false },
+      }).catch((e: any) => console.warn('[ADMIN] User deactivate warning:', e?.message));
+    }
+
+    // 3. Clean up non-critical dependent records across student tables
+    await Promise.allSettled([
+      prisma.studentTriviaStreak.deleteMany({ where: { studentId } }),
+      prisma.triviaSubmission.deleteMany({ where: { studentId } }),
+      prisma.studentBadge.deleteMany({ where: { studentId } }),
+      prisma.studentAttritionRisk.deleteMany({ where: { studentId } }),
+      prisma.studentWallet.deleteMany({ where: { studentId } }),
+      prisma.triviaArenaParticipant.deleteMany({ where: { studentId } }),
+      prisma.aiCompanionSession.deleteMany({ where: { studentId } }),
+      prisma.parentMessage.deleteMany({ where: { studentId } }),
+      prisma.studentMessage.deleteMany({ where: { studentId } }),
+      prisma.studentReminder.deleteMany({ where: { studentId } }),
+      prisma.studentCommentary.deleteMany({ where: { studentId } }),
+      prisma.onlineExamSubmission.deleteMany({ where: { studentId } }),
+      prisma.homeworkSubmission.deleteMany({ where: { studentId } }),
+      prisma.montessoriAssessment.deleteMany({ where: { studentId } }),
+      prisma.idCard.deleteMany({ where: { studentId } }),
+      prisma.certificate.deleteMany({ where: { studentId } }),
+      prisma.attendance.deleteMany({ where: { studentId } }),
+    ]);
+
+    // 4. Attempt hard-deleting the student record
+    let hardDeleted = false;
+    try {
+      await prisma.student.delete({
+        where: { id: studentId },
+      });
+      hardDeleted = true;
+      if (userId) {
+        await prisma.user.delete({ where: { id: userId } }).catch(() => {});
+      }
+    } catch (delErr: any) {
+      console.warn(`[ADMIN] Soft-expunging student ${studentId} due to historic references:`, delErr?.message);
+      // If historical records (such as past financial invoices or marks) prevent hard deletion:
+      // enrollments are already deleted (so student never appears in roster or alumni lists),
+      // we mark active=false and free the registerNo so it won't collide.
+      await prisma.student.update({
+        where: { id: studentId },
+        data: {
+          active: false,
+          registerNo: student.registerNo ? `${student.registerNo}_DEL_${Date.now()}` : null,
+          updatedAt: new Date(),
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Student account for ${studentName} has been deleted successfully.`,
+      hardDeleted,
+    });
   } catch (error: any) {
     console.error('[ADMIN] Delete student error:', error);
-    return res.status(500).json({ success: false, message: 'Failed to deactivate student.' });
+    return res.status(500).json({ success: false, message: 'Failed to delete student account.' });
   }
 }
 
