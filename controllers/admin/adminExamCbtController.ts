@@ -450,6 +450,154 @@ export async function createExamScheduleSlot(req: Request, res: Response): Promi
   const branchId = req.branchId;
 
   try {
+    const { slots: batchSlots } = req.body;
+
+    // Handle batch creation of multiple subjects before saving
+    if (Array.isArray(batchSlots) && batchSlots.length > 0) {
+      const topClassId = req.body.classId;
+      const topSectionId = req.body.sectionId;
+      const topIsPublished = req.body.isPublished !== undefined ? Boolean(req.body.isPublished) : true;
+
+      const validatedSlots: any[] = [];
+
+      for (let i = 0; i < batchSlots.length; i++) {
+        const item = batchSlots[i];
+        const classId = item.classId || topClassId;
+        const sectionId = item.sectionId !== undefined ? item.sectionId : topSectionId;
+        const subjectId = item.subjectId;
+        const examDate = item.examDate;
+        const startTime = item.startTime;
+        const endTime = item.endTime;
+        const hallId = item.hallId;
+        const invigilatorId = item.invigilatorId;
+        const instructions = item.instructions;
+        const isPublished = item.isPublished !== undefined ? Boolean(item.isPublished) : topIsPublished;
+
+        if (!classId || !subjectId || !examDate || !startTime || !endTime) {
+          return res.status(400).json({
+            success: false,
+            message: `Subject #${i + 1}: Class, Subject, Exam Date, Start Time, and End Time are required.`,
+          });
+        }
+
+        const parsedDate = new Date(examDate);
+        if (isNaN(parsedDate.getTime())) {
+          return res.status(400).json({
+            success: false,
+            message: `Subject #${i + 1}: Invalid exam date format.`,
+          });
+        }
+
+        if (String(endTime) <= String(startTime)) {
+          return res.status(400).json({
+            success: false,
+            message: `Subject #${i + 1}: End time must be after start time.`,
+          });
+        }
+
+        // Check venue collision
+        if (hallId) {
+          const hallConflict = await prisma.examScheduleSlot.findFirst({
+            where: {
+              branchId,
+              hallId: Number(hallId),
+              examDate: parsedDate,
+              OR: [
+                { startTime: { lte: startTime }, endTime: { gt: startTime } },
+                { startTime: { lt: endTime }, endTime: { gte: endTime } },
+                { startTime: { gte: startTime }, endTime: { lte: endTime } },
+              ],
+            },
+            include: {
+              class: { select: { name: true } },
+              subject: { select: { name: true } },
+              hall: { select: { name: true } },
+            },
+          });
+
+          if (hallConflict) {
+            return res.status(400).json({
+              success: false,
+              message: `Venue Collision Warning (Subject #${i + 1}): ${
+                hallConflict.hall?.name || 'Exam Hall'
+              } is already booked for ${hallConflict.subject?.name || 'an exam'} (${
+                hallConflict.class?.name || 'Class'
+              }) on ${examDate} between ${hallConflict.startTime} - ${hallConflict.endTime}.`,
+            });
+          }
+        }
+
+        // Check invigilator collision
+        if (invigilatorId) {
+          const invigilatorConflict = await prisma.examScheduleSlot.findFirst({
+            where: {
+              branchId,
+              invigilatorId: Number(invigilatorId),
+              examDate: parsedDate,
+              OR: [
+                { startTime: { lte: startTime }, endTime: { gt: startTime } },
+                { startTime: { lt: endTime }, endTime: { gte: endTime } },
+                { startTime: { gte: startTime }, endTime: { lte: endTime } },
+              ],
+            },
+            include: {
+              class: { select: { name: true } },
+              subject: { select: { name: true } },
+              invigilator: { select: { name: true } },
+            },
+          });
+
+          if (invigilatorConflict) {
+            return res.status(400).json({
+              success: false,
+              message: `Invigilator Collision Warning (Subject #${i + 1}): Supervisor ${
+                invigilatorConflict.invigilator?.name || ''
+              } is already assigned to ${invigilatorConflict.subject?.name || 'an exam'} in ${
+                invigilatorConflict.class?.name || 'another class'
+              } on ${examDate} between ${invigilatorConflict.startTime} - ${invigilatorConflict.endTime}.`,
+            });
+          }
+        }
+
+        validatedSlots.push({
+          branchId,
+          classId: Number(classId),
+          sectionId: sectionId ? Number(sectionId) : null,
+          subjectId: Number(subjectId),
+          examDate: parsedDate,
+          startTime,
+          endTime,
+          hallId: hallId ? Number(hallId) : null,
+          invigilatorId: invigilatorId ? Number(invigilatorId) : null,
+          instructions: instructions ? String(instructions).trim() : null,
+          isPublished: Boolean(isPublished),
+        });
+      }
+
+      // Create all slots in batch
+      const createdSlots = await prisma.$transaction(
+        validatedSlots.map((data) =>
+          prisma.examScheduleSlot.create({
+            data,
+            include: {
+              class: { select: { id: true, name: true } },
+              section: { select: { id: true, name: true } },
+              subject: { select: { id: true, name: true } },
+              hall: { select: { id: true, name: true, code: true } },
+              invigilator: { select: { id: true, name: true } },
+            },
+          })
+        )
+      );
+
+      return res.status(201).json({
+        success: true,
+        message: `Successfully added ${createdSlots.length} subject(s) to the exam timetable.`,
+        slots: createdSlots,
+        count: createdSlots.length,
+      });
+    }
+
     const {
       id,
       classId,

@@ -805,6 +805,36 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     }
 
     const studentIds = enrolls.map((e) => e.student.id);
+
+    // Query online CBT exam submissions
+    let cbtSubmissions: any[] = [];
+    if (studentIds.length > 0) {
+      cbtSubmissions = await prisma.onlineExamSubmission.findMany({
+        where: {
+          studentId: { in: studentIds },
+          status: 'SUBMITTED',
+          onlineExam: {
+            classId: Number(classId),
+            ...(req.branchId ? { branchId: req.branchId } : {}),
+          },
+        },
+        include: {
+          onlineExam: {
+            select: { id: true, title: true, subjectId: true, totalMarks: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    const cbtSubmissionMap: Record<string, any> = {};
+    cbtSubmissions.forEach((sub) => {
+      const subKey = `${sub.studentId}_${sub.onlineExam?.subjectId}`;
+      if (!cbtSubmissionMap[subKey]) {
+        cbtSubmissionMap[subKey] = sub;
+      }
+    });
+
     const marks = await prisma.mark.findMany({
       where: {
         classId: Number(classId),
@@ -826,12 +856,31 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     const marksMap: Record<string, any> = {};
     marks.forEach((m) => {
       const key = `${m.studentId}_${m.subjectId}`;
+      const cbtSub = cbtSubmissionMap[key];
+      const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && String(m.cbtMark).trim() !== '';
+      const effectiveCbt = hasCbtMark ? m.cbtMark : cbtSub ? String(cbtSub.score) : null;
+
       marksMap[key] = {
         mark: m.mark,
-        cbtMark: m.cbtMark,
-        cbtSource: m.cbtSource,
+        cbtMark: effectiveCbt,
+        cbtSource: m.cbtSource || (cbtSub ? 'ONLINE_EXAM_SUBMISSION' : null),
+        cbtExamTitle: cbtSub?.onlineExam?.title || null,
         absent: m.absent,
       };
+    });
+
+    // Also populate from CBT submissions if student doesn't have a mark record yet
+    cbtSubmissions.forEach((sub) => {
+      const key = `${sub.studentId}_${sub.onlineExam?.subjectId}`;
+      if (!marksMap[key]) {
+        marksMap[key] = {
+          mark: null,
+          cbtMark: String(sub.score),
+          cbtSource: 'ONLINE_EXAM_SUBMISSION',
+          cbtExamTitle: sub.onlineExam?.title || null,
+          absent: '0',
+        };
+      }
     });
 
     const subjects = subjectAssigns.map((sa) => ({

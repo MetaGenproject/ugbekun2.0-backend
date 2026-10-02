@@ -77,6 +77,37 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
 
+    const studentIds = enrolls.map((e) => e.student.id);
+
+    // Query onlineExamSubmissions for CBT scores
+    let cbtSubmissions: any[] = [];
+    if (studentIds.length > 0) {
+      cbtSubmissions = await prisma.onlineExamSubmission.findMany({
+        where: {
+          studentId: { in: studentIds },
+          status: 'SUBMITTED',
+          onlineExam: {
+            classId: cId,
+            subjectId: subId,
+            branchId,
+          },
+        },
+        include: {
+          onlineExam: {
+            select: { id: true, title: true, totalMarks: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    const cbtSubmissionMap: Record<number, any> = {};
+    cbtSubmissions.forEach((sub) => {
+      if (!cbtSubmissionMap[sub.studentId]) {
+        cbtSubmissionMap[sub.studentId] = sub;
+      }
+    });
+
     const existingMarks = await prisma.mark.findMany({
       where: {
         branchId,
@@ -98,13 +129,37 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
         // fallback
       }
 
+      const cbtSub = cbtSubmissionMap[m.studentId];
+      const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && String(m.cbtMark).trim() !== '';
+      const effectiveCbt = hasCbtMark ? String(m.cbtMark) : cbtSub ? String(cbtSub.score) : null;
+
       marksMap[m.studentId] = {
         id: m.id,
         mark: m.mark,
-        cbtMark: m.cbtMark,
+        cbtMark: effectiveCbt,
+        cbtSource: m.cbtSource || (cbtSub ? 'ONLINE_EXAM_SUBMISSION' : null),
+        cbtExamTitle: cbtSub?.onlineExam?.title || null,
+        cbtTotalMarks: cbtSub?.onlineExam?.totalMarks || null,
         absent: m.absent === '1' || m.absent === 'true',
         components: parsedComponents,
       };
+    });
+
+    // Populate for enrolled students who completed a CBT test but do not yet have a mark entry
+    studentIds.forEach((sId) => {
+      if (!marksMap[sId] && cbtSubmissionMap[sId]) {
+        const cbtSub = cbtSubmissionMap[sId];
+        marksMap[sId] = {
+          id: 0,
+          mark: '',
+          cbtMark: String(cbtSub.score),
+          cbtSource: 'ONLINE_EXAM_SUBMISSION',
+          cbtExamTitle: cbtSub.onlineExam?.title || null,
+          cbtTotalMarks: cbtSub.onlineExam?.totalMarks || null,
+          absent: false,
+          components: {},
+        };
+      }
     });
 
     return res.json({
