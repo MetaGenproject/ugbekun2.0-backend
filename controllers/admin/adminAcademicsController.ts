@@ -657,7 +657,10 @@ export async function getClassAcademicOverview(req: Request, res: Response): Pro
 
     // 4. Staff directory eligible for teaching
     const staff = await prisma.teacher.findMany({
-      where: { branchId, isActive: 1 },
+      where: {
+        branchId,
+        active: true,
+      },
       orderBy: { name: 'asc' },
       select: {
         id: true,
