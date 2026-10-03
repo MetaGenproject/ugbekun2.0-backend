@@ -1070,6 +1070,7 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
     const baseWhere: any = {
       branchId,
       classId: parseInt(classId, 10),
+      isAlumni: 0,
     };
 
     if (sectionId && sectionId !== 'ALL') {
@@ -1121,20 +1122,25 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
       });
     }
 
-    const activeStudents = enrolls
-      .filter((e) => e.student && e.student.active)
-      .map((e) => ({
-        enrollId: e.id,
-        studentId: e.student.id,
-        registerNo: e.student.registerNo || `REG-${e.student.id}`,
-        fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
-        gender: e.student.gender || 'N/A',
-        roll: e.roll,
-        currentClassId: e.classId,
-        currentClassName: e.class?.name || 'Class',
-        currentSectionId: e.sectionId,
-        currentSectionName: e.section?.name || 'Section',
-      }));
+    const studentMap = new Map<number, any>();
+    for (const e of enrolls) {
+      if (e.student && e.student.active && !studentMap.has(e.student.id)) {
+        studentMap.set(e.student.id, {
+          enrollId: e.id,
+          studentId: e.student.id,
+          registerNo: e.student.registerNo || `REG-${e.student.id}`,
+          fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
+          gender: e.student.gender || 'N/A',
+          roll: e.roll,
+          currentClassId: e.classId,
+          currentClassName: e.class?.name || 'Class',
+          currentSectionId: e.sectionId,
+          currentSectionName: e.section?.name || 'Section',
+        });
+      }
+    }
+
+    const activeStudents = Array.from(studentMap.values());
 
     return res.json({
       success: true,
@@ -1199,17 +1205,20 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
             },
           });
 
-          // Always update current latest enrollment so student immediately reflects target class/section
-          await tx.enroll.update({
-            where: { id: currentEnroll.id },
-            data: {
-              classId: tClassId,
-              sectionId: tSectionId,
-              updatedAt: new Date(),
-            },
-          });
-
-          if (tSessionId !== currentEnroll.sessionId) {
+          if (tSessionId === currentEnroll.sessionId) {
+            // Same session promotion / reassignment: update current enrollment directly
+            await tx.enroll.update({
+              where: { id: currentEnroll.id },
+              data: {
+                classId: tClassId,
+                sectionId: tSectionId,
+                isAlumni: 0,
+                updatedAt: new Date(),
+              },
+            });
+          } else {
+            // Cross session promotion: Preserve currentEnroll in its historical session/class!
+            // Create or update the enrollment specifically in the new target academic session.
             const existingTargetEnroll = await tx.enroll.findFirst({
               where: { studentId, sessionId: tSessionId, branchId },
             });
@@ -1220,6 +1229,7 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
                 data: {
                   classId: tClassId,
                   sectionId: tSectionId,
+                  isAlumni: 0,
                   updatedAt: new Date(),
                 },
               });
@@ -1232,6 +1242,7 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
                   roll: currentEnroll.roll || 0,
                   sessionId: tSessionId,
                   branchId,
+                  isAlumni: 0,
                 },
               });
             }

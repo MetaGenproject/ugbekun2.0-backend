@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
@@ -21,8 +24,7 @@ function createPool() {
   const usesSupabasePooler = /pooler\.supabase\.com|:6543/i.test(connectionString);
   const max = Number(process.env.PG_POOL_MAX || (usesSupabasePooler ? 5 : 10));
 
-  const pool = new Pool({
-    connectionString,
+  const poolConfig: any = {
     max: Number.isFinite(max) && max > 0 ? max : 5,
     idleTimeoutMillis: 10_000,
     connectionTimeoutMillis: 20_000,
@@ -32,7 +34,20 @@ function createPool() {
     ssl: /sslmode=(require|no-verify)/i.test(connectionString)
       ? { rejectUnauthorized: false }
       : undefined,
-  });
+  };
+
+  try {
+    const parsed = new URL(connectionString);
+    poolConfig.host = parsed.hostname;
+    poolConfig.port = Number(parsed.port) || 5432;
+    poolConfig.user = decodeURIComponent(parsed.username);
+    poolConfig.password = decodeURIComponent(parsed.password);
+    poolConfig.database = parsed.pathname.replace(/^\//, '');
+  } catch {
+    poolConfig.connectionString = connectionString;
+  }
+
+  const pool = new Pool(poolConfig);
 
   pool.on('error', (err) => {
     console.error('[PG POOL] Unexpected client error:', err.message);

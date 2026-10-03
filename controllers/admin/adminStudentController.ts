@@ -1877,7 +1877,7 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
   const branchId = req.branchId;
 
   try {
-    const { classId, sectionId } = req.query;
+    const { classId, sectionId, sessionId: requestedSessionId } = req.query as any;
     if (!classId || !sectionId) {
       return res.json({
         success: true,
@@ -1887,13 +1887,29 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
       });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    let targetSessionId = requestedSessionId ? Number(requestedSessionId) : null;
+    if (!targetSessionId) {
+      const globalSetting = await prisma.globalSettings.findFirst();
+      const defaultSession = globalSetting?.sessionId || 6;
+      const countInDefault = await prisma.enroll.count({
+        where: { branchId, classId: Number(classId), sectionId: Number(sectionId), sessionId: defaultSession, isAlumni: 0 },
+      });
+      if (countInDefault > 0) {
+        targetSessionId = defaultSession;
+      } else {
+        const latestWithStudents = await prisma.enroll.findFirst({
+          where: { branchId, classId: Number(classId), sectionId: Number(sectionId), isAlumni: 0 },
+          orderBy: { sessionId: 'desc' },
+          select: { sessionId: true },
+        });
+        targetSessionId = latestWithStudents?.sessionId || defaultSession;
+      }
+    }
 
     let enrollments = await prisma.enroll.findMany({
       where: {
         branchId,
-        sessionId,
+        sessionId: targetSessionId,
         classId: Number(classId),
         sectionId: Number(sectionId),
         isAlumni: 0,
@@ -1905,11 +1921,10 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
           },
         },
       },
-      orderBy: {
-        student: {
-          lastName: 'asc',
-        },
-      },
+      orderBy: [
+        { student: { lastName: 'asc' } },
+        { id: 'desc' },
+      ],
     });
 
     if (enrollments.length === 0) {
@@ -1927,11 +1942,11 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
             },
           },
         },
-        orderBy: {
-          student: {
-            lastName: 'asc',
-          },
-        },
+        orderBy: [
+          { sessionId: 'desc' },
+          { student: { lastName: 'asc' } },
+          { id: 'desc' },
+        ],
       });
     }
 
@@ -1939,7 +1954,7 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
       where: {
         classId: Number(classId),
         sectionId: Number(sectionId),
-        sessionId,
+        sessionId: targetSessionId,
         branchId,
       },
       include: {
@@ -1947,20 +1962,29 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
       },
     });
 
-    const students = enrollments.map((e) => ({
-      id: e.student.id,
-      registerNo: e.student.registerNo,
-      firstName: e.student.firstName,
-      lastName: e.student.lastName,
-      gender: e.student.gender,
-      mobileno: e.student.mobileno,
-      email: e.student.email,
-      active: e.student.active,
-      parentName: e.student.parent?.name || null,
-      parentRelation: e.student.parent?.relation || null,
-      parentMobile: e.student.parent?.mobileno || null,
-      parentEmail: e.student.parent?.email || null,
-    }));
+    const studentMap = new Map<number, any>();
+    for (const e of enrollments) {
+      if (e.student && !studentMap.has(e.studentId)) {
+        studentMap.set(e.studentId, {
+          id: e.student.id,
+          registerNo: e.student.registerNo,
+          firstName: e.student.firstName,
+          lastName: e.student.lastName,
+          gender: e.student.gender,
+          mobileno: e.student.mobileno,
+          email: e.student.email,
+          active: e.student.active,
+          parentName: e.student.parent?.name || null,
+          parentRelation: e.student.parent?.relation || null,
+          parentMobile: e.student.parent?.mobileno || null,
+          parentEmail: e.student.parent?.email || null,
+          photo: (e.student as any).photo || null,
+          roll: e.roll,
+        });
+      }
+    }
+
+    const students = Array.from(studentMap.values());
 
     const total = students.length;
     const male = students.filter((s) => s.gender?.toLowerCase() === 'male').length;

@@ -52,10 +52,18 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
       });
     }
 
-    const enrollWhere: any = { classId: cId };
+    const globalSetting = await prisma.globalSettings.findFirst();
+    let activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
+
+    const enrollWhere: any = {
+      classId: cId,
+      branchId,
+      isAlumni: 0,
+      sessionId: activeSession,
+    };
     if (secId) enrollWhere.sectionId = secId;
 
-    const enrolls = await prisma.enroll.findMany({
+    let enrolls = await prisma.enroll.findMany({
       where: enrollWhere,
       include: {
         student: {
@@ -63,21 +71,52 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
         },
         section: { select: { id: true, name: true } },
       },
-      orderBy: [{ roll: 'asc' }],
+      orderBy: [{ roll: 'asc' }, { id: 'desc' }],
     });
 
-    const students = enrolls.map((e) => ({
-      id: e.student.id,
-      name: [e.student.firstName, e.student.lastName].filter(Boolean).join(' ') || `Student #${e.student.id}`,
-      roll: e.roll ? String(e.roll) : null,
-      registerNo: e.student.registerNo,
-      sectionName: e.section?.name,
-    }));
+    if (enrolls.length === 0) {
+      // Fallback: look for latest session enrollments for this class
+      const fallbackEnroll = await prisma.enroll.findFirst({
+        where: { classId: cId, branchId, isAlumni: 0, ...(secId ? { sectionId: secId } : {}) },
+        orderBy: { sessionId: 'desc' },
+        select: { sessionId: true },
+      });
+      if (fallbackEnroll?.sessionId) {
+        activeSession = fallbackEnroll.sessionId;
+        enrolls = await prisma.enroll.findMany({
+          where: {
+            classId: cId,
+            branchId,
+            isAlumni: 0,
+            sessionId: activeSession,
+            ...(secId ? { sectionId: secId } : {}),
+          },
+          include: {
+            student: {
+              select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true },
+            },
+            section: { select: { id: true, name: true } },
+          },
+          orderBy: [{ roll: 'asc' }, { id: 'desc' }],
+        });
+      }
+    }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
+    const studentMap = new Map<number, any>();
+    for (const e of enrolls) {
+      if (e.student && !studentMap.has(e.student.id)) {
+        studentMap.set(e.student.id, {
+          id: e.student.id,
+          name: [e.student.firstName, e.student.lastName].filter(Boolean).join(' ') || `Student #${e.student.id}`,
+          roll: e.roll ? String(e.roll) : null,
+          registerNo: e.student.registerNo,
+          sectionName: e.section?.name,
+        });
+      }
+    }
 
-    const studentIds = enrolls.map((e) => e.student.id);
+    const students = Array.from(studentMap.values());
+    const studentIds = students.map((s) => s.id);
 
     // Query onlineExamSubmissions for CBT scores
     let cbtSubmissions: any[] = [];
@@ -533,6 +572,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         sectionId: parsedSectionId,
         sessionId,
         branchId,
+        isAlumni: 0,
       },
       include: {
         student: {
@@ -546,7 +586,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
           },
         },
       },
-      orderBy: { student: { lastName: 'asc' } },
+      orderBy: [{ student: { lastName: 'asc' } }, { id: 'desc' }],
     });
 
     // Fallback: If 0 students in the given session, look for the latest session with enrollments for this class & section
@@ -556,6 +596,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
           classId: parsedClassId,
           sectionId: parsedSectionId,
           branchId,
+          isAlumni: 0,
         },
         orderBy: { sessionId: 'desc' },
         select: { sessionId: true },
@@ -569,6 +610,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
             sectionId: parsedSectionId,
             sessionId,
             branchId,
+            isAlumni: 0,
           },
           include: {
             student: {
@@ -582,7 +624,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
               },
             },
           },
-          orderBy: { student: { lastName: 'asc' } },
+          orderBy: [{ student: { lastName: 'asc' } }, { id: 'desc' }],
         });
       }
     }
@@ -593,6 +635,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         where: {
           classId: parsedClassId,
           branchId,
+          isAlumni: 0,
         },
         orderBy: { sessionId: 'desc' },
         select: { sessionId: true },
@@ -605,6 +648,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
             classId: parsedClassId,
             sessionId,
             branchId,
+            isAlumni: 0,
           },
           include: {
             student: {
@@ -618,12 +662,19 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
               },
             },
           },
-          orderBy: { student: { lastName: 'asc' } },
+          orderBy: [{ student: { lastName: 'asc' } }, { id: 'desc' }],
         });
       }
     }
 
-    const studentIds = enrolls.map((e) => e.studentId);
+    const reportStudentMap = new Map<number, any>();
+    for (const e of enrolls) {
+      if (e.student && !reportStudentMap.has(e.studentId)) {
+        reportStudentMap.set(e.studentId, e);
+      }
+    }
+    const dedupedEnrolls = Array.from(reportStudentMap.values());
+    const studentIds = dedupedEnrolls.map((e) => e.studentId);
 
     const marks = await prisma.mark.findMany({
       where: {
@@ -719,7 +770,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       rankMap[item.id] = idx + 1;
     });
 
-    const studentList = enrolls.map((e) => {
+    const studentList = dedupedEnrolls.map((e) => {
       const st = e.student;
       const agg = studentAggregates[st.id] || { sum: 0, count: 0, totalMarks: 0 };
       const avg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;

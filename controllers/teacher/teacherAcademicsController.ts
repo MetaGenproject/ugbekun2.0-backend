@@ -2260,14 +2260,17 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
     // Calculate student counts offering each subject in each class-section
     const assignedSubjects = await Promise.all(
       teacherSubjectAssigns.map(async (sa) => {
-        const studentCount = await prisma.enroll.count({
+        const distinctStudents = await prisma.enroll.findMany({
           where: {
             classId: sa.classId,
             sectionId: sa.sectionId,
             isAlumni: 0,
             ...(branchId ? { branchId } : {}),
           },
+          distinct: ['studentId'],
+          select: { studentId: true },
         });
+        const studentCount = distinctStudents.length;
 
         return {
           id: sa.id,
@@ -2353,14 +2356,20 @@ export async function getSubjectStudents(req: Request, res: Response): Promise<R
       },
     });
 
-    const students = enrolls.map((e) => ({
-      id: e.student.id,
-      registerNo: e.student.registerNo,
-      fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
-      gender: e.student.gender || 'N/A',
-      photo: e.student.photo,
-      roll: e.roll,
-    }));
+    const studentMap = new Map<number, any>();
+    for (const e of enrolls) {
+      if (e.student && !studentMap.has(e.student.id)) {
+        studentMap.set(e.student.id, {
+          id: e.student.id,
+          registerNo: e.student.registerNo,
+          fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
+          gender: e.student.gender || 'N/A',
+          photo: e.student.photo,
+          roll: e.roll,
+        });
+      }
+    }
+    const students = Array.from(studentMap.values());
 
     return res.json({
       success: true,
