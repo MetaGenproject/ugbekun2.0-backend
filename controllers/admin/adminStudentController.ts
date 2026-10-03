@@ -82,7 +82,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           parent: { select: { name: true, photo: true, mobileno: true, email: true } },
           enrolls: {
             take: 1,
-            orderBy: { id: 'desc' },
+            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
             select: {
               class: { select: { id: true, name: true } },
               section: { select: { id: true, name: true } },
@@ -119,7 +119,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
               registerNo: true,
               enrolls: {
                 take: 1,
-                orderBy: { id: 'desc' },
+                orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
                 select: {
                   class: { select: { name: true } },
                   section: { select: { name: true } },
@@ -272,7 +272,7 @@ export async function searchParents(req: Request, res: Response): Promise<Respon
             photo: true,
             enrolls: {
               take: 1,
-              orderBy: { id: 'desc' },
+              orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
               select: {
                 class: { select: { name: true } },
                 section: { select: { name: true } },
@@ -1185,7 +1185,7 @@ export async function getStudentById(req: Request, res: Response): Promise<Respo
         parent: true,
         enrolls: {
           take: 1,
-          orderBy: { id: 'desc' },
+          orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
           include: {
             class: true,
             section: true,
@@ -3559,9 +3559,10 @@ export async function getAlumniStudents(req: Request, res: Response): Promise<Re
         class: { select: { id: true, name: true } },
         section: { select: { id: true, name: true } },
       },
-      orderBy: {
-        updatedAt: 'desc',
-      },
+      orderBy: [
+        { sessionId: 'desc' },
+        { id: 'desc' },
+      ],
     });
 
     const studentMap = new Map<number, any>();

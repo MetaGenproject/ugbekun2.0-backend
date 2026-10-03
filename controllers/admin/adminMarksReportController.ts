@@ -102,6 +102,31 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
       }
     }
 
+    // Exclude students who have since been promoted or enrolled in a higher/different class in this branch
+    const candidateStudentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
+    if (candidateStudentIds.length > 0) {
+      const latestEnrolls = await prisma.enroll.findMany({
+        where: {
+          studentId: { in: candidateStudentIds },
+          branchId,
+          isAlumni: 0,
+        },
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+      });
+
+      const latestClassByStudent = new Map<number, number>();
+      for (const le of latestEnrolls) {
+        if (!latestClassByStudent.has(le.studentId)) {
+          latestClassByStudent.set(le.studentId, le.classId);
+        }
+      }
+
+      enrolls = enrolls.filter((e) => {
+        const currentActiveClsId = latestClassByStudent.get(e.studentId);
+        return currentActiveClsId === cId;
+      });
+    }
+
     const studentMap = new Map<number, any>();
     for (const e of enrolls) {
       if (e.student && !studentMap.has(e.student.id)) {
@@ -665,6 +690,31 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
           orderBy: [{ student: { lastName: 'asc' } }, { id: 'desc' }],
         });
       }
+    }
+
+    // Exclude students who have since been promoted or enrolled in a higher/different class in this branch
+    const candidateStudentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
+    if (candidateStudentIds.length > 0) {
+      const latestEnrolls = await prisma.enroll.findMany({
+        where: {
+          studentId: { in: candidateStudentIds },
+          branchId,
+          isAlumni: 0,
+        },
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+      });
+
+      const latestClassByStudent = new Map<number, number>();
+      for (const le of latestEnrolls) {
+        if (!latestClassByStudent.has(le.studentId)) {
+          latestClassByStudent.set(le.studentId, le.classId);
+        }
+      }
+
+      enrolls = enrolls.filter((e) => {
+        const currentActiveClsId = latestClassByStudent.get(e.studentId);
+        return currentActiveClsId === parsedClassId;
+      });
     }
 
     const reportStudentMap = new Map<number, any>();
