@@ -59,6 +59,7 @@ import {
   moveToAlumni,
   restoreFromAlumni,
   getAlumniStudents,
+  removeStudentEnrollment,
 } from '../controllers/admin/adminStudentController';
 
 import {
@@ -368,6 +369,7 @@ router.post('/sibling-requests/:id/approve', approveSiblingRequest);
 router.post('/sibling-requests/:id/reject', rejectSiblingRequest);
 router.get('/classroom-students', getClassroomStudents);
 router.get('/classrooms/:id/students', getClassroomStudents);
+router.post('/classrooms/remove-student-enrollment', removeStudentEnrollment);
 router.get('/online-admissions', getOnlineAdmissions);
 router.post('/online-admissions/:id/review', reviewOnlineAdmission);
 router.post('/students/parse-document', upload.single('file'), parseStudentDocument);

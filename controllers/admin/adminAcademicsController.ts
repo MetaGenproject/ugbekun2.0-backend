@@ -2300,12 +2300,50 @@ export async function deleteSubject(req: Request, res: Response): Promise<Respon
       return res.status(404).json({ success: false, message: 'Subject not found.' });
     }
 
-    await prisma.$transaction([
-      prisma.subjectAssign.deleteMany({ where: { subjectId } }),
-      prisma.subject.delete({ where: { id: subjectId } }),
-    ]);
+    await prisma.$transaction(async (tx) => {
+      // 1. Timetable and Exam schedule slots
+      await tx.timetableSlot.deleteMany({ where: { subjectId } });
+      await tx.examScheduleSlot.deleteMany({ where: { subjectId } });
 
-    return res.json({ success: true, message: 'Subject deleted successfully.' });
+      // 2. CBT Distributions
+      await tx.cbtDistribution.deleteMany({ where: { subjectId } });
+
+      // 3. Online Exams and submissions
+      const exams = await tx.onlineExam.findMany({ where: { subjectId }, select: { id: true } });
+      const examIds = exams.map((e) => e.id);
+      if (examIds.length > 0) {
+        await tx.onlineExamSubmission.deleteMany({ where: { onlineExamId: { in: examIds } } });
+        await tx.onlineExam.deleteMany({ where: { id: { in: examIds } } });
+      }
+
+      // 4. Homework and submissions
+      const homeworks = await tx.homework.findMany({ where: { subjectId }, select: { id: true } });
+      const homeworkIds = homeworks.map((h) => h.id);
+      if (homeworkIds.length > 0) {
+        await tx.homeworkSubmission.deleteMany({ where: { homeworkId: { in: homeworkIds } } });
+        await tx.homework.deleteMany({ where: { id: { in: homeworkIds } } });
+      }
+
+      // 5. Lesson Plans
+      await tx.lessonPlan.deleteMany({ where: { subjectId } });
+
+      // 6. Question Banks
+      await tx.questionBank.deleteMany({ where: { subjectId } });
+
+      // 7. Question Groups
+      await tx.questionGroup.deleteMany({ where: { subjectId } });
+
+      // 8. Marks recorded for this subject
+      await tx.mark.deleteMany({ where: { subjectId } });
+
+      // 9. Subject assignments to classes/teachers
+      await tx.subjectAssign.deleteMany({ where: { subjectId } });
+
+      // 10. Delete the subject itself
+      await tx.subject.delete({ where: { id: subjectId } });
+    });
+
+    return res.json({ success: true, message: `Subject "${existing.name}" and all associated schedules/assignments deleted successfully.` });
   } catch (error: any) {
     console.error('[ADMIN] Delete subject error:', error);
     return res.status(500).json({ success: false, message: error?.message || 'Failed to delete subject.' });

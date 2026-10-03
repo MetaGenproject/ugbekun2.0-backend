@@ -1962,6 +1962,31 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
       },
     });
 
+    // Exclude students who have since been promoted or enrolled in a higher/different class in this branch
+    const candidateStudentIds = Array.from(new Set(enrollments.map((e) => e.studentId)));
+    if (candidateStudentIds.length > 0) {
+      const latestEnrolls = await prisma.enroll.findMany({
+        where: {
+          studentId: { in: candidateStudentIds },
+          branchId,
+          isAlumni: 0,
+        },
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+      });
+
+      const latestClassByStudent = new Map<number, number>();
+      for (const le of latestEnrolls) {
+        if (!latestClassByStudent.has(le.studentId)) {
+          latestClassByStudent.set(le.studentId, le.classId);
+        }
+      }
+
+      enrollments = enrollments.filter((e) => {
+        const currentActiveClsId = latestClassByStudent.get(e.studentId);
+        return currentActiveClsId === Number(classId);
+      });
+    }
+
     const studentMap = new Map<number, any>();
     for (const e of enrollments) {
       if (e.student && !studentMap.has(e.studentId)) {
@@ -1999,6 +2024,46 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
   } catch (error) {
     console.error('[ADMIN] Get classroom students error:', error);
     return res.status(500).json({ success: false, message: 'Failed to load classroom students.' });
+  }
+}
+
+/**
+ * POST /api/admin/classrooms/remove-student-enrollment
+ * Removes a student from a specific classroom roster without deleting their account.
+ */
+export async function removeStudentEnrollment(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { studentId, classId, sectionId } = req.body || {};
+
+  if (!studentId || !classId) {
+    return res.status(400).json({ success: false, message: 'studentId and classId are required.' });
+  }
+
+  try {
+    const student = await prisma.student.findUnique({
+      where: { id: Number(studentId) },
+    });
+
+    if (!student || student.branchId !== branchId) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
+    }
+
+    const where: any = {
+      studentId: Number(studentId),
+      classId: Number(classId),
+      branchId,
+    };
+    if (sectionId) where.sectionId = Number(sectionId);
+
+    const deleteResult = await prisma.enroll.deleteMany({ where });
+
+    return res.json({
+      success: true,
+      message: `${student.firstName || ''} ${student.lastName || ''} removed from classroom roster (${deleteResult.count} enrollment record(s) removed). Student account remains intact.`,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Remove student enrollment error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to remove student from classroom.' });
   }
 }
 
