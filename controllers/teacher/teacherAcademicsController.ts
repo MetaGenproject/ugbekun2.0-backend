@@ -2203,8 +2203,32 @@ export async function takeAttritionAction(req: Request, res: Response): Promise<
 export async function getTeacherClassesSections(req: Request, res: Response): Promise<Response | void> {
   try {
     const branchId = req.branchId;
+    const teacherId = req.teacherId;
+    const isAdmin = Boolean(req.isAdmin || req.userRole === 1 || req.userRole === 2);
+
+    let allowedClassIds: number[] | null = null;
+    if (!isAdmin && teacherId) {
+      const [formAllocs, subjAssigns] = await Promise.all([
+        prisma.teacherAllocation.findMany({
+          where: { teacherId, ...(branchId ? { branchId } : {}) },
+          select: { classId: true },
+        }),
+        prisma.subjectAssign.findMany({
+          where: { teacherId, ...(branchId ? { branchId } : {}) },
+          select: { classId: true },
+        }),
+      ]);
+      const classIdSet = new Set<number>();
+      formAllocs.forEach((a: any) => classIdSet.add(a.classId));
+      subjAssigns.forEach((a: any) => classIdSet.add(a.classId));
+      allowedClassIds = Array.from(classIdSet);
+    }
+
     const classes = await prisma.class.findMany({
-      where: branchId ? { branchId } : {},
+      where: {
+        ...(branchId ? { branchId } : {}),
+        ...(allowedClassIds !== null ? { id: { in: allowedClassIds } } : {}),
+      },
       include: {
         sections: {
           include: {
@@ -2238,8 +2262,9 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
   try {
     const branchId = req.branchId;
     const teacherId = req.teacherId;
+    const isAdmin = Boolean(req.isAdmin || req.userRole === 1 || req.userRole === 2);
 
-    const [allBranchSubjects, teacherSubjectAssigns] = await Promise.all([
+    const [allBranchSubjects, directSubjectAssigns, formAllocations] = await Promise.all([
       prisma.subject.findMany({
         where: branchId ? { branchId } : {},
         orderBy: { name: 'asc' },
@@ -2255,11 +2280,66 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
             orderBy: { id: 'desc' },
           })
         : Promise.resolve([]),
+      teacherId
+        ? prisma.teacherAllocation.findMany({
+            where: { teacherId },
+            select: { classId: true, sectionId: true },
+          })
+        : Promise.resolve([]),
     ]);
+
+    // If teacher is a Class Teacher (Form Teacher), automatically retrieve all subjects offered by that class
+    let classTeacherSubjectAssigns: any[] = [];
+    if (formAllocations.length > 0) {
+      classTeacherSubjectAssigns = await prisma.subjectAssign.findMany({
+        where: {
+          OR: formAllocations.map((fa: any) => ({
+            classId: fa.classId,
+            sectionId: fa.sectionId,
+          })),
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          subject: true,
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+          teacher: { select: { id: true, name: true } },
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    // Merge direct subject assignments with class-teacher covered subjects
+    const combinedMap = new Map<string, any>();
+
+    // 1. Class Teacher subjects (covered automatically)
+    for (const sa of classTeacherSubjectAssigns) {
+      const key = `${sa.classId}-${sa.sectionId}-${sa.subjectId}`;
+      combinedMap.set(key, {
+        ...sa,
+        role: 'CLASS_TEACHER',
+        roleLabel: sa.teacherId === teacherId ? 'Class Teacher & Subject Lead' : 'Class Teacher (Auto-Covered)',
+        assignedTeacherName: sa.teacher?.name || 'Class Teacher',
+      });
+    }
+
+    // 2. Direct Subject Teacher assignments (take precedence for specific subject role)
+    for (const sa of directSubjectAssigns) {
+      const key = `${sa.classId}-${sa.sectionId}-${sa.subjectId}`;
+      const existing = combinedMap.get(key);
+      combinedMap.set(key, {
+        ...sa,
+        role: existing ? 'COMPOUND' : 'SUBJECT_TEACHER',
+        roleLabel: existing ? 'Class Teacher & Subject Teacher' : 'Subject Teacher',
+        assignedTeacherName: 'Me',
+      });
+    }
+
+    const mergedAssigns = Array.from(combinedMap.values());
 
     // Calculate student counts offering each subject in each class-section
     const assignedSubjects = await Promise.all(
-      teacherSubjectAssigns.map(async (sa) => {
+      mergedAssigns.map(async (sa) => {
         const distinctStudents = await prisma.enroll.findMany({
           where: {
             classId: sa.classId,
@@ -2283,6 +2363,9 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
           className: sa.class?.name || 'Class',
           sectionId: sa.sectionId,
           sectionName: sa.section?.name || 'Section',
+          role: sa.role,
+          roleLabel: sa.roleLabel,
+          assignedTeacherName: sa.assignedTeacherName,
           studentCount,
           createdAt: sa.createdAt,
         };

@@ -8,6 +8,8 @@ import {
   isSubjectTeacher as originalIsSubjectTeacher,
   isFormTeacher as originalIsFormTeacher,
   hasClassAccess as originalHasClassAccess,
+  canTeacherAccessSubject,
+  getTeacherAcademicRoles,
 } from '../../lib/teacherAccess';
 import { uploadBase64Image } from '../../lib/cloudinary';
 import { getRegisterWithEntries, REGISTER_STATUS } from '../../lib/attendanceRegisterService';
@@ -31,56 +33,17 @@ export async function savePhoto(photoBase64?: string | null, folder: string = 'u
 
 export async function isSubjectTeacher(db: any, teacherId: any, classId: any, sectionId: any, subjectId: any, req: any) {
   if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
-  const hasSpecific = await originalIsSubjectTeacher(db, teacherId, classId, sectionId, subjectId);
-  if (hasSpecific) return true;
-
-  if (req && req.branchId && classId) {
-    const classRecord = await db.class.findFirst({
-      where: {
-        id: Number(classId),
-        branchId: req.branchId,
-      },
-      select: { id: true },
-    });
-    if (classRecord) return true;
-  }
-  return false;
+  return canTeacherAccessSubject(db, teacherId, classId, sectionId, subjectId, req?.sessionId, req);
 }
 
 export async function isFormTeacher(db: any, teacherId: any, classId: any, sectionId: any, req: any) {
   if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
-  const hasSpecific = await originalIsFormTeacher(db, teacherId, classId, sectionId);
-  if (hasSpecific) return true;
-
-  if (req && req.branchId && classId) {
-    const classRecord = await db.class.findFirst({
-      where: {
-        id: Number(classId),
-        branchId: req.branchId,
-      },
-      select: { id: true },
-    });
-    if (classRecord) return true;
-  }
-  return false;
+  return originalIsFormTeacher(db, teacherId, classId, sectionId);
 }
 
 export async function hasClassAccess(db: any, teacherId: any, classId: any, sectionId: any, req: any) {
   if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
-  const hasSpecific = await originalHasClassAccess(db, teacherId, classId, sectionId);
-  if (hasSpecific) return true;
-
-  if (req && req.branchId && classId) {
-    const classRecord = await db.class.findFirst({
-      where: {
-        id: Number(classId),
-        branchId: req.branchId,
-      },
-      select: { id: true },
-    });
-    if (classRecord) return true;
-  }
-  return false;
+  return originalHasClassAccess(db, teacherId, classId, sectionId, req);
 }
 
 export async function saveMediaFile(file: any) {
@@ -280,6 +243,13 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       }
     }
 
+    const academicRoles = await getTeacherAcademicRoles(
+      prisma,
+      req.teacherId,
+      req.branchId,
+      req.sessionId ? Number(req.sessionId) : null
+    );
+
     return res.json({
       success: true,
       profile: {
@@ -325,6 +295,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         nextLesson: 'Scheduled on Timetable',
       })),
       myClasses,
+      academicRoles,
       reminders,
       recentActivities,
     });

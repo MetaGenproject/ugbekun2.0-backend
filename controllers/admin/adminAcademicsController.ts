@@ -522,6 +522,512 @@ export async function assignSubjectBulk(req: Request, res: Response): Promise<Re
 }
 
 /**
+ * GET /api/admin/classes/:classId/academic-overview
+ * Admin View (Step 13): Unified class management screen showing:
+ * - Class info
+ * - Assigned Class Teacher
+ * - Subjects Offered (with status Active)
+ * - Subject Teachers assigned to each subject
+ * - Curriculum subjects available to allocate
+ * - Staff eligible to be assigned
+ */
+export async function getClassAcademicOverview(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.classId);
+
+  try {
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'classId is required.' });
+    }
+
+    const cls = await prisma.class.findFirst({
+      where: { id: classId, branchId },
+      include: {
+        sections: {
+          include: {
+            section: true,
+          },
+        },
+      },
+    });
+
+    if (!cls) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    // Resolve section
+    let sectionId = req.query.sectionId ? Number(req.query.sectionId) : null;
+    if (!sectionId && cls.sections.length > 0) {
+      sectionId = cls.sections[0].section?.id || cls.sections[0].sectionId;
+    }
+
+    const sessionId = await resolveAdminSession(
+      branchId,
+      classId,
+      req.query.sessionId ? Number(req.query.sessionId) : null
+    );
+
+    // 1. Fetch Class Teacher (TeacherAllocation)
+    const classTeacherAlloc = await prisma.teacherAllocation.findFirst({
+      where: {
+        classId,
+        ...(sectionId ? { sectionId } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        branchId,
+      },
+      include: {
+        teacher: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+            photo: true,
+          },
+        },
+      },
+    });
+
+    // 2. Fetch Subjects Offered by this class (SubjectAssign)
+    const subjectAssigns = await prisma.subjectAssign.findMany({
+      where: {
+        classId,
+        ...(sectionId ? { sectionId } : {}),
+        branchId,
+        ...(sessionId ? { sessionId } : {}),
+      },
+      include: {
+        subject: {
+          select: {
+            id: true,
+            name: true,
+            subjectCode: true,
+            subjectType: true,
+            subjectAuthor: true,
+          },
+        },
+        teacher: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+          },
+        },
+      },
+      orderBy: { subject: { name: 'asc' } },
+    });
+
+    const subjectsOffered = subjectAssigns.map((sa: any) => ({
+      assignmentId: sa.id,
+      subjectId: sa.subject?.id || sa.subjectId,
+      name: sa.subject?.name || 'Subject',
+      subjectCode: sa.subject?.subjectCode || 'N/A',
+      subjectType: sa.subject?.subjectType || 'Mandatory',
+      subjectAuthor: sa.subject?.subjectAuthor || null,
+      status: 'Active',
+      assignedTeacherId: sa.teacherId,
+      assignedTeacher: sa.teacher
+        ? {
+            id: sa.teacher.id,
+            name: sa.teacher.name,
+            email: sa.teacher.email,
+            phone: sa.teacher.phone,
+          }
+        : null,
+      coverageType: sa.teacher
+        ? 'SPECIFIC_TEACHER'
+        : classTeacherAlloc?.teacher
+        ? 'CLASS_TEACHER_AUTO'
+        : 'UNASSIGNED',
+      displayTeacherName: sa.teacher?.name || classTeacherAlloc?.teacher?.name || 'Unassigned',
+    }));
+
+    // 3. Central curriculum subject library for this branch
+    const allCurriculumSubjects = await prisma.subject.findMany({
+      where: { branchId },
+      orderBy: { name: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        subjectCode: true,
+        subjectType: true,
+      },
+    });
+
+    // 4. Staff directory eligible for teaching
+    const staff = await prisma.teacher.findMany({
+      where: { branchId, isActive: 1 },
+      orderBy: { name: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+      },
+    });
+
+    return res.json({
+      success: true,
+      class: {
+        id: cls.id,
+        name: cls.name,
+        nameNumeric: cls.nameNumeric,
+        isEcd: cls.isEcd,
+        sections: cls.sections.map((s: any) => ({
+          id: s.section?.id || s.sectionId,
+          name: s.section?.name || 'Main',
+        })),
+        activeSectionId: sectionId,
+        sessionId,
+      },
+      classTeacher: classTeacherAlloc?.teacher || null,
+      subjectsOffered,
+      allCurriculumSubjects,
+      staff,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get class academic overview error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load class academic overview.' });
+  }
+}
+
+/**
+ * POST /api/admin/classes/:classId/allocate-subjects
+ * Step 3: Assign Subjects to a Class
+ * The administrator selects the subjects that this class actually offers.
+ * Allocates subjects to the class without requiring a teacher immediately.
+ */
+export async function allocateClassSubjects(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.classId);
+
+  try {
+    const { sectionId: reqSectionId, subjectIds } = req.body;
+    if (!classId || !Array.isArray(subjectIds)) {
+      return res.status(400).json({ success: false, message: 'classId and subjectIds array are required.' });
+    }
+
+    const cls = await prisma.class.findFirst({
+      where: { id: classId, branchId },
+      include: { sections: true },
+    });
+    if (!cls) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    const sectionId = Number(reqSectionId) || cls.sections[0]?.sectionId || 1;
+    const sessionId = await resolveAdminSession(
+      branchId,
+      classId,
+      req.body.sessionId ? Number(req.body.sessionId) : null
+    );
+
+    // Existing subject assigns for this class and section
+    const existingAssigns = await prisma.subjectAssign.findMany({
+      where: { classId, sectionId, branchId, sessionId },
+    });
+
+    const existingMap = new Map<number, any>();
+    existingAssigns.forEach((ea: any) => existingMap.set(ea.subjectId, ea));
+
+    const selectedSet = new Set(subjectIds.map(Number));
+
+    await prisma.$transaction(async (tx: any) => {
+      // 1. Create or keep selected subjects
+      for (const sId of Array.from(selectedSet)) {
+        if (!existingMap.has(sId)) {
+          await tx.subjectAssign.create({
+            data: {
+              classId,
+              sectionId,
+              subjectId: sId,
+              teacherId: null, // allocated to class, teacher assigned separately or covered by class teacher
+              branchId,
+              sessionId,
+            },
+          });
+        }
+      }
+
+      // 2. Remove subjects that were deselected (safe remove: only if no marks recorded)
+      for (const ea of existingAssigns) {
+        if (!selectedSet.has(ea.subjectId)) {
+          const marksCount = await tx.mark.count({
+            where: { classId, sectionId, subjectId: ea.subjectId, sessionId, branchId },
+          });
+          if (marksCount === 0) {
+            await tx.subjectAssign.delete({ where: { id: ea.id } });
+          }
+        }
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: `Subjects allocated to ${cls.name} successfully.`,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Allocate class subjects error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to allocate subjects to class.' });
+  }
+}
+
+/**
+ * POST /api/admin/classes/:classId/class-teacher
+ * Step 4 & 5: Assign Class Teacher
+ * Assigning a Class Teacher automatically gives them teaching and administrative access
+ * to all subjects allocated to this class.
+ */
+export async function assignClassTeacher(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.classId);
+
+  try {
+    const { teacherId, sectionId: reqSectionId } = req.body;
+    if (!classId || !teacherId) {
+      return res.status(400).json({ success: false, message: 'classId and teacherId are required.' });
+    }
+
+    const [cls, teacher] = await Promise.all([
+      prisma.class.findFirst({
+        where: { id: classId, branchId },
+        include: { sections: true },
+      }),
+      prisma.teacher.findFirst({
+        where: { id: Number(teacherId), branchId },
+        select: { id: true, name: true },
+      }),
+    ]);
+
+    if (!cls) return res.status(404).json({ success: false, message: 'Class not found.' });
+    if (!teacher) return res.status(404).json({ success: false, message: 'Teacher not found in staff directory.' });
+
+    const sectionId = Number(reqSectionId) || cls.sections[0]?.sectionId || 1;
+    const sessionId = await resolveAdminSession(
+      branchId,
+      classId,
+      req.body.sessionId ? Number(req.body.sessionId) : null
+    );
+
+    const existingAlloc = await prisma.teacherAllocation.findFirst({
+      where: { classId, sectionId, sessionId, branchId },
+    });
+
+    if (existingAlloc) {
+      await prisma.teacherAllocation.update({
+        where: { id: existingAlloc.id },
+        data: { teacherId: Number(teacherId) },
+      });
+    } else {
+      const maxAlloc = await prisma.teacherAllocation.findFirst({
+        orderBy: { id: 'desc' },
+        select: { id: true },
+      });
+      await prisma.teacherAllocation.create({
+        data: {
+          id: (maxAlloc?.id || 0) + 1,
+          classId,
+          sectionId,
+          teacherId: Number(teacherId),
+          sessionId,
+          branchId,
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `${teacher.name} has been assigned as Class Teacher for ${cls.name}. They automatically have teaching and administrative access to all subjects offered by this class.`,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Assign class teacher error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to assign class teacher.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/classes/:classId/class-teacher
+ */
+export async function removeClassTeacher(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.classId);
+
+  try {
+    const sectionId = req.query.sectionId ? Number(req.query.sectionId) : req.body.sectionId ? Number(req.body.sectionId) : null;
+    const sessionId = await resolveAdminSession(
+      branchId,
+      classId,
+      req.query.sessionId ? Number(req.query.sessionId) : null
+    );
+
+    const where: any = { classId, branchId, sessionId };
+    if (sectionId) where.sectionId = sectionId;
+
+    await prisma.teacherAllocation.deleteMany({ where });
+
+    return res.json({ success: true, message: 'Class teacher assignment removed successfully.' });
+  } catch (error) {
+    console.error('[ADMIN] Remove class teacher error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to remove class teacher.' });
+  }
+}
+
+/**
+ * POST /api/admin/classes/:classId/assign-subject-teacher
+ * Steps 6, 7, 8, 14: Assign Subject Teacher (Single or Across Multiple Classes)
+ *
+ * CRITICAL AUTOMATIC VALIDATION (Step 14):
+ * "If Physics has not been assigned to JSS 1A, an administrator should not be able to assign a Physics teacher to JSS 1A.
+ * The system should display: '${subject.name} is not currently assigned to ${class.name}. Assign ${subject.name} to this class first before assigning a ${subject.name} teacher.'"
+ */
+export async function assignSubjectTeacher(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.classId);
+
+  try {
+    const { subjectId, teacherId, classIds, sectionId: reqSectionId } = req.body;
+    if (!subjectId || !teacherId) {
+      return res.status(400).json({ success: false, message: 'Subject and Teacher are required.' });
+    }
+
+    const sId = Number(subjectId);
+    const tId = Number(teacherId);
+
+    // If multi-class assignment specified, use classIds; otherwise use classId
+    const targetClassIds = Array.isArray(classIds) && classIds.length > 0
+      ? Array.from(new Set(classIds.map(Number)))
+      : [classId];
+
+    const [subject, teacher] = await Promise.all([
+      prisma.subject.findFirst({ where: { id: sId, branchId } }),
+      prisma.teacher.findFirst({ where: { id: tId, branchId } }),
+    ]);
+
+    if (!subject) return res.status(404).json({ success: false, message: 'Subject not found in curriculum.' });
+    if (!teacher) return res.status(404).json({ success: false, message: 'Teacher not found in staff directory.' });
+
+    // Step 14 Validation: Ensure subject is already allocated to EVERY target class
+    for (const cId of targetClassIds) {
+      const cls = await prisma.class.findFirst({ where: { id: cId, branchId } });
+      const clsName = cls?.name || `Class #${cId}`;
+
+      const isAllocated = await prisma.subjectAssign.findFirst({
+        where: {
+          classId: cId,
+          subjectId: sId,
+          branchId,
+        },
+      });
+
+      if (!isAllocated) {
+        return res.status(400).json({
+          success: false,
+          message: `${subject.name} is not currently assigned to ${clsName}. Assign ${subject.name} to this class first before assigning a ${subject.name} teacher.`,
+        });
+      }
+    }
+
+    // Step 8: Apply teacher assignment across all validated classes
+    await prisma.$transaction(async (tx: any) => {
+      for (const cId of targetClassIds) {
+        const cls = await tx.class.findFirst({
+          where: { id: cId, branchId },
+          include: { sections: true },
+        });
+        const secId = reqSectionId ? Number(reqSectionId) : cls?.sections[0]?.sectionId || 1;
+        const sessionId = await resolveAdminSession(branchId, cId, req.body.sessionId ? Number(req.body.sessionId) : null);
+
+        const existingAssign = await tx.subjectAssign.findFirst({
+          where: {
+            classId: cId,
+            sectionId: secId,
+            subjectId: sId,
+            branchId,
+            sessionId,
+          },
+        });
+
+        if (existingAssign) {
+          await tx.subjectAssign.update({
+            where: { id: existingAssign.id },
+            data: { teacherId: tId },
+          });
+        } else {
+          await tx.subjectAssign.create({
+            data: {
+              classId: cId,
+              sectionId: secId,
+              subjectId: sId,
+              teacherId: tId,
+              branchId,
+              sessionId,
+            },
+          });
+        }
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: `${teacher.name} assigned as ${subject.name} teacher across ${targetClassIds.length} class(es) successfully.`,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Assign subject teacher error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to assign subject teacher.' });
+  }
+}
+
+/**
+ * POST /api/admin/classes/:classId/remove-subject-teacher
+ * Unlinks the teacher from this subject in the class without removing the subject from the class.
+ */
+export async function removeSubjectTeacher(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = Number(req.params.classId);
+
+  try {
+    const { subjectId, sectionId: reqSectionId } = req.body;
+    if (!classId || !subjectId) {
+      return res.status(400).json({ success: false, message: 'classId and subjectId are required.' });
+    }
+
+    const cls = await prisma.class.findFirst({
+      where: { id: classId, branchId },
+      include: { sections: true },
+    });
+    const sectionId = reqSectionId ? Number(reqSectionId) : cls?.sections[0]?.sectionId || 1;
+    const sessionId = await resolveAdminSession(
+      branchId,
+      classId,
+      req.body.sessionId ? Number(req.body.sessionId) : null
+    );
+
+    const existingAssign = await prisma.subjectAssign.findFirst({
+      where: {
+        classId,
+        sectionId,
+        subjectId: Number(subjectId),
+        branchId,
+        sessionId,
+      },
+    });
+
+    if (existingAssign) {
+      await prisma.subjectAssign.update({
+        where: { id: existingAssign.id },
+        data: { teacherId: null },
+      });
+    }
+
+    return res.json({ success: true, message: 'Subject teacher removed from this subject in the class.' });
+  } catch (error) {
+    console.error('[ADMIN] Remove subject teacher error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to remove subject teacher.' });
+  }
+}
+
+/**
  * GET /api/admin/attendance/students
  */
 export async function getStudentAttendance(req: Request, res: Response): Promise<Response | void> {

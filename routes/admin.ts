@@ -119,6 +119,12 @@ import {
   assignSubject,
   assignSubjectBulk,
   deleteSubjectAssignment,
+  getClassAcademicOverview,
+  allocateClassSubjects,
+  assignClassTeacher,
+  removeClassTeacher,
+  assignSubjectTeacher,
+  removeSubjectTeacher,
   getStudentAttendance,
   saveStudentAttendance,
   getMonthlyAttendanceReport,
@@ -469,6 +475,15 @@ router.delete('/subjects/:id', deleteSubject);
 router.post('/subjects/assign', assignSubject);
 router.post('/subjects/assign-bulk', assignSubjectBulk);
 router.delete('/subjects/assign/:id', deleteSubjectAssignment);
+
+// Class Academic Management: Class Teacher & Subject Teacher Assignments
+router.get('/classes/:classId/academic-overview', getClassAcademicOverview);
+router.post('/classes/:classId/allocate-subjects', allocateClassSubjects);
+router.post('/classes/:classId/class-teacher', assignClassTeacher);
+router.delete('/classes/:classId/class-teacher', removeClassTeacher);
+router.post('/classes/:classId/assign-subject-teacher', assignSubjectTeacher);
+router.post('/classes/:classId/remove-subject-teacher', removeSubjectTeacher);
+
 router.get('/student-attendance', getStudentAttendance);
 router.post('/student-attendance', saveStudentAttendance);
 router.get('/attendance/students', getStudentAttendance);
