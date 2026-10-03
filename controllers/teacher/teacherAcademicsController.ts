@@ -809,22 +809,30 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     // Query online CBT exam submissions
     let cbtSubmissions: any[] = [];
     if (studentIds.length > 0) {
-      cbtSubmissions = await prisma.onlineExamSubmission.findMany({
-        where: {
-          studentId: { in: studentIds },
-          status: 'SUBMITTED',
-          onlineExam: {
-            classId: Number(classId),
-            ...(req.branchId ? { branchId: req.branchId } : {}),
+      try {
+        cbtSubmissions = await prisma.onlineExamSubmission.findMany({
+          where: {
+            studentId: { in: studentIds },
+            OR: [
+              { submittedAt: { not: null } },
+              { totalMark: { not: null } },
+            ],
+            onlineExam: {
+              classId: Number(classId),
+              ...(req.branchId ? { branchId: req.branchId } : {}),
+            },
           },
-        },
-        include: {
-          onlineExam: {
-            select: { id: true, title: true, subjectId: true, totalMarks: true },
+          include: {
+            onlineExam: {
+              select: { id: true, title: true, subjectId: true, totalMarks: true },
+            },
           },
-        },
-        orderBy: { id: 'desc' },
-      });
+          orderBy: { id: 'desc' },
+        });
+      } catch (cbtErr) {
+        console.warn('[TEACHER_MARKS] Could not fetch CBT submissions for marks entry:', cbtErr);
+        cbtSubmissions = [];
+      }
     }
 
     const cbtSubmissionMap: Record<string, any> = {};

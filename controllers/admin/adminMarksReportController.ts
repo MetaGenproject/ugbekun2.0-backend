@@ -82,23 +82,31 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
     // Query onlineExamSubmissions for CBT scores
     let cbtSubmissions: any[] = [];
     if (studentIds.length > 0) {
-      cbtSubmissions = await prisma.onlineExamSubmission.findMany({
-        where: {
-          studentId: { in: studentIds },
-          status: 'SUBMITTED',
-          onlineExam: {
-            classId: cId,
-            subjectId: subId,
-            branchId,
+      try {
+        cbtSubmissions = await prisma.onlineExamSubmission.findMany({
+          where: {
+            studentId: { in: studentIds },
+            OR: [
+              { submittedAt: { not: null } },
+              { totalMark: { not: null } },
+            ],
+            onlineExam: {
+              classId: cId,
+              subjectId: subId,
+              branchId,
+            },
           },
-        },
-        include: {
-          onlineExam: {
-            select: { id: true, title: true, totalMarks: true },
+          include: {
+            onlineExam: {
+              select: { id: true, title: true, totalMarks: true },
+            },
           },
-        },
-        orderBy: { id: 'desc' },
-      });
+          orderBy: { id: 'desc' },
+        });
+      } catch (cbtErr) {
+        console.warn('[MARKS] Could not fetch CBT submissions for marks entry:', cbtErr);
+        cbtSubmissions = [];
+      }
     }
 
     const cbtSubmissionMap: Record<number, any> = {};
