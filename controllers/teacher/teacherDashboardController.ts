@@ -642,6 +642,7 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
       branchName,
       branch: teacherRecord?.branch || null,
       isFormTeacher: formAllocations.length > 0,
+      isClassTeacher: formAllocations.length > 0,
       isSubjectTeacher: subjectAssignments.length > 0,
       formAllocations: formAllocations.map((a) => ({
         classId: a.classId,

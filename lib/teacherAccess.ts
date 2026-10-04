@@ -242,14 +242,15 @@ export async function getTeacherAcademicRoles(
     })
   );
 
-  // Classes where this teacher is already Class Teacher
-  const classTeacherClassIds = new Set(formAllocations.map((fa: any) => fa.classId));
+  // Pairs of (classId, sectionId) where this teacher is already Class Teacher
+  const classTeacherClassSectionPairs = new Set(
+    formAllocations.map((fa: any) => `${fa.classId}:${fa.sectionId || 0}`)
+  );
 
-  // 2. Fetch Direct Subject Teacher Assignments (only for classes where they are NOT already the Class Teacher)
-  const subjectAssignments = await prisma.subjectAssign.findMany({
+  // 2. Fetch Direct Subject Teacher Assignments
+  const rawSubjectAssignments = await prisma.subjectAssign.findMany({
     where: {
       teacherId: tId,
-      ...(classTeacherClassIds.size > 0 ? { classId: { notIn: Array.from(classTeacherClassIds) } } : {}),
       ...(branchId ? { branchId } : {}),
       ...(sessionId ? { sessionId } : {}),
     },
@@ -258,6 +259,12 @@ export async function getTeacherAcademicRoles(
       section: { select: { id: true, name: true } },
       subject: { select: { id: true, name: true, subjectCode: true, subjectType: true } },
     },
+  });
+
+  // Only exclude subject assignments where they are already the Class Teacher for that exact class & section
+  const subjectAssignments = rawSubjectAssignments.filter((sa: any) => {
+    const pairKey = `${sa.classId}:${sa.sectionId || 0}`;
+    return !classTeacherClassSectionPairs.has(pairKey);
   });
 
   // Group by Subject for "My Teaching" view (Step 8 & 10)
