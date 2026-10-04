@@ -3003,7 +3003,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         id: true,
         studentId: true,
         status: true,
-        date: true,
+        attendanceDate: true,
       },
     });
 
