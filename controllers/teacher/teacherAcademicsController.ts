@@ -3114,22 +3114,38 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
     const highestTotalScore = rankedRows[0]?.totalScore || 0;
     const lowestTotalScore = rankedRows[totalStudents - 1]?.totalScore || 0;
 
+    const summaryPayload = {
+      id: cls.id,
+      classId: cls.id,
+      name: cls.name,
+      className: cls.name,
+      sectionId,
+      sectionName: cls.sections.find((s) => s.sectionId === sectionId)?.section?.name || 'All Sections',
+      totalStudents,
+      classAverage: overallClassAverage,
+      highestScore: highestTotalScore,
+      lowestScore: lowestTotalScore,
+    };
+
+    const offeredSubjectsPayload = cls.subjects.map((s) => ({
+      id: s.subject.id,
+      name: s.subject.name,
+      code: s.subject.subjectCode,
+      subjectCode: s.subject.subjectCode,
+    }));
+
     return res.json({
       success: true,
-      classInfo: {
-        id: cls.id,
-        name: cls.name,
-        sectionId,
-        sectionName: cls.sections.find((s) => s.sectionId === sectionId)?.section?.name || 'All Sections',
-        totalStudents,
-        classAverage: overallClassAverage,
-        highestScore: highestTotalScore,
-        lowestScore: lowestTotalScore,
-      },
-      offeredSubjects,
-      tabulation: rankedRows,
+      classInfo: summaryPayload,
+      classSummary: summaryPayload,
+      offeredSubjects: offeredSubjectsPayload,
+      tabulation: rankedRows.map((r) => ({
+        ...r,
+        name: `${r.firstName} ${r.lastName}`,
+        subjectScores: r.marks,
+      })),
       attendanceOverview: {
-        totalDaysRecorded: attendances.length > 0 ? new Set(attendances.map((a: any) => (a.date ? new Date(a.date).toISOString().split('T')[0] : ''))).size : 0,
+        totalDaysRecorded: attendances.length > 0 ? new Set(attendances.map((a: any) => (a.attendanceDate ? new Date(a.attendanceDate).toISOString().split('T')[0] : ''))).size : 0,
         averageAttendanceRate: totalStudents > 0
           ? Math.round(Object.values(attendanceSummary).reduce((a, b) => a + b.rate, 0) / totalStudents)
           : 100,
