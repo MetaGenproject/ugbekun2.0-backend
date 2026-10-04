@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
-import { isSubjectTeacher, isFormTeacher, hasClassAccess } from './teacherDashboardController';
+import { isSubjectTeacher, isFormTeacher, hasClassAccess, canTeacherAccessSubject } from '../../lib/teacherAccess';
 import { generatePedagogicalLessonPlan } from '../../lib/lessonPlanService';
 import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
 import { generateStudentAiCommentary, generateBatchClassCommentary } from '../../lib/commentaryService';
@@ -89,7 +89,7 @@ export async function getStudents(req: Request, res: Response): Promise<Response
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
   }
 
-  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId, req);
+  const hasAccess = await hasClassAccess(prisma, req.teacherId, Number(classId), Number(sectionId), req);
   if (!hasAccess) {
     return res.status(403).json({
       success: false,
@@ -170,7 +170,7 @@ export async function getScores(req: Request, res: Response): Promise<Response |
     return res.status(400).json({ success: false, message: 'classId, sectionId, subjectId, and examId are required.' });
   }
 
-  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, classId, sectionId, subjectId, req);
+  const isAssigned = await isSubjectTeacher(prisma, req.teacherId, Number(classId), Number(sectionId), Number(subjectId), req);
   if (!isAssigned) {
     return res.status(403).json({
       success: false,
@@ -582,7 +582,7 @@ export async function getReportCards(req: Request, res: Response): Promise<Respo
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
   }
 
-  const isForm = await isFormTeacher(prisma, req.teacherId, classId, sectionId, req);
+  const isForm = await isFormTeacher(prisma, req.teacherId, Number(classId), Number(sectionId), req);
   if (!isForm) {
     return res.status(403).json({
       success: false,
@@ -679,7 +679,7 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     return res.status(400).json({ success: false, message: 'classId, sectionId, and examId are required.' });
   }
 
-  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId, req);
+  const hasAccess = await hasClassAccess(prisma, req.teacherId, Number(classId), Number(sectionId), req);
   if (!hasAccess) {
     return res.status(403).json({
       success: false,
@@ -2676,5 +2676,470 @@ export async function getTeacherTimetable(req: Request, res: Response): Promise<
     return res.status(500).json({ success: false, message: 'Failed to retrieve teacher timetable.' });
   }
 }
+
+/**
+ * GET /api/teacher/marks-entry
+ * Requirement 2: Fetches marks entry roster using the School's Active Evaluation Matrix.
+ * Enforces teacher authorization via canTeacherAccessSubject.
+ */
+export async function getTeacherMarksEntry(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId, sectionId, subjectId, sessionId } = req.query;
+
+  if (!classId || !subjectId) {
+    return res.status(400).json({ success: false, message: 'classId and subjectId are required.' });
+  }
+
+  const cId = Number(classId);
+  const subId = Number(subjectId);
+  const secId = sectionId ? Number(sectionId) : undefined;
+
+  const targetSessionId = sessionId ? Number(sessionId) : undefined;
+  // Strict Permission Enforcement: Class Teacher or assigned Subject Teacher
+  const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, targetSessionId, req);
+  if (!canAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to access marks for this subject and class.',
+    });
+  }
+
+  try {
+    const classData = await prisma.class.findFirst({
+      where: { id: cId, ...(branchId ? { branchId } : {}) },
+      include: { evaluationMatrix: true },
+    });
+
+    if (!classData) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    // Resolve Active School Evaluation Matrix
+    let matrix: any = classData.evaluationMatrix;
+    if (!matrix) {
+      matrix = await prisma.evaluationMatrix.findFirst({
+        where: { branchId, isDefault: true },
+      });
+    }
+    if (!matrix) {
+      matrix = await prisma.evaluationMatrix.findFirst({
+        where: { branchId },
+      });
+    }
+    if (!matrix) {
+      // Default to Standard CA + Examination if no custom matrix exists yet
+      matrix = {
+        id: 0,
+        name: 'Continuous Assessment & Examination',
+        code: 'CA-EXAM',
+        description: 'Standard Assessment Matrix',
+        totalMarks: 100,
+        isDefault: true,
+        components: [
+          { code: 'CA', name: 'Continuous Assessment', maxMarks: 40, passMarks: 20 },
+          { code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, passMarks: 30 },
+        ],
+      };
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    let activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
+
+    const enrollWhere: any = {
+      classId: cId,
+      isAlumni: 0,
+      sessionId: activeSession,
+      ...(branchId ? { branchId } : {}),
+    };
+    if (secId) enrollWhere.sectionId = secId;
+
+    let enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true, photo: true },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
+        where: { classId: cId, isAlumni: 0, ...(secId ? { sectionId: secId } : {}), ...(branchId ? { branchId } : {}) },
+        include: {
+          student: {
+            select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true, photo: true },
+          },
+          section: { select: { id: true, name: true } },
+        },
+        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+      });
+    }
+
+    const studentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
+
+    // Fetch existing marks
+    const existingMarks = await prisma.mark.findMany({
+      where: {
+        classId: cId,
+        subjectId: subId,
+        studentId: { in: studentIds },
+        ...(secId ? { sectionId: secId } : {}),
+        ...(branchId ? { branchId } : {}),
+      },
+    });
+
+    const marksMap: Record<number, any> = {};
+    existingMarks.forEach((m) => {
+      let parsedComponents = {};
+      try {
+        if (m.mark && m.mark.startsWith('{')) {
+          parsedComponents = JSON.parse(m.mark);
+        }
+      } catch (err) {}
+
+      marksMap[m.studentId] = {
+        id: m.id,
+        mark: m.mark,
+        cbtMark: m.cbtMark,
+        cbtSource: m.cbtSource,
+        absent: m.absent === '1' || m.absent === 'true',
+        components: parsedComponents,
+      };
+    });
+
+    return res.json({
+      success: true,
+      matrix,
+      students: enrolls.map((e) => ({
+        id: e.student.id,
+        name: `${e.student.lastName}, ${e.student.firstName}`,
+        firstName: e.student.firstName,
+        lastName: e.student.lastName,
+        registerNo: e.student.registerNo,
+        gender: e.student.gender,
+        photo: e.student.photo,
+        sectionName: e.section?.name,
+      })),
+      marksMap,
+      classData: { id: classData.id, name: classData.name, evaluationMatrixId: classData.evaluationMatrixId },
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Fetch marks entry error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch assessment scores.' });
+  }
+}
+
+/**
+ * POST /api/teacher/marks-entry/batch-save
+ * Saves marks entry according to the active evaluation matrix with strict permission checks.
+ */
+export async function saveTeacherMarksEntryBatch(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId, sectionId, subjectId, sessionId, marks } = req.body;
+
+  if (!classId || !subjectId || !Array.isArray(marks)) {
+    return res.status(400).json({ success: false, message: 'Invalid batch save payload.' });
+  }
+
+  const cId = Number(classId);
+  const subId = Number(subjectId);
+  const secId = sectionId ? Number(sectionId) : 1;
+
+  // Strict Permission Enforcement: Class Teacher or assigned Subject Teacher
+  const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, sessionId, req);
+  if (!canAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to save marks for this subject and class.',
+    });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
+
+    let savedCount = 0;
+    for (const item of marks) {
+      if (!item.studentId) continue;
+      const sId = Number(item.studentId);
+      const isAbsentStr = item.absent ? '1' : '0';
+      const markValue = item.components ? JSON.stringify(item.components) : String(item.mark || '0');
+
+      const existing = await prisma.mark.findFirst({
+        where: {
+          classId: cId,
+          subjectId: subId,
+          studentId: sId,
+          sessionId: activeSession,
+          ...(branchId ? { branchId } : {}),
+        },
+      });
+
+      if (existing) {
+        await prisma.mark.update({
+          where: { id: existing.id },
+          data: {
+            mark: markValue,
+            absent: isAbsentStr,
+          },
+        });
+      } else {
+        await prisma.mark.create({
+          data: {
+            branchId: branchId || 1,
+            classId: cId,
+            sectionId: secId,
+            subjectId: subId,
+            studentId: sId,
+            examId: 1,
+            sessionId: activeSession,
+            mark: markValue,
+            absent: isAbsentStr,
+          },
+        });
+      }
+      savedCount++;
+    }
+
+    return res.json({
+      success: true,
+      savedCount,
+      message: `Scores saved successfully (${savedCount} students updated).`,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Batch save marks error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save scores.' });
+  }
+}
+
+/**
+ * GET /api/teacher/class-reports
+ * Requirement 5: Broad Class Teacher Reports.
+ * Provides Attendance, Student Performance, Tabulation Sheet, and Student Information
+ * strictly scoped to the teacher's authorized classes.
+ */
+export async function getTeacherClassReports(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId, reportType = 'overview' } = req.query;
+
+  if (!reqClassId) {
+    return res.status(400).json({ success: false, message: 'classId is required.' });
+  }
+
+  const classId = Number(reqClassId);
+  const sectionId = reqSectionId ? Number(reqSectionId) : null;
+
+  // Strict access check: teacher must be assigned to this class
+  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId, req);
+  if (!hasAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to view reports for this class.',
+    });
+  }
+
+  try {
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = reqSessionId ? Number(reqSessionId) : globalSetting?.sessionId || 5;
+
+    const cls = await prisma.class.findUnique({
+      where: { id: classId },
+      include: {
+        sections: { include: { section: true } },
+        subjects: { include: { subject: true, teacher: true } },
+      },
+    });
+
+    if (!cls) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    // 1. Enrolled students
+    const enrollWhere: any = {
+      classId,
+      isAlumni: 0,
+      sessionId,
+      ...(branchId ? { branchId } : {}),
+    };
+    if (sectionId) enrollWhere.sectionId = sectionId;
+
+    let enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          include: { parent: true },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
+        where: { classId, isAlumni: 0, ...(sectionId ? { sectionId } : {}), ...(branchId ? { branchId } : {}) },
+        include: {
+          student: {
+            include: { parent: true },
+          },
+          section: { select: { id: true, name: true } },
+        },
+        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+      });
+    }
+
+    const studentIds = enrolls.map((e) => e.student.id);
+
+    // 2. Attendance stats for this class
+    const attendances = await prisma.attendance.findMany({
+      where: {
+        classId,
+        studentId: { in: studentIds },
+        ...(sectionId ? { sectionId } : {}),
+        ...(branchId ? { branchId } : {}),
+      },
+      select: {
+        id: true,
+        studentId: true,
+        status: true,
+        date: true,
+      },
+    });
+
+    const attendanceSummary: Record<number, { present: number; absent: number; total: number; rate: number }> = {};
+    studentIds.forEach((sId) => {
+      attendanceSummary[sId] = { present: 0, absent: 0, total: 0, rate: 100 };
+    });
+
+    attendances.forEach((att) => {
+      const summary = attendanceSummary[att.studentId];
+      if (summary) {
+        summary.total++;
+        if (att.status === 'P' || att.status === 'PRESENT') {
+          summary.present++;
+        } else if (att.status === 'A' || att.status === 'ABSENT') {
+          summary.absent++;
+        }
+      }
+    });
+
+    Object.values(attendanceSummary).forEach((s) => {
+      if (s.total > 0) {
+        s.rate = Math.round((s.present / s.total) * 100);
+      }
+    });
+
+    // 3. Academic Marks & Tabulation Sheet
+    const marks = await prisma.mark.findMany({
+      where: {
+        classId,
+        studentId: { in: studentIds },
+        ...(sectionId ? { sectionId } : {}),
+        ...(branchId ? { branchId } : {}),
+      },
+      select: {
+        id: true,
+        studentId: true,
+        subjectId: true,
+        mark: true,
+        absent: true,
+      },
+    });
+
+    const offeredSubjects = cls.subjects.map((s) => ({
+      id: s.subject.id,
+      name: s.subject.name,
+      code: s.subject.subjectCode,
+    }));
+
+    // Build Tabulation Matrix
+    const tabulationRows = enrolls.map((e) => {
+      const sId = e.student.id;
+      const studentMarks: Record<number, number> = {};
+      let totalScore = 0;
+      let subjectCount = 0;
+
+      offeredSubjects.forEach((sub) => {
+        const markRecord = marks.find((m) => m.studentId === sId && m.subjectId === sub.id);
+        let score = 0;
+        if (markRecord && markRecord.mark) {
+          if (markRecord.mark.startsWith('{')) {
+            try {
+              const comp = JSON.parse(markRecord.mark);
+              const compValues: any[] = Object.values(comp);
+              score = compValues.reduce((sum: number, v: any) => sum + (Number(v) || 0), 0);
+            } catch {
+              score = 0;
+            }
+          } else {
+            score = Number(markRecord.mark) || 0;
+          }
+        }
+        studentMarks[sub.id] = score;
+        totalScore += score;
+        if (score > 0) subjectCount++;
+      });
+
+      const averageScore = offeredSubjects.length > 0 ? Math.round((totalScore / offeredSubjects.length) * 10) / 10 : 0;
+
+      return {
+        studentId: sId,
+        firstName: e.student.firstName,
+        lastName: e.student.lastName,
+        registerNo: e.student.registerNo,
+        rollNo: e.roll,
+        sectionName: e.section?.name || 'Main',
+        marks: studentMarks,
+        totalScore,
+        averageScore,
+        attendanceRate: attendanceSummary[sId]?.rate ?? 100,
+        parentName: e.student.parent?.name || 'N/A',
+        parentPhone: e.student.parent?.mobileno || 'N/A',
+      };
+    });
+
+    // Rank students by totalScore
+    tabulationRows.sort((a, b) => b.totalScore - a.totalScore);
+    const rankedRows = tabulationRows.map((row, idx) => ({
+      ...row,
+      position: idx + 1,
+    }));
+
+    // Calculate class level statistics
+    const totalStudents = rankedRows.length;
+    const overallClassAverage = totalStudents > 0
+      ? Math.round(rankedRows.reduce((acc, r) => acc + r.averageScore, 0) / totalStudents)
+      : 0;
+    const highestTotalScore = rankedRows[0]?.totalScore || 0;
+    const lowestTotalScore = rankedRows[totalStudents - 1]?.totalScore || 0;
+
+    return res.json({
+      success: true,
+      classInfo: {
+        id: cls.id,
+        name: cls.name,
+        sectionId,
+        sectionName: cls.sections.find((s) => s.sectionId === sectionId)?.section?.name || 'All Sections',
+        totalStudents,
+        classAverage: overallClassAverage,
+        highestScore: highestTotalScore,
+        lowestScore: lowestTotalScore,
+      },
+      offeredSubjects,
+      tabulation: rankedRows,
+      attendanceOverview: {
+        totalDaysRecorded: attendances.length > 0 ? new Set(attendances.map((a: any) => (a.date ? new Date(a.date).toISOString().split('T')[0] : ''))).size : 0,
+        averageAttendanceRate: totalStudents > 0
+          ? Math.round(Object.values(attendanceSummary).reduce((a, b) => a + b.rate, 0) / totalStudents)
+          : 100,
+      },
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Class reports error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate class reports.' });
+  }
+}
+
 
 

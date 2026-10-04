@@ -12,9 +12,15 @@ export async function isSubjectTeacher(
   teacherId: number | string | undefined | null,
   classId: number | string | undefined | null,
   sectionId?: number | string | undefined | null,
-  subjectId?: number | string | undefined | null
+  subjectId?: number | string | undefined | null,
+  req?: any
 ): Promise<boolean> {
+  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
   if (!teacherId || !classId) return false;
+
+  // Class Teachers automatically have access to subjects in their assigned class
+  const isForm = await isFormTeacher(prisma, teacherId, classId, sectionId, req);
+  if (isForm) return true;
   
   const where: any = {
     teacherId: Number(teacherId),
@@ -38,8 +44,10 @@ export async function isFormTeacher(
   prisma: any,
   teacherId: number | string | undefined | null,
   classId: number | string | undefined | null,
-  sectionId?: number | string | undefined | null
+  sectionId?: number | string | undefined | null,
+  req?: any
 ): Promise<boolean> {
+  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
   if (!teacherId || !classId) return false;
 
   const where: any = {
@@ -234,10 +242,14 @@ export async function getTeacherAcademicRoles(
     })
   );
 
-  // 2. Fetch Direct Subject Teacher Assignments
+  // Classes where this teacher is already Class Teacher
+  const classTeacherClassIds = new Set(formAllocations.map((fa: any) => fa.classId));
+
+  // 2. Fetch Direct Subject Teacher Assignments (only for classes where they are NOT already the Class Teacher)
   const subjectAssignments = await prisma.subjectAssign.findMany({
     where: {
       teacherId: tId,
+      ...(classTeacherClassIds.size > 0 ? { classId: { notIn: Array.from(classTeacherClassIds) } } : {}),
       ...(branchId ? { branchId } : {}),
       ...(sessionId ? { sessionId } : {}),
     },

@@ -76,8 +76,12 @@ import {
   getTeacherClassesSections,
   getTeacherSubjects,
   getSubjectStudents,
-  getEvents,
   getTeacherTimetable,
+  getEvents,
+  getTeacherMarksEntry,
+  saveTeacherMarksEntryBatch,
+  getTeacherClassReports,
+  batchGradeHomework,
 } from '../controllers/teacher';
 import { importCbtQuestions, aiGenerateCbtQuestions, extractQuestionDrafts, bulkSaveQuestionBank } from '../controllers/admin/adminExamCbtController';
 import { getPublicSchoolInfo } from '../controllers/publicTenant';
@@ -136,16 +140,19 @@ router.post('/commentary/generate-ai', generateCommentaryAi);
 router.post('/commentary/batch-generate-ai', batchGenerateCommentaryAi);
 router.post('/commentary/batch-save', batchSaveCommentary);
 
-// Gradebook & Score Sheets
+// Gradebook & Score Sheets (Matrix Assessment)
+router.get('/marks-entry', getTeacherMarksEntry);
+router.post('/marks-entry/batch-save', saveTeacherMarksEntryBatch);
 router.get('/gradebook/sheet', getGradebookSheet);
 router.post('/gradebook/save-single', saveSingleGrade);
 router.post('/gradebook/batch-save', batchSaveGradebook);
 router.post('/gradebook/csv-upload', uploadGradebookCsv);
 
-// Report Cards
+// Report Cards & Class Reports
 router.get('/report-cards', getReportCards);
 router.get('/report-cards/export-pdf', exportReportCardPdf);
 router.get('/report-cards/export-batch-pdf', exportBatchReportCardsPdf);
+router.get('/class-reports', getTeacherClassReports);
 
 // Montessori Assessments
 router.get('/montessori/sheet', getMontessoriSheet);
@@ -156,6 +163,7 @@ router.get('/homeworks', getHomeworks);
 router.post('/homeworks', createHomework);
 router.get('/homeworks/:id/submissions', getHomeworkSubmissions);
 router.post('/homeworks/submissions/:id/grade', gradeHomeworkSubmission);
+router.post('/homeworks/:id/batch-grade', batchGradeHomework);
 
 // Online Exams & CBT
 router.get('/online-exams', getOnlineExams);

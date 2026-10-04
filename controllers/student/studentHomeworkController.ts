@@ -24,7 +24,7 @@ function parseQuestions(raw: any): any[] {
  */
 export async function submitHomework(req: Request, res: Response): Promise<Response | void> {
   const { id } = req.params;
-  const { answers, notes } = req.body;
+  const { answers, notes, fileUrl, fileName, fileType } = req.body;
   try {
     const homework = await prisma.homework.findUnique({
       where: { id: Number(id) },
@@ -48,7 +48,17 @@ export async function submitHomework(req: Request, res: Response): Promise<Respo
     let maxPossibleScore = 0;
     let hasManual = false;
 
-    const formattedAnswers = Array.isArray(answers) ? answers : [];
+    const formattedAnswers = Array.isArray(answers) ? [...answers] : [];
+    if (fileUrl) {
+      hasManual = true;
+      formattedAnswers.push({
+        submissionType: 'FILE_UPLOAD',
+        fileUrl,
+        fileName: fileName || 'assignment_submission',
+        fileType: fileType || 'file',
+        notes: notes || '',
+      });
+    }
 
     if (questions.length > 0) {
       for (const q of questions) {

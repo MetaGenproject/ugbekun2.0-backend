@@ -78,9 +78,48 @@ export async function getChildTasks(req: Request, res: Response): Promise<Respon
       },
     });
 
+    const homeworks = await prisma.homework.findMany({
+      where: {
+        classId: req.childClassId,
+        branchId: req.studentBranchId,
+      },
+      include: {
+        subject: { select: { name: true } },
+        submissions: {
+          where: { studentId: req.studentId },
+          select: { id: true, score: true, feedback: true, createdAt: true },
+        },
+      },
+      orderBy: { dueDate: 'desc' },
+      take: 30,
+    });
+
+    const formattedAssignments = homeworks.map((hw) => {
+      const sub = hw.submissions[0] || null;
+      let status = 'NOT_SUBMITTED';
+      if (sub) {
+        status = sub.score !== null && sub.score !== undefined ? 'MARKED' : 'AWAITING_MARKING';
+      }
+      return {
+        id: hw.id,
+        title: hw.title,
+        description: hw.description,
+        subjectName: hw.subject?.name || 'General',
+        dueDate: hw.dueDate,
+        submitted: !!sub,
+        status,
+        score: sub ? sub.score : null,
+        feedback: sub ? sub.feedback : null,
+        submittedAt: sub ? sub.createdAt : null,
+        createdAt: hw.createdAt,
+      };
+    });
+
     return res.json({
       success: true,
       notes,
+      homeworks: formattedAssignments,
+      assignments: formattedAssignments,
       onlineExams: onlineExams.map((ex) => {
         const submission = ex.submissions[0] || null;
         return {

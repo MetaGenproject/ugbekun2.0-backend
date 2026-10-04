@@ -310,28 +310,108 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
  */
 export async function getRoster(req: Request, res: Response): Promise<Response | void> {
   try {
+    const { classId: reqClassId, sectionId: reqSectionId, search } = req.query;
+
     const [formAllocations, subjectAssignments] = await Promise.all([
       prisma.teacherAllocation.findMany({
         where: { teacherId: req.teacherId },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+        },
       }),
       prisma.subjectAssign.findMany({
         where: { teacherId: req.teacherId },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+        },
       }),
     ]);
 
-    const classSectionPairs = [
-      ...formAllocations.map((fa) => ({ classId: fa.classId, sectionId: fa.sectionId })),
-      ...subjectAssignments.map((sa) => ({ classId: sa.classId, sectionId: sa.sectionId })),
-    ];
+    // Build unique assigned classes with their sections
+    const assignedClassesMap = new Map<number, { id: number; name: string; sections: Array<{ id: number; name: string }> }>();
 
-    if (classSectionPairs.length === 0) {
-      return res.json({ success: true, students: [] });
+    for (const alloc of [...formAllocations, ...subjectAssignments]) {
+      if (!alloc.classId) continue;
+      if (!assignedClassesMap.has(alloc.classId)) {
+        assignedClassesMap.set(alloc.classId, {
+          id: alloc.classId,
+          name: alloc.class?.name || `Class #${alloc.classId}`,
+          sections: [],
+        });
+      }
+      const cls = assignedClassesMap.get(alloc.classId)!;
+      if (alloc.sectionId && !cls.sections.some((s) => s.id === alloc.sectionId)) {
+        cls.sections.push({
+          id: alloc.sectionId,
+          name: alloc.section?.name || 'Main',
+        });
+      }
+    }
+
+    const assignedClasses = Array.from(assignedClassesMap.values());
+
+    if (assignedClasses.length === 0) {
+      return res.json({ success: true, students: [], assignedClasses: [] });
+    }
+
+    // Backend Permission Rule Enforcement: If classId specified, verify teacher has access
+    let filterClassId: number | null = null;
+    let filterSectionId: number | null = null;
+
+    if (reqClassId) {
+      const targetCId = Number(reqClassId);
+      if (!assignedClassesMap.has(targetCId)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access Denied: You are not authorized to view students in this class.',
+        });
+      }
+      filterClassId = targetCId;
+      if (reqSectionId) {
+        filterSectionId = Number(reqSectionId);
+      }
+    }
+
+    // Build enroll query where condition
+    const whereCondition: any = {
+      isAlumni: 0,
+      ...(req.branchId ? { branchId: req.branchId } : {}),
+    };
+
+    if (filterClassId) {
+      whereCondition.classId = filterClassId;
+      if (filterSectionId) {
+        whereCondition.sectionId = filterSectionId;
+      }
+    } else {
+      // Default: students across all authorized classes and sections
+      const classSectionPairs: Array<{ classId: number; sectionId?: number }> = [];
+      assignedClasses.forEach((ac) => {
+        if (ac.sections.length > 0) {
+          ac.sections.forEach((sec) => classSectionPairs.push({ classId: ac.id, sectionId: sec.id }));
+        } else {
+          classSectionPairs.push({ classId: ac.id });
+        }
+      });
+      whereCondition.OR = classSectionPairs;
+    }
+
+    if (search && String(search).trim() !== '') {
+      const q = String(search).trim();
+      whereCondition.student = {
+        OR: [
+          { firstName: { contains: q, mode: 'insensitive' } },
+          { lastName: { contains: q, mode: 'insensitive' } },
+          { registerNo: { contains: q, mode: 'insensitive' } },
+          ...(Number.isInteger(Number(q)) ? [{ id: Number(q) }] : []),
+        ],
+      };
     }
 
     const enrolls = await prisma.enroll.findMany({
-      where: {
-        OR: classSectionPairs.map((p) => ({ classId: p.classId, sectionId: p.sectionId })),
-      },
+      where: whereCondition,
       include: {
         student: {
           include: {
@@ -341,7 +421,7 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
         class: { select: { id: true, name: true } },
         section: { select: { id: true, name: true } },
       },
-      orderBy: { roll: 'asc' },
+      orderBy: [{ class: { name: 'asc' } }, { roll: 'asc' }, { student: { lastName: 'asc' } }],
     });
 
     const students = enrolls.map((e) => ({
@@ -352,7 +432,9 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
       lastName: e.student.lastName,
       gender: e.student.gender,
       photo: e.student.photo,
+      classId: e.classId,
       className: e.class?.name || 'N/A',
+      sectionId: e.sectionId,
       sectionName: e.section?.name || 'N/A',
       parent: e.student.parent
         ? {
@@ -367,7 +449,7 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
         : null,
     }));
 
-    return res.json({ success: true, students });
+    return res.json({ success: true, students, assignedClasses });
   } catch (error) {
     console.error('[TEACHER] Roster error:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch student roster.' });
