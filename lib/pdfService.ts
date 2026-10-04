@@ -402,7 +402,7 @@ function drawStandardReportCard(doc, params) {
     rankingType = 'full',
     rankingLimit = 3,
     resumptionDate = null,
-    formTeacherName = 'Form Teacher'
+    formTeacherName = 'Class Teacher'
   } = params
 
   // Theme Colors
@@ -576,7 +576,7 @@ function drawStandardReportCard(doc, params) {
 
   // Left: Commentary Title & Text
   doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-     .text('FORM TEACHER HOLISTIC COMMENTARY', 40, y + 10)
+     .text('CLASS TEACHER HOLISTIC COMMENTARY', 40, y + 10)
   
   const remarkText = commentary || 'No performance remarks or behavioral feedback has been recorded for this term yet.'
   doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8.5)
@@ -594,7 +594,7 @@ function drawStandardReportCard(doc, params) {
      .text(resumptionStr, 370, y + 40)
 
   doc.fillColor(textMuted).font('Helvetica')
-     .text('Form Teacher:', 370, y + 58)
+     .text('Class Teacher:', 370, y + 58)
   doc.fillColor(darkColor).font('Helvetica-Bold')
      .text(formTeacherName, 370, y + 70)
 
@@ -606,7 +606,7 @@ function drawStandardReportCard(doc, params) {
   doc.moveTo(375, sigY).lineTo(555, sigY).stroke(lightBorder)
 
   doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('FORM TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
+     .text('CLASS TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
      .text('SCHOOL PRINCIPAL SIGNATURE', 375, sigY + 5, { width: 180, align: 'center' })
 
   // ─── Footer ─────────────────────────────────────────────────────────
@@ -629,7 +629,7 @@ function drawMontessoriReportCard(doc, params) {
     examName = 'Term Evaluation',
     assessment = {},
     resumptionDate = null,
-    formTeacherName = 'Form Teacher'
+    formTeacherName = 'Class Teacher'
   } = params
 
   // Theme Colors (Montessori / Early Childhood Theme: Emerald and Indigo)
@@ -831,7 +831,7 @@ function drawMontessoriReportCard(doc, params) {
   doc.moveTo(375, sigY).lineTo(555, sigY).stroke(lightBorder)
 
   doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('FORM TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
+     .text('CLASS TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
      .text('SCHOOL PRINCIPAL SIGNATURE', 375, sigY + 5, { width: 180, align: 'center' })
 
   // ─── Footer ─────────────────────────────────────────────────────────

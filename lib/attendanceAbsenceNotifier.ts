@@ -53,7 +53,7 @@ export async function notifyParentsOfSubmittedAbsences(args: {
     const subject = `${name} marked ${statusWord} — ${args.dateKey}`;
     const message = `${name} was marked ${statusWord} on the class register for ${args.dateKey}${
       classLabel ? ` (${classLabel})` : ''
-    } at ${schoolName}.${absence.remark ? ` Remark: ${absence.remark}.` : ''} Please contact the form teacher if this is unexpected.`;
+    } at ${schoolName}.${absence.remark ? ` Remark: ${absence.remark}.` : ''} Please contact the class teacher if this is unexpected.`;
 
     await prisma.parentMessage
       .create({

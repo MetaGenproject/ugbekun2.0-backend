@@ -109,7 +109,7 @@ export async function unlockAdminAttendanceRegister(req: Request, res: Response)
 
     return res.json({
       success: true,
-      message: 'Register unlocked. Form teacher can edit until they submit again.',
+      message: 'Register unlocked. Class teacher can edit until they submit again.',
       register: {
         id: updated.id,
         status: updated.status,

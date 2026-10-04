@@ -308,7 +308,7 @@ export async function saveCommentary(req: Request, res: Response): Promise<Respo
     if (!isForm) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied: Only the Form Teacher can draft qualitative commentary.',
+        message: 'Access denied: Only the Class Teacher can draft qualitative commentary.',
       });
     }
 
@@ -382,7 +382,7 @@ export async function generateCommentaryAi(req: Request, res: Response): Promise
     if (!isForm) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied: Only the Form Teacher can generate AI commentary.',
+        message: 'Access denied: Only the Class Teacher can generate AI commentary.',
       });
     }
 
@@ -437,7 +437,7 @@ export async function batchGenerateCommentaryAi(req: Request, res: Response): Pr
   if (!isForm) {
     return res.status(403).json({
       success: false,
-      message: 'Access denied: Only the Form Teacher can run batch AI commentary generation.',
+      message: 'Access denied: Only the Class Teacher can run batch AI commentary generation.',
     });
   }
 
@@ -586,7 +586,7 @@ export async function getReportCards(req: Request, res: Response): Promise<Respo
   if (!isForm) {
     return res.status(403).json({
       success: false,
-      message: 'Access denied: Only the Form Teacher can access the class Report Cards overview.',
+      message: 'Access denied: Only the Class Teacher can access the class Report Cards overview.',
     });
   }
 
@@ -1254,7 +1254,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         examName: assessment?.exam?.name || 'Term Evaluation',
         assessment: assessment || {},
         resumptionDate: assessment?.exam?.resumptionDate || null,
-        formTeacherName: teacherAlloc?.teacher?.name || 'Form Teacher',
+        formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
       });
 
       res.setHeader('Content-Type', 'application/pdf');
@@ -1326,7 +1326,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       rankingType,
       rankingLimit: Number(rankingLimit),
       resumptionDate: studentMarks[0]?.exam?.resumptionDate || null,
-      formTeacherName: teacherAlloc?.teacher?.name || 'Form Teacher',
+      formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1434,7 +1434,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         rank: 1,
         totalClassStudents: enrolls.length,
         resumptionDate: marks[0]?.exam?.resumptionDate || null,
-        formTeacherName: teacherAlloc?.teacher?.name || 'Form Teacher',
+        formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
       });
     }
 
@@ -2118,7 +2118,7 @@ export async function getAttritionDetail(req: Request, res: Response): Promise<R
     if (!isAllocated) {
       return res
         .status(403)
-        .json({ success: false, message: 'Access denied: You are not the Form Teacher for this student.' });
+        .json({ success: false, message: 'Access denied: You are not the Class Teacher for this student.' });
     }
 
     const risk = await prisma.studentAttritionRisk.findUnique({

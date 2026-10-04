@@ -36,7 +36,7 @@ async function forbidUnlessFormTeacher(
   if (isForm) return true;
   res.status(403).json({
     success: false,
-    message: 'Access denied: Only the designated Form Teacher can manage whole-class attendance registers.',
+    message: 'Access denied: Only the designated Class Teacher can manage whole-class attendance registers.',
   });
   return false;
 }

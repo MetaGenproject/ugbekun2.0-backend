@@ -367,7 +367,7 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
 
       let sectionName = 'N/A';
       let sessionName = 'N/A';
-      let formTeacherName = 'Form Teacher';
+      let formTeacherName = 'Class Teacher';
 
       if (req.childSectionId) {
         const sec = await prisma.section.findUnique({ where: { id: req.childSectionId }, select: { name: true } });
@@ -446,7 +446,7 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
     let className = 'N/A';
     let sectionName = 'N/A';
     let sessionName = 'N/A';
-    let formTeacherName = 'Form Teacher';
+    let formTeacherName = 'Class Teacher';
 
     if (req.childClassId && req.childSectionId) {
       const cls = await prisma.class.findUnique({ where: { id: req.childClassId }, select: { name: true } });

@@ -393,7 +393,7 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
 
       let sectionName = 'N/A';
       let sessionName = 'N/A';
-      let formTeacherName = 'Form Teacher';
+      let formTeacherName = 'Class Teacher';
 
       if (req.sectionId) {
         const sec = await prisma.section.findUnique({ where: { id: req.sectionId }, select: { name: true } });
@@ -472,7 +472,7 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
     let className = 'N/A';
     let sectionName = 'N/A';
     let sessionName = 'N/A';
-    let formTeacherName = 'Form Teacher';
+    let formTeacherName = 'Class Teacher';
 
     if (req.classId && req.sectionId) {
       const cls = await prisma.class.findUnique({ where: { id: req.classId }, select: { name: true } });
