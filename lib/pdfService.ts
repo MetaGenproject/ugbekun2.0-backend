@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import { generateQrBuffer, buildVerificationUrl } from './qrService';
+import { calculateGradeFromRanges } from './gradingService';
 
 /**
  * PDF Service
@@ -402,7 +403,8 @@ function drawStandardReportCard(doc, params) {
     rankingType = 'full',
     rankingLimit = 3,
     resumptionDate = null,
-    formTeacherName = 'Class Teacher'
+    formTeacherName = 'Class Teacher',
+    gradingRanges = null,
   } = params
 
   // Theme Colors
@@ -427,13 +429,9 @@ function drawStandardReportCard(doc, params) {
     rankString = 'Hidden'
   }
 
-  // Compute GPA letter grade equivalent
-  let gpaRating = 'F'
-  if (overallAverage >= 70) gpaRating = 'A'
-  else if (overallAverage >= 60) gpaRating = 'B'
-  else if (overallAverage >= 50) gpaRating = 'C'
-  else if (overallAverage >= 45) gpaRating = 'D'
-  else if (overallAverage >= 40) gpaRating = 'E'
+  // Compute GPA letter grade equivalent using active grading scale
+  const gpaInfo = calculateGradeFromRanges(overallAverage, gradingRanges || undefined);
+  const gpaRating = gpaInfo.grade;
 
   // ─── Header Section (Y: 30 to 90) ────────────────────────────────────
   doc.rect(30, 30, 535, 60).fill(primaryColor)
@@ -528,16 +526,12 @@ function drawStandardReportCard(doc, params) {
     const examScore = row.theoryMark !== undefined && row.theoryMark !== null ? String(row.theoryMark) : '-'
     const totalScore = row.mark !== null ? String(row.mark) : '-'
 
-    // Grade calculation based on total score
+    // Grade calculation based on total score using school's active grading scale
     let gradeLetter = '-'
-    if (row.mark !== null && !isNaN(parseFloat(row.mark))) {
+    if (!row.absent && row.mark !== null && !isNaN(parseFloat(row.mark))) {
       const tot = parseFloat(row.mark)
-      if (tot >= 70) gradeLetter = 'A'
-      else if (tot >= 60) gradeLetter = 'B'
-      else if (tot >= 50) gradeLetter = 'C'
-      else if (tot >= 45) gradeLetter = 'D'
-      else if (tot >= 40) gradeLetter = 'E'
-      else gradeLetter = 'F'
+      const res = calculateGradeFromRanges(tot, gradingRanges || undefined)
+      gradeLetter = res.grade
     }
 
     doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)

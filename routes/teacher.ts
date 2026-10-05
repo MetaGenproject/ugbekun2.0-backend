@@ -80,6 +80,7 @@ import {
   getEvents,
   getTeacherMarksEntry,
   saveTeacherMarksEntryBatch,
+  getTeacherGradingSystem,
   getTeacherClassReports,
   batchGradeHomework,
 } from '../controllers/teacher';
@@ -143,6 +144,7 @@ router.post('/commentary/batch-save', batchSaveCommentary);
 // Gradebook & Score Sheets (Matrix Assessment)
 router.get('/marks-entry', getTeacherMarksEntry);
 router.post('/marks-entry/batch-save', saveTeacherMarksEntryBatch);
+router.get('/grading-system', getTeacherGradingSystem);
 router.get('/gradebook/sheet', getGradebookSheet);
 router.post('/gradebook/save-single', saveSingleGrade);
 router.post('/gradebook/batch-save', batchSaveGradebook);

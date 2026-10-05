@@ -204,6 +204,15 @@ import {
 } from '../controllers/admin/adminExamCbtController';
 
 import {
+  getGradingScales,
+  createGradingScale,
+  updateGradingScale,
+  deleteGradingScale,
+  setDefaultGradingScale,
+  assignGradingScaleToClass,
+} from '../controllers/admin/adminGradingController';
+
+import {
   getAdminHomeworks,
   createAdminHomework,
   getAdminHomeworkSubmissions,
@@ -539,6 +548,14 @@ router.put('/evaluation-matrices/:id', updateEvaluationMatrix);
 router.delete('/evaluation-matrices/:id', deleteEvaluationMatrix);
 router.post('/evaluation-matrices/:id/set-default', setDefaultEvaluationMatrix);
 router.post('/evaluation-matrices/assign-class', assignMatrixToClass);
+
+// Grading Scale & Performance Benchmarks
+router.get('/grading-scales', getGradingScales);
+router.post('/grading-scales', createGradingScale);
+router.put('/grading-scales/:id', updateGradingScale);
+router.delete('/grading-scales/:id', deleteGradingScale);
+router.post('/grading-scales/:id/set-default', setDefaultGradingScale);
+router.post('/grading-scales/assign-class', assignGradingScaleToClass);
 router.get('/exam-halls', getExamHalls);
 router.post('/exam-halls', createExamHall);
 router.put('/exam-halls/:id', updateExamHall);

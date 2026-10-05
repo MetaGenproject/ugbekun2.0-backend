@@ -13,6 +13,7 @@ import {
   summarizeSubmittedLogs,
 } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
+import { resolveGradingScale } from '../../lib/gradingService';
 
 /**
  * GET /api/admin/marks-entry
@@ -1073,6 +1074,8 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       where: { studentId: parsedStudentId, sessionId, branchId },
     });
 
+    const gradingScale = await resolveGradingScale(prisma, branchId, parsedClassId);
+
     const pdfBuffer = await generateReportCardPdf({
       schoolName: student.branch?.name || 'Ugbekun Schools',
       branchCode: student.branch?.code || 'GEN',
@@ -1090,6 +1093,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       rankingLimit: Number(rankingLimit),
       resumptionDate: marks[0]?.exam?.resumptionDate || null,
       formTeacherName,
+      gradingRanges: gradingScale.ranges,
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1263,6 +1267,8 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       montMap[m.studentId] = m;
     });
 
+    const gradingScale = await resolveGradingScale(prisma, branchId, parsedClassId);
+
     const batchStudents = enrolls.map((e) => {
       const st = e.student;
       const agg = studentAggregates[st.id] || { sum: 0, count: 0 };
@@ -1286,6 +1292,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         formTeacherName,
         examName: mont?.exam?.name || 'Term Evaluation',
         assessment: mont || {},
+        gradingRanges: gradingScale.ranges,
       };
     });
 

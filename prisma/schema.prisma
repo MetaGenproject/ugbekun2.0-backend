@@ -90,6 +90,7 @@ model Branch {
   staffRoles      StaffRole[]
   timetableSlots  TimetableSlot[]
   evaluationMatrices EvaluationMatrix[]
+  gradingScales      GradingScale[]
   examHalls       ExamHall[]
   examScheduleSlots ExamScheduleSlot[]
   questionGroups  QuestionGroup[]
@@ -605,6 +606,9 @@ model Class {
 
   evaluationMatrixId    Int?              @map("evaluation_matrix_id")
   evaluationMatrix      EvaluationMatrix? @relation(fields: [evaluationMatrixId], references: [id])
+
+  gradingScaleId        Int?              @map("grading_scale_id")
+  gradingScale          GradingScale?     @relation(fields: [gradingScaleId], references: [id])
 
   cbtDistributions      CbtDistribution[]
   questionGroups        QuestionGroup[]
@@ -1746,6 +1750,26 @@ model EvaluationMatrix {
 
   @@index([branchId])
   @@map("evaluation_matrices")
+}
+
+model GradingScale {
+  id          Int       @id @default(autoincrement())
+  name        String
+  code        String    @map("code")
+  description String?   @db.Text
+  isDefault   Boolean   @default(false) @map("is_default")
+  ranges      Json      @default("[]") // Array of { grade, minScore, maxScore, gradePoint, remark, color }
+
+  branchId    Int       @map("branch_id")
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  classes     Class[]
+
+  @@index([branchId])
+  @@map("grading_scales")
 }
 
 model ExamHall {

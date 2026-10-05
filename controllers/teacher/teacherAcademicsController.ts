@@ -14,6 +14,7 @@ import gamificationService from '../../lib/gamificationService';
 import { generateRegistrationNumber } from '../../lib/studentService';
 import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
+import { resolveGradingScale } from '../../lib/gradingService';
 
 let Tesseract: any;
 try {
@@ -1310,6 +1311,8 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
 
     const overallAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
 
+    const gradingScale = await resolveGradingScale(prisma, req.branchId || student.branchId, enroll.classId);
+
     const pdfBuffer = await generateReportCardPdf({
       schoolName: student.branch?.name || 'Ugbekun Schools',
       branchCode: student.branch?.code || 'GEN',
@@ -1327,6 +1330,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       rankingLimit: Number(rankingLimit),
       resumptionDate: studentMarks[0]?.exam?.resumptionDate || null,
       formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
+      gradingRanges: gradingScale.ranges,
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1422,6 +1426,8 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
 
       const avg = marks.length > 0 ? Number((sum / marks.length).toFixed(1)) : 0;
 
+      const gradingScale = await resolveGradingScale(prisma, req.branchId, Number(classId));
+
       studentCards.push({
         studentName: `${e.student.lastName}, ${e.student.firstName}`,
         registerNo: e.student.registerNo,
@@ -1435,6 +1441,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         totalClassStudents: enrolls.length,
         resumptionDate: marks[0]?.exam?.resumptionDate || null,
         formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
+        gradingRanges: gradingScale.ranges,
       });
     }
 
@@ -2815,9 +2822,12 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
       };
     });
 
+    const gradingScale = await resolveGradingScale(prisma, branchId, cId);
+
     return res.json({
       success: true,
       matrix,
+      gradingScale,
       students: enrolls.map((e) => {
         const studentMarkData = marksMap[e.studentId] || {};
         const comps = studentMarkData.components || {};
@@ -2844,6 +2854,23 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
   } catch (error: any) {
     console.error('[TEACHER] Fetch marks entry error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to fetch assessment scores.' });
+  }
+}
+
+/**
+ * GET /api/teacher/grading-system
+ * Returns the active grading system for the teacher's branch and optional class
+ */
+export async function getTeacherGradingSystem(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const classId = req.query.classId ? Number(req.query.classId) : null;
+
+  try {
+    const scale = await resolveGradingScale(prisma, branchId, classId);
+    return res.json({ success: true, scale });
+  } catch (error: any) {
+    console.error('[TEACHER] Get grading scale error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve grading scale.' });
   }
 }
 
