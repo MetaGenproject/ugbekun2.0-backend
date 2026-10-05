@@ -78,7 +78,7 @@ export async function hasClassAccess(
   if (!teacherId || !classId) return false;
 
   // 1. Check if Class Teacher (Form Teacher)
-  const isForm = await isFormTeacher(prisma, teacherId, classId, sectionId);
+  const isForm = await isFormTeacher(prisma, teacherId, classId, sectionId, req);
   if (isForm) return true;
 
   // 2. Check if Subject Teacher (for any subject in this class & section)
@@ -121,7 +121,7 @@ export async function canTeacherAccessSubject(
   const secId = sectionId ? Number(sectionId) : null;
 
   // 1. Check if Class Teacher of this class
-  const isClassTeacher = await isFormTeacher(prisma, tId, cId, secId || undefined);
+  const isClassTeacher = await isFormTeacher(prisma, tId, cId, secId || undefined, req);
   if (isClassTeacher) {
     // Confirm this subject is actually allocated to / offered by this class
     const offeredWhere: any = {

@@ -113,39 +113,78 @@ export async function requireBranchAdmin(req: Request, res: Response, next: Next
 
   try {
     const decoded: any = jwt.verify(token, JWT_SECRET);
-    if (!decoded || (decoded.role !== 2 && decoded.role !== 1 && decoded.role !== 9)) {
-      res.status(403).json({ success: false, message: 'Forbidden. Branch admin privileges required.' });
+    if (!decoded) {
+      res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
       return;
     }
 
-    let branchId = await resolveBranchForAdmin(decoded);
+    if (decoded.role === 2 || decoded.role === 1 || decoded.role === 9) {
+      let branchId = await resolveBranchForAdmin(decoded);
 
-    if (decoded.role === 1) {
-      const headerBranchRaw = req.headers['x-branch-id'];
-      const headerBranchId = Number(Array.isArray(headerBranchRaw) ? headerBranchRaw[0] : headerBranchRaw);
-      if (Number.isFinite(headerBranchId) && headerBranchId > 0) {
-        const branch = await prisma.branch.findUnique({
-          where: { id: headerBranchId },
-          select: { id: true },
-        });
-        if (branch) branchId = branch.id;
+      if (decoded.role === 1) {
+        const headerBranchRaw = req.headers['x-branch-id'];
+        const headerBranchId = Number(Array.isArray(headerBranchRaw) ? headerBranchRaw[0] : headerBranchRaw);
+        if (Number.isFinite(headerBranchId) && headerBranchId > 0) {
+          const branch = await prisma.branch.findUnique({
+            where: { id: headerBranchId },
+            select: { id: true },
+          });
+          if (branch) branchId = branch.id;
+        }
       }
-    }
 
-    if (!branchId) {
-      res.status(403).json({
-        success: false,
-        message: 'Branch admin account is not linked to an active school branch.',
-      });
+      if (!branchId) {
+        res.status(403).json({
+          success: false,
+          message: 'Branch admin account is not linked to an active school branch.',
+        });
+        return;
+      }
+
+      req.user = decoded;
+      req.userId = decoded.sub || decoded.id;
+      req.adminId = decoded.sub || decoded.id;
+      req.userRole = decoded.role;
+      req.branchId = branchId;
+      req.isAdmin = true;
+      next();
       return;
     }
 
-    req.user = decoded;
-    req.userId = decoded.sub || decoded.id;
-    req.adminId = decoded.sub || decoded.id;
-    req.userRole = decoded.role;
-    req.branchId = branchId;
-    next();
+    // Role 3 (Teacher): Allow report card and commentary management for assigned classrooms
+    const reqUrl = req.originalUrl || req.url || '';
+    const isReportCardRoute =
+      reqUrl.includes('/report-cards') ||
+      reqUrl.includes('/commentary') ||
+      (req.path && (req.path.startsWith('/report-cards') || req.path.startsWith('/commentary')));
+
+    if (decoded.role === 3 && isReportCardRoute) {
+      const teacherRecord = await prisma.teacher.findFirst({
+        where: {
+          OR: [
+            { userId: decoded.sub || decoded.id },
+            { id: decoded.sub || decoded.id },
+          ],
+        },
+        select: { id: true, branchId: true },
+      });
+
+      let branchId = teacherRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : null);
+      if (!branchId) {
+        branchId = await resolveBranchForAdmin(decoded);
+      }
+
+      req.user = decoded;
+      req.userId = decoded.sub || decoded.id;
+      req.teacherId = teacherRecord ? teacherRecord.id : req.userId;
+      req.userRole = decoded.role;
+      req.branchId = branchId;
+      next();
+      return;
+    }
+
+    res.status(403).json({ success: false, message: 'Forbidden. Branch admin privileges required.' });
+    return;
   } catch {
     res.status(401).json({ success: false, message: 'Token is invalid or expired.' });
   }

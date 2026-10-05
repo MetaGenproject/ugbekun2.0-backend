@@ -2295,7 +2295,7 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
         where: {
           OR: formAllocations.map((fa: any) => ({
             classId: fa.classId,
-            sectionId: fa.sectionId,
+            ...(fa.sectionId ? { sectionId: fa.sectionId } : {}),
           })),
           ...(branchId ? { branchId } : {}),
         },
@@ -2740,6 +2740,12 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
           { code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, passMarks: 30 },
         ],
       };
+    } else if (matrix && typeof matrix.components === 'string') {
+      try {
+        matrix.components = JSON.parse(matrix.components);
+      } catch {
+        matrix.components = [];
+      }
     }
 
     const globalSetting = await prisma.globalSettings.findFirst();
@@ -2812,16 +2818,26 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
     return res.json({
       success: true,
       matrix,
-      students: enrolls.map((e) => ({
-        id: e.student.id,
-        name: `${e.student.lastName}, ${e.student.firstName}`,
-        firstName: e.student.firstName,
-        lastName: e.student.lastName,
-        registerNo: e.student.registerNo,
-        gender: e.student.gender,
-        photo: e.student.photo,
-        sectionName: e.section?.name,
-      })),
+      students: enrolls.map((e) => {
+        const studentMarkData = marksMap[e.studentId] || {};
+        const comps = studentMarkData.components || {};
+        const total = Object.values(comps).reduce((a: number, b: any) => a + (Number(b) || 0), 0);
+        return {
+          id: e.student.id,
+          studentId: e.student.id,
+          name: `${e.student.lastName}, ${e.student.firstName}`,
+          firstName: e.student.firstName,
+          lastName: e.student.lastName,
+          registerNo: e.student.registerNo,
+          gender: e.student.gender,
+          photo: e.student.photo,
+          sectionName: e.section?.name,
+          componentMarks: comps,
+          totalScore: Number(total) || 0,
+          isAbsent: studentMarkData.absent || false,
+          remarks: studentMarkData.remarks || '',
+        };
+      }),
       marksMap,
       classData: { id: classData.id, name: classData.name, evaluationMatrixId: classData.evaluationMatrixId },
     });
@@ -2837,9 +2853,10 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
  */
 export async function saveTeacherMarksEntryBatch(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, subjectId, sessionId, marks } = req.body;
+  const { classId, sectionId, subjectId, sessionId } = req.body;
+  const rawMarks = req.body.marks || req.body.entries;
 
-  if (!classId || !subjectId || !Array.isArray(marks)) {
+  if (!classId || !subjectId || !Array.isArray(rawMarks)) {
     return res.status(400).json({ success: false, message: 'Invalid batch save payload.' });
   }
 
@@ -2861,11 +2878,12 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
     const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
 
     let savedCount = 0;
-    for (const item of marks) {
-      if (!item.studentId) continue;
-      const sId = Number(item.studentId);
-      const isAbsentStr = item.absent ? '1' : '0';
-      const markValue = item.components ? JSON.stringify(item.components) : String(item.mark || '0');
+    for (const item of rawMarks) {
+      const sId = Number(item.studentId || item.id);
+      if (!sId) continue;
+      const isAbsentStr = (item.absent || item.isAbsent) ? '1' : '0';
+      const compData = item.components || item.componentMarks;
+      const markValue = compData ? JSON.stringify(compData) : String(item.mark || '0');
 
       const existing = await prisma.mark.findFirst({
         where: {
