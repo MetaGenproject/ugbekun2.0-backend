@@ -133,6 +133,7 @@ import publicTenantRouter from './routes/publicTenant';
 import platformApiRouter from './routes/platformApi';
 import { uploadBase64File } from './lib/cloudinary';
 import { bootstrapPlatformSettings } from './lib/platformRuntime';
+import { autoMigrateGradingTables } from './lib/gradingService';
 
 app.use('/api/public/tenant', publicTenantRouter);
 app.use('/api/public', publicTenantRouter);
@@ -280,6 +281,9 @@ app.listen(PORT, () => {
   bootstrapPlatformSettings()
     .then(() => logger.info('PLATFORM', 'Global settings loaded into runtime'))
     .catch((error) => logger.warn('PLATFORM', 'Failed to bootstrap settings:', { error: error?.message || error }));
+
+  autoMigrateGradingTables()
+    .catch((error) => logger.warn('MIGRATION', 'Grading auto-migration note:', { error: error?.message || error }));
 });
 
 export default app;

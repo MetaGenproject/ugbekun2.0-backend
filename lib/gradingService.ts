@@ -1,3 +1,5 @@
+import prisma from './prisma';
+
 export interface GradeRange {
   grade: string;
   minScore: number;
@@ -209,4 +211,77 @@ export async function resolveGradingScale(
     branchId,
     ranges: FALLBACK_PRIMARY_RANGES,
   };
+}
+
+/**
+ * Self-healing automatic migration for grading tables.
+ * Safe and idempotent: creates tables and columns if they do not already exist.
+ */
+export async function autoMigrateGradingTables(dbClient: any = prisma) {
+  try {
+    await dbClient.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS "grading_scales" (
+          "id" SERIAL NOT NULL,
+          "name" TEXT NOT NULL,
+          "code" TEXT NOT NULL,
+          "description" TEXT,
+          "is_default" BOOLEAN NOT NULL DEFAULT false,
+          "ranges" JSONB NOT NULL DEFAULT '[]',
+          "branch_id" INTEGER NOT NULL,
+          "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          "updated_at" TIMESTAMP(3),
+          CONSTRAINT "grading_scales_pkey" PRIMARY KEY ("id")
+      );
+    `);
+
+    await dbClient.$executeRawUnsafe(`
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1 FROM information_schema.columns 
+              WHERE table_name = 'class' AND column_name = 'grading_scale_id'
+          ) THEN
+              ALTER TABLE "class" ADD COLUMN "grading_scale_id" INTEGER;
+          END IF;
+      END $$;
+    `);
+
+    await dbClient.$executeRawUnsafe(`
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1 FROM information_schema.table_constraints 
+              WHERE constraint_name = 'grading_scales_branch_id_fkey'
+          ) THEN
+              ALTER TABLE "grading_scales" 
+              ADD CONSTRAINT "grading_scales_branch_id_fkey" 
+              FOREIGN KEY ("branch_id") REFERENCES "branches"("id") 
+              ON DELETE RESTRICT ON UPDATE CASCADE;
+          END IF;
+      END $$;
+    `);
+
+    await dbClient.$executeRawUnsafe(`
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1 FROM information_schema.table_constraints 
+              WHERE constraint_name = 'class_grading_scale_id_fkey'
+          ) THEN
+              ALTER TABLE "class" 
+              ADD CONSTRAINT "class_grading_scale_id_fkey" 
+              FOREIGN KEY ("grading_scale_id") REFERENCES "grading_scales"("id") 
+              ON DELETE SET NULL ON UPDATE CASCADE;
+          END IF;
+      END $$;
+    `);
+
+    await dbClient.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS "grading_scales_branch_id_idx" ON "grading_scales"("branch_id");
+    `);
+
+    console.log('[MIGRATION] Grading tables and schema verified/migrated successfully.');
+  } catch (err: any) {
+    console.warn('[MIGRATION] Auto-migration check:', err?.message || err);
+  }
 }

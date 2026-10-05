@@ -16,14 +16,14 @@ CREATE TABLE IF NOT EXISTS "grading_scales" (
     CONSTRAINT "grading_scales_pkey" PRIMARY KEY ("id")
 );
 
--- 2. Add grading_scale_id column to classes table if it doesn't exist
+-- 2. Add grading_scale_id column to class table if it doesn't exist
 DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'classes' AND column_name = 'grading_scale_id'
+        WHERE table_name = 'class' AND column_name = 'grading_scale_id'
     ) THEN
-        ALTER TABLE "classes" ADD COLUMN "grading_scale_id" INTEGER;
+        ALTER TABLE "class" ADD COLUMN "grading_scale_id" INTEGER;
     END IF;
 END $$;
 
@@ -45,10 +45,10 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.table_constraints 
-        WHERE constraint_name = 'classes_grading_scale_id_fkey'
+        WHERE constraint_name = 'class_grading_scale_id_fkey'
     ) THEN
-        ALTER TABLE "classes" 
-        ADD CONSTRAINT "classes_grading_scale_id_fkey" 
+        ALTER TABLE "class" 
+        ADD CONSTRAINT "class_grading_scale_id_fkey" 
         FOREIGN KEY ("grading_scale_id") REFERENCES "grading_scales"("id") 
         ON DELETE SET NULL ON UPDATE CASCADE;
     END IF;
