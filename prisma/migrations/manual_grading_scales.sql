@@ -1,43 +1,58 @@
--- Migration: Manual Grading Scales & Class Association
--- Target: MySQL / MariaDB (PipeOps Staging & Production)
+-- Migration: Dynamic Grading Scales & Class Association
+-- Target: PostgreSQL (PipeOps Staging & Production)
 
-CREATE TABLE IF NOT EXISTS `grading_scales` (
-  `id` INT NOT NULL AUTO_INCREMENT,
-  `name` VARCHAR(191) NOT NULL,
-  `code` VARCHAR(191) NOT NULL,
-  `description` TEXT NULL,
-  `is_default` BOOLEAN NOT NULL DEFAULT FALSE,
-  `ranges` JSON NOT NULL,
-  `branch_id` INT NOT NULL,
-  `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  `updated_at` DATETIME(3) NULL,
-  PRIMARY KEY (`id`),
-  INDEX `grading_scales_branch_id_idx` (`branch_id`),
-  CONSTRAINT `grading_scales_branch_id_fkey` FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE
-) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+-- 1. Create table grading_scales
+CREATE TABLE IF NOT EXISTS "grading_scales" (
+    "id" SERIAL NOT NULL,
+    "name" TEXT NOT NULL,
+    "code" TEXT NOT NULL,
+    "description" TEXT,
+    "is_default" BOOLEAN NOT NULL DEFAULT false,
+    "ranges" JSONB NOT NULL DEFAULT '[]',
+    "branch_id" INTEGER NOT NULL,
+    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at" TIMESTAMP(3),
 
--- Add column to classes if not already present
-SET @col_exists = 0;
-SELECT COUNT(*) INTO @col_exists 
-FROM information_schema.COLUMNS 
-WHERE TABLE_SCHEMA = DATABASE() 
-  AND TABLE_NAME = 'classes' 
-  AND COLUMN_NAME = 'grading_scale_id';
+    CONSTRAINT "grading_scales_pkey" PRIMARY KEY ("id")
+);
 
-SET @stmt = IF(@col_exists = 0, 'ALTER TABLE `classes` ADD COLUMN `grading_scale_id` INT NULL', 'SELECT "Column grading_scale_id already exists in classes"');
-PREPARE stmt FROM @stmt;
-EXECUTE stmt;
-DEALLOCATE PREPARE stmt;
+-- 2. Add grading_scale_id column to classes table if it doesn't exist
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'classes' AND column_name = 'grading_scale_id'
+    ) THEN
+        ALTER TABLE "classes" ADD COLUMN "grading_scale_id" INTEGER;
+    END IF;
+END $$;
 
--- Add foreign key constraint if not present
-SET @fk_exists = 0;
-SELECT COUNT(*) INTO @fk_exists 
-FROM information_schema.TABLE_CONSTRAINTS 
-WHERE CONSTRAINT_SCHEMA = DATABASE() 
-  AND TABLE_NAME = 'classes' 
-  AND CONSTRAINT_NAME = 'classes_grading_scale_id_fkey';
+-- 3. Add Foreign Keys if not exist
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints 
+        WHERE constraint_name = 'grading_scales_branch_id_fkey'
+    ) THEN
+        ALTER TABLE "grading_scales" 
+        ADD CONSTRAINT "grading_scales_branch_id_fkey" 
+        FOREIGN KEY ("branch_id") REFERENCES "branches"("id") 
+        ON DELETE RESTRICT ON UPDATE CASCADE;
+    END IF;
+END $$;
 
-SET @stmt_fk = IF(@fk_exists = 0, 'ALTER TABLE `classes` ADD CONSTRAINT `classes_grading_scale_id_fkey` FOREIGN KEY (`grading_scale_id`) REFERENCES `grading_scales` (`id`) ON DELETE SET NULL ON UPDATE CASCADE', 'SELECT "FK classes_grading_scale_id_fkey already exists"');
-PREPARE stmt_fk FROM @stmt_fk;
-EXECUTE stmt_fk;
-DEALLOCATE PREPARE stmt_fk;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints 
+        WHERE constraint_name = 'classes_grading_scale_id_fkey'
+    ) THEN
+        ALTER TABLE "classes" 
+        ADD CONSTRAINT "classes_grading_scale_id_fkey" 
+        FOREIGN KEY ("grading_scale_id") REFERENCES "grading_scales"("id") 
+        ON DELETE SET NULL ON UPDATE CASCADE;
+    END IF;
+END $$;
+
+-- 4. Create Index
+CREATE INDEX IF NOT EXISTS "grading_scales_branch_id_idx" ON "grading_scales"("branch_id");
