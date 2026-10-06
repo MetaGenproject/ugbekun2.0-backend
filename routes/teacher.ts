@@ -42,6 +42,7 @@ import {
   createHomework,
   getHomeworkSubmissions,
   gradeHomeworkSubmission,
+  uploadHomeworkMaterial,
   getOnlineExams,
   createOnlineExam,
   getQuestionBank,
@@ -80,6 +81,8 @@ import {
   getEvents,
   getTeacherMarksEntry,
   saveTeacherMarksEntryBatch,
+  getTeacherEvaluationMatrices,
+  aiDistributeTeacherMarks,
   getTeacherGradingSystem,
   getTeacherClassReports,
   batchGradeHomework,
@@ -144,6 +147,8 @@ router.post('/commentary/batch-save', batchSaveCommentary);
 // Gradebook & Score Sheets (Matrix Assessment)
 router.get('/marks-entry', getTeacherMarksEntry);
 router.post('/marks-entry/batch-save', saveTeacherMarksEntryBatch);
+router.post('/marks-entry/ai-distribute', aiDistributeTeacherMarks);
+router.get('/evaluation-matrices', getTeacherEvaluationMatrices);
 router.get('/grading-system', getTeacherGradingSystem);
 router.get('/gradebook/sheet', getGradebookSheet);
 router.post('/gradebook/save-single', saveSingleGrade);
@@ -163,6 +168,7 @@ router.post('/montessori/save-single', saveSingleMontessori);
 // Homework & Assignments
 router.get('/homeworks', getHomeworks);
 router.post('/homeworks', createHomework);
+router.post('/homeworks/upload', upload.single('file'), uploadHomeworkMaterial);
 router.get('/homeworks/:id/submissions', getHomeworkSubmissions);
 router.post('/homeworks/submissions/:id/grade', gradeHomeworkSubmission);
 router.post('/homeworks/:id/batch-grade', batchGradeHomework);

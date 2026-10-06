@@ -2222,6 +2222,21 @@ export async function takeAttritionAction(req: Request, res: Response): Promise<
   }
 }
 
+async function resolveTeacherSession(branchId?: number, reqSessionId?: number): Promise<number> {
+  if (reqSessionId) return Number(reqSessionId);
+  const globalSetting = await prisma.globalSettings.findFirst();
+  if (globalSetting?.sessionId) return globalSetting.sessionId;
+  if (branchId) {
+    const latestEnroll = await prisma.enroll.findFirst({
+      where: { branchId },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (latestEnroll?.sessionId) return latestEnroll.sessionId;
+  }
+  return 5;
+}
+
 /**
  * GET /api/teacher/classes-sections
  */
@@ -2230,19 +2245,35 @@ export async function getTeacherClassesSections(req: Request, res: Response): Pr
     const branchId = req.branchId;
     const teacherId = req.teacherId;
     const isAdmin = Boolean(req.isAdmin || req.userRole === 1 || req.userRole === 2);
+    const activeSessionId = await resolveTeacherSession(branchId, req.query.sessionId ? Number(req.query.sessionId) : undefined);
 
     let allowedClassIds: number[] | null = null;
     if (!isAdmin && teacherId) {
-      const [formAllocs, subjAssigns] = await Promise.all([
+      let [formAllocs, subjAssigns] = await Promise.all([
         prisma.teacherAllocation.findMany({
-          where: { teacherId, ...(branchId ? { branchId } : {}) },
+          where: { teacherId, sessionId: activeSessionId, ...(branchId ? { branchId } : {}) },
           select: { classId: true },
         }),
         prisma.subjectAssign.findMany({
-          where: { teacherId, ...(branchId ? { branchId } : {}) },
+          where: { teacherId, sessionId: activeSessionId, ...(branchId ? { branchId } : {}) },
           select: { classId: true },
         }),
       ]);
+
+      // Fallback to all sessions if no records in activeSessionId
+      if (formAllocs.length === 0 && subjAssigns.length === 0) {
+        [formAllocs, subjAssigns] = await Promise.all([
+          prisma.teacherAllocation.findMany({
+            where: { teacherId, ...(branchId ? { branchId } : {}) },
+            select: { classId: true },
+          }),
+          prisma.subjectAssign.findMany({
+            where: { teacherId, ...(branchId ? { branchId } : {}) },
+            select: { classId: true },
+          }),
+        ]);
+      }
+
       const classIdSet = new Set<number>();
       formAllocs.forEach((a: any) => classIdSet.add(a.classId));
       subjAssigns.forEach((a: any) => classIdSet.add(a.classId));
@@ -2261,6 +2292,10 @@ export async function getTeacherClassesSections(req: Request, res: Response): Pr
           },
         },
         subjects: {
+          where: {
+            sessionId: activeSessionId,
+            ...(branchId ? { branchId } : {}),
+          },
           include: {
             subject: true,
           },
@@ -2307,15 +2342,20 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
     const branchId = req.branchId;
     const teacherId = req.teacherId;
     const isAdmin = Boolean(req.isAdmin || req.userRole === 1 || req.userRole === 2);
+    const activeSessionId = await resolveTeacherSession(branchId, req.query.sessionId ? Number(req.query.sessionId) : undefined);
 
-    const [allBranchSubjects, directSubjectAssigns, formAllocations] = await Promise.all([
+    const [allBranchSubjects, directSubjectAssignsCurrent, formAllocationsCurrent] = await Promise.all([
       prisma.subject.findMany({
         where: branchId ? { branchId } : {},
         orderBy: { name: 'asc' },
       }),
       teacherId
         ? prisma.subjectAssign.findMany({
-            where: { teacherId },
+            where: {
+              teacherId,
+              sessionId: activeSessionId,
+              ...(branchId ? { branchId } : {}),
+            },
             include: {
               subject: true,
               class: { select: { id: true, name: true } },
@@ -2326,11 +2366,59 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
         : Promise.resolve([]),
       teacherId
         ? prisma.teacherAllocation.findMany({
-            where: { teacherId },
-            select: { classId: true, sectionId: true },
+            where: {
+              teacherId,
+              sessionId: activeSessionId,
+              ...(branchId ? { branchId } : {}),
+            },
+            select: { classId: true, sectionId: true, sessionId: true },
           })
         : Promise.resolve([]),
     ]);
+
+    // Fallback: If no direct assignments in activeSessionId, fallback to latest session with deduplication
+    let directSubjectAssigns = directSubjectAssignsCurrent;
+    if (teacherId && directSubjectAssigns.length === 0) {
+      const fallbackAssigns = await prisma.subjectAssign.findMany({
+        where: {
+          teacherId,
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          subject: true,
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+        },
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+      });
+      const seen = new Set<string>();
+      directSubjectAssigns = fallbackAssigns.filter((item) => {
+        const key = `${item.classId}-${item.sectionId}-${item.subjectId}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    // Fallback: If no form allocations in activeSessionId, fallback to latest session
+    let formAllocations = formAllocationsCurrent;
+    if (teacherId && formAllocations.length === 0) {
+      const fallbackAllocs = await prisma.teacherAllocation.findMany({
+        where: {
+          teacherId,
+          ...(branchId ? { branchId } : {}),
+        },
+        orderBy: { sessionId: 'desc' },
+        select: { classId: true, sectionId: true, sessionId: true },
+      });
+      const seen = new Set<string>();
+      formAllocations = fallbackAllocs.filter((fa) => {
+        const key = `${fa.classId}-${fa.sectionId}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
 
     // If teacher is a Class Teacher (Form Teacher), automatically retrieve all subjects offered by that class
     let classTeacherSubjectAssigns: any[] = [];
@@ -2341,6 +2429,7 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
             classId: fa.classId,
             ...(fa.sectionId ? { sectionId: fa.sectionId } : {}),
           })),
+          sessionId: activeSessionId,
           ...(branchId ? { branchId } : {}),
         },
         include: {
@@ -2351,6 +2440,33 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
         },
         orderBy: { id: 'desc' },
       });
+
+      // If activeSessionId has no class subjects yet, fallback to latest session
+      if (classTeacherSubjectAssigns.length === 0) {
+        const fallbackClassAssigns = await prisma.subjectAssign.findMany({
+          where: {
+            OR: formAllocations.map((fa: any) => ({
+              classId: fa.classId,
+              ...(fa.sectionId ? { sectionId: fa.sectionId } : {}),
+            })),
+            ...(branchId ? { branchId } : {}),
+          },
+          include: {
+            subject: true,
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+            teacher: { select: { id: true, name: true } },
+          },
+          orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+        });
+        const seen = new Set<string>();
+        classTeacherSubjectAssigns = fallbackClassAssigns.filter((item) => {
+          const key = `${item.classId}-${item.sectionId}-${item.subjectId}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      }
     }
 
     // Merge direct subject assignments with class-teacher covered subjects
@@ -2359,12 +2475,14 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
     // 1. Class Teacher subjects (covered automatically)
     for (const sa of classTeacherSubjectAssigns) {
       const key = `${sa.classId}-${sa.sectionId}-${sa.subjectId}`;
-      combinedMap.set(key, {
-        ...sa,
-        role: 'CLASS_TEACHER',
-        roleLabel: sa.teacherId === teacherId ? 'Class Teacher & Subject Lead' : 'Class Teacher (Auto-Covered)',
-        assignedTeacherName: sa.teacher?.name || 'Class Teacher',
-      });
+      if (!combinedMap.has(key)) {
+        combinedMap.set(key, {
+          ...sa,
+          role: 'CLASS_TEACHER',
+          roleLabel: sa.teacherId === teacherId ? 'Class Teacher & Subject Lead' : 'Class Teacher (Auto-Covered)',
+          assignedTeacherName: sa.teacher?.name || 'Class Teacher',
+        });
+      }
     }
 
     // 2. Direct Subject Teacher assignments (take precedence for specific subject role)
@@ -2728,7 +2846,7 @@ export async function getTeacherTimetable(req: Request, res: Response): Promise<
  */
 export async function getTeacherMarksEntry(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, subjectId, sessionId } = req.query;
+  const { classId, sectionId, subjectId, sessionId, matrixId, examId } = req.query;
 
   if (!classId || !subjectId) {
     return res.status(400).json({ success: false, message: 'classId and subjectId are required.' });
@@ -2759,15 +2877,25 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
     }
 
     // Resolve Active School Evaluation Matrix
-    let matrix: any = classData.evaluationMatrix;
+    let matrix: any = null;
+    if (matrixId) {
+      matrix = await prisma.evaluationMatrix.findFirst({
+        where: { id: Number(matrixId), ...(branchId ? { branchId } : {}) },
+      });
+    }
+    if (!matrix && classData.evaluationMatrix) {
+      matrix = classData.evaluationMatrix;
+    }
     if (!matrix) {
       matrix = await prisma.evaluationMatrix.findFirst({
-        where: { branchId, isDefault: true },
+        where: { ...(branchId ? { branchId } : {}), isDefault: true },
+        orderBy: { id: 'desc' },
       });
     }
     if (!matrix) {
       matrix = await prisma.evaluationMatrix.findFirst({
-        where: { branchId },
+        where: branchId ? { branchId } : {},
+        orderBy: { id: 'desc' },
       });
     }
     if (!matrix) {
@@ -2791,6 +2919,16 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
         matrix.components = [];
       }
     }
+
+    // Fetch all evaluation matrices created by admin for this school branch
+    const branchMatrices = await prisma.evaluationMatrix.findMany({
+      where: branchId ? { branchId } : {},
+      orderBy: [{ isDefault: 'desc' }, { id: 'desc' }],
+    });
+    const parsedBranchMatrices = branchMatrices.map((m: any) => ({
+      ...m,
+      components: typeof m.components === 'string' ? JSON.parse(m.components) : m.components,
+    }));
 
     const globalSetting = await prisma.globalSettings.findFirst();
     let activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
@@ -2829,16 +2967,65 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
 
     const studentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
 
+    let cbtSubmissions: any[] = [];
+    if (studentIds.length > 0) {
+      try {
+        cbtSubmissions = await prisma.onlineExamSubmission.findMany({
+          where: {
+            studentId: { in: studentIds },
+            onlineExam: {
+              classId: cId,
+              subjectId: subId,
+              ...(branchId ? { branchId } : {}),
+            },
+          },
+          include: {
+            onlineExam: {
+              select: {
+                id: true,
+                title: true,
+              },
+            },
+          },
+          orderBy: { id: 'desc' },
+        });
+      } catch (cbtErr) {
+        console.warn('[TEACHER] Could not fetch CBT submissions:', cbtErr);
+        cbtSubmissions = [];
+      }
+    }
+    const cbtSubmissionMap: Record<number, any> = {};
+    cbtSubmissions.forEach((sub: any) => {
+      if (!cbtSubmissionMap[sub.studentId]) {
+        cbtSubmissionMap[sub.studentId] = sub;
+      }
+    });
+
     // Fetch existing marks
-    const existingMarks = await prisma.mark.findMany({
+    let existingMarks = await prisma.mark.findMany({
       where: {
         classId: cId,
         subjectId: subId,
         studentId: { in: studentIds },
+        sessionId: activeSession,
         ...(secId ? { sectionId: secId } : {}),
+        ...(examId ? { examId: Number(examId) } : {}),
         ...(branchId ? { branchId } : {}),
       },
     });
+
+    if (existingMarks.length === 0 && examId) {
+      existingMarks = await prisma.mark.findMany({
+        where: {
+          classId: cId,
+          subjectId: subId,
+          studentId: { in: studentIds },
+          sessionId: activeSession,
+          ...(secId ? { sectionId: secId } : {}),
+          ...(branchId ? { branchId } : {}),
+        },
+      });
+    }
 
     const marksMap: Record<number, any> = {};
     existingMarks.forEach((m) => {
@@ -2849,11 +3036,16 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
         }
       } catch (err) {}
 
+      const cbtSub = cbtSubmissionMap[m.studentId];
+      const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && String(m.cbtMark).trim() !== '';
+      const effectiveCbt = hasCbtMark ? String(m.cbtMark) : cbtSub && cbtSub.totalMark !== null ? String(cbtSub.totalMark) : null;
+
       marksMap[m.studentId] = {
         id: m.id,
         mark: m.mark,
-        cbtMark: m.cbtMark,
-        cbtSource: m.cbtSource,
+        cbtMark: effectiveCbt,
+        cbtSource: m.cbtSource || (cbtSub ? 'ONLINE_EXAM_SUBMISSION' : null),
+        cbtExamTitle: cbtSub?.onlineExam?.title || null,
         absent: m.absent === '1' || m.absent === 'true',
         components: parsedComponents,
       };
@@ -2864,11 +3056,14 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
     return res.json({
       success: true,
       matrix,
+      matrices: parsedBranchMatrices,
       gradingScale,
       students: enrolls.map((e) => {
+        const cbtSub = cbtSubmissionMap[e.studentId];
         const studentMarkData = marksMap[e.studentId] || {};
         const comps = studentMarkData.components || {};
         const total = Object.values(comps).reduce((a: number, b: any) => a + (Number(b) || 0), 0);
+        const effectiveCbt = studentMarkData.cbtMark ?? (cbtSub && cbtSub.totalMark !== null ? String(cbtSub.totalMark) : null);
         return {
           id: e.student.id,
           studentId: e.student.id,
@@ -2881,6 +3076,8 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
           sectionName: e.section?.name,
           componentMarks: comps,
           totalScore: Number(total) || 0,
+          cbtMark: effectiveCbt,
+          cbtExamTitle: cbtSub?.onlineExam?.title || null,
           isAbsent: studentMarkData.absent || false,
           remarks: studentMarkData.remarks || '',
         };
@@ -2891,6 +3088,28 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
   } catch (error: any) {
     console.error('[TEACHER] Fetch marks entry error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to fetch assessment scores.' });
+  }
+}
+
+/**
+ * GET /api/teacher/evaluation-matrices
+ * Returns all active evaluation matrices created by admin for this school branch
+ */
+export async function getTeacherEvaluationMatrices(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  try {
+    const matrices = await prisma.evaluationMatrix.findMany({
+      where: branchId ? { branchId } : {},
+      orderBy: [{ isDefault: 'desc' }, { id: 'desc' }],
+    });
+    const parsed = matrices.map((m: any) => ({
+      ...m,
+      components: typeof m.components === 'string' ? JSON.parse(m.components) : m.components,
+    }));
+    return res.json({ success: true, matrices: parsed });
+  } catch (error: any) {
+    console.error('[TEACHER] Fetch evaluation matrices error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch evaluation matrices.' });
   }
 }
 
@@ -2912,12 +3131,72 @@ export async function getTeacherGradingSystem(req: Request, res: Response): Prom
 }
 
 /**
+ * POST /api/teacher/marks-entry/ai-distribute
+ * Proportionally distributes target scores across active evaluation matrix categories
+ */
+export async function aiDistributeTeacherMarks(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const { matrixComponents, studentTotals } = req.body;
+
+    if (!Array.isArray(matrixComponents) || matrixComponents.length === 0) {
+      return res.status(400).json({ success: false, message: 'Matrix components are required.' });
+    }
+
+    if (!Array.isArray(studentTotals) || studentTotals.length === 0) {
+      return res.status(400).json({ success: false, message: 'Student totals array is required.' });
+    }
+
+    const matrixTotalMax =
+      matrixComponents.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0) || 100;
+
+    const distributedMarksMap: Record<number, any> = {};
+
+    studentTotals.forEach((st: any) => {
+      const studentId = st.studentId;
+      const totalScore = Math.min(Math.max(Number(st.totalScore) || 0, 0), matrixTotalMax);
+
+      const components: Record<string, number> = {};
+      let allocatedSum = 0;
+
+      matrixComponents.forEach((comp: any, idx: number) => {
+        const compMax = Number(comp.maxMarks) || 0;
+        const compKey = comp.code || comp.name;
+        const isLast = idx === matrixComponents.length - 1;
+
+        if (isLast) {
+          components[compKey] = Math.max(0, Math.round(totalScore - allocatedSum));
+        } else {
+          const ratio = compMax / matrixTotalMax;
+          const assigned = Math.round(totalScore * ratio);
+          components[compKey] = assigned;
+          allocatedSum += assigned;
+        }
+      });
+
+      distributedMarksMap[studentId] = {
+        totalScore,
+        components,
+      };
+    });
+
+    return res.json({
+      success: true,
+      distributedMarksMap,
+      message: `Proportionally distributed scores across ${matrixComponents.length} assessment categories.`,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] AI marks distribution error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to distribute marks.' });
+  }
+}
+
+/**
  * POST /api/teacher/marks-entry/batch-save
  * Saves marks entry according to the active evaluation matrix with strict permission checks.
  */
 export async function saveTeacherMarksEntryBatch(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId, sectionId, subjectId, sessionId } = req.body;
+  const { classId, sectionId, subjectId, sessionId, examId } = req.body;
   const rawMarks = req.body.marks || req.body.entries;
 
   if (!classId || !subjectId || !Array.isArray(rawMarks)) {
@@ -2927,6 +3206,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
   const cId = Number(classId);
   const subId = Number(subjectId);
   const secId = sectionId ? Number(sectionId) : 1;
+  const exId = examId ? Number(examId) : 1;
 
   // Strict Permission Enforcement: Class Teacher or assigned Subject Teacher
   const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, sessionId, req);
@@ -2955,6 +3235,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
           subjectId: subId,
           studentId: sId,
           sessionId: activeSession,
+          ...(examId ? { examId: exId } : {}),
           ...(branchId ? { branchId } : {}),
         },
       });
@@ -2965,6 +3246,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
           data: {
             mark: markValue,
             absent: isAbsentStr,
+            ...(examId ? { examId: exId } : {}),
           },
         });
       } else {
@@ -2975,7 +3257,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
             sectionId: secId,
             subjectId: subId,
             studentId: sId,
-            examId: 1,
+            examId: exId,
             sessionId: activeSession,
             mark: markValue,
             absent: isAbsentStr,

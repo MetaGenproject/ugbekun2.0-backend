@@ -57,6 +57,21 @@ export async function saveMediaFile(file: any) {
   return `/uploads/${filename}`;
 }
 
+async function resolveTeacherSession(branchId?: number, reqSessionId?: number): Promise<number> {
+  if (reqSessionId) return Number(reqSessionId);
+  const globalSetting = await prisma.globalSettings.findFirst();
+  if (globalSetting?.sessionId) return globalSetting.sessionId;
+  if (branchId) {
+    const latestEnroll = await prisma.enroll.findFirst({
+      where: { branchId },
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (latestEnroll?.sessionId) return latestEnroll.sessionId;
+  }
+  return 5;
+}
+
 export function generateJitsiToken({ roomName, user, isModerator }: { roomName: string; user: any; isModerator: boolean }) {
   const appId = process.env.JITSI_APP_ID || 'vpaas-magic-cookie-ugbekun';
   const appSecret = process.env.JITSI_APP_SECRET || 'jitsi_dummy_secret_key';
@@ -311,23 +326,43 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
 export async function getRoster(req: Request, res: Response): Promise<Response | void> {
   try {
     const { classId: reqClassId, sectionId: reqSectionId, search } = req.query;
+    const activeSessionId = await resolveTeacherSession(req.branchId, req.query.sessionId ? Number(req.query.sessionId) : undefined);
 
-    const [formAllocations, subjectAssignments] = await Promise.all([
+    let [formAllocations, subjectAssignments] = await Promise.all([
       prisma.teacherAllocation.findMany({
-        where: { teacherId: req.teacherId },
+        where: { teacherId: req.teacherId, sessionId: activeSessionId },
         include: {
           class: { select: { id: true, name: true } },
           section: { select: { id: true, name: true } },
         },
       }),
       prisma.subjectAssign.findMany({
-        where: { teacherId: req.teacherId },
+        where: { teacherId: req.teacherId, sessionId: activeSessionId },
         include: {
           class: { select: { id: true, name: true } },
           section: { select: { id: true, name: true } },
         },
       }),
     ]);
+
+    if (formAllocations.length === 0 && subjectAssignments.length === 0) {
+      [formAllocations, subjectAssignments] = await Promise.all([
+        prisma.teacherAllocation.findMany({
+          where: { teacherId: req.teacherId },
+          include: {
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+          },
+        }),
+        prisma.subjectAssign.findMany({
+          where: { teacherId: req.teacherId },
+          include: {
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+          },
+        }),
+      ]);
+    }
 
     // Build unique assigned classes with their sections
     const assignedClassesMap = new Map<number, { id: number; name: string; sections: Array<{ id: number; name: string }> }>();
@@ -377,6 +412,7 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
     // Build enroll query where condition
     const whereCondition: any = {
       isAlumni: 0,
+      sessionId: activeSessionId,
       ...(req.branchId ? { branchId: req.branchId } : {}),
     };
 
@@ -584,22 +620,62 @@ export async function sendMessage(req: Request, res: Response): Promise<Response
  */
 export async function getProfile(req: Request, res: Response): Promise<Response | void> {
   try {
-    const formAllocations = await prisma.teacherAllocation.findMany({
-      where: { teacherId: req.teacherId },
+    const activeSessionId = await resolveTeacherSession(req.branchId);
+
+    let formAllocations = await prisma.teacherAllocation.findMany({
+      where: { teacherId: req.teacherId, sessionId: activeSessionId },
       include: {
         class: { select: { name: true, isEcd: true } },
         section: { select: { name: true } },
       },
     });
 
-    const subjectAssignments = await prisma.subjectAssign.findMany({
-      where: { teacherId: req.teacherId },
+    if (formAllocations.length === 0) {
+      const fallbackAllocs = await prisma.teacherAllocation.findMany({
+        where: { teacherId: req.teacherId },
+        orderBy: { sessionId: 'desc' },
+        include: {
+          class: { select: { name: true, isEcd: true } },
+          section: { select: { name: true } },
+        },
+      });
+      const seen = new Set<string>();
+      formAllocations = fallbackAllocs.filter((a) => {
+        const k = `${a.classId}-${a.sectionId}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    }
+
+    let subjectAssignments = await prisma.subjectAssign.findMany({
+      where: { teacherId: req.teacherId, sessionId: activeSessionId },
       include: {
         class: { select: { name: true, isEcd: true } },
         section: { select: { name: true } },
         subject: { select: { name: true } },
       },
+      orderBy: { id: 'desc' },
     });
+
+    if (subjectAssignments.length === 0) {
+      const fallbackAssigns = await prisma.subjectAssign.findMany({
+        where: { teacherId: req.teacherId },
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+        include: {
+          class: { select: { name: true, isEcd: true } },
+          section: { select: { name: true } },
+          subject: { select: { name: true } },
+        },
+      });
+      const seen = new Set<string>();
+      subjectAssignments = fallbackAssigns.filter((s) => {
+        const k = `${s.classId}-${s.sectionId}-${s.subjectId}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    }
 
     const teacherRecord = await prisma.teacher.findUnique({
       where: { id: req.teacherId },

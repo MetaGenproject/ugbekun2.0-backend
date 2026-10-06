@@ -1,9 +1,12 @@
 import { Request, Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import prisma from '../../lib/prisma';
 import gamificationService from '../../lib/gamificationService';
 import { canTeacherUseClassSubject, teacherScopedContentOr } from '../../lib/teacherAccess';
 import { mapQuestionBankWrite } from '../../lib/questionDraftService';
 import { snapshotFromBank } from '../admin/adminHomeworkController';
+import { uploadBase64File } from '../../lib/cloudinary';
 
 /**
  * GET /api/teacher/homeworks
@@ -40,7 +43,21 @@ export async function getHomeworks(req: Request, res: Response): Promise<Respons
  * POST /api/teacher/homeworks
  */
 export async function createHomework(req: Request, res: Response): Promise<Response | void> {
-  const { title, description, classId, subjectId, dueDate, questions, questionBankIds, termName } = req.body;
+  const {
+    title,
+    description,
+    classId,
+    subjectId,
+    dueDate,
+    questions,
+    questionBankIds,
+    termName,
+    attachmentUrl,
+    attachmentName,
+    submissionMode,
+    maxMarks,
+  } = req.body;
+
   if (!title || !classId || !subjectId || !dueDate) {
     return res.status(400).json({ success: false, message: 'Title, Class, Subject, and Due Date are required.' });
   }
@@ -77,7 +94,7 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
               questionType: q.questionType || (q.type === 'MCQ' ? 'mcq' : 'theory'),
               options: q.options,
               correctOption: q.correctOption || q.correctAnswer,
-              marks: q.marks || q.points,
+              marks: q.marks || q.points || 1,
               subjectId,
               classId,
               termName,
@@ -101,6 +118,18 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
       snapshot = bankResult.questions;
     }
 
+    // Determine final question payload and metadata
+    const parsedQuestions = snapshot || (Array.isArray(questions) && questions.length > 0 ? questions : []);
+    const resolvedSubmissionMode = submissionMode || (attachmentUrl ? 'FILE_UPLOAD' : (parsedQuestions.length > 0 ? 'ONLINE_QUESTIONS' : 'OFFLINE'));
+
+    const questionsPayload = {
+      questions: parsedQuestions,
+      attachmentUrl: attachmentUrl || null,
+      attachmentName: attachmentName || null,
+      submissionMode: resolvedSubmissionMode,
+      maxMarks: Number(maxMarks) || 20,
+    };
+
     const homework = await prisma.homework.create({
       data: {
         title,
@@ -108,7 +137,7 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
         classId: Number(classId),
         subjectId: Number(subjectId),
         dueDate: new Date(dueDate),
-        questions: snapshot || (questions && questions.length > 0 ? questions : null),
+        questions: questionsPayload,
         questionBankIds: ids.length > 0 ? ids : null,
         termName: termName || null,
         createdById: req.teacherId,
@@ -202,6 +231,8 @@ export async function getHomeworkSubmissions(req: Request, res: Response): Promi
 
     const isPastDue = new Date() > new Date(homework.dueDate);
 
+    const maxScore = (homework.questions as any)?.maxMarks || 20;
+
     const studentRoster = enrolls.map((e) => {
       const sub = submissionMap.get(e.student.id);
       let fileUrl = null;
@@ -211,15 +242,15 @@ export async function getHomeworkSubmissions(req: Request, res: Response): Promi
       if (sub && sub.answers) {
         if (typeof sub.answers === 'object') {
           if (Array.isArray(sub.answers)) {
-            const fileItem = sub.answers.find((a: any) => a.fileUrl);
+            const fileItem = sub.answers.find((a: any) => a.fileUrl || a.fileAttachment?.fileUrl);
             if (fileItem) {
-              fileUrl = fileItem.fileUrl;
-              fileName = fileItem.fileName || 'Uploaded Assignment';
+              fileUrl = fileItem.fileUrl || fileItem.fileAttachment?.fileUrl;
+              fileName = fileItem.fileName || fileItem.fileAttachment?.fileName || 'Uploaded Assignment';
               submissionType = 'FILE_UPLOAD';
             }
           } else {
-            fileUrl = (sub.answers as any).fileUrl || null;
-            fileName = (sub.answers as any).fileName || 'Uploaded Assignment';
+            fileUrl = (sub.answers as any).fileUrl || (sub.answers as any).fileAttachment?.fileUrl || null;
+            fileName = (sub.answers as any).fileName || (sub.answers as any).fileAttachment?.fileName || 'Uploaded Assignment';
             submissionType = (sub.answers as any).submissionType || 'ONLINE';
           }
         }
@@ -232,22 +263,28 @@ export async function getHomeworkSubmissions(req: Request, res: Response): Promi
         status = 'MISSING';
       }
 
+      const fullName = `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student';
+
       return {
         studentId: e.student.id,
-        registerNo: e.student.registerNo,
+        name: fullName,
         firstName: e.student.firstName,
         lastName: e.student.lastName,
+        registerNo: e.student.registerNo,
         photo: e.student.photo,
         sectionName: e.section?.name || 'Main',
         submissionId: sub?.id || null,
         submitted: !!sub,
         status,
         score: sub?.score ?? null,
+        maxScore,
         feedback: sub?.feedback || null,
         submittedAt: sub?.createdAt || null,
         fileUrl,
         fileName,
+        fileAttachment: fileUrl ? { fileUrl, fileName: fileName || 'Uploaded Assignment', fileType: 'file' } : null,
         submissionType,
+        answers: sub?.answers || null,
       };
     });
 
@@ -260,6 +297,11 @@ export async function getHomeworkSubmissions(req: Request, res: Response): Promi
         dueDate: homework.dueDate,
         className: homework.class.name,
         subjectName: homework.subject.name,
+        attachmentUrl: (homework.questions as any)?.attachmentUrl || null,
+        attachmentName: (homework.questions as any)?.attachmentName || null,
+        submissionMode: (homework.questions as any)?.submissionMode || 'ONLINE',
+        maxMarks: maxScore,
+        questions: (homework.questions as any)?.questions || homework.questions,
       },
       submissions: studentRoster,
     });
@@ -355,6 +397,62 @@ export async function batchGradeHomework(req: Request, res: Response): Promise<R
   } catch (error: any) {
     console.error('[TEACHER] Batch grade homework error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to batch save grades.' });
+  }
+}
+
+/**
+ * POST /api/teacher/homeworks/upload
+ * Supports file uploads for assignment materials (PDF, Word, image worksheets).
+ */
+export async function uploadHomeworkMaterial(req: Request, res: Response): Promise<Response | void> {
+  try {
+    let fileBuffer: Buffer | null = null;
+    let originalName = 'assignment_file';
+    let mimeType = 'application/octet-stream';
+
+    if (req.file) {
+      fileBuffer = req.file.buffer;
+      originalName = req.file.originalname;
+      mimeType = req.file.mimetype;
+    } else if (req.body?.base64) {
+      fileBuffer = Buffer.from(req.body.base64, 'base64');
+      originalName = req.body.fileName || 'assignment_file';
+      mimeType = req.body.mime || 'application/octet-stream';
+    }
+
+    if (!fileBuffer) {
+      return res.status(400).json({ success: false, message: 'No file provided.' });
+    }
+
+    // Try Cloudinary first
+    try {
+      const base64Str = fileBuffer.toString('base64');
+      const url = await uploadBase64File({
+        base64: base64Str,
+        mime: mimeType,
+        folder: 'ugbekun_assignments',
+      });
+      if (url) {
+        return res.json({ success: true, url, fileName: originalName, fileType: mimeType });
+      }
+    } catch (cErr: any) {
+      console.warn('[HOMEWORK UPLOAD] Cloudinary upload fallback to local disk:', cErr?.message);
+    }
+
+    // Local fallback: write to uploads/assignments
+    const uploadDir = path.join(__dirname, '../../uploads/assignments');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const safeName = `${Date.now()}_${originalName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const filePath = path.join(uploadDir, safeName);
+    fs.writeFileSync(filePath, fileBuffer);
+
+    const localUrl = `/uploads/assignments/${safeName}`;
+    return res.json({ success: true, url: localUrl, fileName: originalName, fileType: mimeType });
+  } catch (error: any) {
+    console.error('[HOMEWORK UPLOAD] Error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to upload homework file.' });
   }
 }
 

@@ -1,7 +1,9 @@
 import express from 'express';
+import multer from 'multer';
 import { requireStudent } from '../middleware/auth';
 import * as studentController from '../controllers/student';
 
+const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 const router = express.Router();
 
 // Middleware guard for all Student routes
@@ -17,6 +19,8 @@ router.get('/grades/export-pdf', studentController.exportGradesPdf);
 
 // Homework Submission
 router.get('/homeworks/:id', studentController.getHomeworkDetail);
+router.post('/homeworks/upload', upload.single('file'), studentController.uploadStudentHomeworkFile);
+router.post('/homeworks/:id/upload', upload.single('file'), studentController.uploadStudentHomeworkFile);
 router.post('/homeworks/:id/submit', studentController.submitHomework);
 
 // CBT / Online Exams

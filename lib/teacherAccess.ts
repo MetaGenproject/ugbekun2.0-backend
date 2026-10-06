@@ -131,13 +131,19 @@ export async function canTeacherAccessSubject(
     if (secId) {
       offeredWhere.OR = [
         { sectionId: secId },
-        { sectionId: null },
         { sectionId: 0 },
       ];
     }
 
-    const offered = await prisma.subjectAssign.findFirst({
+    let offered = await prisma.subjectAssign.findFirst({
       where: offeredWhere,
+      select: { id: true },
+    });
+    if (offered) return true;
+
+    // Fallback: check if offered class-wide
+    offered = await prisma.subjectAssign.findFirst({
+      where: { classId: cId, subjectId: subId },
       select: { id: true },
     });
     if (offered) return true;
@@ -149,10 +155,26 @@ export async function canTeacherAccessSubject(
     classId: cId,
     subjectId: subId,
   };
-  if (secId) subjAssignWhere.sectionId = secId;
+  if (secId) {
+    subjAssignWhere.OR = [
+      { sectionId: secId },
+      { sectionId: 0 },
+    ];
+  }
 
-  const directAssignment = await prisma.subjectAssign.findFirst({
+  let directAssignment = await prisma.subjectAssign.findFirst({
     where: subjAssignWhere,
+    select: { id: true },
+  });
+  if (directAssignment) return true;
+
+  // Fallback: check if teacher is assigned to this subject across this class
+  directAssignment = await prisma.subjectAssign.findFirst({
+    where: {
+      teacherId: tId,
+      classId: cId,
+      subjectId: subId,
+    },
     select: { id: true },
   });
   if (directAssignment) return true;
