@@ -128,7 +128,13 @@ export async function canTeacherAccessSubject(
       classId: cId,
       subjectId: subId,
     };
-    if (secId) offeredWhere.sectionId = secId;
+    if (secId) {
+      offeredWhere.OR = [
+        { sectionId: secId },
+        { sectionId: null },
+        { sectionId: 0 },
+      ];
+    }
 
     const offered = await prisma.subjectAssign.findFirst({
       where: offeredWhere,

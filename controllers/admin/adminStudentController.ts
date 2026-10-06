@@ -66,7 +66,16 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
 
     const [students, parents] = await Promise.all([
       prisma.student.findMany({
-        where: { branchId },
+        where: {
+          branchId,
+          active: true,
+          enrolls: {
+            none: {
+              branchId,
+              isAlumni: 1,
+            },
+          },
+        },
         orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
         select: {
           id: true,
@@ -82,6 +91,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           parent: { select: { name: true, photo: true, mobileno: true, email: true } },
           enrolls: {
             take: 1,
+            where: { isAlumni: 0 },
             orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
             select: {
               class: { select: { id: true, name: true } },
@@ -112,6 +122,15 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
             },
           },
           students: {
+            where: {
+              active: true,
+              enrolls: {
+                none: {
+                  branchId,
+                  isAlumni: 1,
+                },
+              },
+            },
             select: {
               id: true,
               firstName: true,
@@ -119,6 +138,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
               registerNo: true,
               enrolls: {
                 take: 1,
+                where: { isAlumni: 0 },
                 orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
                 select: {
                   class: { select: { name: true } },
@@ -1046,6 +1066,8 @@ export async function exportClassCredentialSlipsPdf(req: Request, res: Response)
 
     const whereEnroll: any = {
       branchId,
+      isAlumni: 0,
+      student: { active: true },
       ...(targetClass ? { classId: targetClass.id } : {}),
       ...(targetSection ? { sectionId: targetSection.id } : {}),
     };
@@ -1913,6 +1935,7 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
         classId: Number(classId),
         sectionId: Number(sectionId),
         isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -1934,6 +1957,7 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
           classId: Number(classId),
           sectionId: Number(sectionId),
           isAlumni: 0,
+          student: { active: true },
         },
         include: {
           student: {
@@ -3467,11 +3491,10 @@ export async function moveToAlumni(req: Request, res: Response): Promise<Respons
       }
     }
 
-    // 2. Ensure the student record and user credentials remain active
-    // so they can log into their portal to view results/transcripts
+    // 2. Mark the student record as inactive so they do not show in active classroom or admin rosters
     await prisma.student.update({
       where: { id: studentId },
-      data: { active: true, updatedAt: new Date() },
+      data: { active: false, updatedAt: new Date() },
     });
 
     if (student.userId) {
@@ -3517,6 +3540,11 @@ export async function restoreFromAlumni(req: Request, res: Response): Promise<Re
         isAlumni: 0,
         updatedAt: new Date(),
       },
+    });
+
+    await prisma.student.update({
+      where: { id: studentId },
+      data: { active: true, updatedAt: new Date() },
     });
 
     return res.json({

@@ -1104,6 +1104,8 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
         branchId,
         classId: cId,
         sessionId: activeSession,
+        isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -1323,7 +1325,12 @@ export async function getDailyAttendanceReport(req: Request, res: Response): Pro
     const activeSession = await resolveAdminSession(branchId, undefined, requestedSession);
 
     const enrolls = await prisma.enroll.findMany({
-      where: { branchId, sessionId: activeSession },
+      where: {
+        branchId,
+        sessionId: activeSession,
+        isAlumni: 0,
+        student: { active: true },
+      },
       select: { studentId: true },
     });
     const enrolledIds = Array.from(new Set(enrolls.map((row) => row.studentId)));
@@ -1394,6 +1401,8 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
       where: {
         branchId,
         sessionId: activeSession,
+        isAlumni: 0,
+        student: { active: true },
         ...(classId ? { classId } : {}),
         ...(sectionId ? { sectionId } : {}),
       },
@@ -1580,6 +1589,7 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
       branchId,
       classId: parseInt(classId, 10),
       isAlumni: 0,
+      student: { active: true },
     };
 
     if (sectionId && sectionId !== 'ALL') {

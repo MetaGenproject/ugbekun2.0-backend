@@ -443,6 +443,8 @@ async function loadEnrolledStudentIds(
       sessionId: args.sessionId,
       classId: args.classId,
       sectionId: args.sectionId,
+      isAlumni: 0,
+      student: { active: true },
       ...(args.studentIds?.length ? { studentId: { in: args.studentIds } } : {}),
     },
     select: { studentId: true, roll: true },
@@ -461,6 +463,8 @@ async function loadRoster(
       sessionId: args.sessionId,
       classId: args.classId,
       sectionId: args.sectionId,
+      isAlumni: 0,
+      student: { active: true },
     },
     include: {
       student: {
@@ -902,12 +906,14 @@ export async function getRegisterWithEntries(
       }));
   }
 
-  const entries = rawEntries.map((row) => ({
-    studentId: row.studentId,
-    status: normalizeAttendanceStatus(row.status) || row.status,
-    remark: row.remark,
-    markedByTeacherId: row.markedByTeacherId,
-  }));
+  const entries = rawEntries
+    .filter((row) => enrolledIds.includes(row.studentId))
+    .map((row) => ({
+      studentId: row.studentId,
+      status: normalizeAttendanceStatus(row.status) || row.status,
+      remark: row.remark,
+      markedByTeacherId: row.markedByTeacherId,
+    }));
 
   const { described, classified } = await classifyDate(db, args.branchId, dateKey);
   const calendar = {

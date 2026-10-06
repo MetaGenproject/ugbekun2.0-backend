@@ -337,7 +337,7 @@ export async function getComprehensiveReport(req: Request, res: Response): Promi
         prisma.officeTransaction.findMany({ where: { branchId: bid, status: { not: 'VOIDED' } } }),
         prisma.payment.findMany({ where: { branchId: bid } }),
         prisma.enroll.findMany({
-          where: { branchId: bid },
+          where: { branchId: bid, isAlumni: 0, student: { active: true } },
           include: {
             student: { select: { id: true, firstName: true, lastName: true, gender: true, active: true } },
             class: { select: { id: true, name: true } },

@@ -82,7 +82,22 @@ export async function getBranchStats(
     invoiceAgg,
     paymentAgg,
   ] = await Promise.all([
-    prisma.student.count({ where: entityWhere }).catch(() => 0),
+    prisma.student
+      .count({
+        where: activeOnly
+          ? {
+              branchId,
+              active: true,
+              enrolls: {
+                none: {
+                  branchId,
+                  isAlumni: 1,
+                },
+              },
+            }
+          : { branchId },
+      })
+      .catch(() => 0),
     prisma.parent.count({ where: entityWhere }).catch(() => 0),
     prisma.teacher.count({ where: entityWhere }).catch(() => 0),
     countStaffForBranch(prisma, branch, options.staffUsers).catch(() => 0),
@@ -140,7 +155,15 @@ export async function getBranchStatsMap(prisma: any, branches: Array<{ id: numbe
   const [studentGroups, parentGroups, teacherGroups] = await Promise.all([
     prisma.student.groupBy({
       by: ['branchId'],
-      where: { branchId: { not: null }, active: true },
+      where: {
+        branchId: { not: null },
+        active: true,
+        enrolls: {
+          none: {
+            isAlumni: 1,
+          },
+        },
+      },
       _count: { id: true },
     }),
     prisma.parent.groupBy({

@@ -108,6 +108,8 @@ export async function getStudents(req: Request, res: Response): Promise<Response
         sectionId: Number(sectionId),
         sessionId,
         branchId: req.branchId,
+        isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -452,6 +454,8 @@ export async function batchGenerateCommentaryAi(req: Request, res: Response): Pr
         sectionId: Number(sectionId),
         sessionId,
         branchId: req.branchId,
+        isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -601,6 +605,8 @@ export async function getReportCards(req: Request, res: Response): Promise<Respo
         sectionId: Number(sectionId),
         sessionId,
         branchId: req.branchId,
+        isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -704,6 +710,8 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
         classId: Number(classId),
         sectionId: Number(sectionId),
         sessionId,
+        isAlumni: 0,
+        student: { active: true },
         ...(req.branchId ? { branchId: req.branchId } : {}),
       },
       include: {
@@ -726,6 +734,8 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
         where: {
           classId: Number(classId),
           sectionId: Number(sectionId),
+          isAlumni: 0,
+          student: { active: true },
         },
         include: {
           student: {
@@ -747,6 +757,8 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
       enrolls = await prisma.enroll.findMany({
         where: {
           classId: Number(classId),
+          isAlumni: 0,
+          student: { active: true },
         },
         include: {
           student: {
@@ -1362,6 +1374,8 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
           sectionId: Number(sectionId),
           sessionId,
           branchId: req.branchId,
+          isAlumni: 0,
+          student: { active: true },
         },
         include: {
           student: {
@@ -1479,6 +1493,8 @@ export async function getMontessoriSheet(req: Request, res: Response): Promise<R
         sectionId: Number(sectionId),
         sessionId,
         branchId: req.branchId,
+        isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -1631,6 +1647,8 @@ export async function scanGrades(req: Request, res: Response): Promise<Response 
         sectionId: Number(sectionId),
         sessionId,
         branchId: req.branchId,
+        isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
@@ -2242,18 +2260,37 @@ export async function getTeacherClassesSections(req: Request, res: Response): Pr
             section: true,
           },
         },
+        subjects: {
+          include: {
+            subject: true,
+          },
+        },
       },
       orderBy: { id: 'asc' },
     });
 
-    const formattedClasses = classes.map((c: any) => ({
-      id: c.id,
-      name: c.name,
-      sections: (c.sections || []).map((s: any) => ({
-        id: s.section?.id || s.sectionId,
-        name: s.section?.name || 'Main',
-      })),
-    }));
+    const formattedClasses = classes.map((c: any) => {
+      const subjectMap = new Map<number, any>();
+      (c.subjects || []).forEach((sa: any) => {
+        if (sa.subject && !subjectMap.has(sa.subject.id)) {
+          subjectMap.set(sa.subject.id, {
+            id: sa.subject.id,
+            name: sa.subject.name,
+            subjectCode: sa.subject.subjectCode,
+          });
+        }
+      });
+
+      return {
+        id: c.id,
+        name: c.name,
+        sections: (c.sections || []).map((s: any) => ({
+          id: s.section?.id || s.sectionId,
+          name: s.section?.name || 'Main',
+        })),
+        subjects: Array.from(subjectMap.values()),
+      };
+    });
 
     return res.json({ success: true, classes: formattedClasses });
   } catch (error) {
@@ -3005,6 +3042,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
     const enrollWhere: any = {
       classId,
       isAlumni: 0,
+      student: { active: true },
       sessionId,
       ...(branchId ? { branchId } : {}),
     };
@@ -3023,7 +3061,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
 
     if (enrolls.length === 0) {
       enrolls = await prisma.enroll.findMany({
-        where: { classId, isAlumni: 0, ...(sectionId ? { sectionId } : {}), ...(branchId ? { branchId } : {}) },
+        where: { classId, isAlumni: 0, student: { active: true }, ...(sectionId ? { sectionId } : {}), ...(branchId ? { branchId } : {}) },
         include: {
           student: {
             include: { parent: true },
