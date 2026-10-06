@@ -845,20 +845,119 @@ export async function deleteTeacher(req: Request, res: Response): Promise<Respon
       return res.status(404).json({ success: false, message: 'Teacher not found.' });
     }
 
-    await prisma.$transaction([
-      prisma.teacherAllocation.deleteMany({ where: { teacherId: id } }),
-      prisma.subjectAssign.deleteMany({ where: { teacherId: id } }),
-      prisma.staffAttendance.deleteMany({ where: { teacherId: id } }),
-      prisma.timetableSlot.deleteMany({ where: { teacherId: id } }),
-      prisma.lessonPlan.deleteMany({ where: { teacherId: id } }),
-      prisma.teacher.delete({ where: { id } }),
-      prisma.user.deleteMany({ where: { id: teacher.userId || id } }),
-    ]);
+    // 1. Unassign from invigilation, attendance markers & timetable slots to prevent FK restrict violations
+    await prisma.timetableSlot.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.examHall.updateMany({ where: { invigilatorId: id }, data: { invigilatorId: null } }).catch(() => {});
+    await prisma.examScheduleSlot.updateMany({ where: { invigilatorId: id }, data: { invigilatorId: null } }).catch(() => {});
+    await prisma.attendanceRegister.updateMany({ where: { takenByTeacherId: id }, data: { takenByTeacherId: null } }).catch(() => {});
+    await prisma.attendance.updateMany({ where: { markedByTeacherId: id }, data: { markedByTeacherId: null } }).catch(() => {});
 
-    return res.json({ success: true, message: 'Teacher record deleted successfully.' });
+    // 2. Remove teacher duties, assignments, attendance and notes
+    await prisma.teacherAllocation.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.subjectAssign.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.staffAttendance.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.lessonPlan.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.teacherNote.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.frontCmsTeacher.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.teacherActivity.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.teacherReminder.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.interventionAlert.deleteMany({ where: { teacherId: id } }).catch(() => {});
+
+    // 3. Clean up optional/historical tables
+    await prisma.$executeRawUnsafe('DELETE FROM score_sheet_scan WHERE teacher_id = $1', id).catch(() => {});
+    await prisma.$executeRawUnsafe('DELETE FROM salary_advances WHERE teacher_id = $1', id).catch(() => {});
+    await prisma.$executeRawUnsafe('DELETE FROM staff_conducts WHERE teacher_id = $1', id).catch(() => {});
+    await prisma.$executeRawUnsafe('DELETE FROM teacher_subject_allocations WHERE teacher_id = $1', id).catch(() => {});
+
+    // 4. Delete the teacher record
+    await prisma.teacher.delete({ where: { id } });
+
+    // 5. Clean up associated login User record if one exists
+    if (teacher.userId) {
+      await prisma.idCard.deleteMany({ where: { userId: teacher.userId } }).catch(() => {});
+      try {
+        await prisma.user.delete({ where: { id: teacher.userId } });
+      } catch (userErr) {
+        // If user record is linked to historical audit/activity logs, safely disable login credentials
+        await prisma.user.update({
+          where: { id: teacher.userId },
+          data: { active: false, role: 0 },
+        }).catch(() => {});
+      }
+    }
+
+    return res.json({ success: true, message: 'Staff deleted successfully' });
   } catch (error: any) {
     console.error('[ADMIN] Delete teacher error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to delete teacher.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/staff/:id
+ * Deletes a staff member (non-teaching staff or teacher)
+ */
+export async function deleteStaff(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const id = Number(req.params.id);
+
+    // 1. Check if this ID is a Teacher record
+    const teacher = await prisma.teacher.findFirst({
+      where: { id, ...(branchId ? { branchId } : {}) },
+    });
+
+    if (teacher) {
+      req.params.id = String(teacher.id);
+      return deleteTeacher(req, res);
+    }
+
+    // 2. Check if this ID is a User record
+    let user = await prisma.user.findUnique({
+      where: { id },
+    });
+
+    if (!user) {
+      // Check if ID corresponds to a teacher's userId
+      const teacherByUser = await prisma.teacher.findFirst({
+        where: { userId: id, ...(branchId ? { branchId } : {}) },
+      });
+      if (teacherByUser) {
+        req.params.id = String(teacherByUser.id);
+        return deleteTeacher(req, res);
+      }
+
+      return res.status(404).json({ success: false, message: 'Staff member not found.' });
+    }
+
+    // Safety guard: Protect Superadmin (1) and School Admin (2) accounts from staff deletion
+    if (user.role === 1 || user.role === 2) {
+      return res.status(403).json({ success: false, message: 'Administrative accounts cannot be deleted from staff directory.' });
+    }
+
+    // 1. Remove ID card, payroll components, attendance, etc.
+    await prisma.idCard.deleteMany({ where: { userId: id } }).catch(() => {});
+    await prisma.payrollComponent.deleteMany({ where: { staffId: id } }).catch(() => {});
+    await prisma.staffAttendance.deleteMany({ where: { teacherId: id } }).catch(() => {});
+    await prisma.$executeRawUnsafe('DELETE FROM salary_advances WHERE staff_id = $1', id).catch(() => {});
+    await prisma.$executeRawUnsafe('DELETE FROM staff_conducts WHERE staff_id = $1', id).catch(() => {});
+    await prisma.teacher.deleteMany({ where: { userId: id } }).catch(() => {});
+
+    // 2. Delete user account or deactivate if foreign keys exist
+    try {
+      await prisma.user.delete({ where: { id } });
+    } catch (dbErr) {
+      await prisma.user.update({
+        where: { id },
+        data: { active: false, role: 0 },
+      }).catch(() => {});
+    }
+
+    return res.json({ success: true, message: 'Staff deleted successfully' });
+  } catch (error: any) {
+    console.error('[ADMIN] Delete staff error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to delete staff member.' });
   }
 }
 

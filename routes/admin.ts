@@ -76,6 +76,7 @@ import {
   toggleTeacherStatus,
   toggleStaffStatus,
   updateStaff,
+  deleteStaff,
   getStaffMessages,
   sendStaffMessage,
   getStaffAttendance,
@@ -432,6 +433,7 @@ router.post('/teachers/:id/upload-photo', upload.single('file'), uploadTeacherPh
 router.post('/teachers/:id/toggle-status', toggleTeacherStatus);
 router.post('/staff/:id/toggle-status', toggleStaffStatus);
 router.put('/staff/:id', updateStaff);
+router.delete('/staff/:id', deleteStaff);
 router.get('/staff-messages', getStaffMessages);
 router.post('/staff-messages', sendStaffMessage);
 router.get('/staff/attendance', getStaffAttendance);
