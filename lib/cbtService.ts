@@ -25,11 +25,15 @@ export function parseAikenFormat(text?: string | null): ParsedQuestion[] {
   const questions: ParsedQuestion[] = [];
   let currentQuestion: ParsedQuestion | null = null;
 
+  const qNumRegex = /^(?:(?:question|q)\s*\d+[\s.:\-)]*|\d+[\s.:\-)])\s*(.*)/i;
+  const optRegex = /^(?:(?:\(|\[)?([a-eA-E])(?:\)|\]|\.|\:|\-)\s*)(.*)/;
+  const ansRegex = /^(?:ans(?:wer)?|correct(?:\s*option|\s*answer)?|key)\s*[:=\-]?\s*(?:option\s*)?(?:\(|\[)?([a-eA-E0-9]+)(?:\)|\])?/i;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // Check if line is ANSWER: X
-    const answerMatch = line.match(/^ANSWER\s*:\s*([A-Z0-9]+)/i);
+    // Check if line is ANSWER: X or Answer: A or Key: A
+    const answerMatch = line.match(ansRegex);
     if (answerMatch) {
       if (currentQuestion && currentQuestion.questionText && currentQuestion.options.length >= 2) {
         currentQuestion.correctOption = answerMatch[1].toUpperCase();
@@ -39,8 +43,8 @@ export function parseAikenFormat(text?: string | null): ParsedQuestion[] {
       continue;
     }
 
-    // Check if line is an Option: A. Text or A) Text
-    const optionMatch = line.match(/^([A-Z])[\.\)]\s*(.+)$/i);
+    // Check if line is an Option: A. Text or A) Text or (A) Text
+    const optionMatch = line.match(optRegex);
     if (optionMatch) {
       if (!currentQuestion) {
         // Option without question prompt, skip
@@ -50,15 +54,18 @@ export function parseAikenFormat(text?: string | null): ParsedQuestion[] {
       continue;
     }
 
-    // If we reach here, it's a new question prompt
+    // If we reach here, it's a question prompt
+    const qMatch = line.match(qNumRegex);
+    const cleanPrompt = qMatch ? qMatch[1].trim() : line;
+
     if (currentQuestion) {
       // If previous question was accumulating text
       if (currentQuestion.options.length === 0) {
-        currentQuestion.questionText += ' ' + line;
+        currentQuestion.questionText += ' ' + cleanPrompt;
       } else {
         // Incomplete question encountered, reset
         currentQuestion = {
-          questionText: line,
+          questionText: cleanPrompt,
           questionType: 'mcq',
           options: [],
           correctOption: 'A',
@@ -67,7 +74,7 @@ export function parseAikenFormat(text?: string | null): ParsedQuestion[] {
       }
     } else {
       currentQuestion = {
-        questionText: line,
+        questionText: cleanPrompt,
         questionType: 'mcq',
         options: [],
         correctOption: 'A',

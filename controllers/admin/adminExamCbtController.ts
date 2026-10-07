@@ -7,7 +7,7 @@ import {
   generateAiCurriculumQuestions,
 } from '../../lib/cbtService';
 import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
-import { generateQuestionDrafts, mapQuestionBankWrite } from '../../lib/questionDraftService';
+import { generateQuestionDrafts, mapQuestionBankWrite, parseQuestionsFromRawText } from '../../lib/questionDraftService';
 import { canTeacherUseClassSubject } from '../../lib/teacherAccess';
 import { parseMaybeDate } from '../../lib/examWindow';
 import { findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
@@ -1317,12 +1317,19 @@ export async function getCbtQuestionBank(req: Request, res: Response): Promise<R
  * POST /api/admin/cbt/question-bank
  */
 export async function createCbtQuestion(req: Request, res: Response): Promise<Response | void> {
-  const branchId = req.branchId;
-
   try {
     const { questionText, subjectId } = req.body;
     if (!questionText || !subjectId) {
       return res.status(400).json({ success: false, message: 'Question prompt and Subject are required.' });
+    }
+
+    let branchId = req.branchId || Number(req.body?.branchId) || (req.user?.branchId ? Number(req.user.branchId) : null);
+    if (!branchId && subjectId) {
+      const subj = await prisma.subject.findUnique({ where: { id: Number(subjectId) }, select: { branchId: true } });
+      if (subj?.branchId) branchId = subj.branchId;
+    }
+    if (!branchId) {
+      return res.status(400).json({ success: false, message: 'Could not resolve the school branch for this question.' });
     }
 
     const globalSetting = await prisma.globalSettings.findFirst();
@@ -1416,6 +1423,9 @@ export async function importCbtQuestions(req: Request, res: Response): Promise<R
     let parsedQuestions: any[] = [];
     if (format === 'aiken') {
       parsedQuestions = parseAikenFormat(typeof data === 'string' ? data : '');
+      if (parsedQuestions.length === 0) {
+        parsedQuestions = parseQuestionsFromRawText(typeof data === 'string' ? data : '');
+      }
     } else if (format === 'csv') {
       parsedQuestions = parseCsvFormat(typeof data === 'string' ? data : '');
     } else if (format === 'json') {
@@ -1429,7 +1439,7 @@ export async function importCbtQuestions(req: Request, res: Response): Promise<R
       });
     }
 
-    if (req.teacherId) {
+    if (req.teacherId && !req.isAdmin && req.userRole !== 1 && req.userRole !== 2 && req.userRole !== 9) {
       if (!cId) {
         return res.status(400).json({ success: false, message: 'Class is required so imported questions stay classified.' });
       }
@@ -1475,7 +1485,7 @@ export async function extractQuestionDrafts(req: Request, res: Response): Promis
     if (!subjectId) {
       return res.status(400).json({ success: false, message: 'Subject is required.' });
     }
-    if (req.teacherId) {
+    if (req.teacherId && !req.isAdmin && req.userRole !== 1 && req.userRole !== 2 && req.userRole !== 9) {
       if (!classId) {
         return res.status(400).json({ success: false, message: 'Class is required so questions stay classified for your authorised students.' });
       }
@@ -1530,14 +1540,23 @@ export async function extractQuestionDrafts(req: Request, res: Response): Promis
  * Persist reviewed drafts into the Question Bank.
  */
 export async function bulkSaveQuestionBank(req: Request, res: Response): Promise<Response | void> {
-  const branchId = req.branchId;
+  let branchId = req.branchId || Number(req.body?.branchId) || (req.user?.branchId ? Number(req.user.branchId) : null);
   const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
   const subjectId = Number(req.body?.subjectId || 0);
   const classId = Number(req.body?.classId || 0) || null;
   if (!subjectId || !questions.length) {
     return res.status(400).json({ success: false, message: 'Subject and at least one reviewed question are required.' });
   }
-  if (req.teacherId) {
+
+  if (!branchId && subjectId) {
+    const subj = await prisma.subject.findUnique({ where: { id: subjectId }, select: { branchId: true } });
+    if (subj?.branchId) branchId = subj.branchId;
+  }
+  if (!branchId) {
+    return res.status(400).json({ success: false, message: 'Could not resolve the school branch for saving questions.' });
+  }
+
+  if (req.teacherId && !req.isAdmin && req.userRole !== 1 && req.userRole !== 2 && req.userRole !== 9) {
     if (!classId) {
       return res.status(400).json({ success: false, message: 'Class is required so questions stay classified for your authorised students.' });
     }
@@ -1571,8 +1590,8 @@ export async function bulkSaveQuestionBank(req: Request, res: Response): Promise
           {
             branchId,
             sessionId,
-            createdById: (req as any).userId || (req as any).teacherId || null,
-            createdByRole: req.teacherId ? 'TEACHER' : 'ADMIN',
+            createdById: (req as any).userId || (req as any).adminId || (req as any).teacherId || null,
+            createdByRole: req.userRole === 3 ? 'TEACHER' : 'ADMIN',
           }
         ),
         include: {
@@ -1609,7 +1628,7 @@ export async function aiGenerateCbtQuestions(req: Request, res: Response): Promi
 
     const sId = Number(subjectId);
     const cId = classId ? Number(classId) : null;
-    if (req.teacherId) {
+    if (req.teacherId && !req.isAdmin && req.userRole !== 1 && req.userRole !== 2 && req.userRole !== 9) {
       if (!cId) {
         return res.status(400).json({ success: false, message: 'Class is required so generated questions stay classified for your authorised students.' });
       }
