@@ -85,6 +85,8 @@ import {
   aiDistributeTeacherMarks,
   getTeacherGradingSystem,
   getTeacherClassReports,
+  getTeacherClassCredentials,
+  exportTeacherClassCredentialsPdf,
   batchGradeHomework,
 } from '../controllers/teacher';
 import { importCbtQuestions, aiGenerateCbtQuestions, extractQuestionDrafts, bulkSaveQuestionBank } from '../controllers/admin/adminExamCbtController';
@@ -160,6 +162,8 @@ router.get('/report-cards', getReportCards);
 router.get('/report-cards/export-pdf', exportReportCardPdf);
 router.get('/report-cards/export-batch-pdf', exportBatchReportCardsPdf);
 router.get('/class-reports', getTeacherClassReports);
+router.get('/class-credentials', getTeacherClassCredentials);
+router.get('/class-credentials/export-pdf', exportTeacherClassCredentialsPdf);
 
 // Montessori Assessments
 router.get('/montessori/sheet', getMontessoriSheet);

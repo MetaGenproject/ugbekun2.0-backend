@@ -9,12 +9,13 @@ import {
   generateReportCardPdf,
   generateMontessoriReportCardPdf,
   generateBatchClassReportCardsPdf,
+  generateBatchClassCredentialSlipsPdf,
 } from '../../lib/pdfService';
 import gamificationService from '../../lib/gamificationService';
 import { generateRegistrationNumber } from '../../lib/studentService';
 import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
-import { resolveGradingScale } from '../../lib/gradingService';
+import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
 
 let Tesseract: any;
 try {
@@ -3280,13 +3281,16 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
 
 /**
  * GET /api/teacher/class-reports
- * Requirement 5: Broad Class Teacher Reports.
- * Provides Attendance, Student Performance, Tabulation Sheet, and Student Information
- * strictly scoped to the teacher's authorized classes.
+ * Comprehensive Class Teacher Academic Intelligence.
+ * Provides:
+ *  1. Tabulation Matrix per Exam & Evaluation Matrix Setup
+ *  2. Student Performance & Grade Analytics
+ *  3. Attendance Overview
+ * Strictly scoped to the teacher's authorized classes.
  */
 export async function getTeacherClassReports(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId, reportType = 'overview' } = req.query;
+  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId, examId: reqExamId } = req.query;
 
   if (!reqClassId) {
     return res.status(400).json({ success: false, message: 'classId is required.' });
@@ -3308,17 +3312,64 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = reqSessionId ? Number(reqSessionId) : globalSetting?.sessionId || 5;
 
+    // Fetch Class with sections, subjects, evaluationMatrix, and gradingScale
     const cls = await prisma.class.findUnique({
       where: { id: classId },
       include: {
         sections: { include: { section: true } },
         subjects: { include: { subject: true, teacher: true } },
+        evaluationMatrix: true,
+        gradingScale: true,
       },
     });
 
     if (!cls) {
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
+
+    // Fetch available exams for selection
+    const exams = await prisma.exam.findMany({
+      where: branchId ? { branchId } : {},
+      select: {
+        id: true,
+        name: true,
+        termId: true,
+      },
+      orderBy: { id: 'desc' },
+    });
+
+    const selectedExamId = reqExamId
+      ? Number(reqExamId)
+      : exams.length > 0
+      ? exams[0].id
+      : null;
+
+    // Resolve Evaluation Matrix for the class
+    let matrix = cls.evaluationMatrix;
+    if (!matrix && branchId) {
+      matrix = await prisma.evaluationMatrix.findFirst({
+        where: { branchId, isDefault: true },
+      });
+      if (!matrix) {
+        matrix = await prisma.evaluationMatrix.findFirst({
+          where: { branchId },
+        });
+      }
+    }
+
+    let matrixComponents: Array<{ key: string; name: string; maxMarks: number }> = [];
+    if (matrix?.components) {
+      try {
+        matrixComponents = typeof matrix.components === 'string'
+          ? JSON.parse(matrix.components)
+          : (matrix.components as any);
+      } catch {
+        matrixComponents = [];
+      }
+    }
+
+    // Resolve Grading Scale
+    const gradingScaleData = await resolveGradingScale(prisma, branchId || 1, classId);
 
     // 1. Enrolled students
     const enrollWhere: any = {
@@ -3334,7 +3385,16 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       where: enrollWhere,
       include: {
         student: {
-          include: { parent: true },
+          include: {
+            parent: {
+              include: {
+                user: { select: { username: true, rawPassword: true } },
+              },
+            },
+            user: {
+              select: { username: true, rawPassword: true, active: true, lastLogin: true },
+            },
+          },
         },
         section: { select: { id: true, name: true } },
       },
@@ -3343,10 +3403,25 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
 
     if (enrolls.length === 0) {
       enrolls = await prisma.enroll.findMany({
-        where: { classId, isAlumni: 0, student: { active: true }, ...(sectionId ? { sectionId } : {}), ...(branchId ? { branchId } : {}) },
+        where: {
+          classId,
+          isAlumni: 0,
+          student: { active: true },
+          ...(sectionId ? { sectionId } : {}),
+          ...(branchId ? { branchId } : {}),
+        },
         include: {
           student: {
-            include: { parent: true },
+            include: {
+              parent: {
+                include: {
+                  user: { select: { username: true, rawPassword: true } },
+                },
+              },
+              user: {
+                select: { username: true, rawPassword: true, active: true, lastLogin: true },
+              },
+            },
           },
           section: { select: { id: true, name: true } },
         },
@@ -3395,20 +3470,26 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       }
     });
 
-    // 3. Academic Marks & Tabulation Sheet
+    // 3. Academic Marks for the Selected Exam
+    const marksWhere: any = {
+      classId,
+      studentId: { in: studentIds },
+      ...(sectionId ? { sectionId } : {}),
+      ...(branchId ? { branchId } : {}),
+    };
+    if (selectedExamId) {
+      marksWhere.examId = selectedExamId;
+    }
+
     const marks = await prisma.mark.findMany({
-      where: {
-        classId,
-        studentId: { in: studentIds },
-        ...(sectionId ? { sectionId } : {}),
-        ...(branchId ? { branchId } : {}),
-      },
+      where: marksWhere,
       select: {
         id: true,
         studentId: true,
         subjectId: true,
         mark: true,
         absent: true,
+        examId: true,
       },
     });
 
@@ -3416,22 +3497,28 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       id: s.subject.id,
       name: s.subject.name,
       code: s.subject.subjectCode,
+      subjectCode: s.subject.subjectCode,
     }));
 
     // Build Tabulation Matrix
     const tabulationRows = enrolls.map((e) => {
       const sId = e.student.id;
       const studentMarks: Record<number, number> = {};
+      const subjectBreakdowns: Record<number, any> = {};
+      const subjectGrades: Record<number, any> = {};
       let totalScore = 0;
       let subjectCount = 0;
 
       offeredSubjects.forEach((sub) => {
         const markRecord = marks.find((m) => m.studentId === sId && m.subjectId === sub.id);
         let score = 0;
+        let componentsMap: Record<string, number> = {};
+
         if (markRecord && markRecord.mark) {
           if (markRecord.mark.startsWith('{')) {
             try {
               const comp = JSON.parse(markRecord.mark);
+              componentsMap = comp;
               const compValues: any[] = Object.values(comp);
               score = compValues.reduce((sum: number, v: any) => sum + (Number(v) || 0), 0);
             } catch {
@@ -3441,26 +3528,49 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
             score = Number(markRecord.mark) || 0;
           }
         }
+
         studentMarks[sub.id] = score;
+        subjectBreakdowns[sub.id] = componentsMap;
+        subjectGrades[sub.id] = calculateGradeFromRanges(score, gradingScaleData.ranges);
         totalScore += score;
         if (score > 0) subjectCount++;
       });
 
       const averageScore = offeredSubjects.length > 0 ? Math.round((totalScore / offeredSubjects.length) * 10) / 10 : 0;
+      const overallGrade = calculateGradeFromRanges(averageScore, gradingScaleData.ranges);
+
+      const s = e.student;
+      const p = s.parent;
 
       return {
         studentId: sId,
-        firstName: e.student.firstName,
-        lastName: e.student.lastName,
-        registerNo: e.student.registerNo,
+        firstName: s.firstName,
+        lastName: s.lastName,
+        name: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
+        registerNo: s.registerNo || 'N/A',
         rollNo: e.roll,
+        gender: s.gender || 'N/A',
         sectionName: e.section?.name || 'Main',
         marks: studentMarks,
+        subjectScores: studentMarks,
+        subjectBreakdowns,
+        subjectGrades,
         totalScore,
         averageScore,
+        grade: overallGrade.grade,
+        gradeRemark: overallGrade.remark,
+        gradeColor: overallGrade.color,
         attendanceRate: attendanceSummary[sId]?.rate ?? 100,
-        parentName: e.student.parent?.name || 'N/A',
-        parentPhone: e.student.parent?.mobileno || 'N/A',
+        // Credential details
+        studentUsername: s.user?.username || `${(s.firstName || '').toLowerCase()}.${(s.lastName || '').toLowerCase()}`,
+        studentPassword: s.user?.rawPassword || 'Pass@123',
+        userActive: s.user?.active ?? true,
+        lastLogin: s.user?.lastLogin || null,
+        parentName: p?.name || 'N/A',
+        parentPhone: p?.mobileno || 'N/A',
+        parentEmail: p?.email || 'N/A',
+        parentUsername: p?.user?.username || null,
+        parentPassword: p?.user?.rawPassword || 'Pass@123',
       };
     });
 
@@ -3478,6 +3588,55 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       : 0;
     const highestTotalScore = rankedRows[0]?.totalScore || 0;
     const lowestTotalScore = rankedRows[totalStudents - 1]?.totalScore || 0;
+    const passCount = rankedRows.filter((r) => r.averageScore >= 50).length;
+    const passRate = totalStudents > 0 ? Math.round((passCount / totalStudents) * 100) : 0;
+
+    // Grade distribution counts
+    const gradeDistribution: Record<string, number> = {
+      A: 0,
+      B: 0,
+      C: 0,
+      D: 0,
+      F: 0,
+    };
+    rankedRows.forEach((r) => {
+      const g = (r.grade || 'F').toUpperCase();
+      if (gradeDistribution[g] !== undefined) {
+        gradeDistribution[g]++;
+      } else {
+        gradeDistribution.F++;
+      }
+    });
+
+    // Top performers (Honor Roll / Podium)
+    const topPerformers = rankedRows.slice(0, 3).map((r) => ({
+      position: r.position,
+      studentId: r.studentId,
+      name: r.name,
+      registerNo: r.registerNo,
+      totalScore: r.totalScore,
+      averageScore: r.averageScore,
+      grade: r.grade,
+      gradeColor: r.gradeColor,
+    }));
+
+    // Subject difficulty & average breakdown
+    const subjectStats = offeredSubjects.map((sub) => {
+      const scores = rankedRows.map((r) => r.marks[sub.id] || 0);
+      const subTotal = scores.reduce((a, b) => a + b, 0);
+      const avg = totalStudents > 0 ? Math.round((subTotal / totalStudents) * 10) / 10 : 0;
+      const highest = scores.length > 0 ? Math.max(...scores) : 0;
+      const subPassCount = scores.filter((s) => s >= 50).length;
+      const subPassRate = totalStudents > 0 ? Math.round((subPassCount / totalStudents) * 100) : 0;
+      return {
+        subjectId: sub.id,
+        name: sub.name,
+        code: sub.code,
+        average: avg,
+        highest,
+        passRate: subPassRate,
+      };
+    });
 
     const summaryPayload = {
       id: cls.id,
@@ -3490,30 +3649,56 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       classAverage: overallClassAverage,
       highestScore: highestTotalScore,
       lowestScore: lowestTotalScore,
+      passRate,
+      passCount,
     };
-
-    const offeredSubjectsPayload = cls.subjects.map((s) => ({
-      id: s.subject.id,
-      name: s.subject.name,
-      code: s.subject.subjectCode,
-      subjectCode: s.subject.subjectCode,
-    }));
 
     return res.json({
       success: true,
       classInfo: summaryPayload,
       classSummary: summaryPayload,
-      offeredSubjects: offeredSubjectsPayload,
-      tabulation: rankedRows.map((r) => ({
-        ...r,
-        name: `${r.firstName} ${r.lastName}`,
-        subjectScores: r.marks,
-      })),
+      selectedExamId,
+      exams,
+      evaluationMatrix: matrix
+        ? {
+            id: matrix.id,
+            name: matrix.name,
+            code: matrix.code,
+            totalMarks: Number(matrix.totalMarks) || 100,
+            components: matrixComponents,
+          }
+        : null,
+      gradingScale: {
+        id: gradingScaleData.id,
+        name: gradingScaleData.name,
+        ranges: gradingScaleData.ranges,
+      },
+      offeredSubjects,
+      tabulation: rankedRows,
+      performance: {
+        totalStudents,
+        classAverage: overallClassAverage,
+        highestScore: highestTotalScore,
+        lowestScore: lowestTotalScore,
+        passCount,
+        passRate,
+        gradeDistribution,
+        topPerformers,
+        subjectStats,
+      },
       attendanceOverview: {
-        totalDaysRecorded: attendances.length > 0 ? new Set(attendances.map((a: any) => (a.attendanceDate ? new Date(a.attendanceDate).toISOString().split('T')[0] : ''))).size : 0,
-        averageAttendanceRate: totalStudents > 0
-          ? Math.round(Object.values(attendanceSummary).reduce((a, b) => a + b.rate, 0) / totalStudents)
-          : 100,
+        totalDaysRecorded:
+          attendances.length > 0
+            ? new Set(
+                attendances.map((a: any) =>
+                  a.attendanceDate ? new Date(a.attendanceDate).toISOString().split('T')[0] : ''
+                )
+              ).size
+            : 0,
+        averageAttendanceRate:
+          totalStudents > 0
+            ? Math.round(Object.values(attendanceSummary).reduce((a, b) => a + b.rate, 0) / totalStudents)
+            : 100,
       },
     });
   } catch (error: any) {
@@ -3521,6 +3706,269 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
     return res.status(500).json({ success: false, message: error.message || 'Failed to generate class reports.' });
   }
 }
+
+/**
+ * GET /api/teacher/class-credentials
+ * Allows teachers to view login usernames and passwords for students in their assigned classes.
+ */
+export async function getTeacherClassCredentials(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId: reqClassId, sectionId: reqSectionId } = req.query;
+
+  if (!reqClassId) {
+    return res.status(400).json({ success: false, message: 'classId is required.' });
+  }
+
+  const classId = Number(reqClassId);
+  const sectionId = reqSectionId ? Number(reqSectionId) : null;
+
+  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId, req);
+  if (!hasAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to view credentials for this class.',
+    });
+  }
+
+  try {
+    const cls = await prisma.class.findUnique({
+      where: { id: classId },
+      include: { sections: { include: { section: true } } },
+    });
+
+    if (!cls) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const enrollWhere: any = {
+      classId,
+      isAlumni: 0,
+      student: { active: true },
+      sessionId,
+      ...(branchId ? { branchId } : {}),
+    };
+    if (sectionId) enrollWhere.sectionId = sectionId;
+
+    let enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          include: {
+            user: { select: { username: true, rawPassword: true, active: true, lastLogin: true } },
+            parent: {
+              include: {
+                user: { select: { username: true, rawPassword: true, active: true } },
+              },
+            },
+          },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
+        where: {
+          classId,
+          isAlumni: 0,
+          student: { active: true },
+          ...(sectionId ? { sectionId } : {}),
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          student: {
+            include: {
+              user: { select: { username: true, rawPassword: true, active: true, lastLogin: true } },
+              parent: {
+                include: {
+                  user: { select: { username: true, rawPassword: true, active: true } },
+                },
+              },
+            },
+          },
+          section: { select: { id: true, name: true } },
+        },
+        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+      });
+    }
+
+    const credentials = enrolls.map((e) => {
+      const s = e.student;
+      const p = s.parent;
+      return {
+        studentId: s.id,
+        rollNo: e.roll,
+        name: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
+        firstName: s.firstName,
+        lastName: s.lastName,
+        registerNo: s.registerNo || 'N/A',
+        gender: s.gender || 'N/A',
+        className: cls.name,
+        sectionName: e.section?.name || 'Main',
+        studentUsername: s.user?.username || `${(s.firstName || '').toLowerCase()}.${(s.lastName || '').toLowerCase()}`,
+        studentPassword: s.user?.rawPassword || 'Pass@123',
+        userActive: s.user?.active ?? true,
+        lastLogin: s.user?.lastLogin || null,
+        parentName: p?.name || 'N/A',
+        parentPhone: p?.mobileno || 'N/A',
+        parentEmail: p?.email || 'N/A',
+        parentRelation: p?.relation || 'Parent',
+        parentUsername: p?.user?.username || null,
+        parentPassword: p?.user?.rawPassword || 'Pass@123',
+      };
+    });
+
+    return res.json({
+      success: true,
+      classInfo: {
+        id: cls.id,
+        name: cls.name,
+        sectionId,
+        sectionName: sectionId
+          ? cls.sections.find((s) => s.sectionId === sectionId)?.section?.name || 'Section'
+          : 'All Sections',
+        totalStudents: credentials.length,
+      },
+      credentials,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Fetch class credentials error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to fetch student credentials.' });
+  }
+}
+
+/**
+ * GET /api/teacher/class-credentials/export-pdf
+ * Generates an official PDF batch login slip for all students in the assigned class.
+ */
+export async function exportTeacherClassCredentialsPdf(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId: reqClassId, sectionId: reqSectionId } = req.query;
+
+  if (!reqClassId) {
+    return res.status(400).json({ success: false, message: 'classId is required.' });
+  }
+
+  const classId = Number(reqClassId);
+  const sectionId = reqSectionId ? Number(reqSectionId) : null;
+
+  const hasAccess = await hasClassAccess(prisma, req.teacherId, classId, sectionId, req);
+  if (!hasAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to export credentials for this class.',
+    });
+  }
+
+  try {
+    const cls = await prisma.class.findUnique({
+      where: { id: classId },
+      include: { sections: { include: { section: true } } },
+    });
+
+    if (!cls) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    const branch = branchId ? await prisma.branch.findUnique({ where: { id: branchId } }) : null;
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const enrollWhere: any = {
+      classId,
+      isAlumni: 0,
+      student: { active: true },
+      sessionId,
+      ...(branchId ? { branchId } : {}),
+    };
+    if (sectionId) enrollWhere.sectionId = sectionId;
+
+    let enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          include: {
+            user: { select: { username: true, rawPassword: true } },
+            parent: {
+              include: {
+                user: { select: { username: true, rawPassword: true } },
+              },
+            },
+          },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    if (enrolls.length === 0) {
+      enrolls = await prisma.enroll.findMany({
+        where: {
+          classId,
+          isAlumni: 0,
+          student: { active: true },
+          ...(sectionId ? { sectionId } : {}),
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          student: {
+            include: {
+              user: { select: { username: true, rawPassword: true } },
+              parent: {
+                include: {
+                  user: { select: { username: true, rawPassword: true } },
+                },
+              },
+            },
+          },
+          section: { select: { id: true, name: true } },
+        },
+        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+      });
+    }
+
+    const slips = enrolls.map((e) => {
+      const s = e.student;
+      const p = s.parent;
+      return {
+        studentName: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
+        registerNo: s.registerNo || '',
+        studentUsername: s.user?.username || `${(s.firstName || '').toLowerCase()}.${(s.lastName || '').toLowerCase()}`,
+        studentPassword: s.user?.rawPassword || 'Pass@123',
+        parentName: p ? p.name : '',
+        parentRelation: p ? p.relation : 'Parent',
+        parentUsername: p?.user?.username || null,
+        parentPassword: p?.user?.rawPassword || 'Pass@123',
+        isExistingParent: false,
+      };
+    });
+
+    const targetSection = sectionId ? cls.sections.find((s) => s.sectionId === sectionId)?.section : null;
+
+    const pdfBuffer = await generateBatchClassCredentialSlipsPdf({
+      schoolName: branch?.name || 'Ugbekun Academy',
+      branchCode: branch?.code || '',
+      className: cls.name,
+      sectionName: targetSection ? targetSection.name : 'All Sections',
+      slips,
+      loginUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
+    });
+
+    const safeClassName = cls.name.replace(/\s+/g, '_');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=Batch_Login_Slips_${safeClassName}.pdf`);
+    return res.send(pdfBuffer);
+  } catch (error: any) {
+    console.error('[TEACHER] Export batch credentials PDF error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate batch login slips PDF.' });
+  }
+}
+
 
 
 
