@@ -531,6 +531,16 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
       orderBy: { name: 'asc' },
     });
 
+    const classPubs = await prisma.classReportCardPublication.findMany({
+      where: {
+        sessionId,
+        isPublished: true,
+        ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+      },
+      select: { classId: true, sectionId: true },
+    });
+    const publishedClassIds = new Set(classPubs.map((p) => p.classId));
+
     const formatted = classes.map((c) => {
       const secMap: Record<number, any> = {};
       c.sections.forEach((s) => {
@@ -553,6 +563,7 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
         id: c.id,
         name: c.name,
         isEcd: c.isEcd || false,
+        isPublished: publishedClassIds.has(c.id),
         totalEnrolled: c.enrolls.length,
         sections: Object.values(secMap),
       };
@@ -889,11 +900,25 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       };
     });
 
+    const classPub = await prisma.classReportCardPublication.findFirst({
+      where: {
+        classId: parsedClassId,
+        sessionId,
+        ...(parsedSectionId ? { OR: [{ sectionId: parsedSectionId }, { sectionId: null }] } : {}),
+        ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+        isPublished: true,
+      },
+    });
+    const isPublished = Boolean(classPub);
+
     return res.json({
       success: true,
       sessionId,
       className: cls?.name || 'Classroom',
+      classId: parsedClassId,
+      sectionId: parsedSectionId,
       isEcd: cls?.isEcd || false,
+      isPublished,
       totalStudents: studentList.length,
       students: studentList,
     });
@@ -1671,5 +1696,216 @@ export async function batchSaveCommentary(req: Request, res: Response): Promise<
   } catch (err) {
     console.error('[ADMIN] Batch save commentary error:', err);
     return res.status(500).json({ success: false, message: 'Failed to batch save commentary.' });
+  }
+}
+
+/**
+ * GET /api/admin/report-cards/publish-status
+ */
+export async function getReportCardPublishStatus(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { sessionId: reqSessionId, classId, sectionId } = (req.query || {}) as any;
+
+  try {
+    const sessionId = await resolveReportCardSession(branchId, reqSessionId);
+
+    // If checking for a specific class
+    if (classId) {
+      const parsedClassId = Number(classId);
+      const parsedSectionId = sectionId ? Number(sectionId) : null;
+      const classPub = await prisma.classReportCardPublication.findFirst({
+        where: {
+          classId: parsedClassId,
+          sessionId,
+          ...(parsedSectionId ? { OR: [{ sectionId: parsedSectionId }, { sectionId: null }] } : {}),
+          ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+          isPublished: true,
+        },
+      });
+
+      const cls = await prisma.class.findUnique({
+        where: { id: parsedClassId },
+        select: { name: true },
+      });
+
+      return res.json({
+        success: true,
+        sessionId,
+        classId: parsedClassId,
+        className: cls?.name || 'Class',
+        isPublished: Boolean(classPub),
+      });
+    }
+
+    // Session-wide overview of all published classes
+    const [allClasses, publishedPubs] = await Promise.all([
+      prisma.class.findMany({
+        where: { ...(branchId ? { branchId } : {}) },
+        select: { id: true, name: true },
+      }),
+      prisma.classReportCardPublication.findMany({
+        where: {
+          sessionId,
+          isPublished: true,
+          ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+        },
+        select: { classId: true },
+      }),
+    ]);
+
+    const publishedClassSet = new Set(publishedPubs.map((p) => p.classId));
+    const publishedClassesCount = allClasses.filter((c) => publishedClassSet.has(c.id)).length;
+    const isSessionFullyPublished = allClasses.length > 0 && publishedClassesCount === allClasses.length;
+
+    return res.json({
+      success: true,
+      sessionId,
+      isPublished: publishedClassesCount > 0,
+      isFullyPublished: isSessionFullyPublished,
+      publishedClassesCount,
+      totalClassesCount: allClasses.length,
+      classes: allClasses.map((c) => ({
+        id: c.id,
+        name: c.name,
+        isPublished: publishedClassSet.has(c.id),
+      })),
+    });
+  } catch (err) {
+    console.error('[ADMIN] Get publish status error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve report card publication status.' });
+  }
+}
+
+/**
+ * POST /api/admin/report-cards/toggle-publish
+ * Solely accessible by School Admin
+ */
+export async function togglePublishReportCards(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const adminUserId = req.userId;
+  const { classId, sectionId, sessionId: reqSessionId, publish, publishAllClasses } = req.body || {};
+
+  try {
+    const publishValue = Boolean(publish);
+    const sessionId = await resolveReportCardSession(branchId, reqSessionId);
+
+    // Option A: Admin chooses to bulk publish/unpublish ALL classes in the session
+    if (publishAllClasses) {
+      const allClasses = await prisma.class.findMany({
+        where: { ...(branchId ? { branchId } : {}) },
+        select: { id: true },
+      });
+
+      for (const cls of allClasses) {
+        const existing = await prisma.classReportCardPublication.findFirst({
+          where: {
+            classId: cls.id,
+            sessionId,
+            ...(branchId ? { branchId } : {}),
+          },
+        });
+
+        if (existing) {
+          await prisma.classReportCardPublication.update({
+            where: { id: existing.id },
+            data: {
+              isPublished: publishValue,
+              publishedBy: adminUserId || null,
+              publishedAt: new Date(),
+            },
+          });
+        } else {
+          await prisma.classReportCardPublication.create({
+            data: {
+              classId: cls.id,
+              sessionId,
+              branchId: branchId || null,
+              isPublished: publishValue,
+              publishedBy: adminUserId || null,
+              publishedAt: new Date(),
+            },
+          });
+        }
+      }
+
+      // Also sync exam table publishResult for global compatibility
+      await prisma.exam.updateMany({
+        where: {
+          sessionId,
+          ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+        },
+        data: {
+          publishResult: publishValue ? 1 : 0,
+        },
+      });
+
+      const actionText = publishValue ? 'published to students & parents' : 'returned to moderation/draft mode';
+      return res.json({
+        success: true,
+        isPublished: publishValue,
+        scope: 'all_classes',
+        message: 'Report cards for ALL ' + allClasses.length + ' classes successfully ' + actionText + '.',
+      });
+    }
+
+    // Option B: Admin publishes/unpublishes specifically for a single class
+    if (!classId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please select a specific Class to publish, or choose publishAllClasses.',
+      });
+    }
+
+    const parsedClassId = Number(classId);
+    const parsedSectionId = sectionId ? Number(sectionId) : null;
+
+    const existing = await prisma.classReportCardPublication.findFirst({
+      where: {
+        classId: parsedClassId,
+        sessionId,
+        ...(parsedSectionId ? { sectionId: parsedSectionId } : {}),
+        ...(branchId ? { branchId } : {}),
+      },
+    });
+
+    if (existing) {
+      await prisma.classReportCardPublication.update({
+        where: { id: existing.id },
+        data: {
+          isPublished: publishValue,
+          publishedBy: adminUserId || null,
+          publishedAt: new Date(),
+        },
+      });
+    } else {
+      await prisma.classReportCardPublication.create({
+        data: {
+          classId: parsedClassId,
+          sectionId: parsedSectionId,
+          sessionId,
+          branchId: branchId || null,
+          isPublished: publishValue,
+          publishedBy: adminUserId || null,
+          publishedAt: new Date(),
+        },
+      });
+    }
+
+    const cls = await prisma.class.findUnique({
+      where: { id: parsedClassId },
+      select: { name: true },
+    });
+
+    const actionText = publishValue ? 'published to students & parents' : 'returned to draft mode';
+    return res.json({
+      success: true,
+      isPublished: publishValue,
+      classId: parsedClassId,
+      className: cls?.name || 'Class',
+      message: 'Report cards for ' + (cls?.name || 'Class') + ' successfully ' + actionText + '. Other classes remain unaffected.',
+    });
+  } catch (err) {
+    console.error('[ADMIN] Toggle class publish error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to update class publication status.' });
   }
 }

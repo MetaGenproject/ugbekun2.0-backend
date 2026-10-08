@@ -94,16 +94,38 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       })),
     };
 
-    // 3. Grades / Average / Rank
+    // 3. Grades / Average / Rank (Gated by School Admin's Per-Class Publication)
     let overallAverage = 0;
     let rank = null;
     let totalClassStudents = fellowStudentsCount;
     let subjectPerformance: any[] = [];
 
-    const studentMarks = await prisma.mark.findMany({
-      where: { studentId: req.studentId, sessionId: req.sessionId, branchId: req.branchId },
-      include: { subject: { select: { name: true } } },
-    });
+    let isClassPublished = false;
+    if (req.classId && req.sessionId) {
+      const classPub = await prisma.classReportCardPublication.findFirst({
+        where: {
+          classId: req.classId,
+          sessionId: req.sessionId,
+          ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
+          isPublished: true,
+        },
+      });
+      isClassPublished = Boolean(classPub);
+    }
+
+    const studentMarks = isClassPublished
+      ? await prisma.mark.findMany({
+          where: {
+            studentId: req.studentId,
+            sessionId: req.sessionId,
+            branchId: req.branchId,
+          },
+          include: {
+            subject: { select: { name: true } },
+            exam: { select: { publishResult: true } },
+          },
+        })
+      : [];
 
     if (studentMarks.length > 0) {
       let totalScoreSum = 0;
@@ -139,7 +161,11 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
 
         if (studentIds.length > 0) {
           const allMarks = await prisma.mark.findMany({
-            where: { studentId: { in: studentIds }, sessionId: req.sessionId, branchId: req.branchId },
+            where: {
+              studentId: { in: studentIds },
+              sessionId: req.sessionId,
+              branchId: req.branchId,
+            },
             select: { studentId: true, mark: true, cbtMark: true },
           });
           const agg: Record<string, any> = {};
@@ -427,11 +453,12 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       success: true,
       profile,
       kpi: {
-        averageScore: overallAverage,
-        classRank: rank,
+        averageScore: (isClassPublished && studentMarks.length > 0) ? overallAverage : null,
+        classRank: (isClassPublished && studentMarks.length > 0) ? rank : null,
         totalClassStudents,
         attendancePercentage: attendancePct,
         behaviourRating: attendancePct >= 90 ? 'Excellent' : attendancePct >= 75 ? 'Good' : 'Fair',
+        resultsPublished: isClassPublished && studentMarks.length > 0,
       },
       attendance,
       todayTimetable,

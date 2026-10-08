@@ -1264,10 +1264,12 @@ export async function getCbtQuestionBank(req: Request, res: Response): Promise<R
   const branchId = req.branchId;
 
   try {
-    const { subjectId, classId, search, termName, topic, page = 1, limit = 50, status, questionType, sourceType, category } = req.query;
-    const p = parseInt(page as string, 10);
-    const l = parseInt(limit as string, 10);
-    const skip = (p - 1) * l;
+    const { subjectId, classId, search, termName, topic, page = 1, limit, status, questionType, sourceType, category } = req.query;
+    const isAll = limit === "all" || limit === "0";
+    const parsedLimit = limit ? parseInt(limit as string, 10) : 5000;
+    const l = isAll ? undefined : (isNaN(parsedLimit) ? 5000 : parsedLimit);
+    const p = Math.max(1, parseInt(page as string, 10) || 1);
+    const skip = isAll || !l ? undefined : (p - 1) * l;
 
     const where: any = { branchId };
     if (subjectId) where.subjectId = Number(subjectId);
@@ -1290,8 +1292,8 @@ export async function getCbtQuestionBank(req: Request, res: Response): Promise<R
           class: { select: { id: true, name: true } },
         },
         orderBy: { createdAt: 'desc' },
-        skip,
-        take: l,
+        ...(skip !== undefined ? { skip } : {}),
+        ...(l !== undefined ? { take: l } : {}),
       }),
       prisma.questionBank.count({ where }),
     ]);
@@ -1302,9 +1304,9 @@ export async function getCbtQuestionBank(req: Request, res: Response): Promise<R
       total,
       pagination: {
         page: p,
-        limit: l,
+        limit: l || total,
         total,
-        totalPages: Math.ceil(total / l),
+        totalPages: l ? Math.ceil(total / l) : 1,
       },
     });
   } catch (error) {

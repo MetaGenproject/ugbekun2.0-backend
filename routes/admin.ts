@@ -236,6 +236,8 @@ import {
   generateAiComments,
   batchGenerateCommentary,
   batchSaveCommentary,
+  getReportCardPublishStatus,
+  togglePublishReportCards,
 } from '../controllers/admin/adminMarksReportController';
 
 import {
@@ -613,6 +615,8 @@ router.post('/report-cards/behavioral', saveReportCardBehavioral);
 router.post('/report-cards/ai-comments', generateAiComments);
 router.post('/report-cards/batch-generate-commentary', batchGenerateCommentary);
 router.post('/report-cards/batch-save-commentary', batchSaveCommentary);
+router.get('/report-cards/publish-status', getReportCardPublishStatus);
+router.post('/report-cards/toggle-publish', togglePublishReportCards);
 
 // ============================================================================
 // 8. FINANCES, INVOICES, PAYMENTS, VOUCHERS & BANK

@@ -156,6 +156,33 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       isEcdClass = !!clsInfo?.isEcd;
     }
 
+    // Per-Class Publication Gating: Verify if the School Admin has released this specific class
+    let isClassPublished = false;
+    if (req.classId && req.sessionId) {
+      const classPub = await prisma.classReportCardPublication.findFirst({
+        where: {
+          classId: req.classId,
+          sessionId: req.sessionId,
+          ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
+          isPublished: true,
+        },
+      });
+      isClassPublished = Boolean(classPub);
+    }
+
+    if (!isClassPublished) {
+      return res.json({
+        success: true,
+        isPublished: false,
+        reportCard: [],
+        overallAverage: null,
+        commentary: null,
+        rank: null,
+        totalClassStudents: 0,
+        message: 'Official report cards for your class have not been released yet by the school administration.',
+      });
+    }
+
     if (isEcdClass) {
       const assessment = await prisma.montessoriAssessment.findFirst({
         where: {
@@ -166,23 +193,14 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
           branchId: req.branchId,
         },
         include: {
-          exam: { select: { name: true } },
+          exam: { select: { name: true, publishResult: true } },
         },
       });
       return res.json({
         success: true,
         isEcd: true,
-        assessment: assessment || {
-          writingMastery: '',
-          drawingCapability: '',
-          physicalCoordination: '',
-          motorSkillProgression: '',
-          generalPunctuality: '',
-          peerRespect: '',
-          aestheticNeatness: '',
-          activeGroupParticipation: '',
-          narrativeComment: '',
-        },
+        isPublished: true,
+        assessment: assessment || null,
       });
     }
 
@@ -195,7 +213,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
-        exam: { select: { id: true, name: true } },
+        exam: { select: { id: true, name: true, publishResult: true } },
       },
     });
 
@@ -203,7 +221,10 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
     // find their latest available session marks
     if (studentMarks.length === 0) {
       const pastMark = await prisma.mark.findFirst({
-        where: { studentId: req.studentId, branchId: req.branchId },
+        where: {
+          studentId: req.studentId,
+          branchId: req.branchId,
+        },
         orderBy: { sessionId: 'desc' },
         select: { sessionId: true },
       });
@@ -217,14 +238,32 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
           },
           include: {
             subject: { select: { id: true, name: true, subjectCode: true } },
-            exam: { select: { id: true, name: true } },
+            exam: { select: { id: true, name: true, publishResult: true } },
           },
         });
       }
     }
 
     if (studentMarks.length === 0) {
-      return res.json({ success: true, reportCard: [], overallAverage: 0, commentary: null });
+      const commentary = await prisma.studentCommentary.findFirst({
+        where: {
+          studentId: req.studentId,
+          sessionId: activeSessionId,
+          status: 'PRINCIPAL_SIGNED_OFF',
+        },
+        select: { remark: true },
+      });
+
+      return res.json({
+        success: true,
+        isPublished: true,
+        reportCard: [],
+        overallAverage: null,
+        commentary: commentary?.remark || null,
+        rank: null,
+        totalClassStudents: 0,
+        message: 'Report cards are published. No subject scores recorded yet for this session.',
+      });
     }
 
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
@@ -350,6 +389,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
 
     return res.json({
       success: true,
+      isPublished: true,
       reportCard,
       overallAverage,
       commentary: commentary?.remark || null,
@@ -369,6 +409,27 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
   try {
     const { rankingType = 'full', rankingLimit = 3 } = req.query as any;
     const limit = parseInt(rankingLimit as string, 10) || 3;
+
+    // Per-Class Publication Gating: Prevent direct PDF download if class is not released
+    let isClassPublished = false;
+    if (req.classId && req.sessionId) {
+      const classPub = await prisma.classReportCardPublication.findFirst({
+        where: {
+          classId: req.classId,
+          sessionId: req.sessionId,
+          ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
+          isPublished: true,
+        },
+      });
+      isClassPublished = Boolean(classPub);
+    }
+
+    if (!isClassPublished) {
+      return res.status(403).json({
+        success: false,
+        message: 'Official report cards for your class have not been published yet by the school administration.',
+      });
+    }
 
     let isEcdClass = false;
     let clsInfo = null;
@@ -429,9 +490,16 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
           ...(examIdVal ? { examId: examIdVal } : {}),
         },
         include: {
-          exam: { select: { name: true, resumptionDate: true } },
+          exam: { select: { name: true, resumptionDate: true, publishResult: true } },
         },
       });
+
+      if (!assessment) {
+        return res.status(404).json({
+          success: false,
+          message: 'No Montessori assessment recorded yet for this student.',
+        });
+      }
 
       const examName = assessment?.exam?.name || 'Term Evaluation';
       const resumptionDate = assessment?.exam?.resumptionDate || null;
@@ -506,12 +574,15 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       },
       include: {
         subject: { select: { name: true, subjectCode: true } },
-        exam: { select: { name: true, resumptionDate: true } },
+        exam: { select: { name: true, resumptionDate: true, publishResult: true } },
       },
     });
 
     if (studentMarks.length === 0) {
-      return res.status(400).json({ success: false, message: 'No grade records found to export.' });
+      return res.status(404).json({
+        success: false,
+        message: 'No subject marks recorded yet for this student in the published session.',
+      });
     }
 
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
