@@ -54,6 +54,7 @@ import {
   gradeOnlineExamSubmission,
   updateOnlineExam,
   deleteOnlineExam,
+  extendCbtDistributionDate,
   scanGrades,
   getScanRecord,
   commitScanRecord,
@@ -185,6 +186,8 @@ router.get('/online-exams/:id/submissions', getOnlineExamSubmissions);
 router.post('/online-exams/submissions/:id/grade', gradeOnlineExamSubmission);
 router.put('/online-exams/:id', updateOnlineExam);
 router.delete('/online-exams/:id', deleteOnlineExam);
+router.post('/cbt/distributions/:id/extend-date', extendCbtDistributionDate);
+router.post('/cbt/distributions/:id/reschedule', extendCbtDistributionDate);
 
 // Question Bank
 router.get('/question-bank', getQuestionBank);

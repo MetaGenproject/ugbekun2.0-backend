@@ -6,15 +6,65 @@ import { examWindowMessage, examWindowStatus } from '../../lib/examWindow';
 import { companionExamKey, findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
 import { DEFAULT_CBT_SCALE, recordCbtPercentageOnMarksheet } from '../../lib/cbtMarkRecord';
 
+function normalizeSession(str?: string | null): string {
+  if (!str) return '';
+  return str.trim().replace('/', '-');
+}
+
+function resolveSessionForExam(date: Date | null, sessionId: number | null, sessionById: Map<number, string>, defaultSession: string): string {
+  if (sessionId && sessionById.has(sessionId)) {
+    return sessionById.get(sessionId)!;
+  }
+  if (date) {
+    const d = new Date(date);
+    if (!isNaN(d.getTime())) {
+      const year = d.getFullYear();
+      const month = d.getMonth() + 1;
+      const startYear = month >= 8 ? year : year - 1;
+      return `${startYear}-${startYear + 1}`;
+    }
+  }
+  return defaultSession;
+}
+
+function detectExamType(title: string): string {
+  const lower = (title || '').toLowerCase();
+  if (lower.includes('ca 1') || lower.includes('ca1') || lower.includes('first ca') || lower.includes('1st ca') || lower.includes('test 1')) return 'CA 1';
+  if (lower.includes('ca 2') || lower.includes('ca2') || lower.includes('second ca') || lower.includes('2nd ca') || lower.includes('test 2')) return 'CA 2';
+  if (lower.includes('mid') && (lower.includes('term') || lower.includes('exam') || lower.includes('test'))) return 'Mid-Term Exam';
+  if (lower.includes('mock') || lower.includes('practice')) return 'Mock / Practice';
+  if (lower.includes('exam') || lower.includes('terminal') || lower.includes('end of term') || lower.includes('final')) return 'Terminal Exam';
+  return 'General Assessment';
+}
+
 /**
  * GET /api/student/cbt/active-exams
+ * Query parameters:
+ *  - session: string (e.g. "2026-2027", "2025-2026", or "all")
+ *  - examType: string (e.g. "CA 1", "Mid-Term Exam", "all")
  */
 export async function getActiveCbtExams(req: Request, res: Response): Promise<Response | void> {
   try {
     const classId = req.classId;
     if (!classId) {
-      return res.json({ success: true, exams: [] });
+      return res.json({ success: true, exams: [], availableSessions: [], availableExamTypes: [] });
     }
+
+    // Resolve branch current session and system settings
+    const branchSetting = await prisma.systemSetting.findFirst({
+      where: { branchId: req.branchId },
+      select: { academicSession: true, currentTerm: true },
+    });
+    const currentSessionRaw = branchSetting?.academicSession || '2026-2027';
+    const currentSession = normalizeSession(currentSessionRaw);
+    const currentTerm = branchSetting?.currentTerm || 'First Term';
+
+    // Retrieve recorded school years to map session IDs and offer past session archives
+    const schoolYears = await prisma.schoolYear.findMany({
+      select: { id: true, schoolYear: true },
+      orderBy: { id: 'desc' },
+    });
+    const sessionById = new Map<number, string>(schoolYears.map((s) => [s.id, normalizeSession(s.schoolYear)]));
 
     const onlineExams = await prisma.onlineExam.findMany({
       where: { classId, branchId: req.branchId },
@@ -75,6 +125,11 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
         const sub = companion ? subMap[companion.id] : undefined;
         const qCount = Array.isArray(dist.group?.questionIds) ? (dist.group.questionIds as any[]).length : 10;
         const windowStatus = examWindowStatus(dist.startDate, dist.endDate);
+        const examDate = dist.startDate || dist.createdAt;
+        const examSession = resolveSessionForExam(examDate, companion?.sessionId || null, sessionById, currentSession);
+        const isCurrentSession = normalizeSession(examSession) === currentSession;
+        const examType = detectExamType(dist.title);
+
         return {
           id: dist.id,
           sourceType: 'distribution',
@@ -92,8 +147,13 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
           submittedAt: sub?.submittedAt || null,
           startDate: dist.startDate,
           endDate: dist.endDate,
+          createdAt: dist.createdAt,
           windowStatus,
           windowMessage: examWindowMessage(windowStatus, dist.startDate, dist.endDate),
+          academicSession: examSession,
+          isCurrentSession,
+          examType,
+          isExpired: windowStatus === 'ended',
         };
       }),
       ...onlineExams
@@ -102,6 +162,11 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
         const sub = subMap[ex.id];
         const questions = Array.isArray(ex.questions) ? ex.questions : [];
         const windowStatus = examWindowStatus(ex.examDate, null);
+        const examDate = ex.examDate || ex.createdAt;
+        const examSession = resolveSessionForExam(examDate, ex.sessionId, sessionById, currentSession);
+        const isCurrentSession = normalizeSession(examSession) === currentSession;
+        const examType = detectExamType(ex.title);
+
         return {
           id: ex.id,
           sourceType: 'online_exam',
@@ -119,15 +184,58 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
           submittedAt: sub?.submittedAt || null,
           startDate: ex.examDate,
           endDate: null,
+          createdAt: ex.createdAt,
           windowStatus,
           windowMessage: examWindowMessage(windowStatus, ex.examDate, null),
+          academicSession: examSession,
+          isCurrentSession,
+          examType,
+          isExpired: windowStatus === 'ended',
         };
       }),
     ];
 
+    // Optional query filtering
+    const querySession = req.query.session ? String(req.query.session).trim() : null;
+    const queryExamType = req.query.examType ? String(req.query.examType).trim() : null;
+
+    let resultList = formattedList;
+    if (querySession && querySession !== 'all' && querySession !== 'ALL') {
+      const normQuery = normalizeSession(querySession);
+      resultList = resultList.filter((e) => normalizeSession(e.academicSession) === normQuery);
+    }
+    if (queryExamType && queryExamType !== 'all' && queryExamType !== 'All Types') {
+      resultList = resultList.filter((e) => e.examType === queryExamType);
+    }
+
+    // Available sessions list (current session first, then other school years)
+    const distinctSessions = Array.from(
+      new Set([
+        currentSession,
+        ...formattedList.map((e) => e.academicSession),
+        ...schoolYears.map((s) => normalizeSession(s.schoolYear)),
+      ])
+    ).filter(Boolean);
+
+    const availableExamTypes = [
+      'All Types',
+      'CA 1',
+      'CA 2',
+      'Mid-Term Exam',
+      'Terminal Exam',
+      'Mock / Practice',
+      'General Assessment',
+    ];
+
     return res.json({
       success: true,
-      exams: formattedList,
+      currentSession,
+      currentTerm,
+      availableSessions: distinctSessions,
+      availableExamTypes,
+      exams: resultList,
+      totalCount: formattedList.length,
+      currentSessionCount: formattedList.filter((e) => e.isCurrentSession).length,
     });
   } catch (error) {
     console.error('[STUDENT] Active CBT exams error:', error);

@@ -1,3 +1,4 @@
+import { findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { assertTeacherQuestionAccess, canTeacherUseClassSubject, teacherScopedContentOr } from '../../lib/teacherAccess';
@@ -460,5 +461,81 @@ export async function deleteOnlineExam(req: Request, res: Response): Promise<Res
   } catch (error) {
     console.error('[TEACHER] Delete online exam error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete online exam.' });
+  }
+}
+
+
+/**
+ * POST /api/teacher/cbt/distributions/:id/extend-date
+ * POST /api/teacher/cbt/distributions/:id/reschedule
+ * Allows the teacher in charge of the subject/class to extend the CBT sitting deadline.
+ */
+export async function extendCbtDistributionDate(req: Request, res: Response): Promise<Response | void> {
+  const distId = Number(req.params.id);
+  const { startDate, endDate } = req.body;
+
+  if (!startDate || !endDate) {
+    return res.status(400).json({ success: false, message: 'New start and end dates/times are required.' });
+  }
+
+  const parsedStart = new Date(startDate);
+  const parsedEnd = new Date(endDate);
+  if (isNaN(parsedStart.getTime()) || isNaN(parsedEnd.getTime())) {
+    return res.status(400).json({ success: false, message: 'Invalid date/time provided.' });
+  }
+  if (parsedEnd <= parsedStart) {
+    return res.status(400).json({ success: false, message: 'End date/time must be after the start date/time.' });
+  }
+
+  try {
+    const existing = await prisma.cbtDistribution.findFirst({
+      where: { id: distId, branchId: req.branchId },
+      include: { class: true, subject: true },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'CBT examination not found.' });
+    }
+
+    // Verify teacher has access to this subject and class if teacherId exists
+    const teacherId = (req as any).teacherId || (req as any).user?.teacherId;
+    if (teacherId) {
+      const allowed = await canTeacherUseClassSubject(prisma, teacherId, existing.classId, existing.subjectId);
+      if (!allowed) {
+        return res.status(403).json({ success: false, message: 'You can only extend dates for subjects assigned to you.' });
+      }
+    }
+
+    const updated = await prisma.cbtDistribution.update({
+      where: { id: distId },
+      data: {
+        startDate: parsedStart,
+        endDate: parsedEnd,
+      },
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        group: { select: { id: true, title: true, groupCode: true } },
+      },
+    });
+
+    // Also update companion online exam if present
+    const companion = await findCompanionOnlineExam(existing);
+    if (companion) {
+      await prisma.onlineExam.update({
+        where: { id: companion.id },
+        data: { examDate: parsedStart },
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'CBT assessment sitting deadline extended successfully. Students can now take this examination.',
+      distribution: updated,
+    });
+  } catch (error) {
+    console.error('[TEACHER] Extend CBT distribution date error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to extend examination deadline.' });
   }
 }
