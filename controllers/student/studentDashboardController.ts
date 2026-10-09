@@ -1,8 +1,45 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import path from 'path';
+import fs from 'fs';
 import prisma from '../../lib/prisma';
 import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
+import { uploadBase64Image } from '../../lib/cloudinary';
+
+export async function savePhoto(photoBase64?: string | null, folder: string = 'ugbekun2/students/photos'): Promise<string | null> {
+  if (!photoBase64) return null;
+  try {
+    const uploadedUrl = await uploadBase64Image(photoBase64, folder);
+    if (uploadedUrl) return uploadedUrl;
+  } catch (err: any) {
+    console.warn(`[PHOTO UPLOAD] Cloudinary upload unavailable for ${folder}, using fallback:`, err?.message);
+  }
+  if (photoBase64.startsWith('data:image/')) {
+    try {
+      const uploadDir = path.join(__dirname, '../../uploads/students');
+      if (!fs.existsSync(uploadDir)) {
+        fs.mkdirSync(uploadDir, { recursive: true });
+      }
+      const matches = photoBase64.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+      if (matches && matches.length === 3) {
+        const ext = matches[1].split('/')[1] || 'png';
+        const filename = `student_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
+        const filepath = path.join(uploadDir, filename);
+        fs.writeFileSync(filepath, Buffer.from(matches[2], 'base64'));
+        return `/uploads/students/${filename}`;
+      }
+    } catch (fsErr: any) {
+      console.warn('[PHOTO UPLOAD] Disk fallback error:', fsErr.message);
+    }
+    return photoBase64;
+  }
+  if (photoBase64.startsWith('http://') || photoBase64.startsWith('https://') || photoBase64.startsWith('/uploads/')) {
+    return photoBase64;
+  }
+  return null;
+}
+
 
 /**
  * GET /api/student/dashboard-overview
@@ -16,7 +53,10 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
     // 1. Student Profile
     const student = await prisma.student.findUnique({
       where: { id: req.studentId },
-      include: { branch: { select: { name: true } } },
+      include: {
+        branch: { select: { name: true } },
+        user: { select: { username: true } },
+      },
     });
     if (!student) {
       return res.status(404).json({ success: false, message: 'Student not found.' });
@@ -38,24 +78,68 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       ]);
       const formAlloc = await prisma.teacherAllocation.findFirst({
         where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
-        include: { teacher: { select: { name: true, email: true, phone: true } } },
+        include: { teacher: { select: { name: true, email: true, phone: true, photo: true } } },
       });
       formTeacher = formAlloc?.teacher || null;
 
       const subjectAssigns = await prisma.subjectAssign.findMany({
-        where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
-        include: { subject: { select: { id: true, name: true, subjectCode: true, subjectType: true } } },
+        where: {
+          classId: req.classId,
+          ...(req.sectionId
+            ? {
+                OR: [
+                  { sectionId: req.sectionId },
+                  { sectionId: 0 },
+                ],
+              }
+            : {}),
+          sessionId: req.sessionId,
+          ...(req.branchId ? { branchId: req.branchId } : {}),
+        },
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true, subjectType: true, subjectAuthor: true } },
+          teacher: { select: { id: true, name: true, email: true, phone: true, photo: true, department: true } },
+        },
       });
-      subjects = subjectAssigns.map((sa) => ({
-        id: sa.subject.id,
-        name: sa.subject.name,
-        code: sa.subject.subjectCode,
-        type: sa.subject.subjectType,
-      }));
+
+      const subjMap = new Map();
+      subjectAssigns.forEach((sa) => {
+        if (!sa.subject) return;
+        if (!subjMap.has(sa.subject.id)) {
+          subjMap.set(sa.subject.id, {
+            id: sa.subject.id,
+            name: sa.subject.name,
+            code: sa.subject.subjectCode,
+            type: sa.subject.subjectType || 'Core',
+            author: sa.subject.subjectAuthor || null,
+            teacher: sa.teacher
+              ? {
+                  id: sa.teacher.id,
+                  name: sa.teacher.name,
+                  email: sa.teacher.email,
+                  phone: sa.teacher.phone,
+                  photo: sa.teacher.photo,
+                  department: sa.teacher.department,
+                }
+              : null,
+          });
+        } else if (sa.teacher && !subjMap.get(sa.subject.id).teacher) {
+          subjMap.get(sa.subject.id).teacher = {
+            id: sa.teacher.id,
+            name: sa.teacher.name,
+            email: sa.teacher.email,
+            phone: sa.teacher.phone,
+            photo: sa.teacher.photo,
+            department: sa.teacher.department,
+          };
+        }
+      });
+      subjects = Array.from(subjMap.values());
     }
 
     const profile = {
       studentId: student.id,
+      username: student.user?.username || null,
       firstName: student.firstName,
       lastName: student.lastName,
       registerNo: student.registerNo,
@@ -483,7 +567,33 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
   try {
     const student = await prisma.student.findUnique({
       where: { id: req.studentId },
-      include: { branch: { select: { name: true, code: true } } },
+      include: {
+        branch: { select: { name: true, code: true } },
+        parent: {
+          select: {
+            id: true,
+            name: true,
+            relation: true,
+            fatherName: true,
+            motherName: true,
+            occupation: true,
+            income: true,
+            education: true,
+            email: true,
+            mobileno: true,
+            address: true,
+            city: true,
+            state: true,
+          },
+        },
+        user: {
+          select: {
+            id: true,
+            username: true,
+            photo: true,
+          },
+        },
+      },
     });
 
     if (!student) {
@@ -496,28 +606,29 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
     let formTeacher = null;
     let subjects: any[] = [];
 
-    if (req.classId && req.sectionId) {
+    if (req.classId) {
       classInfo = await prisma.class.findUnique({ where: { id: req.classId }, select: { name: true } });
-      sectionInfo = await prisma.section.findUnique({ where: { id: req.sectionId }, select: { name: true } });
-
-      fellowStudentsCount = await prisma.enroll.count({
-        where: {
-          classId: req.classId,
-          sectionId: req.sectionId,
-          sessionId: req.sessionId,
-          branchId: req.branchId,
-        },
-      });
+      if (req.sectionId) {
+        sectionInfo = await prisma.section.findUnique({ where: { id: req.sectionId }, select: { name: true } });
+        fellowStudentsCount = await prisma.enroll.count({
+          where: {
+            classId: req.classId,
+            sectionId: req.sectionId,
+            sessionId: req.sessionId,
+            branchId: req.branchId,
+          },
+        });
+      }
 
       const formAllocation = await prisma.teacherAllocation.findFirst({
         where: {
           classId: req.classId,
-          sectionId: req.sectionId,
+          ...(req.sectionId ? { sectionId: req.sectionId } : {}),
           sessionId: req.sessionId,
           branchId: req.branchId,
         },
         include: {
-          teacher: { select: { name: true, email: true, phone: true } },
+          teacher: { select: { id: true, name: true, email: true, phone: true, photo: true } },
         },
       });
       formTeacher = formAllocation?.teacher || null;
@@ -525,21 +636,88 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
       const subjectAssigns = await prisma.subjectAssign.findMany({
         where: {
           classId: req.classId,
-          sectionId: req.sectionId,
-          sessionId: req.sessionId,
-          branchId: req.branchId,
+          ...(req.sectionId
+            ? {
+                OR: [
+                  { sectionId: req.sectionId },
+                  { sectionId: 0 },
+                ],
+              }
+            : {}),
+          ...(req.branchId ? { branchId: req.branchId } : {}),
         },
         include: {
-          subject: { select: { id: true, name: true, subjectCode: true, subjectType: true } },
+          subject: { select: { id: true, name: true, subjectCode: true, subjectType: true, subjectAuthor: true } },
+          teacher: { select: { id: true, name: true, email: true, phone: true, photo: true, department: true } },
         },
+        orderBy: { id: 'asc' },
       });
-      subjects = subjectAssigns.map((sa) => ({
-        id: sa.subject.id,
-        name: sa.subject.name,
-        code: sa.subject.subjectCode,
-        type: sa.subject.subjectType,
-      }));
+
+      const subjMap = new Map();
+      subjectAssigns.forEach((sa) => {
+        if (!sa.subject) return;
+        if (!subjMap.has(sa.subject.id)) {
+          subjMap.set(sa.subject.id, {
+            id: sa.subject.id,
+            name: sa.subject.name,
+            code: sa.subject.subjectCode,
+            type: sa.subject.subjectType || 'Core',
+            author: sa.subject.subjectAuthor || null,
+            teacher: sa.teacher
+              ? {
+                  id: sa.teacher.id,
+                  name: sa.teacher.name,
+                  email: sa.teacher.email,
+                  phone: sa.teacher.phone,
+                  photo: sa.teacher.photo,
+                  department: sa.teacher.department,
+                }
+              : null,
+          });
+        } else if (sa.teacher && !subjMap.get(sa.subject.id).teacher) {
+          subjMap.get(sa.subject.id).teacher = {
+            id: sa.teacher.id,
+            name: sa.teacher.name,
+            email: sa.teacher.email,
+            phone: sa.teacher.phone,
+            photo: sa.teacher.photo,
+            department: sa.teacher.department,
+          };
+        }
+      });
+      subjects = Array.from(subjMap.values());
     }
+
+    // Class History & School Years
+    const [enrollRecords, schoolYears] = await Promise.all([
+      prisma.enroll.findMany({
+        where: { studentId: req.studentId },
+        include: {
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
+        },
+        orderBy: { sessionId: 'desc' },
+      }),
+      prisma.schoolYear.findMany({
+        select: { id: true, schoolYear: true },
+      }),
+    ]);
+
+    const schoolYearMap = new Map<number, string>();
+    schoolYears.forEach((sy) => schoolYearMap.set(sy.id, sy.schoolYear));
+
+    const classHistory = enrollRecords.map((en) => ({
+      id: en.id,
+      sessionId: en.sessionId,
+      sessionName: schoolYearMap.get(en.sessionId) || `Session #${en.sessionId}`,
+      classId: en.classId,
+      className: en.class?.name || 'Class',
+      sectionId: en.sectionId,
+      sectionName: en.section?.name || 'Section',
+      roll: en.roll,
+      isAlumni: Boolean(en.isAlumni),
+      enrolledAt: en.createdAt,
+    }));
 
     let isEcdClass = false;
     if (req.classId) {
@@ -547,23 +725,42 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
       isEcdClass = !!cls?.isEcd;
     }
 
+    const currentSchoolYear = req.sessionId ? schoolYearMap.get(req.sessionId) : null;
+
     return res.json({
       success: true,
       studentId: student.id,
+      userId: student.userId,
+      username: student.user?.username || null,
       firstName: student.firstName,
       lastName: student.lastName,
       registerNo: student.registerNo,
       gender: student.gender,
-      photo: student.photo,
+      admissionDate: student.admissionDate,
+      birthday: student.birthday,
+      religion: student.religion,
+      caste: student.caste,
+      bloodGroup: student.bloodGroup,
+      motherTongue: student.motherTongue,
+      currentAddress: student.currentAddress,
+      permanentAddress: student.permanentAddress,
+      city: student.city,
+      state: student.state,
+      mobileno: student.mobileno,
+      email: student.email || null,
+      photo: student.photo || student.user?.photo || null,
       branchName: student.branch?.name || null,
       classId: req.classId || null,
       className: classInfo?.name || null,
       sectionId: req.sectionId || null,
       sectionName: sectionInfo?.name || null,
       sessionId: req.sessionId,
+      sessionName: currentSchoolYear || null,
       fellowStudentsCount,
       formTeacher,
       subjects,
+      parent: student.parent || null,
+      classHistory,
       isEcd: isEcdClass,
     });
   } catch (error) {
@@ -741,3 +938,107 @@ export async function changePassword(req: Request, res: Response): Promise<Respo
     return res.status(500).json({ success: false, message: error.message || 'Failed to change password.' });
   }
 }
+
+/**
+ * PUT /api/student/change-username
+ */
+export async function changeUsername(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const { newUsername } = req.body;
+    const clean = typeof newUsername === 'string' ? newUsername.trim() : '';
+    if (!clean || clean.length < 3) {
+      return res.status(400).json({ success: false, message: 'Username must be at least 3 characters long.' });
+    }
+    if (!/^[a-zA-Z0-9._-]+$/.test(clean)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username may only contain letters, numbers, dots, hyphens, and underscores.',
+      });
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: req.studentId },
+      select: { id: true, userId: true },
+    });
+
+    if (!student || !student.userId) {
+      return res.status(400).json({ success: false, message: 'User account not linked to student.' });
+    }
+
+    const existing = await prisma.user.findFirst({
+      where: {
+        username: { equals: clean, mode: 'insensitive' },
+        id: { not: student.userId },
+      },
+    });
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: 'Username is already taken by another account.' });
+    }
+
+    await prisma.user.update({
+      where: { id: student.userId },
+      data: { username: clean, updatedAt: new Date() },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Username updated successfully.',
+      username: clean,
+    });
+  } catch (error: any) {
+    console.error('[STUDENT] Change username error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to change username.' });
+  }
+}
+
+/**
+ * POST /api/student/upload-photo
+ */
+export async function uploadProfilePhoto(req: Request, res: Response): Promise<Response | void> {
+  try {
+    let inputPhoto = req.body?.photoBase64 || req.body?.photo;
+    if (!inputPhoto && req.file) {
+      inputPhoto = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    }
+    if (!inputPhoto) {
+      return res.status(400).json({ success: false, message: 'Photograph data is required.' });
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: req.studentId },
+      select: { id: true, userId: true },
+    });
+
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student profile not found.' });
+    }
+
+    const photoUrl = await savePhoto(inputPhoto, 'ugbekun2/students/photos');
+
+    const updated = await prisma.student.update({
+      where: { id: req.studentId },
+      data: { photo: photoUrl, updatedAt: new Date() },
+      select: { id: true, photo: true },
+    });
+
+    if (student.userId) {
+      await prisma.user
+        .update({
+          where: { id: student.userId },
+          data: { photo: photoUrl },
+        })
+        .catch((e: any) => console.warn('[STUDENT] User photo sync warning:', e.message));
+    }
+
+    return res.json({
+      success: true,
+      message: 'Profile photo updated successfully.',
+      photo: updated.photo,
+    });
+  } catch (error: any) {
+    console.error('[STUDENT] Profile photo upload error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update profile photo.' });
+  }
+}
+

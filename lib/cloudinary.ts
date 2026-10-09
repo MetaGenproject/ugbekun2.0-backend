@@ -1,7 +1,8 @@
 import { v2 as cloudinary } from 'cloudinary';
 
 function assertConfigured() {
-  const hasUrl = Boolean(process.env.CLOUDINARY_URL);
+  const url = process.env.CLOUDINARY_URL;
+  const hasUrl = Boolean(url);
   const hasExplicit =
     Boolean(process.env.CLOUDINARY_CLOUD_NAME) &&
     Boolean(process.env.CLOUDINARY_API_KEY) &&
@@ -20,6 +21,18 @@ function assertConfigured() {
       api_secret: process.env.CLOUDINARY_API_SECRET,
       secure: true,
     });
+  } else if (url) {
+    try {
+      const parsed = new URL(url.replace('cloudinary://', 'http://'));
+      cloudinary.config({
+        cloud_name: parsed.hostname,
+        api_key: parsed.username,
+        api_secret: parsed.password,
+        secure: true,
+      });
+    } catch (err: any) {
+      console.warn('[CLOUDINARY] Failed to parse CLOUDINARY_URL:', err.message);
+    }
   }
 }
 

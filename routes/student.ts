@@ -57,5 +57,7 @@ router.delete('/reminders/:id', studentController.deleteReminder);
 router.get('/messages', studentController.getMessages);
 router.post('/messages', studentController.sendMessage);
 router.put('/change-password', studentController.changePassword);
+router.put('/change-username', studentController.changeUsername);
+router.post('/upload-photo', upload.single('file'), studentController.uploadProfilePhoto);
 
 export default router;

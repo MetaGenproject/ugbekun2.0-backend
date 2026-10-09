@@ -794,8 +794,15 @@ export async function getTeachers(req: Request, res: Response): Promise<Response
     const subjectAssigns = await prisma.subjectAssign.findMany({
       where: {
         classId: req.classId,
-        ...(req.sectionId ? { sectionId: req.sectionId } : {}),
-        branchId: req.branchId,
+        ...(req.sectionId
+          ? {
+              OR: [
+                { sectionId: req.sectionId },
+                { sectionId: 0 },
+              ],
+            }
+          : {}),
+        ...(req.branchId ? { branchId: req.branchId } : {}),
       },
       include: {
         teacher: {
