@@ -1687,6 +1687,8 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
       return res.status(404).json({ success: false, message: 'CBT Distribution not found.' });
     }
 
+    const effectiveBranchId = req.branchId || dist.branchId;
+
     let questions: any[] = [];
     if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
       questions = await prisma.questionBank.findMany({
@@ -1694,7 +1696,7 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
       });
     } else {
       questions = await prisma.questionBank.findMany({
-        where: { branchId, subjectId: dist.subjectId, status: 'APPROVED' },
+        where: { branchId: effectiveBranchId, subjectId: dist.subjectId, status: 'APPROVED' },
         take: 20,
       });
     }
@@ -1704,45 +1706,73 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
 
     const enrollWhere: any = {
       classId: dist.classId,
-      branchId,
+      branchId: effectiveBranchId,
       sessionId,
     };
     if (dist.sectionId) enrollWhere.sectionId = dist.sectionId;
 
-    const enrollments = await prisma.enroll.findMany({
+    let enrollments = await prisma.enroll.findMany({
       where: enrollWhere,
       include: {
         student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
       },
     });
-    const activeStudents = enrollments.filter((e) => e.student && e.student.active);
+
+    if (enrollments.length === 0) {
+      enrollments = await prisma.enroll.findMany({
+        where: {
+          classId: dist.classId,
+          ...(dist.sectionId ? { sectionId: dist.sectionId } : {}),
+          ...(effectiveBranchId ? { branchId: effectiveBranchId } : {}),
+          isAlumni: 0,
+        },
+        include: {
+          student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
+        },
+      });
+    }
 
     const companion = await findCompanionOnlineExam(dist);
-    const studentIds = activeStudents.map((e) => e.student.id);
-    const submissions =
-      companion && studentIds.length > 0
-        ? await prisma.onlineExamSubmission.findMany({
-            where: {
-              onlineExamId: companion.id,
-              studentId: { in: studentIds },
-            },
-            include: {
-              student: { select: { id: true, firstName: true, lastName: true, registerNo: true } },
-            },
-            orderBy: { submittedAt: 'desc' },
-          })
-        : [];
+    const examIdsToMatch = Array.from(
+      new Set([companion?.id, dist.onlineExamId, dist.id].filter((x): x is number => typeof x === 'number' && x > 0))
+    );
 
-    const examId = await resolveTermExamId(branchId, sessionId);
+    const submissions = examIdsToMatch.length > 0
+      ? await prisma.onlineExamSubmission.findMany({
+          where: {
+            onlineExamId: { in: examIdsToMatch },
+          },
+          include: {
+            student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
+          },
+          orderBy: { submittedAt: 'desc' },
+        })
+      : [];
+
+    const activeStudents = enrollments.filter((e) => e.student && e.student.active);
+    const seenStudentIds = new Set(activeStudents.map((e) => e.student.id));
+
+    // Ensure all students who submitted are present in the analytics matrix
+    for (const sub of submissions) {
+      if (sub.student && !seenStudentIds.has(sub.student.id)) {
+        seenStudentIds.add(sub.student.id);
+        activeStudents.push({
+          student: sub.student,
+          classId: dist.classId,
+          sectionId: dist.sectionId,
+        } as any);
+      }
+    }
+
+    const studentIds = activeStudents.map((e) => e.student.id);
+
     const markRows =
       studentIds.length > 0
         ? await prisma.mark.findMany({
             where: {
               subjectId: dist.subjectId,
               classId: dist.classId,
-              sessionId,
-              branchId,
-              ...(examId ? { examId } : {}),
+              ...(effectiveBranchId ? { branchId: effectiveBranchId } : {}),
               studentId: { in: studentIds },
             },
             select: {
@@ -1751,11 +1781,14 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
               cbtSource: true,
               cbtScale: true,
             },
+            orderBy: { id: 'desc' },
           })
         : [];
     const markByStudent: Record<number, (typeof markRows)[number]> = {};
     markRows.forEach((row) => {
-      markByStudent[row.studentId] = row;
+      if (!markByStudent[row.studentId]) {
+        markByStudent[row.studentId] = row;
+      }
     });
 
     const studentRoster = activeStudents.map((e) => {
@@ -1766,7 +1799,7 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
         studentId: st.id,
         studentName: `${st.lastName}, ${st.firstName}`,
         registerNo: st.registerNo || 'Pending',
-        isSubmitted: Boolean(sub && sub.submittedAt),
+        isSubmitted: Boolean(sub && (sub.submittedAt || sub.totalMark !== null)),
         totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
         submittedAt: sub?.submittedAt || null,
         reportCbtMark: recorded?.cbtMark ?? null,
@@ -1816,23 +1849,24 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
     const overwriteOverride = Boolean(req.body?.overwriteOverride);
 
     const dist = await prisma.cbtDistribution.findFirst({
-      where: { id: distId, branchId },
+      where: {
+        id: distId,
+        ...(branchId ? { branchId } : {}),
+      },
     });
 
     if (!dist) {
       return res.status(404).json({ success: false, message: 'CBT Distribution not found.' });
     }
 
+    const effectiveBranchId = dist.branchId || branchId;
     const companion = await findCompanionOnlineExam(dist);
-    if (!companion) {
-      return res.status(400).json({
-        success: false,
-        message: 'No companion online examination is linked to this sitting.',
-      });
-    }
+    const examIdsToMatch = Array.from(
+      new Set([companion?.id, dist.onlineExamId, dist.id].filter((x): x is number => typeof x === 'number' && x > 0))
+    );
 
     const sessionId = await resolveActiveSessionId();
-    const examId = await resolveTermExamId(branchId, sessionId, req.body?.targetExamId);
+    const examId = await resolveTermExamId(effectiveBranchId, sessionId, req.body?.targetExamId);
     if (!examId) {
       return res.status(400).json({
         success: false,
@@ -1840,46 +1874,33 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
       });
     }
 
-    const enrollWhere: any = {
-      classId: dist.classId,
-      branchId,
-      sessionId,
-    };
-    if (dist.sectionId) enrollWhere.sectionId = dist.sectionId;
+    const submissions = examIdsToMatch.length > 0
+      ? await prisma.onlineExamSubmission.findMany({
+          where: {
+            onlineExamId: { in: examIdsToMatch },
+            totalMark: { not: null },
+          },
+          orderBy: { submittedAt: 'desc' },
+        })
+      : [];
 
-    const enrollments = await prisma.enroll.findMany({
-      where: enrollWhere,
-      select: { studentId: true, classId: true, sectionId: true },
-    });
-    const studentIds = enrollments.map((e) => e.studentId);
-    if (studentIds.length === 0) {
-      return res.json({ success: true, syncCount: 0, skippedOverrides: 0, message: 'No enrolled students to sync.' });
+    if (submissions.length === 0) {
+      return res.json({ success: true, syncCount: 0, skippedOverrides: 0, message: 'No completed submissions found to sync.' });
     }
-
-    const submissions = await prisma.onlineExamSubmission.findMany({
-      where: {
-        onlineExamId: companion.id,
-        studentId: { in: studentIds },
-        submittedAt: { not: null },
-        totalMark: { not: null },
-      },
-      orderBy: { submittedAt: 'desc' },
-    });
 
     let syncCount = 0;
     let skippedOverrides = 0;
 
     await prisma.$transaction(async (tx: any) => {
-      for (const enroll of enrollments) {
-        const sub = submissions.find((s) => s.studentId === enroll.studentId);
-        if (!sub || sub.totalMark === null || sub.totalMark === undefined) continue;
+      for (const sub of submissions) {
+        if (sub.totalMark === null || sub.totalMark === undefined) continue;
 
         const result = await recordCbtPercentageOnMarksheet({
-          studentId: enroll.studentId,
-          classId: enroll.classId,
-          sectionId: enroll.sectionId,
+          studentId: sub.studentId,
+          classId: dist.classId,
+          sectionId: dist.sectionId,
           subjectId: dist.subjectId,
-          branchId,
+          branchId: effectiveBranchId,
           sessionId,
           examId,
           percentage: Number(sub.totalMark),

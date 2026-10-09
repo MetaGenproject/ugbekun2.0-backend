@@ -12,10 +12,15 @@ export async function getOnlineExams(req: Request, res: Response): Promise<Respo
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
 
+    const whereClause: any = {
+      ...(req.branchId ? { branchId: req.branchId } : {}),
+    };
+    if (req.teacherId) {
+      whereClause.OR = await teacherScopedContentOr(prisma, req.teacherId);
+    }
+
     const exams = await prisma.onlineExam.findMany({
-      where: {
-        ...(req.branchId ? { branchId: req.branchId } : {}),
-      },
+      where: whereClause,
       include: {
         class: { select: { id: true, name: true } },
         subject: { select: { id: true, name: true } },
@@ -372,6 +377,8 @@ export async function getOnlineExamSubmissions(req: Request, res: Response): Pro
   }
 }
 
+import { recordCbtPercentageOnMarksheet, DEFAULT_CBT_SCALE, resolveActiveSessionId, resolveTermExamId } from '../../lib/cbtMarkRecord';
+
 /**
  * POST /api/teacher/online-exams/submissions/:id/grade
  */
@@ -384,7 +391,27 @@ export async function gradeOnlineExamSubmission(req: Request, res: Response): Pr
       data: {
         totalMark: Number(score),
       },
+      include: {
+        onlineExam: true,
+      },
     });
+
+    if (submission && submission.onlineExam) {
+      const branchId = req.branchId || submission.onlineExam.branchId;
+      if (branchId) {
+        await recordCbtPercentageOnMarksheet({
+          studentId: submission.studentId,
+          classId: submission.onlineExam.classId,
+          subjectId: submission.onlineExam.subjectId,
+          branchId,
+          percentage: Number(score),
+          source: 'CBT_SYNC',
+          submissionId: submission.id,
+          scale: DEFAULT_CBT_SCALE,
+        }).catch((e) => console.error('[TEACHER] gradeOnlineExam marksheet sync error:', e));
+      }
+    }
+
     return res.json({ success: true, submission, message: 'Submission graded successfully.' });
   } catch (error) {
     console.error('[TEACHER] Grade online-exam submission error:', error);
@@ -537,5 +564,289 @@ export async function extendCbtDistributionDate(req: Request, res: Response): Pr
   } catch (error) {
     console.error('[TEACHER] Extend CBT distribution date error:', error);
     return res.status(500).json({ success: false, message: 'Failed to extend examination deadline.' });
+  }
+}
+
+/**
+ * GET /api/teacher/cbt/distributions/:id/analytics
+ */
+export async function getTeacherCbtDistributionAnalytics(req: Request, res: Response): Promise<Response | void> {
+  const teacherId = req.teacherId;
+  const branchId = req.branchId;
+  const distId = Number(req.params.id);
+
+  try {
+    const dist = await prisma.cbtDistribution.findUnique({
+      where: { id: distId },
+      include: {
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        group: true,
+      },
+    });
+
+    if (!dist) {
+      return res.status(404).json({ success: false, message: 'CBT Distribution not found.' });
+    }
+
+    if (teacherId) {
+      const allowed = await canTeacherUseClassSubject(prisma, teacherId, dist.classId, dist.subjectId);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          message: 'Accessed can not be granted meet Admin for the priveleges..',
+        });
+      }
+    }
+
+    const effectiveBranchId = branchId || dist.branchId;
+
+    let questions: any[] = [];
+    if (dist.group && Array.isArray(dist.group.questionIds) && dist.group.questionIds.length > 0) {
+      questions = await prisma.questionBank.findMany({
+        where: { id: { in: (dist.group.questionIds as any[]).map(Number) }, status: 'APPROVED' },
+      });
+    } else {
+      questions = await prisma.questionBank.findMany({
+        where: { branchId: effectiveBranchId, subjectId: dist.subjectId, status: 'APPROVED' },
+        take: 20,
+      });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const sessionId = globalSetting?.sessionId || 5;
+
+    const enrollWhere: any = {
+      classId: dist.classId,
+      branchId: effectiveBranchId,
+      sessionId,
+    };
+    if (dist.sectionId) enrollWhere.sectionId = dist.sectionId;
+
+    let enrollments = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
+      },
+    });
+
+    if (enrollments.length === 0) {
+      enrollments = await prisma.enroll.findMany({
+        where: {
+          classId: dist.classId,
+          ...(dist.sectionId ? { sectionId: dist.sectionId } : {}),
+          ...(effectiveBranchId ? { branchId: effectiveBranchId } : {}),
+          isAlumni: 0,
+        },
+        include: {
+          student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
+        },
+      });
+    }
+
+    const companion = await findCompanionOnlineExam(dist);
+    const examIdsToMatch = Array.from(
+      new Set([companion?.id, dist.onlineExamId, dist.id].filter((x): x is number => typeof x === 'number' && x > 0))
+    );
+
+    const submissions = examIdsToMatch.length > 0
+      ? await prisma.onlineExamSubmission.findMany({
+          where: {
+            onlineExamId: { in: examIdsToMatch },
+          },
+          include: {
+            student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
+          },
+          orderBy: { submittedAt: 'desc' },
+        })
+      : [];
+
+    const activeStudents = enrollments.filter((e) => e.student && e.student.active);
+    const seenStudentIds = new Set(activeStudents.map((e) => e.student.id));
+
+    for (const sub of submissions) {
+      if (sub.student && !seenStudentIds.has(sub.student.id)) {
+        seenStudentIds.add(sub.student.id);
+        activeStudents.push({
+          student: sub.student,
+          classId: dist.classId,
+          sectionId: dist.sectionId,
+        } as any);
+      }
+    }
+
+    const studentIds = activeStudents.map((e) => e.student.id);
+
+    const markRows =
+      studentIds.length > 0
+        ? await prisma.mark.findMany({
+            where: {
+              subjectId: dist.subjectId,
+              classId: dist.classId,
+              ...(effectiveBranchId ? { branchId: effectiveBranchId } : {}),
+              studentId: { in: studentIds },
+            },
+            select: {
+              studentId: true,
+              cbtMark: true,
+              cbtSource: true,
+              cbtScale: true,
+            },
+            orderBy: { id: 'desc' },
+          })
+        : [];
+    const markByStudent: Record<number, (typeof markRows)[number]> = {};
+    markRows.forEach((row) => {
+      if (!markByStudent[row.studentId]) {
+        markByStudent[row.studentId] = row;
+      }
+    });
+
+    const studentRoster = activeStudents.map((e) => {
+      const st = e.student;
+      const sub = submissions.find((s) => s.studentId === st.id);
+      const recorded = markByStudent[st.id];
+      return {
+        studentId: st.id,
+        studentName: `${st.lastName}, ${st.firstName}`,
+        registerNo: st.registerNo || 'Pending',
+        isSubmitted: Boolean(sub && (sub.submittedAt || sub.totalMark !== null)),
+        totalMark: sub?.totalMark !== null && sub?.totalMark !== undefined ? sub.totalMark : null,
+        submittedAt: sub?.submittedAt || null,
+        reportCbtMark: recorded?.cbtMark ?? null,
+        cbtSource: recorded?.cbtSource ?? null,
+        cbtScale: recorded?.cbtScale || DEFAULT_CBT_SCALE,
+        onReportCard: Boolean(recorded?.cbtMark),
+      };
+    });
+
+    const submittedOnly = studentRoster.filter((s) => s.isSubmitted && s.totalMark !== null);
+    const totalScoreSum = submittedOnly.reduce((acc, s) => acc + Number(s.totalMark), 0);
+    const averageScore = submittedOnly.length > 0 ? totalScoreSum / submittedOnly.length : 0;
+    const highestScore = submittedOnly.length > 0 ? Math.max(...submittedOnly.map((s) => Number(s.totalMark))) : 0;
+    const lowestScore = submittedOnly.length > 0 ? Math.min(...submittedOnly.map((s) => Number(s.totalMark))) : 0;
+    const passedCount = submittedOnly.filter((s) => Number(s.totalMark) >= (dist.passingMark || 50)).length;
+    const passRate = submittedOnly.length > 0 ? (passedCount / submittedOnly.length) * 100 : 0;
+
+    return res.json({
+      success: true,
+      distribution: dist,
+      totalEnrolled: activeStudents.length,
+      submittedCount: submittedOnly.length,
+      pendingCount: activeStudents.length - submittedOnly.length,
+      averageScore: Math.round(averageScore * 10) / 10,
+      highestScore,
+      lowestScore,
+      passRate: Math.round(passRate * 10) / 10,
+      questionsCount: questions.length,
+      students: studentRoster,
+    });
+  } catch (error) {
+    console.error('[TEACHER] Fetch CBT distribution analytics error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load CBT analytics.' });
+  }
+}
+
+/**
+ * POST /api/teacher/cbt/distributions/:id/sync-marks
+ */
+export async function syncTeacherCbtMarks(req: Request, res: Response): Promise<Response | void> {
+  const teacherId = req.teacherId;
+  const branchId = req.branchId;
+  const distId = Number(req.params.id);
+  const maxScoreBase = Number(req.body?.maxScoreBase) || DEFAULT_CBT_SCALE;
+  const overwriteOverride = Boolean(req.body?.overwriteOverride);
+
+  try {
+    const dist = await prisma.cbtDistribution.findUnique({
+      where: { id: distId },
+    });
+
+    if (!dist) {
+      return res.status(404).json({ success: false, message: 'CBT Distribution not found.' });
+    }
+
+    if (teacherId) {
+      const allowed = await canTeacherUseClassSubject(prisma, teacherId, dist.classId, dist.subjectId);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          message: 'Accessed can not be granted meet Admin for the priveleges..',
+        });
+      }
+    }
+
+    const effectiveBranchId = dist.branchId || branchId;
+    const companion = await findCompanionOnlineExam(dist);
+    const examIdsToMatch = Array.from(
+      new Set([companion?.id, dist.onlineExamId, dist.id].filter((x): x is number => typeof x === 'number' && x > 0))
+    );
+
+    const sessionId = await resolveActiveSessionId();
+    const examId = await resolveTermExamId(effectiveBranchId, sessionId, req.body?.targetExamId);
+    if (!examId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Create a term examination first so CBT scores can land on report cards.',
+      });
+    }
+
+    const submissions = examIdsToMatch.length > 0
+      ? await prisma.onlineExamSubmission.findMany({
+          where: {
+            onlineExamId: { in: examIdsToMatch },
+            totalMark: { not: null },
+          },
+          orderBy: { submittedAt: 'desc' },
+        })
+      : [];
+
+    if (submissions.length === 0) {
+      return res.json({ success: true, syncCount: 0, skippedOverrides: 0, message: 'No completed submissions found to sync.' });
+    }
+
+    let syncCount = 0;
+    let skippedOverrides = 0;
+
+    await prisma.$transaction(async (tx: any) => {
+      for (const sub of submissions) {
+        if (sub.totalMark === null || sub.totalMark === undefined) continue;
+
+        const result = await recordCbtPercentageOnMarksheet({
+          studentId: sub.studentId,
+          classId: dist.classId,
+          sectionId: dist.sectionId,
+          subjectId: dist.subjectId,
+          branchId: effectiveBranchId,
+          sessionId,
+          examId,
+          percentage: Number(sub.totalMark),
+          source: 'CBT_SYNC',
+          submissionId: sub.id,
+          scale: maxScoreBase,
+          overwriteOverride,
+          tx,
+        });
+        if (result.skipped && result.reason === 'admin_override') {
+          skippedOverrides++;
+          continue;
+        }
+        if (!result.skipped) syncCount++;
+      }
+    });
+
+    return res.json({
+      success: true,
+      syncCount,
+      skippedOverrides,
+      message:
+        skippedOverrides > 0
+          ? `Recorded CBT scores for ${syncCount} student(s). ${skippedOverrides} admin-corrected score(s) were left unchanged.`
+          : `CBT scores recorded for ${syncCount} student(s) on the official mark register and report cards.`,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Sync CBT marks error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to sync CBT marks.' });
   }
 }

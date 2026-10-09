@@ -204,7 +204,12 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
 
       const cbtSub = cbtSubmissionMap[m.studentId];
       const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && String(m.cbtMark).trim() !== '';
-      const effectiveCbt = hasCbtMark ? String(m.cbtMark) : cbtSub ? String(cbtSub.score) : null;
+      const cbtSubScore = cbtSub
+        ? (cbtSub.totalMark !== null && cbtSub.totalMark !== undefined
+            ? String(cbtSub.totalMark)
+            : (cbtSub.score !== null && cbtSub.score !== undefined ? String(cbtSub.score) : null))
+        : null;
+      const effectiveCbt = hasCbtMark ? String(m.cbtMark) : cbtSubScore;
 
       marksMap[m.studentId] = {
         id: m.id,
@@ -222,10 +227,13 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
     studentIds.forEach((sId) => {
       if (!marksMap[sId] && cbtSubmissionMap[sId]) {
         const cbtSub = cbtSubmissionMap[sId];
+        const fallbackMark = cbtSub.totalMark !== null && cbtSub.totalMark !== undefined
+          ? String(cbtSub.totalMark)
+          : (cbtSub.score !== null && cbtSub.score !== undefined ? String(cbtSub.score) : null);
         marksMap[sId] = {
           id: 0,
           mark: '',
-          cbtMark: String(cbtSub.score),
+          cbtMark: fallbackMark,
           cbtSource: 'ONLINE_EXAM_SUBMISSION',
           cbtExamTitle: cbtSub.onlineExam?.title || null,
           cbtTotalMarks: cbtSub.onlineExam?.totalMarks || null,

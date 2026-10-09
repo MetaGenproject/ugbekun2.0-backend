@@ -879,8 +879,13 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     marks.forEach((m) => {
       const key = `${m.studentId}_${m.subjectId}`;
       const cbtSub = cbtSubmissionMap[key];
-      const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && String(m.cbtMark).trim() !== '';
-      const effectiveCbt = hasCbtMark ? m.cbtMark : cbtSub ? String(cbtSub.score) : null;
+      const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && m.cbtMark !== '';
+      const cbtSubScore = cbtSub
+        ? (cbtSub.totalMark !== null && cbtSub.totalMark !== undefined
+            ? String(cbtSub.totalMark)
+            : null)
+        : null;
+      const effectiveCbt = hasCbtMark ? m.cbtMark : cbtSubScore;
 
       marksMap[key] = {
         mark: m.mark,
@@ -895,9 +900,12 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
     cbtSubmissions.forEach((sub) => {
       const key = `${sub.studentId}_${sub.onlineExam?.subjectId}`;
       if (!marksMap[key]) {
+        const fallbackMark = sub.totalMark !== null && sub.totalMark !== undefined
+          ? String(sub.totalMark)
+          : (sub.score !== null && sub.score !== undefined ? String(sub.score) : null);
         marksMap[key] = {
           mark: null,
-          cbtMark: String(sub.score),
+          cbtMark: fallbackMark,
           cbtSource: 'ONLINE_EXAM_SUBMISSION',
           cbtExamTitle: sub.onlineExam?.title || null,
           absent: '0',

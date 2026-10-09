@@ -55,6 +55,8 @@ import {
   updateOnlineExam,
   deleteOnlineExam,
   extendCbtDistributionDate,
+  getTeacherCbtDistributionAnalytics,
+  syncTeacherCbtMarks,
   scanGrades,
   getScanRecord,
   commitScanRecord,
@@ -188,6 +190,8 @@ router.put('/online-exams/:id', updateOnlineExam);
 router.delete('/online-exams/:id', deleteOnlineExam);
 router.post('/cbt/distributions/:id/extend-date', extendCbtDistributionDate);
 router.post('/cbt/distributions/:id/reschedule', extendCbtDistributionDate);
+router.get('/cbt/distributions/:id/analytics', getTeacherCbtDistributionAnalytics);
+router.post('/cbt/distributions/:id/sync-marks', syncTeacherCbtMarks);
 
 // Question Bank
 router.get('/question-bank', getQuestionBank);

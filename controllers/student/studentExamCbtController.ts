@@ -446,16 +446,26 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
         });
       }
 
-      const onlineEx = await prisma.onlineExam.findFirst({
-        where: {
+      let onlineEx = dist.onlineExamId
+        ? await prisma.onlineExam.findUnique({ where: { id: dist.onlineExamId } })
+        : null;
+      if (!onlineEx) {
+        onlineEx = await findCompanionOnlineExam({
           title: dist.title,
           classId: dist.classId,
           subjectId: dist.subjectId,
-          branchId: req.branchId,
-        },
-      });
+          branchId: dist.branchId || req.branchId || 0,
+          onlineExamId: dist.onlineExamId,
+        });
+      }
       if (onlineEx) {
         targetOnlineExamId = onlineEx.id;
+        if (!dist.onlineExamId) {
+          await prisma.cbtDistribution.update({
+            where: { id: dist.id },
+            data: { onlineExamId: onlineEx.id },
+          }).catch(() => {});
+        }
       }
     } else {
       const onlineExam = await prisma.onlineExam.findUnique({
@@ -474,6 +484,7 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
         studentId: req.studentId,
         OR: [{ onlineExamId: targetOnlineExamId }, { onlineExamId: examId }],
       },
+      orderBy: { id: 'desc' },
     });
 
     if (!existing) {
@@ -503,16 +514,18 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
       dist ||
       (await prisma.onlineExam.findUnique({
         where: { id: targetOnlineExamId },
-        select: { classId: true, subjectId: true },
+        select: { classId: true, subjectId: true, branchId: true },
       }));
 
-    if (onlineExamMeta && req.studentId && req.branchId) {
+    const effectiveBranchId = dist?.branchId || req.branchId || (onlineExamMeta as any)?.branchId;
+
+    if (onlineExamMeta && req.studentId && effectiveBranchId) {
       try {
         await recordCbtPercentageOnMarksheet({
           studentId: req.studentId,
           classId: dist?.classId || onlineExamMeta.classId,
           subjectId: dist?.subjectId || onlineExamMeta.subjectId,
-          branchId: req.branchId,
+          branchId: effectiveBranchId,
           sectionId: dist?.sectionId || req.sectionId || null,
           percentage: grading.percentage,
           source: 'CBT_AUTO',

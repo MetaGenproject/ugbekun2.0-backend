@@ -44,11 +44,35 @@ export async function resolveTermExamId(
   })
   if (bySession) return bySession.id
 
-  const any = await prisma.exam.findFirst({
+  const anyBranchExam = await prisma.exam.findFirst({
     where: { branchId },
     orderBy: { id: 'desc' },
   })
-  return any?.id ?? null
+  if (anyBranchExam) return anyBranchExam.id
+
+  const globalAny = await prisma.exam.findFirst({
+    orderBy: { id: 'desc' },
+  })
+  if (globalAny) return globalAny.id
+
+  // Auto-create a default exam record if completely missing
+  try {
+    const created = await prisma.exam.create({
+      data: {
+        name: 'Standard CBT Assessment',
+        branchId,
+        sessionId,
+        typeId: 1,
+        remark: 'Automated CBT Assessment',
+        markDistribution: JSON.stringify([{ id: 1, mark: 100 }]),
+        status: 1,
+        publishResult: 1,
+      },
+    })
+    return created.id
+  } catch {
+    return null
+  }
 }
 
 export async function resolveStudentSectionId(params: {
@@ -59,16 +83,57 @@ export async function resolveStudentSectionId(params: {
   preferredSectionId?: number | null
 }): Promise<number | null> {
   if (params.preferredSectionId) return Number(params.preferredSectionId)
-  const enroll = await prisma.enroll.findFirst({
+  
+  // 1. Try enroll in this session and class
+  let enroll = await prisma.enroll.findFirst({
     where: {
       studentId: params.studentId,
       classId: params.classId,
-      branchId: params.branchId,
+      ...(params.branchId ? { branchId: params.branchId } : {}),
       sessionId: params.sessionId,
     },
     select: { sectionId: true },
   })
-  return enroll?.sectionId ?? null
+  if (enroll?.sectionId) return enroll.sectionId
+
+  // 2. Try enroll in this class across any session (latest first)
+  enroll = await prisma.enroll.findFirst({
+    where: {
+      studentId: params.studentId,
+      classId: params.classId,
+    },
+    orderBy: { id: 'desc' },
+    select: { sectionId: true },
+  })
+  if (enroll?.sectionId) return enroll.sectionId
+
+  // 3. Try any enroll for this student (latest first)
+  enroll = await prisma.enroll.findFirst({
+    where: {
+      studentId: params.studentId,
+    },
+    orderBy: { id: 'desc' },
+    select: { sectionId: true },
+  })
+  if (enroll?.sectionId) return enroll.sectionId
+
+  // 4. Try any section belonging to this class
+  const classSec = await prisma.section.findFirst({
+    where: {
+      classes: {
+        some: { classId: params.classId },
+      },
+    },
+    select: { id: true },
+  })
+  if (classSec?.id) return classSec.id
+
+  // 5. Try any section in this branch
+  const anySec = await prisma.section.findFirst({
+    where: { branchId: params.branchId },
+    select: { id: true },
+  })
+  return anySec?.id ?? null
 }
 
 export async function upsertAcademicCbtMark(params: {
@@ -120,7 +185,10 @@ export async function upsertAcademicCbtMark(params: {
   if (existing) {
     const mark = await db.mark.update({
       where: { id: existing.id },
-      data,
+      data: {
+        ...data,
+        mark: existing.mark || '{"CA1":"","CA2":"","EXAM":""}',
+      },
     })
     return { mark, skipped: false, created: false }
   }
@@ -134,7 +202,7 @@ export async function upsertAcademicCbtMark(params: {
       examId: params.examId,
       sessionId: params.sessionId,
       branchId: params.branchId,
-      mark: null,
+      mark: '{"CA1":"","CA2":"","EXAM":""}',
       absent: '0',
       ...data,
     },
