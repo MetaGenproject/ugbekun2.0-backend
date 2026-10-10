@@ -40,11 +40,14 @@ async function _resolveBranchContextUncached(req: Request) {
   // 2. Direct query by custom domain
   if (queryDomain) {
     const normalized = normalizeHostname(queryDomain);
+    const nonWww = normalized.startsWith('www.') ? normalized.slice(4) : normalized;
     const branch = await prisma.branch.findFirst({
       where: {
         OR: [
           { customDomain: normalized },
-          { customDomain: `www.${normalized}` },
+          { customDomain: nonWww },
+          { customDomain: `www.${nonWww}` },
+          { subdomain: nonWww },
           { subdomain: normalized }
         ],
         active: true

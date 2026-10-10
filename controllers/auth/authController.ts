@@ -370,6 +370,80 @@ export async function getMe(req: Request, res: Response): Promise<Response | voi
 }
 
 /**
+ * POST /api/auth/refresh
+ * Rolling session refresh: verifies valid existing token (with 30-minute grace window for active sessions)
+ * and issues a fresh 8h token and cookie.
+ */
+export async function refreshToken(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const token = getAccessToken(req);
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided.' });
+    }
+
+    const secret = process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod';
+    let decoded: any;
+
+    try {
+      decoded = jwt.verify(token, secret);
+    } catch (err: any) {
+      // Grace period: If token expired within the last 30 minutes (1800s),
+      // allow active sliding refresh if cryptographic signature is valid.
+      if (err?.name === 'TokenExpiredError') {
+        const decodedExpired: any = jwt.decode(token);
+        const nowSec = Math.floor(Date.now() / 1000);
+        const expiredAt = decodedExpired?.exp || 0;
+        if (decodedExpired && (decodedExpired.sub || decodedExpired.id) && (nowSec - expiredAt <= 1800)) {
+          decoded = decodedExpired;
+        } else {
+          return res.status(401).json({ success: false, message: 'Token has expired beyond renewal window.' });
+        }
+      } else {
+        return res.status(401).json({ success: false, message: 'Token is invalid.' });
+      }
+    }
+
+    const userId = Number(decoded.sub || decoded.id);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Token is invalid.' });
+    }
+
+    const user =
+      (await prisma.user.findUnique({ where: { id: userId } })) ||
+      (await prisma.user.findFirst({ where: { legacyUserId: userId } }));
+
+    if (!user || !user.active) {
+      return res.status(401).json({ success: false, message: 'User account is inactive or disabled.' });
+    }
+
+    const branchInfo = await resolveUserBranch(user);
+    const expiresIn = process.env.JWT_EXPIRES_IN || '8h';
+
+    const payload = {
+      sub: user.id,
+      username: user.username,
+      role: user.role,
+      roleName: ROLE_NAMES[user.role] || 'user',
+      branchId: branchInfo?.id || null,
+      legacyUserId: user.legacyUserId,
+    };
+
+    const newToken = jwt.sign(payload, secret, { expiresIn } as any);
+    setAuthCookie(res, newToken);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Session refreshed successfully.',
+      token: newToken,
+      user: publicAuthUser(user, branchInfo),
+    });
+  } catch (error) {
+    console.error('[AUTH] Token refresh error:', error);
+    return res.status(500).json({ success: false, message: 'An error occurred while refreshing session.' });
+  }
+}
+
+/**
  * POST /api/auth/logout
  */
 export function logout(_req: Request, res: Response): Response {

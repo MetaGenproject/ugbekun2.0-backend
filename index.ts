@@ -11,6 +11,8 @@ import logger, {
   globalErrorMiddleware,
   registerProcessErrorHandlers,
 } from './lib/logger';
+import { cacheGetOrSet } from './lib/cacheService';
+import { normalizeHostname } from './lib/domainService';
 
 // Register global crash and rejection traps early
 registerProcessErrorHandlers();
@@ -21,7 +23,7 @@ const PORT = process.env.PORT || 5001;
 
 app.set('trust proxy', 1);
 
-function isAllowedCorsOrigin(origin: string) {
+async function isAllowedCorsOrigin(origin: string): Promise<boolean> {
   const extraAllowedOrigins = (process.env.ALLOWED_HOSTS || process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((value) => value.trim())
@@ -38,6 +40,12 @@ function isAllowedCorsOrigin(origin: string) {
       'http://127.0.0.1:3002',
       'https://ugbekun-beta.vercel.app',
       'https://www.ugbekun-beta.vercel.app',
+      'https://app.ugbekun.com',
+      'https://www.app.ugbekun.com',
+      'https://ugbekun.com',
+      'https://www.ugbekun.com',
+      'https://ugbekun.edu.ng',
+      'https://www.ugbekun.edu.ng',
       ...extraAllowedOrigins,
     ].filter(Boolean) as string[]
   );
@@ -54,25 +62,58 @@ function isAllowedCorsOrigin(origin: string) {
   if (/^https?:\/\/([a-z0-9-]+\.)*ugbekun\.(com|edu\.ng)(:[0-9]+)?$/i.test(origin)) return true;
 
   if (process.env.NODE_ENV !== 'production') {
-    return /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/i.test(origin);
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/i.test(origin)) {
+      return true;
+    }
   }
 
-  return false;
+  // Dynamically allow active school custom domains and subdomains from database
+  try {
+    const originUrl = new URL(origin);
+    const originHostname = normalizeHostname(originUrl.hostname);
+    if (!originHostname) return false;
+
+    const cleanHost = originHostname.startsWith('www.') ? originHostname.slice(4) : originHostname;
+
+    // Cache lookup for 10 minutes (600s) to avoid hitting database on every CORS check
+    const isAllowed = await cacheGetOrSet<boolean>(
+      `cors:domain:${cleanHost}`,
+      600,
+      async () => {
+        const branch = await prisma.branch.findFirst({
+          where: {
+            OR: [
+              { customDomain: cleanHost },
+              { customDomain: `www.${cleanHost}` },
+              { subdomain: cleanHost },
+            ],
+            active: true,
+          },
+          select: { id: true },
+        });
+        return Boolean(branch);
+      }
+    );
+
+    return Boolean(isAllowed);
+  } catch (err) {
+    return false;
+  }
 }
 
 app.use(cors({
-  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+  origin: async (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
     if (!origin) {
       callback(null, true);
       return;
     }
 
-    if (isAllowedCorsOrigin(origin)) {
-      callback(null, true);
-      return;
+    try {
+      const allowed = await isAllowedCorsOrigin(origin);
+      callback(null, allowed);
+    } catch (err) {
+      callback(null, false);
     }
-
-    callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
