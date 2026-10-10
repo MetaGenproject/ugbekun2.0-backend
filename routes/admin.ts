@@ -202,6 +202,8 @@ import {
   syncCbtMarks,
   overrideCbtMark,
   syncCbtLegacy,
+  getAdminOnlineExams,
+  deleteAdminOnlineExam,
 } from '../controllers/admin/adminExamCbtController';
 
 import {
@@ -591,6 +593,8 @@ router.get('/cbt/distributions/:id/analytics', getCbtDistributionAnalytics);
 router.post('/cbt/distributions/:id/sync-marks', syncCbtMarks);
 router.post('/cbt/distributions/:id/override-mark', overrideCbtMark);
 router.post('/cbt/sync', syncCbtLegacy);
+router.get('/online-exams', getAdminOnlineExams);
+router.delete('/online-exams/:id', deleteAdminOnlineExam);
 
 router.get('/homeworks', getAdminHomeworks);
 router.post('/homeworks', createAdminHomework);

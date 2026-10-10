@@ -926,12 +926,102 @@ export async function getCbtDistributions(req: Request, res: Response): Promise<
         class: { select: { id: true, name: true } },
         section: { select: { id: true, name: true } },
         subject: { select: { id: true, name: true, subjectCode: true } },
-        group: { select: { id: true, title: true, groupCode: true } },
+        group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
+        onlineExam: {
+          select: {
+            id: true,
+            questions: true,
+            submissions: {
+              select: { id: true, totalMark: true, createdAt: true, studentId: true },
+            },
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    return res.json({ success: true, distributions });
+    // For any distributions where onlineExam relation is null, find companion OnlineExam
+    const missingCompanionDists = distributions.filter((d) => !d.onlineExam);
+    const companionMap = new Map<number, any>();
+
+    if (missingCompanionDists.length > 0) {
+      const candidateOnlineExams = await prisma.onlineExam.findMany({
+        where: {
+          branchId,
+          OR: missingCompanionDists.map((d) => ({
+            title: d.title,
+            classId: d.classId,
+            subjectId: d.subjectId,
+          })),
+        },
+        select: {
+          id: true,
+          title: true,
+          classId: true,
+          subjectId: true,
+          questions: true,
+          submissions: {
+            select: { id: true, totalMark: true, createdAt: true, studentId: true },
+          },
+        },
+      });
+
+      for (const dist of missingCompanionDists) {
+        const matched = candidateOnlineExams.find(
+          (ex) =>
+            ex.title === dist.title &&
+            ex.classId === dist.classId &&
+            ex.subjectId === dist.subjectId
+        );
+        if (matched) {
+          companionMap.set(dist.id, matched);
+        }
+      }
+    }
+
+    const enrichedDistributions = distributions.map((d) => {
+      const exam = d.onlineExam || companionMap.get(d.id) || null;
+
+      // Extract question IDs from group
+      let groupQIds: any[] = [];
+      if (Array.isArray(d.group?.questionIds)) {
+        groupQIds = d.group.questionIds;
+      } else if (typeof d.group?.questionIds === 'string') {
+        try {
+          const parsed = JSON.parse(d.group.questionIds);
+          if (Array.isArray(parsed)) groupQIds = parsed;
+        } catch (_) {}
+      }
+
+      // Extract questions from onlineExam
+      let examQuestions: any[] = [];
+      if (Array.isArray(exam?.questions)) {
+        examQuestions = exam.questions;
+      } else if (typeof exam?.questions === 'string') {
+        try {
+          const parsed = JSON.parse(exam.questions);
+          if (Array.isArray(parsed)) examQuestions = parsed;
+        } catch (_) {}
+      }
+
+      // Questions array: prefer exam questions (which has full objects), fallback to group question IDs
+      const questions = examQuestions.length > 0 ? examQuestions : groupQIds;
+      const questionCount = Math.max(examQuestions.length, groupQIds.length);
+      const submissions = exam?.submissions || [];
+      const submissionCount = submissions.length;
+
+      return {
+        ...d,
+        onlineExamId: d.onlineExamId || exam?.id || null,
+        onlineExam: exam,
+        questions,
+        questionCount,
+        submissions,
+        submissionCount,
+      };
+    });
+
+    return res.json({ success: true, distributions: enrichedDistributions });
   } catch (error) {
     console.error('[ADMIN] Fetch CBT distributions error:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch CBT distributions.' });
@@ -1038,7 +1128,7 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           class: { select: { id: true, name: true } },
           section: { select: { id: true, name: true } },
           subject: { select: { id: true, name: true, subjectCode: true } },
-          group: { select: { id: true, title: true, groupCode: true } },
+          group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
         },
       });
     } else {
@@ -1063,7 +1153,7 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           class: { select: { id: true, name: true } },
           section: { select: { id: true, name: true } },
           subject: { select: { id: true, name: true, subjectCode: true } },
-          group: { select: { id: true, title: true, groupCode: true } },
+          group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
         },
       });
     }
@@ -1147,7 +1237,7 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           class: { select: { id: true, name: true } },
           section: { select: { id: true, name: true } },
           subject: { select: { id: true, name: true, subjectCode: true } },
-          group: { select: { id: true, title: true, groupCode: true } },
+          group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
         },
       });
     }
@@ -1196,7 +1286,7 @@ export async function rescheduleCbtDistribution(req: Request, res: Response): Pr
         class: { select: { id: true, name: true } },
         section: { select: { id: true, name: true } },
         subject: { select: { id: true, name: true, subjectCode: true } },
-        group: { select: { id: true, title: true, groupCode: true } },
+        group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
       },
     });
 
@@ -2184,5 +2274,86 @@ export async function deleteExam(req: Request, res: Response): Promise<Response 
   } catch (error: any) {
     console.error('[ADMIN] Delete exam error:', error);
     return res.status(500).json({ success: false, message: error?.message || 'Failed to delete exam.' });
+  }
+}
+
+/**
+ * GET /api/admin/online-exams
+ */
+export async function getAdminOnlineExams(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const exams = await prisma.onlineExam.findMany({
+      where: branchId ? { branchId } : {},
+      include: {
+        class: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true } },
+        submissions: {
+          select: { id: true, totalMark: true, createdAt: true, studentId: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const distByExam = new Map<number, { startDate: Date | null; endDate: Date | null; shuffleQuestions: boolean; showResults: boolean }>();
+    if (exams.length) {
+      const dists = await prisma.cbtDistribution.findMany({
+        where: {
+          ...(branchId ? { branchId } : {}),
+          onlineExamId: { in: exams.map((e) => e.id) },
+        },
+        select: { onlineExamId: true, startDate: true, endDate: true, shuffleQuestions: true, showResults: true },
+      });
+      dists.forEach((d) => {
+        if (d.onlineExamId) distByExam.set(d.onlineExamId, d);
+      });
+    }
+
+    return res.json({
+      success: true,
+      exams: exams.map((exam) => ({
+        ...exam,
+        ...(distByExam.get(exam.id) || {}),
+      })),
+    });
+  } catch (error) {
+    console.error('[ADMIN] Get online-exams error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve online exams.' });
+  }
+}
+
+/**
+ * DELETE /api/admin/online-exams/:id
+ */
+export async function deleteAdminOnlineExam(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const examId = Number(req.params.id);
+
+  try {
+    const existing = await prisma.onlineExam.findFirst({
+      where: { id: examId, ...(branchId ? { branchId } : {}) },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Online exam not found.' });
+    }
+
+    await prisma.cbtDistribution.updateMany({
+      where: { onlineExamId: examId },
+      data: { onlineExamId: null },
+    });
+
+    await prisma.onlineExamSubmission.deleteMany({
+      where: { onlineExamId: examId },
+    });
+
+    await prisma.onlineExam.delete({
+      where: { id: examId },
+    });
+
+    return res.json({ success: true, message: 'Online exam deleted successfully.' });
+  } catch (error) {
+    console.error('[ADMIN] Delete online-exam error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to delete online exam.' });
   }
 }
