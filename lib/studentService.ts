@@ -191,25 +191,29 @@ export async function bindEvaluationMatrix(tx: any, { studentId, classId, sectio
     return;
   }
 
-  // 3. Build the evaluation rows (cartesian product of subjects and exams)
+  // 3. Fetch all existing marks for this student/class/session in ONE query
+  const existingMarks = await tx.mark.findMany({
+    where: {
+      studentId,
+      classId,
+      sectionId,
+      sessionId,
+      branchId,
+    },
+    select: {
+      subjectId: true,
+      examId: true,
+    },
+  });
+
+  const existingSet = new Set(
+    existingMarks.map((m: any) => `${m.subjectId}:${m.examId}`)
+  );
+
   const marksData: any[] = [];
   for (const assign of subjectAssignments) {
     for (const exam of exams) {
-      // Check if a mark entry already exists to ensure idempotency
-      const existingMark = await tx.mark.findFirst({
-        where: {
-          studentId,
-          subjectId: assign.subjectId,
-          classId,
-          sectionId,
-          examId: exam.id,
-          sessionId,
-          branchId,
-        },
-        select: { id: true },
-      });
-
-      if (!existingMark) {
+      if (!existingSet.has(`${assign.subjectId}:${exam.id}`)) {
         marksData.push({
           studentId,
           subjectId: assign.subjectId,
@@ -229,6 +233,7 @@ export async function bindEvaluationMatrix(tx: any, { studentId, classId, sectio
   if (marksData.length > 0) {
     await tx.mark.createMany({
       data: marksData,
+      skipDuplicates: true,
     });
     console.log(`[STUDENT SERVICE] Successfully bound ${marksData.length} evaluation matrix entries for student ${studentId}`);
   }

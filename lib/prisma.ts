@@ -22,12 +22,12 @@ declare global {
 function createPool() {
   const connectionString = process.env.DATABASE_URL || '';
   const usesSupabasePooler = /pooler\.supabase\.com|:6543/i.test(connectionString);
-  const max = Number(process.env.PG_POOL_MAX || (usesSupabasePooler ? 5 : 10));
+  const max = Number(process.env.PG_POOL_MAX || (usesSupabasePooler ? 20 : 15));
 
   const poolConfig: any = {
-    max: Number.isFinite(max) && max > 0 ? max : 5,
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 20_000,
+    max: Number.isFinite(max) && max > 0 ? max : 20,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 30_000,
     keepAlive: true,
     keepAliveInitialDelayMillis: 5_000,
     allowExitOnIdle: true,
