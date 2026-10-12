@@ -298,6 +298,25 @@ export async function requireTeacher(req: Request, res: Response, next: NextFunc
   }
 }
 
+interface CachedStudentContext {
+  studentId: number;
+  branchId: number | null;
+  classId: number | null;
+  sectionId: number | null;
+  sessionId: number;
+  cachedAt: number;
+}
+const studentContextCache = new Map<number, CachedStudentContext>();
+const STUDENT_CONTEXT_TTL = 3 * 60 * 1000; // 3 minutes TTL
+
+export function invalidateStudentContextCache(userId?: number): void {
+  if (userId) {
+    studentContextCache.delete(Number(userId));
+  } else {
+    studentContextCache.clear();
+  }
+}
+
 /**
  * Verifies Role 7 (Student)
  */
@@ -319,37 +338,67 @@ export async function requireStudent(req: Request, res: Response, next: NextFunc
     req.userId = decoded.sub || decoded.id;
     req.userRole = decoded.role;
 
-    const studentRecord = await prisma.student.findFirst({
-      where: {
-        OR: [
-          { userId: req.userId },
-          { id: req.userId },
-        ],
-      },
-      select: {
-        id: true,
-        branchId: true,
-        enrolls: {
-          take: 1,
-          orderBy: { id: 'desc' },
-          select: {
-            classId: true,
-            sectionId: true,
-            sessionId: true,
+    const userIdNum = Number(req.userId);
+    const now = Date.now();
+    const cached = studentContextCache.get(userIdNum);
+
+    if (cached && (now - cached.cachedAt) < STUDENT_CONTEXT_TTL) {
+      req.studentId = cached.studentId;
+      req.branchId = cached.branchId;
+      req.classId = cached.classId;
+      req.sectionId = cached.sectionId;
+      req.sessionId = cached.sessionId;
+      return next();
+    }
+
+    const [studentRecord, globalSetting] = await Promise.all([
+      prisma.student.findFirst({
+        where: {
+          OR: [
+            { userId: req.userId },
+            { id: req.userId },
+          ],
+        },
+        select: {
+          id: true,
+          branchId: true,
+          enrolls: {
+            take: 1,
+            orderBy: { id: 'desc' },
+            select: {
+              classId: true,
+              sectionId: true,
+              sessionId: true,
+            },
           },
         },
-      },
-    });
+      }),
+      prisma.globalSettings.findFirst({ orderBy: { id: 'desc' }, select: { sessionId: true } }),
+    ]);
 
     const latestEnroll = studentRecord?.enrolls?.[0];
-    const globalSetting = await prisma.globalSettings.findFirst({ orderBy: { id: 'desc' } });
     const activeSessionId = latestEnroll?.sessionId || globalSetting?.sessionId || 5;
 
-    req.studentId = studentRecord ? studentRecord.id : req.userId;
-    req.branchId = studentRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null));
-    req.classId = latestEnroll?.classId || null;
-    req.sectionId = latestEnroll?.sectionId || null;
-    req.sessionId = activeSessionId;
+    const studentId = studentRecord ? studentRecord.id : req.userId;
+    const branchId = studentRecord?.branchId || (decoded.branchId ? Number(decoded.branchId) : (decoded.legacyUserId ? Number(decoded.legacyUserId) : null));
+    const classId = latestEnroll?.classId || null;
+    const sectionId = latestEnroll?.sectionId || null;
+    const sessionId = activeSessionId;
+
+    studentContextCache.set(userIdNum, {
+      studentId,
+      branchId,
+      classId,
+      sectionId,
+      sessionId,
+      cachedAt: now,
+    });
+
+    req.studentId = studentId;
+    req.branchId = branchId;
+    req.classId = classId;
+    req.sectionId = sectionId;
+    req.sessionId = sessionId;
     next();
   } catch {
     res.status(401).json({ success: false, message: 'Token is invalid or expired.' });

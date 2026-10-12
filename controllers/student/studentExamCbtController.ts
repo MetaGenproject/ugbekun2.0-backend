@@ -50,21 +50,29 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
       return res.json({ success: true, exams: [], availableSessions: [], availableExamTypes: [] });
     }
 
-    // Resolve branch current session and system settings
-    const branchSetting = await prisma.systemSetting.findFirst({
-      where: { branchId: req.branchId },
-      select: { academicSession: true, currentTerm: true },
-    });
-    const currentSessionRaw = branchSetting?.academicSession || '2026-2027';
-    const currentSession = normalizeSession(currentSessionRaw);
-    const currentTerm = branchSetting?.currentTerm || 'First Term';
-
     // Retrieve recorded school years to map session IDs and offer past session archives
     const schoolYears = await prisma.schoolYear.findMany({
       select: { id: true, schoolYear: true },
       orderBy: { id: 'desc' },
     });
     const sessionById = new Map<number, string>(schoolYears.map((s) => [s.id, normalizeSession(s.schoolYear)]));
+
+    // Resolve active academic session: priority to active school year (sessionId 5 -> "2026-2027")
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const globalActiveSession = globalSetting?.sessionId && sessionById.has(globalSetting.sessionId)
+      ? sessionById.get(globalSetting.sessionId)!
+      : '2026-2027';
+
+    // Resolve branch current session and system settings
+    const branchSetting = await prisma.systemSetting.findFirst({
+      where: { branchId: req.branchId },
+      select: { academicSession: true, currentTerm: true },
+    });
+    const branchSessionRaw = branchSetting?.academicSession ? normalizeSession(branchSetting.academicSession) : null;
+    const currentSession = branchSessionRaw && branchSessionRaw.includes('2026')
+      ? branchSessionRaw
+      : globalActiveSession;
+    const currentTerm = branchSetting?.currentTerm || 'First Term';
 
     const onlineExams = await prisma.onlineExam.findMany({
       where: { classId, branchId: req.branchId },
@@ -521,12 +529,14 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
 
     if (onlineExamMeta && req.studentId && effectiveBranchId) {
       try {
+        const targetSessionId = (onlineExamMeta as any)?.sessionId || 5;
         await recordCbtPercentageOnMarksheet({
           studentId: req.studentId,
           classId: dist?.classId || onlineExamMeta.classId,
           subjectId: dist?.subjectId || onlineExamMeta.subjectId,
           branchId: effectiveBranchId,
           sectionId: dist?.sectionId || req.sectionId || null,
+          sessionId: targetSessionId,
           percentage: grading.percentage,
           source: 'CBT_AUTO',
           submissionId: updated.id,

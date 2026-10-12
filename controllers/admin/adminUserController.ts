@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../../lib/prisma';
+import { invalidateStudentContextCache } from '../../middleware/auth';
 
 const ROLE_NAMES: Record<number, string> = {
   1: 'SuperAdmin',
@@ -24,76 +25,114 @@ function generateSecurePassword(length = 10): string {
   return password;
 }
 
-async function resolveUserWithBranch(targetId: number, adminBranchId?: number) {
-  // 1. If adminBranchId is provided, first prioritize resolving within this branch
+async function resolveUserWithBranch(targetId: number, adminBranchId?: number, roleHint?: string) {
+  const normalizedRole = roleHint ? roleHint.trim().toLowerCase() : '';
+
+  // 1. Direct User lookup by Primary Key (id) first!
+  const directUser = await prisma.user.findUnique({
+    where: { id: targetId },
+    include: {
+      student: { select: { branchId: true, firstName: true, lastName: true } },
+      teacher: { select: { branchId: true, name: true } },
+      parent: { select: { branchId: true, name: true } },
+    },
+  });
+
+  if (directUser) {
+    const student = directUser.student;
+    const teacher = directUser.teacher;
+    const parent = directUser.parent;
+    const resolvedBranch = student?.branchId || teacher?.branchId || parent?.branchId || directUser.legacyUserId;
+
+    if (!adminBranchId || resolvedBranch === adminBranchId) {
+      let displayName = directUser.username;
+      if (student) displayName = `${student.firstName} ${student.lastName}`.trim();
+      else if (teacher) displayName = teacher.name;
+      else if (parent) displayName = parent.name;
+
+      return {
+        ...directUser,
+        resolvedBranchId: resolvedBranch,
+        displayName,
+      };
+    }
+  }
+
+  // 2. If adminBranchId is provided, fallback to resolving via student / teacher / parent ID
   if (adminBranchId) {
-    // 1a. Check if targetId is a teacher in this branch (by teacher id or user id)
-    const teacher = await prisma.teacher.findFirst({
-      where: {
-        branchId: adminBranchId,
-        OR: [
-          { id: targetId },
-          { userId: targetId },
-        ],
-      },
-      include: {
-        user: true,
-      },
-    });
+    // 2a. If roleHint is student or default check student first
+    if (normalizedRole === 'student' || (!normalizedRole && targetId > 0)) {
+      const student = await prisma.student.findFirst({
+        where: {
+          branchId: adminBranchId,
+          OR: [
+            { id: targetId },
+            { userId: targetId },
+          ],
+        },
+        include: {
+          user: true,
+        },
+      });
 
-    if (teacher?.user) {
-      return {
-        ...teacher.user,
-        resolvedBranchId: adminBranchId,
-        displayName: teacher.name,
-      };
+      if (student?.user) {
+        return {
+          ...student.user,
+          resolvedBranchId: adminBranchId,
+          displayName: `${student.firstName} ${student.lastName}`.trim(),
+        };
+      }
     }
 
-    // 1b. Check if targetId is a student in this branch
-    const student = await prisma.student.findFirst({
-      where: {
-        branchId: adminBranchId,
-        OR: [
-          { id: targetId },
-          { userId: targetId },
-        ],
-      },
-      include: {
-        user: true,
-      },
-    });
+    // 2b. Check teacher
+    if (normalizedRole === 'teacher' || (!normalizedRole && targetId > 0)) {
+      const teacher = await prisma.teacher.findFirst({
+        where: {
+          branchId: adminBranchId,
+          OR: [
+            { id: targetId },
+            { userId: targetId },
+          ],
+        },
+        include: {
+          user: true,
+        },
+      });
 
-    if (student?.user) {
-      return {
-        ...student.user,
-        resolvedBranchId: adminBranchId,
-        displayName: `${student.firstName} ${student.lastName}`.trim(),
-      };
+      if (teacher?.user) {
+        return {
+          ...teacher.user,
+          resolvedBranchId: adminBranchId,
+          displayName: teacher.name,
+        };
+      }
     }
 
-    // 1c. Check if targetId is a parent in this branch
-    const parent = await prisma.parent.findFirst({
-      where: {
-        branchId: adminBranchId,
-        OR: [
-          { id: targetId },
-          { userId: targetId },
-        ],
-      },
-      include: {
-        user: true,
-      },
-    });
+    // 2c. Check parent
+    if (normalizedRole === 'parent' || (!normalizedRole && targetId > 0)) {
+      const parent = await prisma.parent.findFirst({
+        where: {
+          branchId: adminBranchId,
+          OR: [
+            { id: targetId },
+            { userId: targetId },
+          ],
+        },
+        include: {
+          user: true,
+        },
+      });
 
-    if (parent?.user) {
-      return {
-        ...parent.user,
-        resolvedBranchId: adminBranchId,
-        displayName: parent.name,
-      };
+      if (parent?.user) {
+        return {
+          ...parent.user,
+          resolvedBranchId: adminBranchId,
+          displayName: parent.name,
+        };
+      }
     }
 
-    // 1d. Check direct user record in this branch
+    // 2d. Check direct user record in this branch
     const branchUser = await prisma.user.findFirst({
       where: {
         id: targetId,
@@ -126,7 +165,7 @@ async function resolveUserWithBranch(targetId: number, adminBranchId?: number) {
     }
   }
 
-  // 2. Fallback: Search by direct User ID
+  // 3. Fallback: Search by direct User ID
   let user = await prisma.user.findFirst({
     where: { id: targetId },
     include: {
@@ -136,13 +175,13 @@ async function resolveUserWithBranch(targetId: number, adminBranchId?: number) {
     },
   });
 
-  // 3. Fallback: Search by profile record IDs or legacyUserId
+  // 4. Fallback: Search by profile record IDs or legacyUserId
   if (!user) {
     user = await prisma.user.findFirst({
       where: {
         OR: [
-          { teacher: { id: targetId } },
           { student: { id: targetId } },
+          { teacher: { id: targetId } },
           { parent: { id: targetId } },
           { legacyUserId: targetId },
         ],
@@ -157,10 +196,10 @@ async function resolveUserWithBranch(targetId: number, adminBranchId?: number) {
 
   if (!user) return null;
 
-  const branchId = user.teacher?.branchId || user.student?.branchId || user.parent?.branchId || null;
+  const branchId = user.student?.branchId || user.teacher?.branchId || user.parent?.branchId || null;
   const displayName =
-    user.teacher?.name ||
     (user.student ? `${user.student.firstName} ${user.student.lastName}`.trim() : null) ||
+    user.teacher?.name ||
     user.parent?.name ||
     user.username;
 
@@ -179,12 +218,13 @@ export async function getUserCredentials(req: Request, res: Response): Promise<R
   try {
     const adminBranchId = (req as any).branchId;
     const targetUserId = parseInt(String(req.params.userId), 10);
+    const roleHint = req.query.role ? String(req.query.role) : undefined;
 
     if (isNaN(targetUserId)) {
       return res.status(400).json({ success: false, message: 'Invalid target user ID.' });
     }
 
-    const targetUser = await resolveUserWithBranch(targetUserId, adminBranchId);
+    const targetUser = await resolveUserWithBranch(targetUserId, adminBranchId, roleHint);
 
     if (!targetUser) {
       return res.status(404).json({ success: false, message: 'User record not found.' });
@@ -198,12 +238,29 @@ export async function getUserCredentials(req: Request, res: Response): Promise<R
       });
     }
 
+    let displayRawPassword = targetUser.rawPassword;
+    if (!displayRawPassword && targetUser.password) {
+      const isDefault = await bcrypt.compare('student123', targetUser.password).catch(() => false);
+      if (isDefault) displayRawPassword = 'student123';
+    }
+
+    // Fallback for students (role 7) to the school's configured default password
+    if (!displayRawPassword && targetUser.role === 7) {
+      const branchSetting = targetUser.resolvedBranchId
+        ? await prisma.systemSetting.findFirst({
+            where: { branchId: targetUser.resolvedBranchId },
+            select: { defaultStudentPassword: true },
+          })
+        : null;
+      displayRawPassword = branchSetting?.defaultStudentPassword || 'student123';
+    }
+
     return res.status(200).json({
       success: true,
       user: {
         id: targetUser.id,
         username: targetUser.username,
-        rawPassword: targetUser.rawPassword || '•••••••• (Initial Password Unchanged)',
+        rawPassword: displayRawPassword || '•••••••• (Initial Password Unchanged)',
         role: targetUser.role,
         roleName: ROLE_NAMES[targetUser.role] || 'User',
         name: targetUser.displayName,
@@ -219,19 +276,20 @@ export async function getUserCredentials(req: Request, res: Response): Promise<R
 
 /**
  * POST /api/admin/users/:userId/reset-password
- * School Admin resets user password globally across the system
+ * PUT/POST /api/admin/users/:userId/credentials
+ * School Admin can update both username and password for students and users in their branch
  */
-export async function resetUserPassword(req: Request, res: Response): Promise<Response | void> {
+export async function updateUserCredentials(req: Request, res: Response): Promise<Response | void> {
   try {
     const adminBranchId = (req as any).branchId;
     const targetUserId = parseInt(String(req.params.userId), 10);
-    const { newPassword } = req.body;
+    const { username, newPassword, password, roleHint } = req.body;
 
     if (isNaN(targetUserId)) {
       return res.status(400).json({ success: false, message: 'Invalid target user ID.' });
     }
 
-    const targetUser = await resolveUserWithBranch(targetUserId, adminBranchId);
+    const targetUser = await resolveUserWithBranch(targetUserId, adminBranchId, roleHint);
 
     if (!targetUser) {
       return res.status(404).json({ success: false, message: 'User record not found.' });
@@ -241,38 +299,107 @@ export async function resetUserPassword(req: Request, res: Response): Promise<Re
     if (adminBranchId && targetUser.resolvedBranchId && targetUser.resolvedBranchId !== adminBranchId) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only reset passwords for users in your school branch.',
+        message: 'Access denied. You can only manage credentials for users in your school branch.',
       });
     }
 
-    const finalPassword = (newPassword && String(newPassword).trim().length >= 6)
-      ? String(newPassword).trim()
-      : generateSecurePassword();
+    const updateData: { username?: string; password?: string; rawPassword?: string; updatedAt: Date } = {
+      updatedAt: new Date(),
+    };
 
-    const hashedPassword = await bcrypt.hash(finalPassword, 10);
+    let updatedUsername = targetUser.username;
+    let finalRawPassword = targetUser.rawPassword;
 
-    // Update global user credentials
+    // 1. Process custom Username update if supplied
+    if (username !== undefined && username !== null) {
+      const trimmedUsername = String(username).trim();
+      if (trimmedUsername.length < 3) {
+        return res.status(400).json({
+          success: false,
+          message: 'Username must be at least 3 characters long.',
+        });
+      }
+
+      if (trimmedUsername.toLowerCase() !== targetUser.username.toLowerCase()) {
+        const existingUser = await prisma.user.findFirst({
+          where: {
+            username: { equals: trimmedUsername, mode: 'insensitive' },
+            id: { not: targetUser.id },
+          },
+          select: { id: true },
+        });
+
+        if (existingUser) {
+          return res.status(400).json({
+            success: false,
+            message: `Username "${trimmedUsername}" is already taken by another account. Please choose a different username.`,
+          });
+        }
+      }
+
+      updateData.username = trimmedUsername;
+      updatedUsername = trimmedUsername;
+    }
+
+    // 2. Process custom Password update if supplied
+    const rawPassInput = (newPassword !== undefined ? newPassword : password);
+    if (rawPassInput !== undefined && rawPassInput !== null && String(rawPassInput).trim().length > 0) {
+      const trimmedPass = String(rawPassInput).trim();
+      if (trimmedPass.length < 4) {
+        return res.status(400).json({
+          success: false,
+          message: 'Password must be at least 4 characters long.',
+        });
+      }
+
+      const hashedPassword = await bcrypt.hash(trimmedPass, 10);
+      updateData.password = hashedPassword;
+      updateData.rawPassword = trimmedPass;
+      finalRawPassword = trimmedPass;
+    } else if (rawPassInput !== undefined && String(rawPassInput).trim().length === 0 && !username) {
+      // If admin explicitly requested auto-generated password without entering one
+      const generated = generateSecurePassword();
+      const hashedPassword = await bcrypt.hash(generated, 10);
+      updateData.password = hashedPassword;
+      updateData.rawPassword = generated;
+      finalRawPassword = generated;
+    }
+
+    if (!updateData.username && !updateData.password) {
+      return res.status(400).json({
+        success: false,
+        message: 'No changes provided. Please enter a new username or password.',
+      });
+    }
+
+    // Update global user credentials in database
     await prisma.user.update({
       where: { id: targetUser.id },
-      data: {
-        password: hashedPassword,
-        rawPassword: finalPassword,
-        updatedAt: new Date(),
-      },
+      data: updateData,
     });
+
+    const isStudent = targetUser.role === 7;
+    if (isStudent) {
+      invalidateStudentContextCache(targetUser.id);
+    }
+    const roleLabel = ROLE_NAMES[targetUser.role] || 'User';
 
     return res.status(200).json({
       success: true,
-      message: `Password reset successfully for ${targetUser.displayName}.`,
+      message: `Credentials updated successfully for ${targetUser.displayName} (${roleLabel}).`,
       credentials: {
         id: targetUser.id,
-        username: targetUser.username,
-        newPassword: finalPassword,
-        roleName: ROLE_NAMES[targetUser.role] || 'User',
+        username: updatedUsername,
+        newPassword: finalRawPassword || '••••••••',
+        rawPassword: finalRawPassword || '••••••••',
+        roleName: roleLabel,
+        isStudent,
       },
     });
   } catch (error: any) {
-    console.error('[ADMIN_USER] Reset password error:', error);
-    return res.status(500).json({ success: false, message: 'Failed to reset user password.' });
+    console.error('[ADMIN_USER] Update credentials error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to update user credentials.' });
   }
 }
+
+export const resetUserPassword = updateUserCredentials;

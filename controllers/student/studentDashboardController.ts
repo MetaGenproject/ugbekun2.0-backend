@@ -50,7 +50,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
     const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
     const todayDayName = dayNames[today.getDay()];
 
-    // 1. Student Profile
+    // 1. Student Profile lookup
     const student = await prisma.student.findUnique({
       where: { id: req.studentId },
       include: {
@@ -62,48 +62,184 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       return res.status(404).json({ success: false, message: 'Student not found.' });
     }
 
-    let classInfo = null;
-    let sectionInfo = null;
-    let fellowStudentsCount = 0;
-    let formTeacher = null;
-    let subjects: any[] = [];
+    // 2. High-Performance Concurrent Batch Execution
+    const [
+      classSectionData,
+      attendanceRes,
+      classPub,
+      timetableSlotsRaw,
+      homeworkData,
+      examData,
+      invoice,
+      events,
+    ] = await Promise.all([
+      // A. Class, Section, Student Count, Form Teacher, and Subject Allocations
+      (async () => {
+        if (!req.classId || !req.sectionId) return null;
+        const [classInfo, sectionInfo, fellowStudentsCount, formAlloc, subjectAssigns] = await Promise.all([
+          prisma.class.findUnique({ where: { id: req.classId }, select: { name: true } }),
+          prisma.section.findUnique({ where: { id: req.sectionId }, select: { name: true } }),
+          prisma.enroll.count({
+            where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
+          }),
+          prisma.teacherAllocation.findFirst({
+            where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
+            include: { teacher: { select: { name: true, email: true, phone: true, photo: true } } },
+          }),
+          prisma.subjectAssign.findMany({
+            where: {
+              classId: req.classId,
+              ...(req.sectionId
+                ? {
+                    OR: [
+                      { sectionId: req.sectionId },
+                      { sectionId: 0 },
+                    ],
+                  }
+                : {}),
+              sessionId: req.sessionId,
+              ...(req.branchId ? { branchId: req.branchId } : {}),
+            },
+            include: {
+              subject: { select: { id: true, name: true, subjectCode: true, subjectType: true, subjectAuthor: true } },
+              teacher: { select: { id: true, name: true, email: true, phone: true, photo: true, department: true } },
+            },
+          }),
+        ]);
+        return {
+          classInfo,
+          sectionInfo,
+          fellowStudentsCount,
+          formTeacher: formAlloc?.teacher || null,
+          subjectAssigns,
+        };
+      })(),
 
-    if (req.classId && req.sectionId) {
-      [classInfo, sectionInfo, fellowStudentsCount] = await Promise.all([
-        prisma.class.findUnique({ where: { id: req.classId }, select: { name: true } }),
-        prisma.section.findUnique({ where: { id: req.sectionId }, select: { name: true } }),
-        prisma.enroll.count({
-          where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
-        }),
-      ]);
-      const formAlloc = await prisma.teacherAllocation.findFirst({
-        where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
-        include: { teacher: { select: { name: true, email: true, phone: true, photo: true } } },
-      });
-      formTeacher = formAlloc?.teacher || null;
+      // B. Attendance KPI (Submitted registers)
+      listSubmittedAttendance(prisma, {
+        studentId: req.studentId,
+        sessionId: req.sessionId,
+        branchId: req.branchId,
+      }),
 
-      const subjectAssigns = await prisma.subjectAssign.findMany({
+      // C. Class publication check
+      (async () => {
+        if (!req.classId || !req.sessionId) return null;
+        return prisma.classReportCardPublication.findFirst({
+          where: {
+            classId: req.classId,
+            sessionId: req.sessionId,
+            ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
+            isPublished: true,
+          },
+        });
+      })(),
+
+      // D. Today's Timetable Slots
+      (async () => {
+        if (!req.classId) return [];
+        let slots = await prisma.timetableSlot.findMany({
+          where: {
+            classId: req.classId,
+            branchId: req.branchId,
+            dayOfWeek: todayDayName,
+            isPublished: true,
+            ...(req.sectionId
+              ? {
+                  OR: [{ sectionId: req.sectionId }, { sectionId: null }],
+                }
+              : {}),
+          },
+          include: {
+            subject: { select: { id: true, name: true, subjectCode: true } },
+            teacher: { select: { id: true, name: true, phone: true, photo: true } },
+            section: { select: { id: true, name: true } },
+            class: { select: { id: true, name: true } },
+          },
+          orderBy: { startTime: 'asc' },
+        });
+
+        if (slots.length === 0) {
+          slots = await prisma.timetableSlot.findMany({
+            where: {
+              classId: req.classId,
+              branchId: req.branchId,
+              dayOfWeek: todayDayName,
+            },
+            include: {
+              subject: { select: { id: true, name: true, subjectCode: true } },
+              teacher: { select: { id: true, name: true, phone: true, photo: true } },
+              section: { select: { id: true, name: true } },
+              class: { select: { id: true, name: true } },
+            },
+            orderBy: { startTime: 'asc' },
+          });
+        }
+        return slots;
+      })(),
+
+      // E. Homeworks and Submissions
+      (async () => {
+        if (!req.classId) return { homeworks: [], submissions: [] };
+        const [homeworks, submissions] = await Promise.all([
+          prisma.homework.findMany({
+            where: { classId: req.classId, branchId: req.branchId },
+            include: { subject: { select: { name: true } } },
+            orderBy: { dueDate: 'asc' },
+          }),
+          prisma.homeworkSubmission.findMany({
+            where: { studentId: req.studentId },
+            include: { homework: { include: { subject: { select: { name: true } } } } },
+            orderBy: { createdAt: 'desc' },
+          }),
+        ]);
+        return { homeworks, submissions };
+      })(),
+
+      // F. CBT Online Exams and Submissions
+      (async () => {
+        if (!req.classId) return { onlineExams: [], examSubs: [] };
+        const [onlineExams, examSubs] = await Promise.all([
+          prisma.onlineExam.findMany({
+            where: { classId: req.classId, branchId: req.branchId },
+            include: { subject: { select: { name: true } } },
+            orderBy: { examDate: 'asc' },
+            take: 8,
+          }),
+          prisma.onlineExamSubmission.findMany({
+            where: { studentId: req.studentId },
+            include: { onlineExam: { include: { subject: { select: { name: true } } } } },
+            orderBy: { submittedAt: 'desc' },
+            take: 8,
+          }),
+        ]);
+        return { onlineExams, examSubs };
+      })(),
+
+      // G. School fee status / Invoices
+      prisma.invoice.findFirst({
+        where: { studentId: req.studentId, sessionId: req.sessionId, branchId: req.branchId },
+        include: { payments: { select: { amount: true } } },
+        orderBy: { createdAt: 'desc' },
+      }),
+
+      // H. Events / Announcements
+      prisma.event.findMany({
         where: {
-          classId: req.classId,
-          ...(req.sectionId
-            ? {
-                OR: [
-                  { sectionId: req.sectionId },
-                  { sectionId: 0 },
-                ],
-              }
-            : {}),
+          branchId: req.branchId,
           sessionId: req.sessionId,
-          ...(req.branchId ? { branchId: req.branchId } : {}),
+          startDate: { gte: new Date(today.getFullYear(), today.getMonth() - 1, 1) },
         },
-        include: {
-          subject: { select: { id: true, name: true, subjectCode: true, subjectType: true, subjectAuthor: true } },
-          teacher: { select: { id: true, name: true, email: true, phone: true, photo: true, department: true } },
-        },
-      });
+        orderBy: { startDate: 'asc' },
+        take: 5,
+      }),
+    ]);
 
+    // Profile processing
+    let subjects: any[] = [];
+    if (classSectionData?.subjectAssigns) {
       const subjMap = new Map();
-      subjectAssigns.forEach((sa) => {
+      classSectionData.subjectAssigns.forEach((sa) => {
         if (!sa.subject) return;
         if (!subjMap.has(sa.subject.id)) {
           subjMap.set(sa.subject.id, {
@@ -147,23 +283,19 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       photo: student.photo,
       branchName: student.branch?.name || null,
       classId: req.classId || null,
-      className: classInfo?.name || null,
+      className: classSectionData?.classInfo?.name || null,
       sectionId: req.sectionId || null,
-      sectionName: sectionInfo?.name || null,
+      sectionName: classSectionData?.sectionInfo?.name || null,
       sessionId: req.sessionId,
-      fellowStudentsCount,
-      formTeacher,
+      fellowStudentsCount: classSectionData?.fellowStudentsCount || 0,
+      formTeacher: classSectionData?.formTeacher || null,
       subjects,
     };
 
-    // 2. Attendance KPI — submitted registers only
-    const { logs: attendanceLogs, summary: attendanceSummary } = await listSubmittedAttendance(prisma, {
-      studentId: req.studentId,
-      sessionId: req.sessionId,
-      branchId: req.branchId,
-    });
+    // Attendance KPI processing
+    const attendanceLogs = attendanceRes.logs || [];
+    const attendanceSummary = attendanceRes.summary || { percentage: 0, totalDays: 0, presentCount: 0, absentCount: 0, lateCount: 0 };
     const attendancePct = attendanceSummary.percentage;
-
     const attendance = {
       percentage: attendancePct,
       totalDays: attendanceSummary.totalDays,
@@ -178,27 +310,17 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       })),
     };
 
-    // 3. Grades / Average / Rank (Gated by School Admin's Per-Class Publication)
+    // Grades / Average / Rank
+    const isClassPublished = Boolean(classPub);
     let overallAverage = 0;
     let rank = null;
-    let totalClassStudents = fellowStudentsCount;
+    let totalClassStudents = classSectionData?.fellowStudentsCount || 0;
     let subjectPerformance: any[] = [];
+    let studentMarks: any[] = [];
 
-    let isClassPublished = false;
-    if (req.classId && req.sessionId) {
-      const classPub = await prisma.classReportCardPublication.findFirst({
-        where: {
-          classId: req.classId,
-          sessionId: req.sessionId,
-          ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
-          isPublished: true,
-        },
-      });
-      isClassPublished = Boolean(classPub);
-    }
-
-    const studentMarks = isClassPublished
-      ? await prisma.mark.findMany({
+    if (isClassPublished && req.classId && req.sessionId) {
+      const [marks, enrolls] = await Promise.all([
+        prisma.mark.findMany({
           where: {
             studentId: req.studentId,
             sessionId: req.sessionId,
@@ -208,42 +330,42 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
             subject: { select: { name: true } },
             exam: { select: { publishResult: true } },
           },
-        })
-      : [];
+        }),
+        req.sectionId
+          ? prisma.enroll.findMany({
+              where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
+              select: { studentId: true },
+            })
+          : Promise.resolve([]),
+      ]);
 
-    if (studentMarks.length > 0) {
-      let totalScoreSum = 0;
-      let marksCount = 0;
-      const subjectMap: Record<string, any> = {};
+      studentMarks = marks;
+      if (studentMarks.length > 0) {
+        let totalScoreSum = 0;
+        let marksCount = 0;
+        const subjectMap: Record<string, any> = {};
 
-      studentMarks.forEach((m) => {
-        const parsed = parseMarkScore(m.mark, m.cbtMark);
-        if (parsed.hasValidScore) {
-          totalScoreSum += parsed.total;
-          marksCount++;
-          const sName = m.subject?.name || 'Unknown';
-          if (!subjectMap[sName]) subjectMap[sName] = { sum: 0, count: 0 };
-          subjectMap[sName].sum += parsed.total;
-          subjectMap[sName].count++;
-        }
-      });
-
-      overallAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
-      subjectPerformance = Object.entries(subjectMap).map(([name, d]) => ({
-        name,
-        score: Number((d.sum / d.count).toFixed(1)),
-      }));
-
-      // Compute rank within class
-      if (req.classId && req.sectionId) {
-        const enrolls = await prisma.enroll.findMany({
-          where: { classId: req.classId, sectionId: req.sectionId, sessionId: req.sessionId, branchId: req.branchId },
-          select: { studentId: true },
+        studentMarks.forEach((m) => {
+          const parsed = parseMarkScore(m.mark, m.cbtMark);
+          if (parsed.hasValidScore) {
+            totalScoreSum += parsed.total;
+            marksCount++;
+            const sName = m.subject?.name || 'Unknown';
+            if (!subjectMap[sName]) subjectMap[sName] = { sum: 0, count: 0 };
+            subjectMap[sName].sum += parsed.total;
+            subjectMap[sName].count++;
+          }
         });
-        const studentIds = enrolls.map((e) => e.studentId);
-        totalClassStudents = studentIds.length;
 
+        overallAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+        subjectPerformance = Object.entries(subjectMap).map(([name, d]) => ({
+          name,
+          score: Number((d.sum / d.count).toFixed(1)),
+        }));
+
+        const studentIds = enrolls.map((e) => e.studentId);
         if (studentIds.length > 0) {
+          totalClassStudents = studentIds.length;
           const allMarks = await prisma.mark.findMany({
             where: {
               studentId: { in: studentIds },
@@ -272,198 +394,91 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       }
     }
 
-    // 4. Today's Timetable
-    let todayTimetable: any[] = [];
-    if (req.classId) {
-      let slots = await prisma.timetableSlot.findMany({
-        where: {
-          classId: req.classId,
-          branchId: req.branchId,
-          dayOfWeek: todayDayName,
-          isPublished: true,
-          ...(req.sectionId
-            ? {
-                OR: [{ sectionId: req.sectionId }, { sectionId: null }],
-              }
-            : {}),
-        },
-        include: {
-          subject: { select: { id: true, name: true, subjectCode: true } },
-          teacher: { select: { id: true, name: true, phone: true, photo: true } },
-          section: { select: { id: true, name: true } },
-          class: { select: { id: true, name: true } },
-        },
-        orderBy: { startTime: 'asc' },
-      });
+    // Timetable formatting
+    const todayTimetable = timetableSlotsRaw.map((s) => ({
+      id: s.id,
+      startTime: s.startTime,
+      endTime: s.endTime,
+      time: `${s.startTime} - ${s.endTime}`,
+      type: s.type,
+      title:
+        s.title ||
+        s.subject?.name ||
+        (s.type === 'BREAK' ? 'Recess / Break' : s.type === 'ASSEMBLY' ? 'Morning Assembly' : 'Period'),
+      subjectName: s.subject?.name || null,
+      subjectCode: s.subject?.subjectCode || '',
+      teacherName: s.teacher?.name || null,
+      teacher: s.teacher?.name || (s.type === 'SUBJECT' ? 'Teacher Unassigned' : null),
+      teacherPhone: s.teacher?.phone || null,
+      roomLabel: s.section?.name || s.class?.name || null,
+      className: s.class?.name || null,
+      sectionName: s.section?.name || null,
+    }));
 
-      if (slots.length === 0) {
-        slots = await prisma.timetableSlot.findMany({
-          where: {
-            classId: req.classId,
-            branchId: req.branchId,
-            dayOfWeek: todayDayName,
-            isPublished: true,
-          },
-          include: {
-            subject: { select: { id: true, name: true, subjectCode: true } },
-            teacher: { select: { id: true, name: true, phone: true, photo: true } },
-            section: { select: { id: true, name: true } },
-            class: { select: { id: true, name: true } },
-          },
-          orderBy: { startTime: 'asc' },
-        });
-      }
-
-      if (slots.length === 0) {
-        slots = await prisma.timetableSlot.findMany({
-          where: {
-            classId: req.classId,
-            branchId: req.branchId,
-            dayOfWeek: todayDayName,
-          },
-          include: {
-            subject: { select: { id: true, name: true, subjectCode: true } },
-            teacher: { select: { id: true, name: true, phone: true, photo: true } },
-            section: { select: { id: true, name: true } },
-            class: { select: { id: true, name: true } },
-          },
-          orderBy: { startTime: 'asc' },
-        });
-      }
-
-      todayTimetable = slots.map((s) => ({
-        id: s.id,
-        startTime: s.startTime,
-        endTime: s.endTime,
-        time: `${s.startTime} - ${s.endTime}`,
-        type: s.type,
-        title:
-          s.title ||
-          s.subject?.name ||
-          (s.type === 'BREAK' ? 'Recess / Break' : s.type === 'ASSEMBLY' ? 'Morning Assembly' : 'Period'),
-        subjectName: s.subject?.name || null,
-        subjectCode: s.subject?.subjectCode || '',
-        teacherName: s.teacher?.name || null,
-        teacher: s.teacher?.name || (s.type === 'SUBJECT' ? 'Teacher Unassigned' : null),
-        teacherPhone: s.teacher?.phone || null,
-        roomLabel: s.section?.name || s.class?.name || null,
-        className: s.class?.name || null,
-        sectionName: s.section?.name || null,
-      }));
-    }
-
-    // 5. Upcoming Assignments (Homeworks)
-    let upcomingHomeworks: any[] = [];
-    if (req.classId) {
-      const homeworks = await prisma.homework.findMany({
-        where: { classId: req.classId, branchId: req.branchId },
-        include: { subject: { select: { name: true } } },
-        orderBy: { dueDate: 'asc' },
-        take: 6,
-      });
-      const submissions = await prisma.homeworkSubmission.findMany({
-        where: { studentId: req.studentId, homeworkId: { in: homeworks.map((h) => h.id) } },
-        select: { homeworkId: true, score: true, feedback: true },
-      });
-      const subMap = new Map(submissions.map((s) => [s.homeworkId, s]));
-
-      upcomingHomeworks = homeworks.map((hw) => {
-        const dueDate = new Date(hw.dueDate);
-        const diffDays = Math.ceil((dueDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-        let deadlineBadge = 'Upcoming';
-        if (diffDays < 0) deadlineBadge = 'Overdue';
-        else if (diffDays === 0) deadlineBadge = 'Due Today';
-        else if (diffDays === 1) deadlineBadge = 'Due Tomorrow';
-        else deadlineBadge = `${diffDays} Days Left`;
-        const sub = subMap.get(hw.id);
-        return {
-          id: hw.id,
-          title: hw.title,
-          description: hw.description,
-          questions: hw.questions || [],
-          subjectName: hw.subject?.name || 'General',
-          dueDate: hw.dueDate,
-          deadlineBadge,
-          diffDays,
-          submitted: !!sub,
-          score: sub?.score ?? null,
-          submissionScore: sub?.score ?? null,
-          submissionStatus: sub ? (sub.score !== null ? 'GRADED' : 'SUBMITTED') : 'PENDING',
-          feedback: sub?.feedback || null,
-        };
-      });
-    }
-
-    // 6. Upcoming CBT / Exams
-    let upcomingExams: any[] = [];
-    if (req.classId) {
-      const onlineExams = await prisma.onlineExam.findMany({
-        where: { classId: req.classId, branchId: req.branchId },
-        include: { subject: { select: { name: true } } },
-        orderBy: { examDate: 'asc' },
-        take: 6,
-      });
-      const submittedExIds = new Set(
-        (
-          await prisma.onlineExamSubmission.findMany({
-            where: { studentId: req.studentId, onlineExamId: { in: onlineExams.map((e) => e.id) } },
-            select: { onlineExamId: true },
-          })
-        ).map((s) => s.onlineExamId)
-      );
-      upcomingExams = onlineExams.map((ex) => {
-        const examDate = ex.examDate ? new Date(ex.examDate) : null;
-        const diffDays = examDate ? Math.ceil((examDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)) : null;
-        let deadlineBadge = 'Available';
-        if (diffDays === null) deadlineBadge = 'Available';
-        else if (diffDays < 0) deadlineBadge = 'Past';
-        else if (diffDays === 0) deadlineBadge = 'Today';
-        else deadlineBadge = `${diffDays} Days Left`;
-        return {
-          id: ex.id,
-          title: ex.title,
-          subjectName: ex.subject?.name || 'General',
-          examDate: ex.examDate,
-          deadlineBadge,
-          diffDays,
-          submitted: submittedExIds.has(ex.id),
-        };
-      });
-    }
-
-    // 7. Homework Progress Stats
-    let homeworkProgress = { completed: 0, pending: 0, overdue: 0, percentage: 0 };
-    if (req.classId) {
-      const allHomeworks = await prisma.homework.findMany({
-        where: { classId: req.classId, branchId: req.branchId },
-        select: { id: true, dueDate: true },
-      });
-      const submittedHwSet = new Set(
-        (
-          await prisma.homeworkSubmission.findMany({
-            where: { studentId: req.studentId },
-            select: { homeworkId: true },
-          })
-        ).map((s) => s.homeworkId)
-      );
-      const completed = allHomeworks.filter((h) => submittedHwSet.has(h.id)).length;
-      const overdue = allHomeworks.filter((h) => !submittedHwSet.has(h.id) && new Date(h.dueDate) < today).length;
-      const pending = allHomeworks.length - completed - overdue;
-      homeworkProgress = {
-        completed,
-        pending: Math.max(0, pending),
-        overdue,
-        percentage: allHomeworks.length > 0 ? Math.round((completed / allHomeworks.length) * 100) : 0,
+    // Homeworks & Progress (Processed from batch)
+    const { homeworks: allHomeworks, submissions: allHwSubmissions } = homeworkData;
+    const subMap = new Map(allHwSubmissions.map((s) => [s.homeworkId, s]));
+    const upcomingHomeworks = allHomeworks.slice(0, 6).map((hw) => {
+      const dueDate = new Date(hw.dueDate);
+      const diffDays = Math.ceil((dueDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+      let deadlineBadge = 'Upcoming';
+      if (diffDays < 0) deadlineBadge = 'Overdue';
+      else if (diffDays === 0) deadlineBadge = 'Due Today';
+      else if (diffDays === 1) deadlineBadge = 'Due Tomorrow';
+      else deadlineBadge = `${diffDays} Days Left`;
+      const sub = subMap.get(hw.id);
+      return {
+        id: hw.id,
+        title: hw.title,
+        description: hw.description,
+        questions: hw.questions || [],
+        subjectName: hw.subject?.name || 'General',
+        dueDate: hw.dueDate,
+        deadlineBadge,
+        diffDays,
+        submitted: !!sub,
+        score: sub?.score ?? null,
+        submissionScore: sub?.score ?? null,
+        submissionStatus: sub ? (sub.score !== null ? 'GRADED' : 'SUBMITTED') : 'PENDING',
+        feedback: sub?.feedback || null,
       };
-    }
-
-    // 8. School Fee Status
-    let feeStatus = { status: 'Unknown', totalBilled: 0, totalPaid: 0, outstanding: 0, nextTermDate: null };
-    const invoice = await prisma.invoice.findFirst({
-      where: { studentId: req.studentId, sessionId: req.sessionId, branchId: req.branchId },
-      include: { payments: { select: { amount: true } } },
-      orderBy: { createdAt: 'desc' },
     });
+
+    const submittedHwSet = new Set(allHwSubmissions.map((s) => s.homeworkId));
+    const completedHw = allHomeworks.filter((h) => submittedHwSet.has(h.id)).length;
+    const overdueHw = allHomeworks.filter((h) => !submittedHwSet.has(h.id) && new Date(h.dueDate) < today).length;
+    const pendingHw = allHomeworks.length - completedHw - overdueHw;
+    const homeworkProgress = {
+      completed: completedHw,
+      pending: Math.max(0, pendingHw),
+      overdue: overdueHw,
+      percentage: allHomeworks.length > 0 ? Math.round((completedHw / allHomeworks.length) * 100) : 0,
+    };
+
+    // CBT Exams (Processed from batch)
+    const { onlineExams, examSubs } = examData;
+    const submittedExIds = new Set(examSubs.map((s) => s.onlineExamId));
+    const upcomingExams = onlineExams.slice(0, 6).map((ex) => {
+      const examDate = ex.examDate ? new Date(ex.examDate) : null;
+      const diffDays = examDate ? Math.ceil((examDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)) : null;
+      let deadlineBadge = 'Available';
+      if (diffDays === null) deadlineBadge = 'Available';
+      else if (diffDays < 0) deadlineBadge = 'Past';
+      else if (diffDays === 0) deadlineBadge = 'Today';
+      else deadlineBadge = `${diffDays} Days Left`;
+      return {
+        id: ex.id,
+        title: ex.title,
+        subjectName: ex.subject?.name || 'General',
+        examDate: ex.examDate,
+        deadlineBadge,
+        diffDays,
+        submitted: submittedExIds.has(ex.id),
+      };
+    });
+
+    // Fee Status
+    let feeStatus = { status: 'Unknown', totalBilled: 0, totalPaid: 0, outstanding: 0, nextTermDate: null };
     if (invoice) {
       const totalBilled = parseFloat(String(invoice.totalAmount || '0'));
       const totalPaid = invoice.payments.reduce((s, p) => s + parseFloat(String(p.amount || '0')), 0);
@@ -474,16 +489,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       feeStatus = { status, totalBilled, totalPaid, outstanding, nextTermDate: null };
     }
 
-    // 9. Events / Announcements
-    const events = await prisma.event.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId: req.sessionId,
-        startDate: { gte: new Date(today.getFullYear(), today.getMonth() - 1, 1) },
-      },
-      orderBy: { startDate: 'asc' },
-      take: 5,
-    });
+    // Announcements
     const announcements = events.map((ev) => ({
       id: ev.id,
       title: ev.title,
@@ -491,16 +497,9 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       startDate: ev.startDate,
     }));
 
-    // 10. Recent Activities
+    // Recent Activities (Aggregated from batch in memory)
     const recentActivities: any[] = [];
-
-    const recentHwSubs = await prisma.homeworkSubmission.findMany({
-      where: { studentId: req.studentId },
-      include: { homework: { include: { subject: { select: { name: true } } } } },
-      orderBy: { createdAt: 'desc' },
-      take: 3,
-    });
-    recentHwSubs.forEach((s) => {
+    allHwSubmissions.slice(0, 3).forEach((s) => {
       recentActivities.push({
         type: 'homework_submitted',
         text: `You submitted ${s.homework?.subject?.name || 'a'} homework`,
@@ -508,13 +507,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       });
     });
 
-    const recentExamSubs = await prisma.onlineExamSubmission.findMany({
-      where: { studentId: req.studentId },
-      include: { onlineExam: { include: { subject: { select: { name: true } } } } },
-      orderBy: { submittedAt: 'desc' },
-      take: 3,
-    });
-    recentExamSubs.forEach((s) => {
+    examSubs.slice(0, 3).forEach((s) => {
       const scoreText = s.totalMark !== null && s.totalMark !== undefined ? ` (Score: ${s.totalMark})` : '';
       recentActivities.push({
         type: 'exam_submitted',

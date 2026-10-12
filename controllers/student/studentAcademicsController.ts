@@ -54,12 +54,41 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
   }
 
   try {
-    const allNotes = await prisma.teacherNote.findMany({
-      where: { branchId: req.branchId },
-      include: {
-        teacher: { select: { name: true } },
-      },
-    });
+    const [allNotes, onlineExams, homeworks] = await Promise.all([
+      prisma.teacherNote.findMany({
+        where: { branchId: req.branchId },
+        include: {
+          teacher: { select: { name: true } },
+        },
+      }),
+      prisma.onlineExam.findMany({
+        where: {
+          classId: targetClassId,
+          ...(req.branchId ? { branchId: req.branchId } : {}),
+        },
+        include: {
+          subject: { select: { name: true } },
+          submissions: {
+            where: { studentId: req.studentId },
+            select: { totalMark: true, createdAt: true },
+          },
+        },
+      }),
+      prisma.homework.findMany({
+        where: {
+          classId: targetClassId,
+          ...(req.branchId ? { branchId: req.branchId } : {}),
+        },
+        include: {
+          subject: { select: { name: true } },
+          submissions: {
+            where: { studentId: req.studentId },
+            select: { id: true, score: true, feedback: true, createdAt: true },
+          },
+        },
+        orderBy: { dueDate: 'asc' },
+      }),
+    ]);
 
     const notes = allNotes
       .filter((n) => n.classId.split(',').map((s) => s.trim()).includes(String(targetClassId)))
@@ -72,35 +101,6 @@ export async function getTasks(req: Request, res: Response): Promise<Response | 
         teacherName: n.teacher?.name || 'Staff',
         createdAt: n.createdAt,
       }));
-
-    const onlineExams = await prisma.onlineExam.findMany({
-      where: {
-        classId: targetClassId,
-        ...(req.branchId ? { branchId: req.branchId } : {}),
-      },
-      include: {
-        subject: { select: { name: true } },
-        submissions: {
-          where: { studentId: req.studentId },
-          select: { totalMark: true, createdAt: true },
-        },
-      },
-    });
-
-    const homeworks = await prisma.homework.findMany({
-      where: {
-        classId: targetClassId,
-        ...(req.branchId ? { branchId: req.branchId } : {}),
-      },
-      include: {
-        subject: { select: { name: true } },
-        submissions: {
-          where: { studentId: req.studentId },
-          select: { id: true, score: true, feedback: true, createdAt: true },
-        },
-      },
-      orderBy: { dueDate: 'asc' },
-    });
 
     return res.json({
       success: true,

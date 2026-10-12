@@ -10,4 +10,8 @@ router.get('/schools', publicTenantController.listPublicSchools);
 router.get('/school-info', publicTenantController.getPublicSchoolInfo);
 router.get('/resolve-domain', publicTenantController.resolveDomain);
 
+// Public Online Admissions Routes
+router.get('/admissions/meta', publicTenantController.getAdmissionMetadata);
+router.post('/admissions/apply', publicTenantController.submitAdmissionApplication);
+
 export default router;

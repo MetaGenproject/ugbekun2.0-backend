@@ -79,6 +79,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
         orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
         select: {
           id: true,
+          userId: true,
           registerNo: true,
           firstName: true,
           lastName: true,
@@ -88,6 +89,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           photo: true,
           parentId: true,
           active: true,
+          user: { select: { id: true, username: true } },
           parent: { select: { name: true, photo: true, mobileno: true, email: true } },
           enrolls: {
             take: 1,
@@ -442,14 +444,31 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
-      select: { name: true, code: true },
+      select: {
+        name: true,
+        code: true,
+        systemSetting: {
+          select: {
+            defaultStudentPassword: true,
+            defaultParentPassword: true,
+          },
+        },
+      },
     });
+
+    const defaultStudentPassword = branch?.systemSetting?.defaultStudentPassword || 'student123';
+    const defaultParentPassword = branch?.systemSetting?.defaultParentPassword || 'parent123';
+
+    // Allow custom student password from body or default to school standard student password (student123)
+    const rawStudentPassInput = String(student.password || student.studentPassword || body.studentPassword || body.password || '').trim();
+    const studentPlainPassword = rawStudentPassInput || defaultStudentPassword;
+
+    const rawParentPassInput = String(parent.password || parent.parentPassword || body.parentPassword || '').trim();
+    const parentPlainPassword = rawParentPassInput || defaultParentPassword;
 
     const registerNo = await generateRegistrationNumber(prisma, branchId);
     const idCardToken = crypto.randomUUID();
 
-    const studentPlainPassword = generateSecurePassword();
-    const parentPlainPassword = generateSecurePassword();
     const [hashedStudentPassword, hashedParentPassword] = await Promise.all([
       bcrypt.hash(studentPlainPassword, 10),
       bcrypt.hash(parentPlainPassword, 10),
@@ -544,13 +563,28 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
         });
       }
 
-      const studentUsername = `${firstName.toLowerCase()}.${lastName.toLowerCase()}`.replace(/[^a-zA-Z0-9.]/g, '');
-      let uniqueStudentUsername = studentUsername;
-      let sCounter = 1;
-      while (true) {
-        const userCheck = await tx.user.findUnique({ where: { username: uniqueStudentUsername }, select: { id: true } });
-        if (!userCheck) break;
-        uniqueStudentUsername = `${studentUsername}_${sCounter++}`;
+      // Support custom student username if specified by admin
+      const customStudentUsername = String(student.username || student.studentUsername || body.studentUsername || '').trim();
+      let uniqueStudentUsername = '';
+
+      if (customStudentUsername) {
+        const userCheck = await tx.user.findFirst({
+          where: { username: { equals: customStudentUsername, mode: 'insensitive' } },
+          select: { id: true },
+        });
+        if (userCheck) {
+          throw new Error(`Username "${customStudentUsername}" is already taken by another account. Please choose a different username.`);
+        }
+        uniqueStudentUsername = customStudentUsername;
+      } else {
+        const studentUsername = `${firstName.toLowerCase()}.${lastName.toLowerCase()}`.replace(/[^a-zA-Z0-9.]/g, '');
+        uniqueStudentUsername = studentUsername;
+        let sCounter = 1;
+        while (true) {
+          const userCheck = await tx.user.findUnique({ where: { username: uniqueStudentUsername }, select: { id: true } });
+          if (!userCheck) break;
+          uniqueStudentUsername = `${studentUsername}_${sCounter++}`;
+        }
       }
       finalStudentUsername = uniqueStudentUsername;
 
@@ -1043,8 +1077,20 @@ export async function exportClassCredentialSlipsPdf(req: Request, res: Response)
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
-      select: { name: true, code: true },
+      select: {
+        name: true,
+        code: true,
+        systemSetting: {
+          select: {
+            defaultStudentPassword: true,
+            defaultParentPassword: true,
+          },
+        },
+      },
     });
+
+    const defaultStudentPassword = branch?.systemSetting?.defaultStudentPassword || 'student123';
+    const defaultParentPassword = branch?.systemSetting?.defaultParentPassword || 'parent123';
 
     let targetClass = null;
     let targetSection = null;
@@ -1077,10 +1123,10 @@ export async function exportClassCredentialSlipsPdf(req: Request, res: Response)
       include: {
         student: {
           include: {
-            user: { select: { username: true } },
+            user: { select: { username: true, rawPassword: true } },
             parent: {
               include: {
-                user: { select: { username: true } },
+                user: { select: { username: true, rawPassword: true } },
               },
             },
           },
@@ -1098,11 +1144,11 @@ export async function exportClassCredentialSlipsPdf(req: Request, res: Response)
         studentName: `${s.firstName} ${s.lastName}`,
         registerNo: s.registerNo || '',
         studentUsername: s.user?.username || `${s.firstName.toLowerCase()}.${s.lastName.toLowerCase()}`,
-        studentPassword: 'Check Login Slip / Contact Admin',
+        studentPassword: s.user?.rawPassword || defaultStudentPassword,
         parentName: p ? p.name : '',
         parentRelation: p ? p.relation : 'Parent',
         parentUsername: p?.user?.username || null,
-        parentPassword: 'Check Login Slip / Contact Admin',
+        parentPassword: p?.user?.rawPassword || defaultParentPassword,
         isExistingParent: true,
       };
     });
@@ -1941,6 +1987,12 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
         student: {
           include: {
             parent: true,
+            user: {
+              select: {
+                id: true,
+                username: true,
+              },
+            },
           },
         },
       },
@@ -1963,6 +2015,12 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
           student: {
             include: {
               parent: true,
+              user: {
+                select: {
+                  id: true,
+                  username: true,
+                },
+              },
             },
           },
         },
@@ -2016,6 +2074,8 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
       if (e.student && !studentMap.has(e.studentId)) {
         studentMap.set(e.studentId, {
           id: e.student.id,
+          userId: e.student.userId || e.student.user?.id || null,
+          username: e.student.user?.username || null,
           registerNo: e.student.registerNo,
           firstName: e.student.firstName,
           lastName: e.student.lastName,
@@ -2271,6 +2331,50 @@ export async function updateOnlineAdmissionStatus(req: Request, res: Response): 
           data: { status: 3 },
         });
       });
+
+      // Dispatch automated admission acceptance & credentials email to parent
+      try {
+        const branch = await prisma.branch.findUnique({
+          where: { id: branchId },
+          select: {
+            name: true,
+            code: true,
+            customDomain: true,
+            subdomain: true,
+            systemSetting: { select: { schoolName: true } },
+          },
+        });
+
+        const recipientEmail = (admission.grdEmail || admission.email || '').trim();
+        if (recipientEmail) {
+          const tenantUrl = branch?.customDomain
+            ? `https://${branch.customDomain}/login`
+            : branch?.subdomain
+            ? `https://${branch.subdomain}.ugbekun.com/login`
+            : (process.env.FRONTEND_URL || 'https://www.ugbekun.com') + '/login';
+
+          const schoolName = branch?.systemSetting?.schoolName || branch?.name || 'School';
+
+          sendOnboardingCredentials({
+            parentEmail: recipientEmail,
+            parentName: admission.guardianName || 'Parent / Guardian',
+            studentName: `${admission.firstName} ${admission.lastName || ''}`.trim(),
+            registerNo,
+            studentUsername,
+            studentPassword: studentPlainPassword,
+            parentUsername: parentUsername || null,
+            parentPassword: parentPlainPassword || null,
+            isExistingParent: !parentUsername,
+            schoolName,
+            branchCode: branch?.code || '',
+            loginUrl: tenantUrl,
+          }).catch((err: any) => {
+            console.warn('[ADMIN] Async online admission approval email dispatch failed:', err?.message);
+          });
+        }
+      } catch (emailDispatchErr: any) {
+        console.warn('[ADMIN] Error preparing online admission approval email:', emailDispatchErr?.message);
+      }
 
       return res.json({
         success: true,

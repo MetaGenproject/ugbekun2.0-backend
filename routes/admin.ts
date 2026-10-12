@@ -700,6 +700,7 @@ router.delete('/inventory/items/:id', deleteInventoryItem);
 import {
   getUserCredentials,
   resetUserPassword,
+  updateUserCredentials,
 } from '../controllers/admin/adminUserController';
 
 router.get('/myeduride/config', getMyEduRideConfigHandler);
@@ -726,5 +727,7 @@ router.delete('/domain/remove', removeDomain);
 // User Credential Management & Global Reset
 router.get('/users/:userId/credentials', getUserCredentials);
 router.post('/users/:userId/reset-password', resetUserPassword);
+router.put('/users/:userId/credentials', updateUserCredentials);
+router.post('/users/:userId/credentials', updateUserCredentials);
 
 export default router;
