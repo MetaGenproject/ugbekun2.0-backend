@@ -189,7 +189,15 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
           }),
           prisma.homeworkSubmission.findMany({
             where: { studentId: req.studentId },
-            include: { homework: { include: { subject: { select: { name: true } } } } },
+            // Only fields the dashboard uses — skips the large `answers` JSON column.
+            select: {
+              id: true,
+              homeworkId: true,
+              score: true,
+              feedback: true,
+              createdAt: true,
+              homework: { select: { subject: { select: { name: true } } } },
+            },
             orderBy: { createdAt: 'desc' },
           }),
         ]);
@@ -208,7 +216,13 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
           }),
           prisma.onlineExamSubmission.findMany({
             where: { studentId: req.studentId },
-            include: { onlineExam: { include: { subject: { select: { name: true } } } } },
+            // Only fields the dashboard uses — skips the exam `questions` JSON.
+            select: {
+              onlineExamId: true,
+              totalMark: true,
+              submittedAt: true,
+              onlineExam: { select: { subject: { select: { name: true } } } },
+            },
             orderBy: { submittedAt: 'desc' },
             take: 8,
           }),

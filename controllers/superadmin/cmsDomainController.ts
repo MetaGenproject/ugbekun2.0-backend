@@ -11,6 +11,7 @@ import {
   formatDomainSlug,
   DEFAULT_DNS_TARGET,
 } from '../../lib/domainService';
+import { cacheDelPattern } from '../../lib/cacheService';
 
 /**
  * GET /api/superadmin/branches/:branchId/landing-page
@@ -32,7 +33,7 @@ export async function getBranchLandingPage(req: Request, res: Response): Promise
     }
 
     const landingPage = branch.landingPage || (await getOrCreateLandingPage(prisma, branch.id));
-    const responseData = formatLandingPageResponse(branch, landingPage);
+    const responseData = formatLandingPageResponse(branch, landingPage, branch.systemSetting);
 
     return res.json({ success: true, data: responseData });
   } catch (error: any) {
@@ -51,31 +52,99 @@ export async function updateBranchLandingPage(req: Request, res: Response): Prom
   }
 
   try {
-    const body = req.body || {};
-    const updated = await prisma.schoolLandingPage.upsert({
+    const {
+      isEnabled,
+      heroHeadline,
+      heroSubheadline,
+      heroBanners,
+      welcomeTitle,
+      welcomeMessage,
+      welcomeAuthor,
+      welcomePhoto,
+      aboutText,
+      photoGallery,
+      academicPrograms,
+      announcements,
+      primaryColor,
+      secondaryColor,
+      showAdmissionCta,
+      showPortalLoginCta,
+      showGallery,
+      showAnnouncements,
+      facebookUrl,
+      instagramUrl,
+      youtubeUrl,
+      twitterUrl,
+    } = req.body || {};
+
+    const updatedLandingPage = await prisma.schoolLandingPage.upsert({
       where: { branchId },
       update: {
-        heroHeadline: body.heroHeadline,
-        heroSubheadline: body.heroSubheadline,
-        aboutText: body.aboutText,
-        primaryColor: body.primaryColor,
-        secondaryColor: body.secondaryColor,
-        isEnabled: body.isEnabled !== undefined ? Boolean(body.isEnabled) : undefined,
-        showAdmissionCta: body.showAdmissionCta !== undefined ? Boolean(body.showAdmissionCta) : undefined,
-        showPortalLoginCta: body.showPortalLoginCta !== undefined ? Boolean(body.showPortalLoginCta) : undefined,
+        ...(isEnabled !== undefined && { isEnabled: Boolean(isEnabled) }),
+        ...(heroHeadline !== undefined && { heroHeadline: String(heroHeadline).trim() }),
+        ...(heroSubheadline !== undefined && { heroSubheadline: String(heroSubheadline).trim() }),
+        ...(heroBanners !== undefined && { heroBanners }),
+        ...(welcomeTitle !== undefined && { welcomeTitle }),
+        ...(welcomeMessage !== undefined && { welcomeMessage }),
+        ...(welcomeAuthor !== undefined && { welcomeAuthor }),
+        ...(welcomePhoto !== undefined && { welcomePhoto }),
+        ...(aboutText !== undefined && { aboutText }),
+        ...(photoGallery !== undefined && { photoGallery }),
+        ...(academicPrograms !== undefined && { academicPrograms }),
+        ...(announcements !== undefined && { announcements }),
+        ...(primaryColor !== undefined && { primaryColor }),
+        ...(secondaryColor !== undefined && { secondaryColor }),
+        ...(showAdmissionCta !== undefined && { showAdmissionCta: Boolean(showAdmissionCta) }),
+        ...(showPortalLoginCta !== undefined && { showPortalLoginCta: Boolean(showPortalLoginCta) }),
+        ...(showGallery !== undefined && { showGallery: Boolean(showGallery) }),
+        ...(showAnnouncements !== undefined && { showAnnouncements: Boolean(showAnnouncements) }),
+        ...(facebookUrl !== undefined && { facebookUrl }),
+        ...(instagramUrl !== undefined && { instagramUrl }),
+        ...(youtubeUrl !== undefined && { youtubeUrl }),
+        ...(twitterUrl !== undefined && { twitterUrl }),
       },
       create: {
         branchId,
-        heroHeadline: body.heroHeadline || 'Welcome to Our School',
-        heroSubheadline: body.heroSubheadline || '',
-        aboutText: body.aboutText || '',
-        primaryColor: body.primaryColor || '#0284c7',
-        secondaryColor: body.secondaryColor || '#0f172a',
-        isEnabled: body.isEnabled !== undefined ? Boolean(body.isEnabled) : true,
+        isEnabled: isEnabled !== undefined ? Boolean(isEnabled) : true,
+        heroHeadline: heroHeadline || 'Welcome to Our School',
+        heroSubheadline: heroSubheadline || '',
+        heroBanners: heroBanners || [],
+        welcomeTitle: welcomeTitle || 'Welcome from the Principal',
+        welcomeMessage: welcomeMessage || '',
+        welcomeAuthor: welcomeAuthor || '',
+        welcomePhoto: welcomePhoto || null,
+        aboutText: aboutText || '',
+        photoGallery: photoGallery || [],
+        academicPrograms: academicPrograms || [],
+        announcements: announcements || [],
+        primaryColor: primaryColor || '#0284c7',
+        secondaryColor: secondaryColor || '#0f172a',
+        showAdmissionCta: showAdmissionCta !== undefined ? Boolean(showAdmissionCta) : true,
+        showPortalLoginCta: showPortalLoginCta !== undefined ? Boolean(showPortalLoginCta) : true,
+        showGallery: showGallery !== undefined ? Boolean(showGallery) : true,
+        showAnnouncements: showAnnouncements !== undefined ? Boolean(showAnnouncements) : true,
+        facebookUrl: facebookUrl || '',
+        instagramUrl: instagramUrl || '',
+        youtubeUrl: youtubeUrl || '',
+        twitterUrl: twitterUrl || '',
       },
     });
 
-    return res.json({ success: true, message: 'Landing page updated successfully.', data: updated });
+    // Invalidate cached tenant resolution so public domain immediately reflects updates
+    await cacheDelPattern('tenant:resolve:*');
+
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: { systemSetting: true },
+    });
+
+    const responseData = formatLandingPageResponse(branch, updatedLandingPage, branch?.systemSetting);
+
+    return res.json({
+      success: true,
+      message: 'Landing page updated successfully.',
+      data: responseData,
+    });
   } catch (error: any) {
     console.error('[SUPERADMIN] Update landing page error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to update landing page.' });

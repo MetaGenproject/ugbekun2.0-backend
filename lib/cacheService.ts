@@ -67,3 +67,26 @@ export async function cacheDel(key: string): Promise<void> {
     // Ignore error
   }
 }
+
+/**
+ * Invalidate all cache keys matching a pattern
+ */
+export async function cacheDelPattern(pattern: string): Promise<void> {
+  const regex = new RegExp('^' + pattern.replace(/\*/g, '.*'));
+  for (const k of Array.from(memoryCache.keys())) {
+    if (regex.test(k)) {
+      memoryCache.delete(k);
+    }
+  }
+  try {
+    if (redisClient?.isOpen) {
+      const keys = await redisClient.keys(pattern);
+      if (keys && keys.length > 0) {
+        await redisClient.del(keys);
+      }
+    }
+  } catch (err) {
+    // Ignore error
+  }
+}
+

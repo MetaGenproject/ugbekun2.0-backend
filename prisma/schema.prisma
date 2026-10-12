@@ -373,6 +373,7 @@ model TeacherAllocation {
   class   Class   @relation(fields: [classId], references: [id])
   section Section @relation(fields: [sectionId], references: [id])
 
+  @@index([teacherId])
   @@map("teacher_allocations")
 }
 
@@ -694,6 +695,7 @@ model SubjectAssign {
 
   @@index([branchId, sessionId])
   @@index([classId, sectionId])
+  @@index([teacherId])
   @@map("subject_assign")
 }
 
@@ -716,6 +718,7 @@ model Enroll {
 
   @@index([branchId, sessionId])
   @@index([studentId])
+  @@index([classId, sectionId, sessionId])
   @@map("enroll")
 }
 
@@ -775,6 +778,7 @@ model Mark {
 
   @@index([studentId, examId])
   @@index([classId, sectionId, sessionId])
+  @@index([subjectId, sessionId])
   @@map("mark")
 }
 
@@ -1014,6 +1018,7 @@ model HomeworkSubmission {
   student  Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
   @@index([studentId, homeworkId])
+  @@index([homeworkId])
   @@map("homework_submission")
 }
 

@@ -106,15 +106,15 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
   try {
     const todayKey = todaySchoolDateKey();
 
-    const teacher = await prisma.teacher.findUnique({
-      where: { id: req.teacherId },
-      include: { branch: { select: { id: true, name: true } } },
-    });
-    if (!teacher) {
-      return res.status(404).json({ success: false, message: 'Teacher profile not found.' });
-    }
-
-    const [formAllocations, subjectAssignments] = await Promise.all([
+    // Batch 1: profile, allocations and active session are independent — fetch together.
+    const [teacher, activeSessionId, formAllocations, subjectAssignments] = await Promise.all([
+      prisma.teacher.findUnique({
+        where: { id: req.teacherId },
+        include: { branch: { select: { id: true, name: true } } },
+      }),
+      // req.sessionId is not set by requireTeacher, so resolve the active session here
+      // (previously attendance fell back to sessionId = 1).
+      resolveTeacherSession(req.branchId, req.sessionId ? Number(req.sessionId) : undefined),
       prisma.teacherAllocation.findMany({
         where: { teacherId: req.teacherId },
         include: {
@@ -131,6 +131,9 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         },
       }),
     ]);
+    if (!teacher) {
+      return res.status(404).json({ success: false, message: 'Teacher profile not found.' });
+    }
 
     const primaryForm = formAllocations[0]
       ? `${formAllocations[0].class?.name || ''} ${formAllocations[0].section?.name || ''}`.trim()
@@ -146,32 +149,94 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
     });
     const subjectsCount = uniqueSubjectsMap.size;
 
-    const classSectionPairs = [
-      ...formAllocations.map((fa) => ({ classId: fa.classId, sectionId: fa.sectionId })),
-      ...subjectAssignments.map((sa) => ({ classId: sa.classId, sectionId: sa.sectionId })),
-    ];
+    // De-duplicated (classId, sectionId) pairs the teacher covers.
+    const pairKeys = new Set<string>();
+    const classSectionPairs: Array<{ classId: number; sectionId: number }> = [];
+    [...formAllocations, ...subjectAssignments].forEach((a) => {
+      const key = `${a.classId}-${a.sectionId}`;
+      if (!pairKeys.has(key)) {
+        pairKeys.add(key);
+        classSectionPairs.push({ classId: a.classId, sectionId: a.sectionId });
+      }
+    });
 
-    let totalStudentsCount = 0;
-    if (classSectionPairs.length > 0) {
-      totalStudentsCount = await prisma.enroll.count({
-        where: {
-          OR: classSectionPairs.map((p) => ({ classId: p.classId, sectionId: p.sectionId })),
-        },
-      });
-    }
+    // (subjectId, classId, sectionId) triples — used to scope marks to the teacher's own classes.
+    const markScopes = subjectAssignments.map((sa) => ({
+      subjectId: sa.subjectId,
+      classId: sa.classId,
+      sectionId: sa.sectionId,
+    }));
+
+    const teacherSubjectIds = Array.from(uniqueSubjectsMap.keys());
+
+    // Batch 2: everything below only depends on batch 1 — run concurrently.
+    const [
+      totalStudentsCount,
+      snapshot,
+      assignmentsCount,
+      pendingReviewCount,
+      testsCount,
+      lessonNotesCount,
+      scopedMarks,
+      dbActivities,
+      dbReminders,
+      academicRoles,
+    ] = await Promise.all([
+      classSectionPairs.length > 0
+        ? prisma.enroll.count({
+            where: {
+              sessionId: activeSessionId,
+              ...(req.branchId ? { branchId: req.branchId } : {}),
+              OR: classSectionPairs,
+            },
+          })
+        : Promise.resolve(0),
+      formAllocations[0]
+        ? getRegisterWithEntries(prisma, {
+            branchId: req.branchId,
+            sessionId: activeSessionId,
+            classId: formAllocations[0].classId,
+            sectionId: formAllocations[0].sectionId,
+            dateKey: todayKey,
+          })
+        : Promise.resolve(null),
+      teacherSubjectIds.length > 0
+        ? prisma.homework.count({ where: { subjectId: { in: teacherSubjectIds }, branchId: req.branchId } })
+        : Promise.resolve(0),
+      teacherSubjectIds.length > 0
+        ? prisma.homeworkSubmission.count({
+            where: { score: null, homework: { subjectId: { in: teacherSubjectIds }, branchId: req.branchId } },
+          })
+        : Promise.resolve(0),
+      teacherSubjectIds.length > 0
+        ? prisma.onlineExam.count({ where: { subjectId: { in: teacherSubjectIds }, branchId: req.branchId } })
+        : Promise.resolve(0),
+      prisma.lessonPlan.count({ where: { teacherId: req.teacherId } }),
+      // One scoped query replaces the old per-subject loop, which loaded every mark for
+      // each subject across ALL schools and sessions (full table scan per subject).
+      markScopes.length > 0
+        ? prisma.mark.findMany({
+            where: { sessionId: activeSessionId, OR: markScopes },
+            select: { subjectId: true, mark: true, cbtMark: true },
+          })
+        : Promise.resolve([] as Array<{ subjectId: number; mark: string | null; cbtMark: string | null }>),
+      prisma.teacherActivity.findMany({
+        where: { teacherId: req.teacherId },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+      }),
+      prisma.teacherReminder.findMany({
+        where: { teacherId: req.teacherId },
+        orderBy: { createdAt: 'desc' },
+      }),
+      getTeacherAcademicRoles(prisma, req.teacherId, req.branchId, req.sessionId ? Number(req.sessionId) : null),
+    ]);
 
     let attendancePct = 0,
       presentCount = 0,
       lateCount = 0,
       absentCount = 0;
-    if (formAllocations[0]) {
-      const snapshot = await getRegisterWithEntries(prisma, {
-        branchId: req.branchId,
-        sessionId: Number(req.sessionId) || 1,
-        classId: formAllocations[0].classId,
-        sectionId: formAllocations[0].sectionId,
-        dateKey: todayKey,
-      });
+    if (snapshot) {
       const published =
         snapshot.register?.status === REGISTER_STATUS.SUBMITTED ||
         snapshot.register?.status === REGISTER_STATUS.LOCKED;
@@ -184,32 +249,21 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       }
     }
 
-    const teacherSubjectIds = Array.from(uniqueSubjectsMap.keys());
-    const [assignmentsCount, pendingReviewCount, testsCount, lessonNotesCount] = await Promise.all([
-      teacherSubjectIds.length > 0 ? prisma.homework.count({ where: { subjectId: { in: teacherSubjectIds }, branchId: req.branchId } }) : 0,
-      teacherSubjectIds.length > 0 ? prisma.homeworkSubmission.count({ where: { homework: { subjectId: { in: teacherSubjectIds } }, score: null } }) : 0,
-      teacherSubjectIds.length > 0 ? prisma.onlineExam.count({ where: { subjectId: { in: teacherSubjectIds }, branchId: req.branchId } }) : 0,
-      prisma.lessonPlan.count({ where: { teacherId: req.teacherId } }),
-    ]);
-
-    const subjectPerformance: any[] = [];
-    for (const [subId, subName] of Array.from(uniqueSubjectsMap.entries())) {
-      const marks = await prisma.mark.findMany({
-        where: { subjectId: subId },
-        select: { mark: true, cbtMark: true },
-      });
-      let totalScore = 0,
-        validCount = 0;
-      marks.forEach((m) => {
-        const val = Number(m.mark || m.cbtMark || 0);
-        if (val > 0) {
-          totalScore += val;
-          validCount++;
-        }
-      });
-      const avgScore = validCount > 0 ? Math.round(totalScore / validCount) : 0;
-      subjectPerformance.push({ name: subName, score: avgScore });
-    }
+    // Aggregate marks per subject in memory (same scoring rule as before).
+    const markAgg = new Map<number, { total: number; count: number }>();
+    scopedMarks.forEach((m) => {
+      const val = Number(m.mark || m.cbtMark || 0);
+      if (val > 0) {
+        const agg = markAgg.get(m.subjectId) || { total: 0, count: 0 };
+        agg.total += val;
+        agg.count++;
+        markAgg.set(m.subjectId, agg);
+      }
+    });
+    const subjectPerformance: any[] = Array.from(uniqueSubjectsMap.entries()).map(([subId, subName]) => {
+      const agg = markAgg.get(subId);
+      return { name: subName, score: agg && agg.count > 0 ? Math.round(agg.total / agg.count) : 0 };
+    });
 
     const myClasses = formAllocations.map((fa) => ({
       name: `${fa.class?.name || ''} ${fa.section?.name || ''}`.trim(),
@@ -227,11 +281,6 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       }
     });
 
-    const dbActivities = await prisma.teacherActivity.findMany({
-      where: { teacherId: req.teacherId },
-      orderBy: { createdAt: 'desc' },
-      take: 5,
-    });
     const recentActivities = dbActivities.map((a) => ({
       id: a.id,
       text: a.activity,
@@ -239,10 +288,6 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       icon: a.type.toLowerCase(),
     }));
 
-    const dbReminders = await prisma.teacherReminder.findMany({
-      where: { teacherId: req.teacherId },
-      orderBy: { createdAt: 'desc' },
-    });
     const reminders = dbReminders.map((r) => ({
       id: r.id,
       text: r.text,
@@ -257,13 +302,6 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         classAverage = Math.round(validScores.reduce((acc, curr) => acc + curr.score, 0) / validScores.length);
       }
     }
-
-    const academicRoles = await getTeacherAcademicRoles(
-      prisma,
-      req.teacherId,
-      req.branchId,
-      req.sessionId ? Number(req.sessionId) : null
-    );
 
     return res.json({
       success: true,
