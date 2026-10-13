@@ -28,7 +28,7 @@ export async function findCompanionOnlineExam(dist: {
 }) {
   if (dist.onlineExamId) {
     const byId = await prisma.onlineExam.findFirst({
-      where: { id: dist.onlineExamId, branchId: dist.branchId },
+      where: { id: dist.onlineExamId, branchId: dist.branchId, classId: dist.classId },
     })
     if (byId) return byId
   }

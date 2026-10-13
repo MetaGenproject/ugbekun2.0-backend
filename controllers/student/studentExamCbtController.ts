@@ -317,6 +317,7 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
         classId: dist.classId,
         subjectId: dist.subjectId,
         branchId: req.branchId,
+        onlineExamId: dist.onlineExamId,
       });
       if (!onlineEx) {
         onlineEx = await prisma.onlineExam.create({
@@ -334,6 +335,15 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
         });
       }
       targetOnlineExamId = onlineEx.id;
+
+      if (dist.onlineExamId !== onlineEx.id) {
+        await prisma.cbtDistribution
+          .update({
+            where: { id: dist.id },
+            data: { onlineExamId: onlineEx.id },
+          })
+          .catch(() => {});
+      }
     } else {
       const onlineExam = await prisma.onlineExam.findUnique({
         where: { id: examId },
@@ -454,25 +464,28 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
         });
       }
 
-      let onlineEx = dist.onlineExamId
-        ? await prisma.onlineExam.findUnique({ where: { id: dist.onlineExamId } })
-        : null;
-      if (!onlineEx) {
-        onlineEx = await findCompanionOnlineExam({
-          title: dist.title,
-          classId: dist.classId,
-          subjectId: dist.subjectId,
-          branchId: dist.branchId || req.branchId || 0,
-          onlineExamId: dist.onlineExamId,
-        });
+      let onlineEx = await findCompanionOnlineExam({
+        title: dist.title,
+        classId: dist.classId,
+        subjectId: dist.subjectId,
+        branchId: dist.branchId || req.branchId || 0,
+        onlineExamId: dist.onlineExamId,
+      });
+      if (!onlineEx && dist.onlineExamId) {
+        onlineEx = await prisma.onlineExam.findUnique({ where: { id: dist.onlineExamId } });
       }
       if (onlineEx) {
         targetOnlineExamId = onlineEx.id;
-        if (!dist.onlineExamId) {
-          await prisma.cbtDistribution.update({
-            where: { id: dist.id },
-            data: { onlineExamId: onlineEx.id },
-          }).catch(() => {});
+        if (dist.onlineExamId !== onlineEx.id) {
+          await prisma.cbtDistribution
+            .update({
+              where: { id: dist.id },
+              data: { onlineExamId: onlineEx.id },
+            })
+            .catch(() => {});
+        }
+        if (rawQuestions.length === 0 && Array.isArray(onlineEx.questions) && onlineEx.questions.length > 0) {
+          rawQuestions = onlineEx.questions as any[];
         }
       }
     } else {
@@ -487,16 +500,37 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
       targetOnlineExamId = onlineExam.id;
     }
 
+    const candidateExamIds = new Set<number>([examId, targetOnlineExamId]);
+    if (dist?.onlineExamId) {
+      candidateExamIds.add(dist.onlineExamId);
+    }
+    if (dist) {
+      const companions = await prisma.onlineExam.findMany({
+        where: {
+          branchId: dist.branchId || req.branchId || 0,
+          title: dist.title,
+          classId: dist.classId,
+          subjectId: dist.subjectId,
+        },
+        select: { id: true },
+      });
+      companions.forEach((c) => candidateExamIds.add(c.id));
+    }
+
     const existing = await prisma.onlineExamSubmission.findFirst({
       where: {
         studentId: req.studentId,
-        OR: [{ onlineExamId: targetOnlineExamId }, { onlineExamId: examId }],
+        onlineExamId: { in: Array.from(candidateExamIds) },
       },
       orderBy: { id: 'desc' },
     });
 
     if (!existing) {
       return res.status(400).json({ success: false, message: 'No active attempt found for this examination.' });
+    }
+
+    if (existing.onlineExamId) {
+      targetOnlineExamId = existing.onlineExamId;
     }
 
     if (existing.submittedAt !== null && existing.totalMark !== null) {
@@ -513,7 +547,7 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
       where: { id: existing.id },
       data: {
         answers,
-        totalMark: grading.percentage,
+        totalMark: grading.totalScore,
         submittedAt: new Date(),
       },
     });
@@ -538,9 +572,11 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
           sectionId: dist?.sectionId || req.sectionId || null,
           sessionId: targetSessionId,
           percentage: grading.percentage,
+          rawScore: grading.totalScore,
+          totalPossible: grading.totalPossible,
           source: 'CBT_AUTO',
           submissionId: updated.id,
-          scale: DEFAULT_CBT_SCALE,
+          scale: grading.totalPossible || 10,
         });
       } catch (markError: any) {
         console.error('[STUDENT] CBT marksheet record error:', markError?.message || markError);

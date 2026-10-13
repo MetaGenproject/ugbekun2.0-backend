@@ -1,6 +1,6 @@
 import prisma from './prisma'
 
-export const DEFAULT_CBT_SCALE = 40
+export const DEFAULT_CBT_SCALE = 10
 
 export type CbtMarkSource = 'CBT_AUTO' | 'CBT_SYNC' | 'ADMIN_OVERRIDE'
 
@@ -215,7 +215,9 @@ export async function recordCbtPercentageOnMarksheet(params: {
   classId: number
   subjectId: number
   branchId: number
-  percentage: number
+  percentage?: number
+  rawScore?: number | null
+  totalPossible?: number | null
   source: CbtMarkSource
   sectionId?: number | null
   sessionId?: number | null
@@ -242,8 +244,12 @@ export async function recordCbtPercentageOnMarksheet(params: {
     return { mark: null, skipped: true, reason: 'no_section' }
   }
 
-  const scale = params.scale ?? DEFAULT_CBT_SCALE
-  const scaled = scaleCbtPercentage(params.percentage, scale)
+  const finalScale = params.scale ?? params.totalPossible ?? DEFAULT_CBT_SCALE
+  const finalCbtMark =
+    params.rawScore !== undefined && params.rawScore !== null
+      ? params.rawScore
+      : scaleCbtPercentage(params.percentage ?? 0, finalScale)
+
   return upsertAcademicCbtMark({
     studentId: params.studentId,
     classId: params.classId,
@@ -252,10 +258,10 @@ export async function recordCbtPercentageOnMarksheet(params: {
     branchId: params.branchId,
     sessionId,
     examId,
-    cbtMark: scaled,
+    cbtMark: finalCbtMark,
     source: params.source,
     submissionId: params.submissionId,
-    scale,
+    scale: finalScale,
     overwriteOverride: params.overwriteOverride,
     tx: params.tx,
   })

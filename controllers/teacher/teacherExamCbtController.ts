@@ -404,10 +404,10 @@ export async function gradeOnlineExamSubmission(req: Request, res: Response): Pr
           classId: submission.onlineExam.classId,
           subjectId: submission.onlineExam.subjectId,
           branchId,
-          percentage: Number(score),
+          rawScore: Number(score),
           source: 'CBT_SYNC',
           submissionId: submission.id,
-          scale: DEFAULT_CBT_SCALE,
+          scale: 10,
         }).catch((e) => console.error('[TEACHER] gradeOnlineExam marksheet sync error:', e));
       }
     }
@@ -821,6 +821,7 @@ export async function syncTeacherCbtMarks(req: Request, res: Response): Promise<
           branchId: effectiveBranchId,
           sessionId,
           examId,
+          rawScore: Number(sub.totalMark),
           percentage: Number(sub.totalMark),
           source: 'CBT_SYNC',
           submissionId: sub.id,

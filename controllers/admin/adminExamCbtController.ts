@@ -1993,6 +1993,7 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
           branchId: effectiveBranchId,
           sessionId,
           examId,
+          rawScore: Number(sub.totalMark),
           percentage: Number(sub.totalMark),
           source: 'CBT_SYNC',
           submissionId: sub.id,

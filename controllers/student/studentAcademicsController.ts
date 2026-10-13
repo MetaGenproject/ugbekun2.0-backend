@@ -324,6 +324,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
         cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
+        cbtScale: (m as any).cbtScale || 10,
         theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
         mark: parsed.hasValidScore ? String(parsed.total) : null,
         absent: m.absent === '1' || m.absent === 'true',
