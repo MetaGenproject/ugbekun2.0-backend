@@ -450,14 +450,13 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
         systemSetting: {
           select: {
             defaultStudentPassword: true,
-            defaultParentPassword: true,
           },
         },
       },
     });
 
     const defaultStudentPassword = branch?.systemSetting?.defaultStudentPassword || 'student123';
-    const defaultParentPassword = branch?.systemSetting?.defaultParentPassword || 'parent123';
+    const defaultParentPassword = 'parent123';
 
     // Allow custom student password from body or default to school standard student password (student123)
     const rawStudentPassInput = String(student.password || student.studentPassword || body.studentPassword || body.password || '').trim();
@@ -1083,14 +1082,13 @@ export async function exportClassCredentialSlipsPdf(req: Request, res: Response)
         systemSetting: {
           select: {
             defaultStudentPassword: true,
-            defaultParentPassword: true,
           },
         },
       },
     });
 
     const defaultStudentPassword = branch?.systemSetting?.defaultStudentPassword || 'student123';
-    const defaultParentPassword = branch?.systemSetting?.defaultParentPassword || 'parent123';
+    const defaultParentPassword = 'parent123';
 
     let targetClass = null;
     let targetSection = null;
