@@ -1175,62 +1175,151 @@ export async function exportClassCredentialSlipsPdf(req: Request, res: Response)
  */
 export async function promoteStudent(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const studentId = Number(req.params.id);
 
   try {
-    const { classId, sectionId } = req.body;
-    if (!classId || !sectionId) {
-      return res.status(400).json({ success: false, message: 'Target classId and sectionId are required.' });
+    const rawSingleId = req.params.id || req.body.studentId || req.body.id;
+    let studentIds: number[] = [];
+
+    if (Array.isArray(req.body.studentIds) && req.body.studentIds.length > 0) {
+      studentIds = req.body.studentIds.map((id: any) => Number(id)).filter((id: number) => !isNaN(id) && id > 0);
+    } else if (rawSingleId) {
+      const parsed = Number(rawSingleId);
+      if (!isNaN(parsed) && parsed > 0) {
+        studentIds = [parsed];
+      }
+    }
+
+    if (studentIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Please provide at least one valid student ID for promotion.' });
+    }
+
+    const { classId, targetClassId, sectionId, targetSectionId, sessionId: reqSessionId, targetSessionId, action } = req.body;
+    const tClassId = Number(targetClassId || classId);
+    const tSectionId = Number(targetSectionId || sectionId);
+
+    if (!tClassId || !tSectionId) {
+      return res.status(400).json({ success: false, message: 'Target class and section are required.' });
     }
 
     const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const defaultSession = globalSetting?.sessionId || 5;
+    const tSessionId = Number(targetSessionId || reqSessionId || defaultSession);
+    const isRepeat = action === 'REPEAT';
+    const actorId = Number(req.userId || 1);
 
-    await prisma.$transaction(async (tx: any) => {
-      const currentEnroll = await tx.enroll.findFirst({
-        where: { studentId, sessionId, branchId },
-      });
+    let successCount = 0;
+    let failureCount = 0;
 
-      if (!currentEnroll) {
-        throw new Error('Student has no current active enrollment in this session.');
+    for (const studentId of studentIds) {
+      try {
+        await prisma.$transaction(async (tx: any) => {
+          // Find active enrollment
+          let currentEnroll = await tx.enroll.findFirst({
+            where: { studentId, branchId, isAlumni: 0 },
+            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          });
+
+          if (!currentEnroll) {
+            currentEnroll = await tx.enroll.findFirst({
+              where: { studentId, branchId },
+              orderBy: { id: 'desc' },
+            });
+          }
+
+          if (!currentEnroll) {
+            throw new Error(`No active enrollment found for student #${studentId}`);
+          }
+
+          // Record promotion history audit
+          await tx.promotionHistory.create({
+            data: {
+              studentId,
+              fromClassId: currentEnroll.classId,
+              fromSectionId: currentEnroll.sectionId,
+              toClassId: tClassId,
+              toSectionId: tSectionId,
+              promotedBy: actorId,
+              sessionId: tSessionId,
+            },
+          });
+
+          if (tSessionId === currentEnroll.sessionId) {
+            // Same session reassignment/promotion
+            await tx.enroll.update({
+              where: { id: currentEnroll.id },
+              data: {
+                classId: tClassId,
+                sectionId: tSectionId,
+                isAlumni: 0,
+                updatedAt: new Date(),
+              },
+            });
+          } else {
+            // Cross session promotion
+            const existingTargetEnroll = await tx.enroll.findFirst({
+              where: { studentId, sessionId: tSessionId, branchId },
+            });
+
+            if (existingTargetEnroll) {
+              await tx.enroll.update({
+                where: { id: existingTargetEnroll.id },
+                data: {
+                  classId: tClassId,
+                  sectionId: tSectionId,
+                  isAlumni: 0,
+                  updatedAt: new Date(),
+                },
+              });
+            } else {
+              await tx.enroll.create({
+                data: {
+                  studentId,
+                  classId: tClassId,
+                  sectionId: tSectionId,
+                  roll: currentEnroll.roll || 0,
+                  sessionId: tSessionId,
+                  branchId,
+                  isAlumni: 0,
+                },
+              });
+            }
+          }
+
+          await wipeEvaluationMatrix(tx, { studentId, sessionId: tSessionId }).catch(() => {});
+          await bindEvaluationMatrix(tx, {
+            studentId,
+            classId: tClassId,
+            sectionId: tSectionId,
+            branchId,
+            sessionId: tSessionId,
+          }).catch(() => {});
+        });
+
+        successCount++;
+      } catch (err: any) {
+        console.error(`[ADMIN] Promotion failure for student #${studentId}:`, err);
+        failureCount++;
       }
+    }
 
-      await tx.promotionHistory.create({
-        data: {
-          studentId,
-          fromClassId: currentEnroll.classId,
-          fromSectionId: currentEnroll.sectionId,
-          toClassId: Number(classId),
-          toSectionId: Number(sectionId),
-          promotedBy: req.userId,
-          sessionId,
-        },
-      });
+    if (successCount === 0 && failureCount > 0) {
+      return res.status(500).json({ success: false, message: 'Failed to promote the selected student(s).' });
+    }
 
-      await wipeEvaluationMatrix(tx, { studentId, sessionId });
+    const actionText = isRepeat ? 'repeated' : 'promoted';
+    const message = studentIds.length === 1
+      ? `Student successfully ${actionText}.`
+      : `Batch promotion completed: ${successCount} student(s) ${actionText}.${failureCount > 0 ? ` (${failureCount} failed)` : ''}`;
 
-      await tx.enroll.update({
-        where: { id: currentEnroll.id },
-        data: {
-          classId: Number(classId),
-          sectionId: Number(sectionId),
-          updatedAt: new Date(),
-        },
-      });
-
-      await bindEvaluationMatrix(tx, {
-        studentId,
-        classId: Number(classId),
-        sectionId: Number(sectionId),
-        branchId,
-        sessionId,
-      });
+    return res.json({
+      success: true,
+      message,
+      processedCount: successCount,
+      failedCount: failureCount,
     });
-
-    return res.json({ success: true, message: 'Student promoted successfully.' });
   } catch (error: any) {
     console.error('[ADMIN] Student promotion error:', error);
-    return res.status(500).json({ success: false, message: error.message || 'Failed to promote student.' });
+    return res.status(500).json({ success: false, message: error.message || 'Failed to promote student(s).' });
   }
 }
 

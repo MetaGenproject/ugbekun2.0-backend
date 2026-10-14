@@ -1704,7 +1704,7 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
   const branchId = req.branchId;
 
   try {
-    const { studentIds, targetClassId, targetSectionId, targetSessionId, action } = req.body;
+    const { studentIds, targetClassId, targetSectionId, targetSessionId, sourceClassId, sourceSessionId, action } = req.body;
 
     if (!Array.isArray(studentIds) || studentIds.length === 0) {
       return res.status(400).json({ success: false, message: 'Please select at least one student for promotion.' });
@@ -1719,7 +1719,10 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
     const tClassId = parseInt(targetClassId, 10);
     const tSectionId = parseInt(targetSectionId, 10);
     const tSessionId = parseInt(targetSessionId, 10);
+    const sClassId = sourceClassId ? parseInt(sourceClassId, 10) : undefined;
+    const sSessionId = sourceSessionId ? parseInt(sourceSessionId, 10) : undefined;
     const promotionAction = action === 'REPEAT' ? 'REPEAT' : 'PROMOTE';
+    const actorId = Number(req.userId || 1);
 
     let successCount = 0;
     let failureCount = 0;
@@ -1728,10 +1731,31 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
       const studentId = parseInt(id, 10);
       try {
         await prisma.$transaction(async (tx: any) => {
-          const currentEnroll = await tx.enroll.findFirst({
-            where: { studentId, branchId },
-            orderBy: { id: 'desc' },
-          });
+          let currentEnroll = null;
+
+          if (sClassId || sSessionId) {
+            const matchWhere: any = { studentId, branchId, isAlumni: 0 };
+            if (sClassId) matchWhere.classId = sClassId;
+            if (sSessionId) matchWhere.sessionId = sSessionId;
+            currentEnroll = await tx.enroll.findFirst({
+              where: matchWhere,
+              orderBy: { id: 'desc' },
+            });
+          }
+
+          if (!currentEnroll) {
+            currentEnroll = await tx.enroll.findFirst({
+              where: { studentId, branchId, isAlumni: 0 },
+              orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+            });
+          }
+
+          if (!currentEnroll) {
+            currentEnroll = await tx.enroll.findFirst({
+              where: { studentId, branchId },
+              orderBy: { id: 'desc' },
+            });
+          }
 
           if (!currentEnroll) {
             throw new Error(`No active enrollment record for student ID ${studentId}`);
@@ -1744,7 +1768,7 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
               fromSectionId: currentEnroll.sectionId,
               toClassId: tClassId,
               toSectionId: tSectionId,
-              promotedBy: req.userId,
+              promotedBy: actorId,
               sessionId: tSessionId,
             },
           });

@@ -362,6 +362,7 @@ router.post('/students/onboard-with-photo', upload.single('file'), onboardStuden
 router.post('/students/onboard', upload.single('file'), onboardStudentWithPhoto);
 router.post('/students/bulk-import', upload.single('file'), bulkImportStudents);
 router.get('/students/export-credential-slips', exportCredentialSlips);
+router.post('/students/:id/promote', promoteStudents);
 router.post('/students/promote', promoteStudents);
 router.get('/students/:id/profile', getStudentProfile);
 router.put('/students/:id/profile', updateStudentProfile);
