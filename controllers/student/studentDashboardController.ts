@@ -207,7 +207,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       // F. CBT Online Exams and Submissions
       (async () => {
         if (!req.classId) return { onlineExams: [], examSubs: [] };
-        const [onlineExams, examSubs] = await Promise.all([
+        const [rawOnlineExams, examSubs, unpublishedDists] = await Promise.all([
           prisma.onlineExam.findMany({
             where: { classId: req.classId, branchId: req.branchId },
             include: { subject: { select: { name: true } } },
@@ -226,7 +226,16 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
             orderBy: { submittedAt: 'desc' },
             take: 8,
           }),
+          prisma.cbtDistribution.findMany({
+            where: { classId: req.classId, branchId: req.branchId, isPublished: false },
+            select: { onlineExamId: true, title: true, subjectId: true },
+          }),
         ]);
+        const unpublishedIds = new Set(unpublishedDists.map((d) => d.onlineExamId).filter(Boolean));
+        const unpublishedTitles = new Set(unpublishedDists.map((d) => `${d.title}::${d.subjectId}`));
+        const onlineExams = rawOnlineExams.filter(
+          (ex) => !unpublishedIds.has(ex.id) && !unpublishedTitles.has(`${ex.title}::${ex.subjectId}`)
+        );
         return { onlineExams, examSubs };
       })(),
 

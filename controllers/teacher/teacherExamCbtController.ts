@@ -1,4 +1,8 @@
-import { findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
+import {
+  findCompanionOnlineExam,
+  cascadeDeleteCbtExam,
+  cascadeDeleteQuestionBankItem,
+} from '../../lib/cbtCompanionExam';
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { assertTeacherQuestionAccess, canTeacherUseClassSubject, teacherScopedContentOr } from '../../lib/teacherAccess';
@@ -279,10 +283,8 @@ export async function deleteQuestionBankItem(req: Request, res: Response): Promi
     if (!allowed) {
       return res.status(403).json({ success: false, message: 'You can only delete questions for your authorised class and subject.' });
     }
-    await prisma.questionBank.delete({
-      where: { id: Number(id) },
-    });
-    return res.json({ success: true, message: 'Question removed from bank.' });
+    const result = await cascadeDeleteQuestionBankItem(Number(id), req.branchId);
+    return res.json({ success: true, message: result.message });
   } catch (error) {
     console.error('[TEACHER] Delete question-bank item error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete question.' });
@@ -478,13 +480,14 @@ export async function updateOnlineExam(req: Request, res: Response): Promise<Res
 export async function deleteOnlineExam(req: Request, res: Response): Promise<Response | void> {
   const { id } = req.params;
   try {
-    await prisma.onlineExamSubmission.deleteMany({
-      where: { onlineExamId: Number(id) },
+    const result = await cascadeDeleteCbtExam({
+      onlineExamId: Number(id),
+      branchId: req.branchId,
     });
-    await prisma.onlineExam.delete({
-      where: { id: Number(id) },
-    });
-    return res.json({ success: true, message: 'Online exam deleted successfully.' });
+    if (!result.success) {
+      return res.status(404).json({ success: false, message: result.message || 'Online exam not found.' });
+    }
+    return res.json({ success: true, message: result.message || 'Online exam deleted successfully.' });
   } catch (error) {
     console.error('[TEACHER] Delete online exam error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete online exam.' });

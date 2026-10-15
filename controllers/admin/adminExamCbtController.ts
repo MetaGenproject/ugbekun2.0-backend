@@ -10,7 +10,12 @@ import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
 import { generateQuestionDrafts, mapQuestionBankWrite, parseQuestionsFromRawText } from '../../lib/questionDraftService';
 import { canTeacherUseClassSubject } from '../../lib/teacherAccess';
 import { parseMaybeDate } from '../../lib/examWindow';
-import { findCompanionOnlineExam } from '../../lib/cbtCompanionExam';
+import {
+  findCompanionOnlineExam,
+  cascadeDeleteCbtExam,
+  cascadeDeleteQuestionBankItem,
+  cascadeDeleteQuestionGroup,
+} from '../../lib/cbtCompanionExam';
 import {
   DEFAULT_CBT_SCALE,
   parseCbtScore,
@@ -901,12 +906,11 @@ export async function deleteCbtGroup(req: Request, res: Response): Promise<Respo
 
   try {
     const groupId = Number(req.params.id);
-
-    await prisma.questionGroup.deleteMany({
-      where: { id: groupId, branchId },
-    });
-
-    return res.json({ success: true, message: 'Question group deleted.' });
+    const result = await cascadeDeleteQuestionGroup(groupId, branchId);
+    if (!result.success) {
+      return res.status(404).json({ success: false, message: result.message || 'Question group not found.' });
+    }
+    return res.json({ success: true, message: result.message });
   } catch (error) {
     console.error('[ADMIN] Delete CBT group error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete question group.' });
@@ -1337,10 +1341,18 @@ export async function togglePublishCbtDistribution(req: Request, res: Response):
  * DELETE /api/admin/cbt/distributions/:id
  */
 export async function deleteCbtDistribution(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const distId = Number(req.params.id);
+
   try {
-    const distId = Number(req.params.id);
-    await prisma.cbtDistribution.delete({ where: { id: distId } });
-    return res.json({ success: true, message: 'CBT distribution deleted.' });
+    const result = await cascadeDeleteCbtExam({
+      distributionId: distId,
+      branchId,
+    });
+    if (!result.success) {
+      return res.status(404).json({ success: false, message: result.message || 'CBT distribution not found.' });
+    }
+    return res.json({ success: true, message: result.message || 'CBT distribution deleted.' });
   } catch (error) {
     console.error('[ADMIN] Delete CBT distribution error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete CBT distribution.' });
@@ -1489,8 +1501,11 @@ export async function updateCbtQuestion(req: Request, res: Response): Promise<Re
 export async function deleteCbtQuestion(req: Request, res: Response): Promise<Response | void> {
   try {
     const id = Number(req.params.id);
-    await prisma.questionBank.delete({ where: { id } });
-    return res.json({ success: true, message: 'Question deleted successfully.' });
+    const result = await cascadeDeleteQuestionBankItem(id, req.branchId);
+    if (!result.success) {
+      return res.status(404).json({ success: false, message: result.message || 'Question not found.' });
+    }
+    return res.json({ success: true, message: result.message });
   } catch (error) {
     console.error('[ADMIN] Delete question bank item error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete question.' });
@@ -2332,27 +2347,14 @@ export async function deleteAdminOnlineExam(req: Request, res: Response): Promis
   const examId = Number(req.params.id);
 
   try {
-    const existing = await prisma.onlineExam.findFirst({
-      where: { id: examId, ...(branchId ? { branchId } : {}) },
+    const result = await cascadeDeleteCbtExam({
+      onlineExamId: examId,
+      branchId,
     });
-    if (!existing) {
-      return res.status(404).json({ success: false, message: 'Online exam not found.' });
+    if (!result.success) {
+      return res.status(404).json({ success: false, message: result.message || 'Online exam not found.' });
     }
-
-    await prisma.cbtDistribution.updateMany({
-      where: { onlineExamId: examId },
-      data: { onlineExamId: null },
-    });
-
-    await prisma.onlineExamSubmission.deleteMany({
-      where: { onlineExamId: examId },
-    });
-
-    await prisma.onlineExam.delete({
-      where: { id: examId },
-    });
-
-    return res.json({ success: true, message: 'Online exam deleted successfully.' });
+    return res.json({ success: true, message: result.message || 'Online exam deleted successfully.' });
   } catch (error) {
     console.error('[ADMIN] Delete online-exam error:', error);
     return res.status(500).json({ success: false, message: 'Failed to delete online exam.' });

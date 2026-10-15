@@ -112,6 +112,16 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
       companionExams.map((e) => [companionExamKey(e.title, e.classId, e.subjectId), e])
     );
     const coveredKeys = new Set(distributions.map((d) => companionExamKey(d.title, d.classId, d.subjectId)));
+    const unpublishedDists = await prisma.cbtDistribution.findMany({
+      where: {
+        classId,
+        branchId: req.branchId,
+        isPublished: false,
+      },
+      select: { title: true, classId: true, subjectId: true, onlineExamId: true },
+    });
+    const unpublishedKeys = new Set(unpublishedDists.map((d) => companionExamKey(d.title, d.classId, d.subjectId)));
+    const unpublishedExamIds = new Set(unpublishedDists.map((d) => d.onlineExamId).filter(Boolean) as number[]);
     const uniqueExamIds = [...new Set([...onlineExams.map((e) => e.id), ...companionExams.map((e) => e.id)])];
     const submissions =
       uniqueExamIds.length === 0
@@ -165,7 +175,10 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
         };
       }),
       ...onlineExams
-        .filter((ex) => !coveredKeys.has(companionExamKey(ex.title, ex.classId, ex.subjectId)))
+        .filter((ex) => {
+          const key = companionExamKey(ex.title, ex.classId, ex.subjectId);
+          return !coveredKeys.has(key) && !unpublishedKeys.has(key) && !unpublishedExamIds.has(ex.id);
+        })
         .map((ex) => {
         const sub = subMap[ex.id];
         const questions = Array.isArray(ex.questions) ? ex.questions : [];
