@@ -490,7 +490,7 @@ async function loadRoster(
   }));
 }
 
-function serializeRegister(register: {
+export function serializeRegister(register: {
   id: number;
   classId: number;
   sectionId: number;
@@ -522,7 +522,7 @@ function serializeRegister(register: {
     notes: register.notes,
     unlockedAt: register.unlockedAt ?? null,
     unlockedReason: register.unlockedReason ?? null,
-    canEdit: register.status === REGISTER_STATUS.DRAFT,
+    canEdit: register.status !== REGISTER_STATUS.LOCKED,
   };
 }
 
@@ -672,18 +672,11 @@ async function upsertAttendanceRow(
 type WriteMode = 'patch' | 'submit' | 'legacy-save' | 'admin-save';
 
 function assertWritable(register: { status: string }, mode: WriteMode) {
-  if (register.status === REGISTER_STATUS.LOCKED || register.status === REGISTER_STATUS.SUBMITTED) {
+  if (register.status === REGISTER_STATUS.LOCKED) {
     if (mode === 'admin-save') return;
     throw new AttendanceRegisterError(
       'LOCKED',
-      'This register is locked. Ask a school admin to unlock it before editing.',
-      409
-    );
-  }
-  if (mode === 'patch' && register.status !== REGISTER_STATUS.DRAFT) {
-    throw new AttendanceRegisterError(
-      'NOT_DRAFT',
-      'Draft autosave is only allowed while the register is still a draft.',
+      'This register is locked by school admin. Ask a school admin to unlock it before editing.',
       409
     );
   }
@@ -815,6 +808,13 @@ export async function upsertEntries(
   });
 
   for (const row of planned.rows) {
+    const before = auditEdits
+      ? await db.attendance.findFirst({
+          where: { registerId: register.id, studentId: row.studentId },
+          select: { id: true, status: true },
+        })
+      : null;
+
     await upsertAttendanceRow(db, {
       registerId: register.id,
       studentId: row.studentId,
@@ -827,6 +827,19 @@ export async function upsertEntries(
       remark: row.remark,
       markedByTeacherId: args.teacherId ?? null,
     });
+
+    if (auditEdits && before && before.status !== row.status) {
+      await writeAudit(db, {
+        registerId: register.id,
+        branchId: register.branchId,
+        action: 'EDIT',
+        attendanceId: before.id,
+        studentId: row.studentId,
+        fromCode: before.status,
+        toCode: row.status,
+        actorUserId: args.actorUserId,
+      });
+    }
   }
 
   const bumpVersion = mode === 'submit' || mode === 'legacy-save' || mode === 'admin-save';
@@ -853,7 +866,7 @@ export async function upsertEntries(
     await writeAudit(db, {
       registerId: register.id,
       branchId: register.branchId,
-      action: 'SUBMIT',
+      action: register.submittedAt ? 'EDIT' : 'SUBMIT',
       actorUserId: args.actorUserId,
     });
   }
@@ -926,7 +939,7 @@ export async function getRegisterWithEntries(
   const canEdit =
     !calendar.isFuture &&
     calendar.isSchoolDay &&
-    (!register || register.status === REGISTER_STATUS.DRAFT);
+    (!register || register.status !== REGISTER_STATUS.LOCKED);
 
   return {
     register: register ? serializeRegister(register) : null,

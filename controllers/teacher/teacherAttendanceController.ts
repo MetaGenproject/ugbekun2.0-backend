@@ -364,12 +364,16 @@ export async function submitAttendanceRegister(req: Request, res: Response): Pro
       });
     });
 
+    const isUpdate = Boolean(register.submittedAt);
+
     await prisma.teacherActivity
       .create({
         data: {
           branchId: req.branchId,
           teacherId: req.teacherId,
-          activity: 'You marked class roll call attendance',
+          activity: isUpdate
+            ? 'You updated class roll call attendance'
+            : 'You marked class roll call attendance',
           type: 'ATTENDANCE',
         },
       })
@@ -395,7 +399,9 @@ export async function submitAttendanceRegister(req: Request, res: Response): Pro
 
     return res.json({
       success: true,
-      message: 'Attendance register submitted successfully.',
+      message: isUpdate
+        ? 'Attendance register updated successfully.'
+        : 'Attendance register submitted successfully.',
       register: {
         id: result.register.id,
         status: result.register.status,

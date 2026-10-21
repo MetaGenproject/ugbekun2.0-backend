@@ -22,6 +22,8 @@ const {
   summarizeEntries,
   summarizeDailyPresence,
   summarizeSubmittedLogs,
+  serializeRegister,
+  REGISTER_STATUS,
 } = require('../../lib/attendanceRegisterService');
 const { inferEventKind, classifySchoolDateFromEvents } = require('../../lib/schoolCalendarService');
 const { normalizeNigerianPhone } = require('../../lib/smsService');
@@ -200,6 +202,37 @@ async function testAttendanceRegisterUnit() {
   assert.equal(published.sickCount, 1);
   assert.equal(published.percentage, 40);
   console.log('✓ Published attendance % uses submitted codes only: Present+Late over coded school days');
+
+  const submittedReg = serializeRegister({
+    id: 1,
+    classId: 1,
+    sectionId: 1,
+    registerDate: new Date('2026-09-07T00:00:00.000Z'),
+    sessionId: 1,
+    branchId: 1,
+    status: REGISTER_STATUS.SUBMITTED,
+    takenByTeacherId: 5,
+    submittedAt: new Date(),
+    version: 1,
+    notes: null,
+  });
+  assert.equal(submittedReg.canEdit, true);
+
+  const lockedReg = serializeRegister({
+    id: 2,
+    classId: 1,
+    sectionId: 1,
+    registerDate: new Date('2026-09-07T00:00:00.000Z'),
+    sessionId: 1,
+    branchId: 1,
+    status: REGISTER_STATUS.LOCKED,
+    takenByTeacherId: 5,
+    submittedAt: new Date(),
+    version: 1,
+    notes: null,
+  });
+  assert.equal(lockedReg.canEdit, false);
+  console.log('✓ Submitted registers are editable by teachers, while LOCKED registers remain restricted');
 
   assert.equal(parseSchoolMonthKey('2026-09'), '2026-09');
   assert.equal(parseSchoolMonthKey('2026-09-07'), '2026-09');
