@@ -106,6 +106,7 @@ model Branch {
   salaryAdvances  SalaryAdvance[]
   staffConducts   StaffConduct[]
   employmentLetters EmploymentLetter[]
+  subjectCommentAssessments SubjectCommentAssessment[]
 
   @@map("branches")
 }
@@ -299,6 +300,7 @@ model Student {
   parentMessages        ParentMessage[]
   studentMessages       StudentMessage[]
   studentReminders       StudentReminder[]
+  subjectCommentAssessments SubjectCommentAssessment[]
 
   @@map("students")
 }
@@ -583,6 +585,7 @@ model Class {
   id                    Int                    @id @default(autoincrement())
   name                  String
   nameNumeric           String                 @map("name_numeric")
+  usesScores            Boolean                @default(true) @map("uses_scores")
   isEcd                 Boolean                @default(false) @map("is_ecd")
   createdAt             DateTime               @default(now()) @map("created_at")
   updatedAt             DateTime?              @updatedAt @map("updated_at")
@@ -613,6 +616,7 @@ model Class {
 
   cbtDistributions      CbtDistribution[]
   questionGroups        QuestionGroup[]
+  subjectCommentAssessments SubjectCommentAssessment[]
 
   @@index([branchId])
   @@map("class")
@@ -672,6 +676,7 @@ model Subject {
 
   questionGroups    QuestionGroup[]
   cbtDistributions  CbtDistribution[]
+  subjectCommentAssessments SubjectCommentAssessment[]
 
   @@index([branchId])
   @@map("subject")
@@ -730,6 +735,10 @@ model Exam {
   sessionId             Int                    @map("session_id")
   branchId              Int?                   @map("branch_id")
   remark                String
+  examCategory          String                 @default("CBT") @map("exam_category")
+  cbtTotalMarks         Float?                 @map("cbt_total_marks")
+  totalQuestionCount    Int?                   @map("total_question_count")
+  manualMarksBreakdown  Json?                  @map("manual_marks_breakdown")
   markDistribution      String                 @map("mark_distribution")
   status                Int                    @default(1)
   publishResult         Int                    @default(0) @map("publish_result")
@@ -739,6 +748,7 @@ model Exam {
   updatedAt             DateTime?              @updatedAt @map("updated_at")
   marks                 Mark[]
   montessoriAssessments MontessoriAssessment[]
+  matrixMappings        EvaluationMatrixItemMapping[]
 
   @@index([branchId, sessionId])
   @@map("exam")
@@ -1752,9 +1762,50 @@ model EvaluationMatrix {
   updatedAt   DateTime? @updatedAt @map("updated_at")
 
   classes     Class[]
+  columns     EvaluationMatrixColumn[]
 
   @@index([branchId])
   @@map("evaluation_matrices")
+}
+
+model EvaluationMatrixColumn {
+  id           Int       @id @default(autoincrement())
+  matrixId     Int       @map("matrix_id")
+  matrix       EvaluationMatrix @relation(fields: [matrixId], references: [id], onDelete: Cascade)
+  
+  columnKey    String    @map("column_key")      // 'CA1' | 'CA2' | 'EXAM'
+  columnLabel  String    @map("column_label")    // "Continuous Assessment 1"
+  maxMarks     Float     @map("max_marks")       // e.g. 20.0
+  passMarks    Float     @default(0) @map("pass_marks")
+  displayOrder Int       @default(1) @map("display_order")
+
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  feedItems    EvaluationMatrixItemMapping[]
+
+  @@index([matrixId])
+  @@map("evaluation_matrix_columns")
+}
+
+model EvaluationMatrixItemMapping {
+  id             Int       @id @default(autoincrement())
+  columnId       Int       @map("column_id")
+  column         EvaluationMatrixColumn @relation(fields: [columnId], references: [id], onDelete: Cascade)
+  
+  componentName  String    @map("component_name")    // e.g. "CBT 1", "Manual Theory 1"
+  componentType  String    @map("component_type")    // 'CBT' | 'MANUAL'
+  weightMarks    Float     @map("weight_marks")      // e.g. 10.0 out of 20.0
+  
+  examMasterId   Int?      @map("exam_master_id")
+  examMaster     Exam?     @relation(fields: [examMasterId], references: [id])
+
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  @@index([columnId])
+  @@index([examMasterId])
+  @@map("evaluation_matrix_item_mappings")
 }
 
 model GradingScale {
@@ -2521,12 +2572,43 @@ model ClassReportCardPublication {
   classId     Int       @map("class_id")
   sectionId   Int?      @map("section_id")
   sessionId   Int       @map("session_id")
+  termId      Int       @default(1) @map("term_id")
   branchId    Int?      @map("branch_id")
   isPublished Boolean   @default(false) @map("is_published")
+  releaseCa1  Boolean   @default(false) @map("release_ca1")
+  releaseCa2  Boolean   @default(false) @map("release_ca2")
+  releaseExam Boolean   @default(false) @map("release_exam")
+  releaseFull Boolean   @default(false) @map("release_full")
   publishedBy Int?      @map("published_by")
   publishedAt DateTime  @default(now()) @map("published_at")
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime? @updatedAt @map("updated_at")
 
   @@map("class_report_card_publication")
+}
+
+model SubjectCommentAssessment {
+  id          Int       @id @default(autoincrement())
+  studentId   Int       @map("student_id")
+  subjectId   Int       @map("subject_id")
+  classId     Int       @map("class_id")
+  termId      Int       @map("term_id")
+  sessionId   Int       @map("session_id")
+  branchId    Int       @map("branch_id")
+
+  comment     String    @db.Text @map("comment")
+  rating      Int       @map("rating") // 1 to 5
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  student     Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subject     Subject   @relation(fields: [subjectId], references: [id])
+  class       Class     @relation(fields: [classId], references: [id])
+  branch      Branch    @relation(fields: [branchId], references: [id])
+
+  @@unique([studentId, subjectId, termId, sessionId])
+  @@index([classId, termId, sessionId])
+  @@index([branchId])
+  @@map("subject_comment_assessments")
 }

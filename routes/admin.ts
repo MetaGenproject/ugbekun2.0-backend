@@ -10,6 +10,14 @@ import {
   getGamificationConfig,
   updateGamificationConfig,
 } from '../controllers/admin/adminStatsController';
+import {
+  getAttendanceAnalyticsReport,
+  getFinancialAgingDebtorsReport,
+  getAdmissionsFunnelReport,
+  getInventoryValuationReport,
+  getStaffAttendanceAuditReport,
+  exportCentralReportCsv,
+} from '../controllers/admin/adminCentralReportsController';
 
 import {
   getStudentsParents,
@@ -28,6 +36,9 @@ import {
   deleteStudent,
   updateParent,
   deleteParent,
+  attachStudentToParent,
+  detachStudentFromParent,
+  reassignStudentParent,
   getParentMessages,
   sendParentMessage,
   updateParentMessage,
@@ -109,6 +120,7 @@ import {
   deleteClass,
   seedClassPresets,
   toggleClassEcd,
+  toggleClassUsesScores,
   createSection,
   updateSection,
   deleteSection,
@@ -226,6 +238,8 @@ import {
 import {
   getMarksEntry,
   saveMarksEntryBatch,
+  getSubjectComments,
+  saveSubjectCommentsBatch,
   aiDistributeMarks,
   getPendingCommentary,
   reviewCommentary,
@@ -350,6 +364,12 @@ router.use(requireBranchAdmin);
 router.get('/stats', getAdminStats);
 router.get('/staff-activity', getStaffActivity);
 router.get('/reports/comprehensive', getComprehensiveReports);
+router.get('/reports/attendance-analytics', getAttendanceAnalyticsReport);
+router.get('/reports/financial-aging', getFinancialAgingDebtorsReport);
+router.get('/reports/admissions-funnel', getAdmissionsFunnelReport);
+router.get('/reports/inventory-valuation', getInventoryValuationReport);
+router.get('/reports/staff-attendance-audit', getStaffAttendanceAuditReport);
+router.get('/reports/export-csv', exportCentralReportCsv);
 router.get('/gamification/config', getGamificationConfig);
 router.post('/gamification/config', updateGamificationConfig);
 
@@ -370,6 +390,9 @@ router.post('/students/:id/upload-photo', upload.single('file'), uploadStudentPh
 router.post('/parents/:id/upload-photo', upload.single('file'), uploadParentPhoto);
 router.put('/parents/:id', updateParent);
 router.delete('/parents/:id', deleteParent);
+router.post('/parents/:id/attach-student', attachStudentToParent);
+router.post('/parents/:id/detach-student', detachStudentFromParent);
+router.post('/parents/:id/reassign-student', reassignStudentParent);
 
 // Parent EduChat Communication Endpoints
 router.get('/parents/:parentId/messages', getParentMessages);
@@ -480,6 +503,8 @@ router.delete('/classes/:id', deleteClass);
 router.post('/classes/seed-presets', seedClassPresets);
 router.post('/classes/seed-preset', seedClassPresets);
 router.post('/classes/:id/toggle-ecd', toggleClassEcd);
+router.post('/classes/:id/toggle-uses-scores', toggleClassUsesScores);
+router.post('/classes/toggle-uses-scores', toggleClassUsesScores);
 router.post('/sections', createSection);
 router.put('/sections/:id', updateSection);
 router.delete('/sections/:id', deleteSection);
@@ -609,6 +634,8 @@ router.delete('/homeworks/:id', deleteAdminHomework);
 router.get('/marks-entry', getMarksEntry);
 router.post('/marks-entry/batch-save', saveMarksEntryBatch);
 router.post('/marks-entry/ai-distribute', aiDistributeMarks);
+router.get('/subject-comments', getSubjectComments);
+router.post('/subject-comments/batch-save', saveSubjectCommentsBatch);
 router.get('/commentary/pending', getPendingCommentary);
 router.post('/commentary/review', reviewCommentary);
 router.get('/report-cards/classes', getReportCardClasses);

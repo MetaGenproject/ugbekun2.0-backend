@@ -8,6 +8,7 @@ import {
   generateLessonPlanPdf,
   generateReportCardPdf,
   generateMontessoriReportCardPdf,
+  generateCommentBasedReportCardPdf,
   generateBatchClassReportCardsPdf,
   generateBatchClassCredentialSlipsPdf,
 } from '../../lib/pdfService';
@@ -16,6 +17,7 @@ import { generateRegistrationNumber } from '../../lib/studentService';
 import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
 import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
+import { getRatingLabel } from '../admin/adminMarksReportController';
 
 let Tesseract: any;
 try {
@@ -3060,6 +3062,29 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
       };
     });
 
+    const parsedTermId = req.query.termId ? Number(req.query.termId) : 1;
+    const commentsMap: Record<number, any> = {};
+    if (classData.usesScores === false && studentIds.length > 0) {
+      const existingComments = await prisma.subjectCommentAssessment.findMany({
+        where: {
+          studentId: { in: studentIds },
+          classId: cId,
+          subjectId: subId,
+          sessionId: activeSession,
+          termId: parsedTermId,
+          ...(branchId ? { branchId } : {}),
+        },
+      });
+      existingComments.forEach((c) => {
+        commentsMap[c.studentId] = {
+          id: c.id,
+          comment: c.comment,
+          rating: c.rating,
+          ratingLabel: getRatingLabel(c.rating),
+        };
+      });
+    }
+
     const gradingScale = await resolveGradingScale(prisma, branchId, cId);
 
     return res.json({
@@ -3092,11 +3117,221 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
         };
       }),
       marksMap,
-      classData: { id: classData.id, name: classData.name, evaluationMatrixId: classData.evaluationMatrixId },
+      commentsMap,
+      usesScores: classData.usesScores ?? true,
+      isCommentBased: !(classData.usesScores ?? true),
+      classData: {
+        id: classData.id,
+        name: classData.name,
+        evaluationMatrixId: classData.evaluationMatrixId,
+        usesScores: classData.usesScores ?? true,
+        isEcd: classData.isEcd || false,
+        isCommentBased: !(classData.usesScores ?? true),
+      },
     });
   } catch (error: any) {
     console.error('[TEACHER] Fetch marks entry error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to fetch assessment scores.' });
+  }
+}
+
+/**
+ * GET /api/teacher/subject-comments
+ */
+export async function getTeacherSubjectComments(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId, sectionId, subjectId, sessionId, termId } = req.query;
+
+  if (!classId || !subjectId) {
+    return res.status(400).json({ success: false, message: 'classId and subjectId are required.' });
+  }
+
+  const cId = Number(classId);
+  const subId = Number(subjectId);
+  const secId = sectionId ? Number(sectionId) : undefined;
+  const targetSessionId = sessionId ? Number(sessionId) : undefined;
+  const parsedTermId = termId ? Number(termId) : 1;
+
+  const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, targetSessionId, req);
+  if (!canAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to access comments for this subject and class.',
+    });
+  }
+
+  try {
+    const classData = await prisma.class.findFirst({
+      where: { id: cId, ...(branchId ? { branchId } : {}) },
+    });
+    if (!classData) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    let activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
+
+    const enrollWhere: any = {
+      classId: cId,
+      isAlumni: 0,
+      sessionId: activeSession,
+      ...(branchId ? { branchId } : {}),
+    };
+    if (secId) enrollWhere.sectionId = secId;
+
+    let enrolls = await prisma.enroll.findMany({
+      where: enrollWhere,
+      include: {
+        student: {
+          select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true, photo: true },
+        },
+        section: { select: { id: true, name: true } },
+      },
+      orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    const studentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
+
+    const comments = await prisma.subjectCommentAssessment.findMany({
+      where: {
+        studentId: { in: studentIds },
+        classId: cId,
+        subjectId: subId,
+        sessionId: activeSession,
+        termId: parsedTermId,
+        ...(branchId ? { branchId } : {}),
+      },
+    });
+
+    const commentsMap: Record<number, any> = {};
+    comments.forEach((c) => {
+      commentsMap[c.studentId] = {
+        id: c.id,
+        comment: c.comment,
+        rating: c.rating,
+        ratingLabel: getRatingLabel(c.rating),
+      };
+    });
+
+    const students = enrolls.map((e) => ({
+      id: e.student.id,
+      studentId: e.student.id,
+      name: `${e.student.lastName}, ${e.student.firstName}`,
+      firstName: e.student.firstName,
+      lastName: e.student.lastName,
+      registerNo: e.student.registerNo,
+      sectionName: e.section?.name,
+      comment: commentsMap[e.student.id]?.comment || '',
+      rating: commentsMap[e.student.id]?.rating || 3,
+    }));
+
+    return res.json({
+      success: true,
+      usesScores: classData.usesScores,
+      isCommentBased: !classData.usesScores,
+      classData: { id: classData.id, name: classData.name, usesScores: classData.usesScores },
+      students,
+      commentsMap,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Fetch subject comments error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch subject comments.' });
+  }
+}
+
+/**
+ * POST /api/teacher/subject-comments/batch-save
+ */
+export async function saveTeacherSubjectCommentsBatch(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId, sectionId, subjectId, sessionId, termId, assessments } = req.body;
+
+  if (!classId || !subjectId || !Array.isArray(assessments)) {
+    return res.status(400).json({
+      success: false,
+      message: 'classId, subjectId, and assessments array are required.',
+    });
+  }
+
+  const cId = Number(classId);
+  const subId = Number(subjectId);
+  const secId = sectionId ? Number(sectionId) : undefined;
+  const targetSessionId = sessionId ? Number(sessionId) : undefined;
+  const parsedTermId = termId ? Number(termId) : 1;
+
+  const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, targetSessionId, req);
+  if (!canAccess) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access Denied: You are not authorized to submit comments for this subject and class.',
+    });
+  }
+
+  try {
+    const classData = await prisma.class.findFirst({
+      where: { id: cId, ...(branchId ? { branchId } : {}) },
+    });
+    if (!classData) {
+      return res.status(404).json({ success: false, message: 'Class not found.' });
+    }
+
+    const effectiveBranchId = branchId || classData.branchId;
+    if (!effectiveBranchId) {
+      return res.status(400).json({ success: false, message: 'Branch ID could not be resolved for class.' });
+    }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
+
+    const savedRecords = await prisma.$transaction(async (tx) => {
+      const results: any[] = [];
+
+      for (const item of assessments) {
+        if (!item.studentId) continue;
+        const studentId = Number(item.studentId);
+        const comment = typeof item.comment === 'string' ? item.comment.trim() : '';
+        let rating = Number(item.rating) || 3;
+        if (rating < 1) rating = 1;
+        if (rating > 5) rating = 5;
+
+        const record = await tx.subjectCommentAssessment.upsert({
+          where: {
+            studentId_subjectId_termId_sessionId: {
+              studentId,
+              subjectId: subId,
+              termId: parsedTermId,
+              sessionId: activeSession,
+            },
+          },
+          create: {
+            studentId,
+            subjectId: subId,
+            classId: cId,
+            termId: parsedTermId,
+            sessionId: activeSession,
+            branchId: effectiveBranchId,
+            comment,
+            rating,
+          },
+          update: {
+            comment,
+            rating,
+            classId: cId,
+          },
+        });
+        results.push(record);
+      }
+      return results;
+    });
+
+    return res.json({
+      success: true,
+      message: `Successfully saved ${savedRecords.length} developmental comment assessments.`,
+      savedCount: savedRecords.length,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Batch save subject comments error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to save subject comments.' });
   }
 }
 

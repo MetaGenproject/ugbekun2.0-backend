@@ -226,6 +226,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           email: student.email,
           photo: sanitizePhotoUrl(student.photo),
           active: student.active,
+          parentId: student.parentId || null,
           parentName: student.parent?.name || null,
           parentPhoto: sanitizePhotoUrl(student.parent?.photo),
           parentPhone: student.parent?.mobileno || null,
@@ -253,27 +254,27 @@ export async function searchParents(req: Request, res: Response): Promise<Respon
 
   try {
     const rawQuery = String(req.query.query || req.query.q || '').trim();
-    if (!rawQuery || rawQuery.length < 2) {
-      return res.json({ success: true, parents: [] });
-    }
+    const whereConditions: any[] = [];
 
-    const cleanPhone = rawQuery.replace(/[^0-9]/g, '');
+    if (rawQuery.length >= 2) {
+      const cleanPhone = rawQuery.replace(/[^0-9]/g, '');
 
-    const whereConditions: any[] = [
-      { name: { contains: rawQuery, mode: 'insensitive' } },
-      { email: { contains: rawQuery, mode: 'insensitive' } },
-    ];
+      whereConditions.push(
+        { name: { contains: rawQuery, mode: 'insensitive' } },
+        { email: { contains: rawQuery, mode: 'insensitive' } }
+      );
 
-    if (cleanPhone.length >= 3) {
-      whereConditions.push({ mobileno: { contains: cleanPhone } });
+      if (cleanPhone.length >= 3) {
+        whereConditions.push({ mobileno: { contains: cleanPhone } });
+      }
     }
 
     const parents = await prisma.parent.findMany({
       where: {
         branchId,
-        OR: whereConditions,
+        ...(whereConditions.length > 0 ? { OR: whereConditions } : {}),
       },
-      take: 10,
+      take: whereConditions.length > 0 ? 30 : 60,
       orderBy: { name: 'asc' },
       select: {
         id: true,
@@ -498,8 +499,10 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
         });
       }
 
-      if (!parentRecord && parentPhone) {
-        const cleanPhone = parentPhone.replace(/[\s\-\+]/g, '');
+      const cleanPhone = parentPhone ? parentPhone.replace(/[\s\-\+]/g, '') : '';
+      const isValidPhone = Boolean(cleanPhone && cleanPhone.length >= 7 && !/^0+$/.test(cleanPhone) && cleanPhone !== '0');
+
+      if (!parentRecord && isValidPhone) {
         parentRecord = await tx.parent.findFirst({
           where: {
             branchId,
@@ -514,7 +517,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
         parentUserId = parentRecord.userId;
         finalParentUsername = parentRecord.user ? parentRecord.user.username : null;
       } else {
-        const baseUsername = parentEmail || parentPhone || `parent_${Date.now()}`;
+        const baseUsername = parentEmail || (isValidPhone ? cleanPhone : '') || `parent_${Date.now()}`;
         const cleanUsername = `${baseUsername.split('@')[0].replace(/[^a-zA-Z0-9]/g, '')}_parent`;
 
         let uniqueUsername = cleanUsername;
@@ -876,7 +879,9 @@ export async function importBulkStudents(req: Request, res: Response): Promise<R
         let finalParentUsername: string | null = null;
 
         const normEmail = row.parentEmail ? row.parentEmail.trim().toLowerCase() : '';
-        const normPhone = row.parentPhone ? row.parentPhone.trim().replace(/[\s\-\+]/g, '') : '';
+        const rawPhone = row.parentPhone ? String(row.parentPhone).trim().replace(/[\s\-\+]/g, '') : '';
+        const isValidPhone = Boolean(rawPhone && rawPhone.length >= 7 && !/^0+$/.test(rawPhone) && rawPhone !== '0');
+        const normPhone = isValidPhone ? rawPhone : '';
 
         if (normEmail && batchParentCache.has(`email:${normEmail}`)) {
           parentRecord = batchParentCache.get(`email:${normEmail}`);
@@ -1359,6 +1364,7 @@ export async function getStudentById(req: Request, res: Response): Promise<Respo
       success: true,
       student: {
         id: student.id,
+        parentId: student.parentId || (student.parent ? student.parent.id : null),
         registerNo: student.registerNo || '',
         firstName: student.firstName || '',
         lastName: student.lastName || '',
@@ -1535,6 +1541,7 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
       active,
       classId,
       sectionId,
+      parentId,
       parentName,
       parentEmail,
       parentPhone,
@@ -1573,6 +1580,26 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
       if (previousDetails !== undefined) updateData.previousDetails = previousDetails;
       if (photo !== undefined) updateData.photo = photo;
       if (active !== undefined) updateData.active = Boolean(active);
+
+      // Handle reassigning or unlinking parent
+      if (parentId !== undefined) {
+        if (parentId === null || parentId === 0 || parentId === '' || parentId === 'null') {
+          updateData.parentId = null;
+        } else {
+          const numParentId = Number(parentId);
+          if (!isNaN(numParentId) && numParentId > 0) {
+            const targetParent = await tx.parent.findUnique({
+              where: { id: numParentId },
+              select: { id: true, branchId: true },
+            });
+            if (!targetParent || (req.userRole !== 1 && branchId && targetParent.branchId !== branchId)) {
+              throw new Error('Selected parent record not found or belongs to another branch.');
+            }
+            updateData.parentId = numParentId;
+          }
+        }
+      }
+
       updateData.updatedAt = new Date();
 
       await tx.student.update({
@@ -1625,7 +1652,8 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
         }
       }
 
-      if (existingStudent.parentId && (parentName || parentEmail || parentPhone || parentRelation)) {
+      const effectiveParentId = updateData.parentId !== undefined ? updateData.parentId : existingStudent.parentId;
+      if (effectiveParentId && (parentName || parentEmail || parentPhone || parentRelation)) {
         const parentUpdate: any = {};
         if (parentName) parentUpdate.name = parentName;
         if (parentEmail) parentUpdate.email = parentEmail;
@@ -1634,7 +1662,7 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
         parentUpdate.updatedAt = new Date();
 
         await tx.parent.update({
-          where: { id: existingStudent.parentId },
+          where: { id: effectiveParentId },
           data: parentUpdate,
         });
       }
@@ -3429,6 +3457,254 @@ export async function deleteParent(req: Request, res: Response): Promise<Respons
   } catch (error: any) {
     console.error('[ADMIN] Delete parent error:', error);
     return res.status(500).json({ success: false, message: error?.message || 'Failed to delete parent record.' });
+  }
+}
+
+/**
+ * POST /api/admin/parents/:id/attach-student
+ * Links an existing student in this school branch to the specified parent.
+ */
+export async function attachStudentToParent(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const parentId = Number(req.params.id);
+  const studentId = Number(req.body.studentId);
+
+  if (!parentId || isNaN(parentId)) {
+    return res.status(400).json({ success: false, message: 'Valid parent ID is required.' });
+  }
+  if (!studentId || isNaN(studentId)) {
+    return res.status(400).json({ success: false, message: 'Valid student ID is required.' });
+  }
+
+  try {
+    const parent = await prisma.parent.findUnique({
+      where: { id: parentId },
+      select: { id: true, branchId: true, name: true },
+    });
+    if (!parent || (req.userRole !== 1 && branchId && parent.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Parent not found or access denied.' });
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      select: { id: true, branchId: true, firstName: true, lastName: true },
+    });
+    if (!student || (req.userRole !== 1 && branchId && student.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
+    }
+
+    await prisma.student.update({
+      where: { id: studentId },
+      data: {
+        parentId,
+        updatedAt: new Date(),
+      },
+    });
+
+    const updatedStudents = await prisma.student.findMany({
+      where: { parentId, ...(branchId ? { branchId } : {}) },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        registerNo: true,
+        photo: true,
+        enrolls: {
+          take: 1,
+          orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          select: {
+            class: { select: { name: true } },
+            section: { select: { name: true } },
+          },
+        },
+      },
+    });
+
+    const children = updatedStudents.map((s) => ({
+      id: s.id,
+      name: `${s.firstName || ''} ${s.lastName || ''}`.trim() || `Student #${s.id}`,
+      registerNo: s.registerNo || '',
+      photo: sanitizePhotoUrl(s.photo),
+      className: s.enrolls[0]?.class?.name || 'Unassigned',
+      sectionName: s.enrolls[0]?.section?.name || '',
+    }));
+
+    return res.json({
+      success: true,
+      message: `${student.firstName || 'Student'} successfully assigned to parent ${parent.name || ''}.`,
+      children,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Attach student to parent error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to attach student to parent.' });
+  }
+}
+
+/**
+ * POST /api/admin/parents/:id/detach-student
+ * Unlinks a wrongly assigned student from this parent (sets student.parentId = null).
+ */
+export async function detachStudentFromParent(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const parentId = Number(req.params.id);
+  const studentId = Number(req.body.studentId);
+
+  if (!parentId || isNaN(parentId)) {
+    return res.status(400).json({ success: false, message: 'Valid parent ID is required.' });
+  }
+  if (!studentId || isNaN(studentId)) {
+    return res.status(400).json({ success: false, message: 'Valid student ID is required.' });
+  }
+
+  try {
+    const parent = await prisma.parent.findUnique({
+      where: { id: parentId },
+      select: { id: true, branchId: true, name: true },
+    });
+    if (!parent || (req.userRole !== 1 && branchId && parent.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Parent not found or access denied.' });
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      select: { id: true, branchId: true, parentId: true, firstName: true, lastName: true },
+    });
+    if (!student || (req.userRole !== 1 && branchId && student.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Student not found or access denied.' });
+    }
+
+    if (student.parentId !== parentId) {
+      return res.status(400).json({ success: false, message: 'Student is not currently assigned to this parent.' });
+    }
+
+    await prisma.student.update({
+      where: { id: studentId },
+      data: {
+        parentId: null,
+        updatedAt: new Date(),
+      },
+    });
+
+    const updatedStudents = await prisma.student.findMany({
+      where: { parentId, ...(branchId ? { branchId } : {}) },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        registerNo: true,
+        photo: true,
+        enrolls: {
+          take: 1,
+          orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          select: {
+            class: { select: { name: true } },
+            section: { select: { name: true } },
+          },
+        },
+      },
+    });
+
+    const children = updatedStudents.map((s) => ({
+      id: s.id,
+      name: `${s.firstName || ''} ${s.lastName || ''}`.trim() || `Student #${s.id}`,
+      registerNo: s.registerNo || '',
+      photo: sanitizePhotoUrl(s.photo),
+      className: s.enrolls[0]?.class?.name || 'Unassigned',
+      sectionName: s.enrolls[0]?.section?.name || '',
+    }));
+
+    return res.json({
+      success: true,
+      message: `${student.firstName || 'Student'} unlinked from parent successfully.`,
+      children,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Detach student from parent error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to unlink student from parent.' });
+  }
+}
+
+/**
+ * POST /api/admin/parents/:id/reassign-student
+ * Reassigns a student from current parent to another parent in the same branch.
+ */
+export async function reassignStudentParent(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const currentParentId = Number(req.params.id);
+  const studentId = Number(req.body.studentId);
+  const targetParentId = Number(req.body.targetParentId);
+
+  if (!currentParentId || isNaN(currentParentId)) {
+    return res.status(400).json({ success: false, message: 'Valid current parent ID is required.' });
+  }
+  if (!studentId || isNaN(studentId)) {
+    return res.status(400).json({ success: false, message: 'Valid student ID is required.' });
+  }
+  if (!targetParentId || isNaN(targetParentId)) {
+    return res.status(400).json({ success: false, message: 'Valid target parent ID is required.' });
+  }
+
+  try {
+    const targetParent = await prisma.parent.findUnique({
+      where: { id: targetParentId },
+      select: { id: true, branchId: true, name: true },
+    });
+    if (!targetParent || (req.userRole !== 1 && branchId && targetParent.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Target parent record not found or access denied.' });
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      select: { id: true, branchId: true, parentId: true, firstName: true, lastName: true },
+    });
+    if (!student || (req.userRole !== 1 && branchId && student.branchId !== branchId)) {
+      return res.status(404).json({ success: false, message: 'Student record not found or access denied.' });
+    }
+
+    await prisma.student.update({
+      where: { id: studentId },
+      data: {
+        parentId: targetParentId,
+        updatedAt: new Date(),
+      },
+    });
+
+    const updatedStudents = await prisma.student.findMany({
+      where: { parentId: currentParentId, ...(branchId ? { branchId } : {}) },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        registerNo: true,
+        photo: true,
+        enrolls: {
+          take: 1,
+          orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          select: {
+            class: { select: { name: true } },
+            section: { select: { name: true } },
+          },
+        },
+      },
+    });
+
+    const children = updatedStudents.map((s) => ({
+      id: s.id,
+      name: `${s.firstName || ''} ${s.lastName || ''}`.trim() || `Student #${s.id}`,
+      registerNo: s.registerNo || '',
+      photo: sanitizePhotoUrl(s.photo),
+      className: s.enrolls[0]?.class?.name || 'Unassigned',
+      sectionName: s.enrolls[0]?.section?.name || '',
+    }));
+
+    return res.json({
+      success: true,
+      message: `${student.firstName || 'Student'} successfully reassigned to ${targetParent.name || 'parent'}.`,
+      children,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Reassign student parent error:', error);
+    return res.status(500).json({ success: false, message: error?.message || 'Failed to reassign student.' });
   }
 }
 

@@ -60,16 +60,23 @@ export async function createClass(req: Request, res: Response): Promise<Response
   const branchId = req.branchId;
 
   try {
-    const { name, nameNumeric, isEcd } = req.body;
+    const { name, nameNumeric, isEcd, usesScores } = req.body;
     if (!name) {
       return res.status(400).json({ success: false, message: 'Class name is required.' });
     }
+
+    const isEcdBool = !!isEcd;
+    const nameSuggestsEcd = /nursery|creche|kindergarten|pre-school|preschool|playgroup|toddler|reception/i.test(name);
+    const resolvedUsesScores = usesScores !== undefined
+      ? Boolean(usesScores)
+      : !(isEcdBool || nameSuggestsEcd);
 
     const newClass = await prisma.class.create({
       data: {
         name,
         nameNumeric: nameNumeric || '',
-        isEcd: !!isEcd,
+        isEcd: isEcdBool || nameSuggestsEcd,
+        usesScores: resolvedUsesScores,
         branchId,
       },
     });
@@ -78,6 +85,34 @@ export async function createClass(req: Request, res: Response): Promise<Response
   } catch (error) {
     console.error('[ADMIN] Create class error:', error);
     return res.status(500).json({ success: false, message: 'Failed to create class.' });
+  }
+}
+
+/**
+ * POST /api/admin/classes/toggle-uses-scores
+ */
+export async function toggleUsesScores(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const { classId, usesScores } = req.body;
+    if (!classId) {
+      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    }
+
+    const updatedClass = await prisma.class.update({
+      where: { id: Number(classId), ...(branchId ? { branchId } : {}) },
+      data: { usesScores: Boolean(usesScores) },
+    });
+
+    return res.json({
+      success: true,
+      class: updatedClass,
+      message: `Class score usage mode updated to ${updatedClass.usesScores ? 'Numerical Scores' : 'Qualitative Comments'}.`,
+    });
+  } catch (error) {
+    console.error('[ADMIN] Toggle class usesScores error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update score usage mode.' });
   }
 }
 
@@ -158,6 +193,7 @@ export async function seedClassPreset(req: Request, res: Response): Promise<Resp
               name: item.name,
               nameNumeric: item.name.replace(/\D/g, '') || '1',
               isEcd: item.isEcd,
+              usesScores: !item.isEcd,
               branchId,
             },
           });
@@ -2688,6 +2724,7 @@ export async function requestLessonPlanRevision(req: Request, res: Response): Pr
 export const getClasses = getClassesSections;
 export const seedClassPresets = seedClassPreset;
 export const toggleClassEcd = toggleECD;
+export const toggleClassUsesScores = toggleUsesScores;
 export const allocateSection = allocateSections;
 export const saveStudentAttendance = saveStudentAttendanceBatch;
 export const getPromotionSelection = getPromotionsClassStudents;
@@ -2703,7 +2740,7 @@ export async function updateClass(req: Request, res: Response): Promise<Response
   const classId = Number(req.params.id);
 
   try {
-    const { name, nameNumeric, isEcd } = req.body;
+    const { name, nameNumeric, isEcd, usesScores } = req.body;
     const existing = await prisma.class.findFirst({
       where: { id: classId, branchId },
     });
@@ -2718,6 +2755,7 @@ export async function updateClass(req: Request, res: Response): Promise<Response
         ...(name !== undefined && { name }),
         ...(nameNumeric !== undefined && { nameNumeric: String(nameNumeric) }),
         ...(isEcd !== undefined && { isEcd: !!isEcd }),
+        ...(usesScores !== undefined && { usesScores: Boolean(usesScores) }),
       },
     });
 

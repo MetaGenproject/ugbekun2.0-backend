@@ -1,8 +1,9 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
-import { generateReportCardPdf, generateMontessoriReportCardPdf } from '../../lib/pdfService';
+import { generateReportCardPdf, generateMontessoriReportCardPdf, generateCommentBasedReportCardPdf } from '../../lib/pdfService';
 import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
+import { getRatingLabel } from '../admin/adminMarksReportController';
 
 /**
  * GET /api/parent/child/:studentId/attendance
@@ -143,42 +144,161 @@ export async function getChildTasks(req: Request, res: Response): Promise<Respon
 /**
  * GET /api/parent/child/:studentId/grades
  */
+async function resolveNextTermFees(branchId?: number | null, classId?: number | null): Promise<string> {
+  if (!branchId) return '₦125,000';
+  try {
+    const feeAssignments = await prisma.feeAssignment.findMany({
+      where: {
+        branchId,
+        active: true,
+        ...(classId ? { OR: [{ classId }, { classId: null }] } : {}),
+      },
+      include: {
+        feeType: { select: { amount: true, active: true } },
+      },
+    });
+
+    let sum = 0;
+    feeAssignments.forEach((fa) => {
+      if (fa.feeType && fa.feeType.active) {
+        sum += Number(fa.feeType.amount || 0);
+      }
+    });
+
+    if (sum > 0) {
+      return `₦${sum.toLocaleString()}`;
+    }
+  } catch {
+    // fallback
+  }
+  return '₦125,000';
+}
+
+/**
+ * GET /api/parent/child/:studentId/grades
+ */
 export async function getChildGrades(req: Request, res: Response): Promise<Response | void> {
   try {
     let isEcdClass = false;
+    let isCommentClass = false;
     let clsInfo = null;
     if (req.childClassId) {
       clsInfo = await prisma.class.findUnique({
         where: { id: req.childClassId },
-        select: { name: true, isEcd: true },
+        select: { name: true, isEcd: true, usesScores: true },
       });
       isEcdClass = !!clsInfo?.isEcd;
+      isCommentClass = clsInfo?.usesScores === false;
     }
 
     // Per-Class Publication Gating: Check if School Admin released this specific child class
-    let isClassPublished = false;
+    let classPub: any = null;
     if (req.childClassId && req.childSessionId) {
-      const classPub = await prisma.classReportCardPublication.findFirst({
+      classPub = await prisma.classReportCardPublication.findFirst({
         where: {
           classId: req.childClassId,
           sessionId: req.childSessionId,
           ...(req.studentBranchId ? { OR: [{ branchId: req.studentBranchId }, { branchId: null }] } : {}),
-          isPublished: true,
         },
       });
-      isClassPublished = Boolean(classPub);
     }
 
-    if (!isClassPublished) {
+    const isPublished = Boolean(
+      classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseExam || classPub.releaseFull)
+    );
+
+    if (!isPublished) {
       return res.json({
         success: true,
         isPublished: false,
+        visibleStages: [],
+        releaseCa1: false,
+        releaseCa2: false,
+        releaseExam: false,
+        releaseFull: false,
         reportCard: [],
         overallAverage: null,
         commentary: null,
         rank: null,
         totalClassStudents: 0,
         message: 'Official report cards for your child\'s class have not been released yet by the school administration.',
+      });
+    }
+
+    const releaseCa1 = Boolean(classPub?.releaseCa1);
+    const releaseCa2 = Boolean(classPub?.releaseCa2);
+    const releaseExam = Boolean(classPub?.releaseExam);
+    const releaseFull = Boolean(classPub?.releaseFull);
+
+    const visibleStages: string[] = [];
+    if (releaseCa1) visibleStages.push('CA1');
+    if (releaseCa2) visibleStages.push('CA2');
+    if (releaseExam) visibleStages.push('EXAM');
+    if (releaseFull) visibleStages.push('FULL');
+
+    const isExamReleased = Boolean(releaseExam || releaseFull);
+
+    if (isCommentClass) {
+      const subjectComments = await prisma.subjectCommentAssessment.findMany({
+        where: {
+          studentId: req.studentId,
+          classId: req.childClassId,
+          sessionId: req.childSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+        },
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+        },
+        orderBy: { subject: { name: 'asc' } },
+      });
+
+      const commentary = await prisma.studentCommentary.findFirst({
+        where: {
+          studentId: req.studentId,
+          sessionId: req.childSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+        },
+      });
+
+      const mont = await prisma.montessoriAssessment.findFirst({
+        where: {
+          studentId: req.studentId,
+          classId: req.childClassId,
+          sectionId: req.childSectionId,
+          sessionId: req.childSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+        },
+      });
+
+      const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
+
+      return res.json({
+        success: true,
+        usesScores: false,
+        isCommentBased: true,
+        isEcd: true,
+        isPublished: true,
+        visibleStages,
+        releaseCa1,
+        releaseCa2,
+        releaseExam,
+        releaseFull,
+        assessment: mont || null,
+        subjectComments: subjectComments.map((sc) => ({
+          id: sc.id,
+          subjectId: sc.subjectId,
+          subjectName: sc.subject?.name || 'Learning Domain',
+          subjectCode: sc.subject?.subjectCode || 'N/A',
+          comment: sc.comment,
+          rating: sc.rating,
+          ratingLabel: getRatingLabel(sc.rating),
+        })),
+        commentary: commentary?.remark || mont?.narrativeComment || null,
+        nextTermFees: nextTermFeesStr,
+        reportCard: [],
+        overallAverage: null,
+        rank: null,
+        totalMarks: null,
       });
     }
 
@@ -199,6 +319,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         success: true,
         isEcd: true,
         isPublished: true,
+        visibleStages,
+        releaseCa1,
+        releaseCa2,
+        releaseExam,
+        releaseFull,
         assessment: assessment || null,
       });
     }
@@ -211,9 +336,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
-        exam: { select: { id: true, name: true, publishResult: true } },
+        exam: { select: { id: true, name: true, resumptionDate: true, publishResult: true } },
       },
     });
+
+    const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
 
     if (studentMarks.length === 0) {
       const commentary = await prisma.studentCommentary.findFirst({
@@ -228,11 +355,19 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       return res.json({
         success: true,
         isPublished: true,
+        stage: isExamReleased ? 'FULL' : 'MID_TERM',
+        visibleStages,
+        releaseCa1,
+        releaseCa2,
+        releaseExam,
+        releaseFull,
         reportCard: [],
         overallAverage: null,
         commentary: commentary?.remark || null,
         rank: null,
         totalClassStudents: 0,
+        nextTermResumptionDate: null,
+        nextTermFees: nextTermFeesStr,
         message: 'Report cards are published. No subject scores recorded yet for this session.',
       });
     }
@@ -289,25 +424,32 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
           ? parsed.total
           : 0;
 
+      // ZERO DATA LEAKAGE: When exam/full is not released, sanitize theoryMark, mark (total) and classAverage!
+      const caScore = parsed.testScore > 0 ? String(parsed.testScore) : (parsed.total > 0 && !isExamReleased ? String(parsed.total) : null);
+
       return {
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
-        mark: parsed.hasValidScore ? String(parsed.total) : null,
+        cbtMark: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? String(parsed.testScore) : null) : null,
+        ca1Score: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
+        ca2Score: releaseCa2 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
+        theoryMark: isExamReleased ? (parsed.examScore > 0 ? String(parsed.examScore) : null) : null,
+        mark: isExamReleased ? (parsed.hasValidScore ? String(parsed.total) : null) : null,
         absent: m.absent === '1' || m.absent === 'true',
-        classAverage,
+        classAverage: isExamReleased ? classAverage : null,
+        statusRemark: m.absent === '1' || m.absent === 'true' ? 'Absent' : (caScore ? 'Progress recorded' : 'Pending'),
       };
     });
 
-    const overallAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+    // Zero Leakage: Withhold overall average if terminal exam is unreleased
+    const overallAverage = isExamReleased && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : null;
 
     let rank = null;
     let totalClassStudents = 0;
 
-    if (req.childClassId && req.childSectionId) {
+    if (isExamReleased && req.childClassId && req.childSectionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
           classId: req.childClassId,
@@ -356,16 +498,34 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
           rank = myIndex + 1;
         }
       }
+    } else if (req.childClassId && req.childSectionId) {
+      const count = await prisma.enroll.count({
+        where: {
+          classId: req.childClassId,
+          sectionId: req.childSectionId,
+          sessionId: req.childSessionId,
+          branchId: req.studentBranchId,
+        },
+      });
+      totalClassStudents = count;
     }
 
     return res.json({
       success: true,
       isPublished: true,
+      stage: isExamReleased ? 'FULL' : 'MID_TERM',
+      visibleStages,
+      releaseCa1,
+      releaseCa2,
+      releaseExam,
+      releaseFull,
       reportCard,
       overallAverage,
       commentary: commentary?.remark || null,
       rank,
       totalClassStudents,
+      nextTermResumptionDate: studentMarks[0]?.exam?.resumptionDate || null,
+      nextTermFees: nextTermFeesStr,
     });
   } catch (error) {
     console.error('[PARENT] Child grades error:', error);
@@ -382,34 +542,143 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
     const limit = parseInt(rankingLimit as string, 10) || 3;
 
     // Per-Class Publication Gating
-    let isClassPublished = false;
+    let classPub: any = null;
     if (req.childClassId && req.childSessionId) {
-      const classPub = await prisma.classReportCardPublication.findFirst({
+      classPub = await prisma.classReportCardPublication.findFirst({
         where: {
           classId: req.childClassId,
           sessionId: req.childSessionId,
           ...(req.studentBranchId ? { OR: [{ branchId: req.studentBranchId }, { branchId: null }] } : {}),
-          isPublished: true,
         },
       });
-      isClassPublished = Boolean(classPub);
     }
 
-    if (!isClassPublished) {
+    const isPublished = Boolean(
+      classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseExam || classPub.releaseFull)
+    );
+
+    if (!isPublished) {
       return res.status(403).json({
         success: false,
         message: 'Official report cards for your child\'s class have not been published yet by the school administration.',
       });
     }
 
+    const releaseCa1 = Boolean(classPub?.releaseCa1);
+    const releaseCa2 = Boolean(classPub?.releaseCa2);
+    const releaseExam = Boolean(classPub?.releaseExam);
+    const releaseFull = Boolean(classPub?.releaseFull);
+
+    const visibleStages: string[] = [];
+    if (releaseCa1) visibleStages.push('CA1');
+    if (releaseCa2) visibleStages.push('CA2');
+    if (releaseExam) visibleStages.push('EXAM');
+    if (releaseFull) visibleStages.push('FULL');
+
+    const isExamReleased = Boolean(releaseExam || releaseFull);
+
     let isEcdClass = false;
+    let isCommentClass = false;
     let clsInfo = null;
     if (req.childClassId) {
       clsInfo = await prisma.class.findUnique({
         where: { id: req.childClassId },
-        select: { name: true, isEcd: true },
+        select: { name: true, isEcd: true, usesScores: true },
       });
       isEcdClass = !!clsInfo?.isEcd;
+      isCommentClass = clsInfo?.usesScores === false;
+    }
+
+    if (isCommentClass && clsInfo) {
+      const student = await prisma.student.findUnique({
+        where: { id: req.studentId },
+        include: {
+          branch: { select: { name: true, code: true } },
+        },
+      });
+      if (!student) {
+        return res.status(404).json({ success: false, message: 'Student not found.' });
+      }
+
+      let sectionName = 'N/A';
+      let sessionName = 'N/A';
+      let formTeacherName = 'Class Teacher';
+
+      if (req.childSectionId) {
+        const sec = await prisma.section.findUnique({ where: { id: req.childSectionId }, select: { name: true } });
+        sectionName = sec?.name || 'N/A';
+        const sess = await prisma.schoolYear.findUnique({ where: { id: req.childSessionId }, select: { schoolYear: true } });
+        sessionName = sess?.schoolYear || 'N/A';
+
+        const formAllocation = await prisma.teacherAllocation.findFirst({
+          where: {
+            classId: req.childClassId,
+            sectionId: req.childSectionId,
+            sessionId: req.childSessionId,
+            ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+          },
+          include: {
+            teacher: { select: { name: true } },
+          },
+        });
+        if (formAllocation?.teacher) {
+          formTeacherName = formAllocation.teacher.name;
+        }
+      }
+
+      const subjectComments = await prisma.subjectCommentAssessment.findMany({
+        where: {
+          studentId: req.studentId,
+          classId: req.childClassId,
+          sessionId: req.childSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+        },
+        include: {
+          subject: { select: { name: true, subjectCode: true } },
+        },
+        orderBy: { subject: { name: 'asc' } },
+      });
+
+      const commentary = await prisma.studentCommentary.findFirst({
+        where: {
+          studentId: req.studentId,
+          sessionId: req.childSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+        },
+      });
+
+      const nextTermFees = await resolveNextTermFees(req.studentBranchId, req.childClassId);
+
+      const pdfBuffer = await generateCommentBasedReportCardPdf({
+        schoolName: student.branch?.name || 'Ugbekun Schools',
+        branchCode: student.branch?.code || 'GEN',
+        studentName: `${student.lastName}, ${student.firstName}`,
+        registerNo: student.registerNo,
+        className: clsInfo.name,
+        sectionName,
+        sessionName,
+        examName: 'Developmental Evaluation',
+        subjectComments: subjectComments.map((sc) => ({
+          subjectName: sc.subject?.name || 'Subject',
+          comment: sc.comment,
+          rating: sc.rating,
+          ratingLabel: getRatingLabel(sc.rating),
+        })),
+        teacherComment: commentary?.remark || 'Pupil displays steady qualitative developmental progression.',
+        principalComment: commentary?.reviewNotes || 'Demonstrating positive qualitative developmental milestones.',
+        nextTermFees,
+        resumptionDate: null,
+        formTeacherName,
+      });
+
+      const safeLastName = (student.lastName || 'Student').replace(/\s+/g, '_');
+      const safeFirstName = (student.firstName || 'Pupil').replace(/\s+/g, '_');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="developmental_report_${safeLastName}_${safeFirstName}.pdf"`
+      );
+      return res.send(pdfBuffer);
     }
 
     if (isEcdClass && clsInfo) {
@@ -599,25 +868,29 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
           ? parsed.total
           : 0;
 
+      // ZERO DATA LEAKAGE IN PDF:
       return {
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
-        mark: parsed.hasValidScore ? String(parsed.total) : null,
+        cbtMark: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? String(parsed.testScore) : null) : null,
+        ca1Score: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
+        ca2Score: releaseCa2 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
+        theoryMark: isExamReleased ? (parsed.examScore > 0 ? String(parsed.examScore) : null) : null,
+        mark: isExamReleased ? (parsed.hasValidScore ? String(parsed.total) : null) : null,
         absent: m.absent === '1' || m.absent === 'true',
-        classAverage,
+        classAverage: isExamReleased ? classAverage : null,
       };
     });
 
-    const overallAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+    const overallAverage = isExamReleased && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+    const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
 
     let rank = null;
     let totalClassStudents = 0;
 
-    if (req.childClassId && req.childSectionId) {
+    if (isExamReleased && req.childClassId && req.childSectionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
           classId: req.childClassId,
@@ -666,6 +939,16 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
           rank = myIndex + 1;
         }
       }
+    } else if (req.childClassId && req.childSectionId) {
+      const count = await prisma.enroll.count({
+        where: {
+          classId: req.childClassId,
+          sectionId: req.childSectionId,
+          sessionId: req.childSessionId,
+          branchId: req.studentBranchId,
+        },
+      });
+      totalClassStudents = count;
     }
 
     const commentaryRecord = await prisma.studentCommentary.findFirst({
@@ -695,7 +978,11 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       rankingType,
       rankingLimit: limit,
       resumptionDate,
+      nextTermFees: nextTermFeesStr,
       formTeacherName,
+      isMidTerm: !isExamReleased,
+      stage: isExamReleased ? 'FULL' : 'CA1',
+      visibleStages,
     });
 
     const safeLastName = (student.lastName || 'Student').replace(/\s+/g, '_');

@@ -403,9 +403,15 @@ function drawStandardReportCard(doc, params) {
     rankingType = 'full',
     rankingLimit = 3,
     resumptionDate = null,
+    nextTermFees = '₦125,000',
     formTeacherName = 'Class Teacher',
     gradingRanges = null,
+    isMidTerm = false,
+    stage = 'FULL',
+    visibleStages = ['FULL'],
   } = params
+
+  const isProgressSlip = Boolean(isMidTerm || stage === 'CA1' || stage === 'CA2');
 
   // Theme Colors
   const primaryColor = '#1e3a8a'   // Royal Navy Blue
@@ -415,23 +421,25 @@ function drawStandardReportCard(doc, params) {
   const lightBorder = '#e2e8f0'    // Slate-200
   const lightBg = '#f8fafc'        // Slate-50
 
-  // Compute Ranking String
+  // Compute Ranking String (only for terminal reports)
   let rankString = '-'
-  if (rankingType === 'full' && rank && totalClassStudents) {
-    rankString = `${rank}${getOrdinalSuffix(rank)} of ${totalClassStudents}`
-  } else if (rankingType === 'topn' && rank && rankingLimit) {
-    if (rank <= rankingLimit) {
-      rankString = `${rank}${getOrdinalSuffix(rank)} (Top ${rankingLimit})`
-    } else {
-      rankString = 'Graded'
+  if (!isProgressSlip) {
+    if (rankingType === 'full' && rank && totalClassStudents) {
+      rankString = `${rank}${getOrdinalSuffix(rank)} of ${totalClassStudents}`
+    } else if (rankingType === 'topn' && rank && rankingLimit) {
+      if (rank <= rankingLimit) {
+        rankString = `${rank}${getOrdinalSuffix(rank)} (Top ${rankingLimit})`
+      } else {
+        rankString = 'Graded'
+      }
+    } else if (rankingType === 'hidden') {
+      rankString = 'Hidden'
     }
-  } else if (rankingType === 'hidden') {
-    rankString = 'Hidden'
   }
 
   // Compute GPA letter grade equivalent using active grading scale
   const gpaInfo = calculateGradeFromRanges(overallAverage, gradingRanges || undefined);
-  const gpaRating = gpaInfo.grade;
+  const gpaRating = isProgressSlip ? 'In Progress' : gpaInfo.grade;
 
   // ─── Header Section (Y: 30 to 90) ────────────────────────────────────
   doc.rect(30, 30, 535, 60).fill(primaryColor)
@@ -445,10 +453,18 @@ function drawStandardReportCard(doc, params) {
   doc.font('Helvetica')
      .fontSize(9)
      .fillColor('#93c5fd') // Light blue
-     .text(`OFFICIAL TERM REPORT CARD • BRANCH: ${branchCode}`, 45, 64)
+     .text(
+       isProgressSlip
+         ? `MID-TERM CONTINUOUS ASSESSMENT PROGRESS SLIP • BRANCH: ${branchCode}`
+         : `OFFICIAL TERM REPORT CARD • BRANCH: ${branchCode}`,
+       45,
+       64
+     )
 
   // Right Header Text (Exam & Session)
-  const examName = reportCard[0]?.examName || 'Term Evaluation'
+  const examName = isProgressSlip
+    ? (stage === 'CA2' ? 'CA 2 Mid-Term Evaluation' : 'CA 1 Mid-Term Evaluation')
+    : (reportCard[0]?.examName || 'Term Evaluation')
   doc.fillColor('#ffffff')
      .font('Helvetica-Bold')
      .fontSize(12)
@@ -477,32 +493,57 @@ function drawStandardReportCard(doc, params) {
      .text(`${className} (${sectionName || 'Main'})`, 130, y + 48)
 
   // Right Column
-  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-     .text('Overall Average:', 330, y + 12)
-     .text('GPA Grade:', 330, y + 30)
-     .text('Class Ranking:', 330, y + 48)
+  if (isProgressSlip) {
+    doc.fillColor(textMuted).font('Helvetica').fontSize(9)
+       .text('Assessment Stage:', 330, y + 12)
+       .text('Report Type:', 330, y + 30)
+       .text('Evaluation Status:', 330, y + 48)
 
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9.5)
-     .text(`${overallAverage}%`, 420, y + 12)
-     .text(gpaRating, 420, y + 30)
-     .text(rankString, 420, y + 48)
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9.5)
+       .text(stage === 'CA2' ? 'Continuous Assessment 2' : 'Continuous Assessment 1', 430, y + 12)
+       .text('Progress Evaluation Slip', 430, y + 30)
+       .text('Released to Parent', 430, y + 48)
+  } else {
+    doc.fillColor(textMuted).font('Helvetica').fontSize(9)
+       .text('Overall Average:', 330, y + 12)
+       .text('GPA Grade:', 330, y + 30)
+       .text('Class Ranking:', 330, y + 48)
+
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9.5)
+       .text(`${overallAverage}%`, 420, y + 12)
+       .text(gpaRating, 420, y + 30)
+       .text(rankString, 420, y + 48)
+  }
 
   y += 85
 
   // ─── Academic Scoreboard Table (Y: 190 onwards) ─────────────────────
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(11).text('ACADEMIC SCORE BOARD', 30, y)
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(11).text(
+    isProgressSlip ? 'CONTINUOUS ASSESSMENT PROGRESS SCORES' : 'ACADEMIC SCORE BOARD',
+    30,
+    y
+  )
   y += 15
 
   // Table Header Row
   doc.rect(30, y, 535, 20).fill(primaryColor)
   doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
-     .text('SUBJECT CODE', 40, y + 6, { width: 75 })
-     .text('SUBJECT NAME', 115, y + 6, { width: 160 })
-     .text('TEST (40)', 280, y + 6, { width: 45, align: 'right' })
-     .text('EXAM (60)', 330, y + 6, { width: 45, align: 'right' })
-     .text('TOTAL (100)', 380, y + 6, { width: 50, align: 'right' })
-     .text('CLASS AVG', 435, y + 6, { width: 60, align: 'right' })
-     .text('GRADE', 500, y + 6, { width: 55, align: 'center' })
+
+  if (isProgressSlip) {
+    doc.text('SUBJECT CODE', 40, y + 6, { width: 85 })
+       .text('SUBJECT NAME', 130, y + 6, { width: 200 })
+       .text('CA SCORE', 340, y + 6, { width: 65, align: 'right' })
+       .text('CLASS AVG', 415, y + 6, { width: 65, align: 'right' })
+       .text('STATUS', 490, y + 6, { width: 65, align: 'center' })
+  } else {
+    doc.text('SUBJECT CODE', 40, y + 6, { width: 75 })
+       .text('SUBJECT NAME', 115, y + 6, { width: 160 })
+       .text('TEST (40)', 280, y + 6, { width: 45, align: 'right' })
+       .text('EXAM (60)', 330, y + 6, { width: 45, align: 'right' })
+       .text('TOTAL (100)', 380, y + 6, { width: 50, align: 'right' })
+       .text('CLASS AVG', 435, y + 6, { width: 60, align: 'right' })
+       .text('GRADE', 500, y + 6, { width: 55, align: 'center' })
+  }
   
   y += 20
 
@@ -522,32 +563,52 @@ function drawStandardReportCard(doc, params) {
     // Draw row borders
     doc.rect(30, y, 535, rowHeight).stroke(lightBorder)
 
-    const testScore = row.cbtMark !== undefined && row.cbtMark !== null ? String(row.cbtMark) : '-'
-    const examScore = row.theoryMark !== undefined && row.theoryMark !== null ? String(row.theoryMark) : '-'
-    const totalScore = row.mark !== null ? String(row.mark) : '-'
+    if (isProgressSlip) {
+      const caScore = row.cbtMark || row.ca1Score || row.ca2Score || (row.testScore ? String(row.testScore) : '-')
+      const statusText = row.absent ? 'ABSENT' : (caScore !== '-' ? 'Completed' : 'Pending')
 
-    // Grade calculation based on total score using school's active grading scale
-    let gradeLetter = '-'
-    if (!row.absent && row.mark !== null && !isNaN(parseFloat(row.mark))) {
-      const tot = parseFloat(row.mark)
-      const res = calculateGradeFromRanges(tot, gradingRanges || undefined)
-      gradeLetter = res.grade
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+         .text(row.subjectCode || '-', 40, y + 6, { width: 85 })
+
+      doc.font('Helvetica').fontSize(8.5)
+         .text(row.subjectName || '-', 130, y + 6, { width: 200 })
+
+      doc.font('Helvetica-Bold').fontSize(8)
+         .text(row.absent ? '-' : String(caScore), 340, y + 6, { width: 65, align: 'right' })
+
+      doc.font('Helvetica').fontSize(8)
+         .text(row.absent ? '-' : (row.classAverage !== undefined ? `${row.classAverage}` : '-'), 415, y + 6, { width: 65, align: 'right' })
+
+      doc.font('Helvetica-Bold').fontSize(8)
+         .text(statusText, 490, y + 6, { width: 65, align: 'center' })
+    } else {
+      const testScore = row.cbtMark !== undefined && row.cbtMark !== null ? String(row.cbtMark) : '-'
+      const examScore = row.theoryMark !== undefined && row.theoryMark !== null ? String(row.theoryMark) : '-'
+      const totalScore = row.mark !== null ? String(row.mark) : '-'
+
+      // Grade calculation based on total score using school's active grading scale
+      let gradeLetter = '-'
+      if (!row.absent && row.mark !== null && !isNaN(parseFloat(row.mark))) {
+        const tot = parseFloat(row.mark)
+        const res = calculateGradeFromRanges(tot, gradingRanges || undefined)
+        gradeLetter = res.grade
+      }
+
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+         .text(row.subjectCode || '-', 40, y + 6, { width: 75 })
+
+      doc.font('Helvetica').fontSize(8.5)
+         .text(row.subjectName || '-', 115, y + 6, { width: 160 })
+
+      doc.font('Helvetica').fontSize(8)
+         .text(row.absent ? '-' : testScore, 280, y + 6, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : examScore, 330, y + 6, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : totalScore, 380, y + 6, { width: 50, align: 'right' })
+         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 435, y + 6, { width: 60, align: 'right' })
+
+      doc.font('Helvetica-Bold').fontSize(8)
+         .text(row.absent ? 'ABS' : gradeLetter, 500, y + 6, { width: 55, align: 'center' })
     }
-
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-       .text(row.subjectCode || '-', 40, y + 6, { width: 75 })
-
-    doc.font('Helvetica').fontSize(8.5)
-       .text(row.subjectName || '-', 115, y + 6, { width: 160 })
-
-    doc.font('Helvetica').fontSize(8)
-       .text(row.absent ? '-' : testScore, 280, y + 6, { width: 45, align: 'right' })
-       .text(row.absent ? '-' : examScore, 330, y + 6, { width: 45, align: 'right' })
-       .text(row.absent ? '-' : totalScore, 380, y + 6, { width: 50, align: 'right' })
-       .text(row.absent ? '-' : `${row.classAverage}`, 435, y + 6, { width: 60, align: 'right' })
-
-    doc.font('Helvetica-Bold').fontSize(8)
-       .text(row.absent ? 'ABS' : gradeLetter, 500, y + 6, { width: 55, align: 'center' })
 
     y += rowHeight
   })
@@ -570,9 +631,11 @@ function drawStandardReportCard(doc, params) {
 
   // Left: Commentary Title & Text
   doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-     .text('CLASS TEACHER HOLISTIC COMMENTARY', 40, y + 10)
+     .text(isProgressSlip ? 'CLASS TEACHER MID-TERM OBSERVATION' : 'CLASS TEACHER HOLISTIC COMMENTARY', 40, y + 10)
   
-  const remarkText = commentary || 'No performance remarks or behavioral feedback has been recorded for this term yet.'
+  const remarkText = commentary || (isProgressSlip 
+    ? 'Student is making steady continuous assessment progress across active subjects this term.' 
+    : 'No performance remarks or behavioral feedback has been recorded for this term yet.')
   doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8.5)
      .text(`"${remarkText}"`, 40, y + 26, { width: 300, height: 55, ellipsis: true })
 
@@ -580,17 +643,22 @@ function drawStandardReportCard(doc, params) {
   doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
      .text('TERM OVERVIEW', 370, y + 10)
 
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8.5)
-     .text('Next Term Resumption:', 370, y + 28)
+  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+     .text('Next Term Resumption:', 370, y + 25)
   
   const resumptionStr = resumptionDate ? new Date(resumptionDate).toLocaleDateString(undefined, { dateStyle: 'medium' }) : 'To Be Announced'
   doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(resumptionStr, 370, y + 40)
+     .text(resumptionStr, 370, y + 36)
 
-  doc.fillColor(textMuted).font('Helvetica')
-     .text('Class Teacher:', 370, y + 58)
+  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+     .text('Next Term Fees:', 370, y + 48)
   doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(formTeacherName, 370, y + 70)
+     .text(nextTermFees || '₦125,000', 370, y + 58)
+
+  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+     .text('Class Teacher:', 370, y + 69)
+  doc.fillColor(darkColor).font('Helvetica-Bold')
+     .text(formTeacherName, 370, y + 78)
 
   y += remarksHeight + 20
 
@@ -836,6 +904,203 @@ function drawMontessoriReportCard(doc, params) {
      .text(`© ${new Date().getFullYear()} ${schoolName}. All rights reserved.`, 30, 775, { align: 'center', width: 535 })
 }
 
+function drawCommentBasedReportCard(doc, params) {
+  const {
+    schoolName = 'Ugbekun Schools',
+    branchCode = 'GEN',
+    studentName = 'Pupil',
+    registerNo = '',
+    className = '',
+    sectionName = '',
+    sessionName = '',
+    examName = 'Developmental Evaluation',
+    subjectComments = [],
+    teacherComment = '',
+    principalComment = '',
+    resumptionDate = null,
+    nextTermFees = '₦125,000',
+    formTeacherName = 'Class Teacher',
+  } = params
+
+  const primaryColor = '#0d9488'   // Teal-600
+  const darkColor = '#0f172a'      // Slate-900
+  const textMuted = '#475569'      // Slate-600
+  const lightBorder = '#e2e8f0'    // Slate-200
+  const lightBg = '#f8fafc'        // Slate-50
+
+  // 1. Header (Y: 30 to 90)
+  doc.rect(30, 30, 535, 60).fill(primaryColor)
+
+  doc.fillColor('#ffffff')
+     .font('Helvetica-Bold')
+     .fontSize(16)
+     .text(schoolName.toUpperCase(), 45, 42, { width: 350, align: 'left' })
+
+  doc.font('Helvetica')
+     .fontSize(9)
+     .fillColor('#ccfbf1')
+     .text(`EARLY YEARS & MONTESSORI DEVELOPMENTAL REPORT • BRANCH: ${branchCode}`, 45, 64)
+
+  doc.fillColor('#ffffff')
+     .font('Helvetica-Bold')
+     .fontSize(12)
+     .text(examName.toUpperCase(), 350, 42, { width: 200, align: 'right' })
+
+  doc.font('Helvetica')
+     .fontSize(9)
+     .fillColor('#f0fdfa')
+     .text(`Session: ${sessionName || 'Active'}`, 350, 60, { width: 200, align: 'right' })
+     .text(`Date printed: ${new Date().toLocaleDateString()}`, 350, 72, { width: 200, align: 'right' })
+
+  let y = 100
+
+  // 2. Student Profile Info Block (Y: 100 to 160)
+  doc.rect(30, y, 535, 55).stroke(lightBorder)
+
+  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
+     .text('Pupil Name:', 45, y + 12)
+     .text('Registration No:', 45, y + 30)
+
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(10)
+     .text(studentName, 130, y + 12)
+     .text(registerNo || 'Pending', 130, y + 30)
+
+  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
+     .text('Class Stage:', 330, y + 12)
+     .text('Assessment Track:', 330, y + 30)
+
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(10)
+     .text(`${className} (${sectionName || 'Main'})`, 420, y + 12)
+     .text('Qualitative Zero-Score System', 420, y + 30)
+
+  y += 65
+
+  // 3. Rubric Legend
+  doc.rect(30, y, 535, 22).fill(lightBg).stroke(lightBorder)
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+     .text('RATING SCALE:  ', 40, y + 6, { continued: true })
+     .font('Helvetica').fillColor(textMuted)
+     .text('[1] Emerging     [2] Developing     [3] Satisfactory     [4] Proficient     [5] Advanced', { align: 'left' })
+
+  y += 30
+
+  // 4. Learning Domains Table Header
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(11).text('LEARNING DOMAINS & QUALITATIVE OBSERVATIONS', 30, y)
+  y += 15
+
+  doc.rect(30, y, 535, 20).fill(primaryColor)
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
+     .text('LEARNING DOMAIN / SUBJECT', 40, y + 6, { width: 140 })
+     .text('TEACHER QUALITATIVE OBSERVATION', 185, y + 6, { width: 260 })
+     .text('RATING (1-5)', 455, y + 6, { width: 100, align: 'center' })
+  y += 20
+
+  // 5. Subject Rows
+  if (!subjectComments || subjectComments.length === 0) {
+    doc.rect(30, y, 535, 30).stroke(lightBorder)
+    doc.fillColor(textMuted).font('Helvetica-Oblique').fontSize(9)
+       .text('No qualitative subject assessments recorded for this period.', 40, y + 10, { width: 515, align: 'center' })
+    y += 30
+  } else {
+    subjectComments.forEach((item, idx) => {
+      const rowHeight = 36
+      if (idx % 2 === 0) doc.rect(30, y, 535, rowHeight).fill(lightBg)
+      else doc.rect(30, y, 535, rowHeight).fill('#ffffff')
+      doc.rect(30, y, 535, rowHeight).stroke(lightBorder)
+
+      // Domain Name
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9)
+         .text(item.subjectName || 'Learning Domain', 40, y + 8, { width: 140 })
+
+      // Observation Narrative
+      const obsText = item.comment || 'Pupil demonstrates active participation and positive curiosity.'
+      doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+         .text(obsText, 185, y + 6, { width: 260, height: 26, ellipsis: true })
+
+      // Rating Pill
+      const ratingVal = Number(item.rating) || 3
+      const ratingLabel = item.ratingLabel || `${ratingVal} / 5`
+      const pillWidth = 90
+      const pillX = 460
+      const pillY = y + 9
+      doc.roundedRect(pillX, pillY, pillWidth, 18, 4).fill(primaryColor)
+      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
+         .text(ratingLabel, pillX, pillY + 4, { width: pillWidth, align: 'center' })
+
+      y += rowHeight
+    })
+  }
+
+  y += 15
+
+  // 6. Summary Remarks Boxes
+  const remarksHeight = 70
+  doc.rect(30, y, 320, remarksHeight).stroke(lightBorder)
+  doc.rect(360, y, 205, remarksHeight).stroke(lightBorder)
+
+  // Teacher feedback
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
+     .text('CLASS TEACHER DEVELOPMENTAL REMARKS', 40, y + 8)
+  const remarkText = teacherComment || 'Pupil demonstrates enthusiastic social adaptation, physical coordination, and consistent milestone progression.'
+  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8)
+     .text(`"${remarkText}"`, 40, y + 22, { width: 300, height: 42, ellipsis: true })
+
+  // Term Overview
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
+     .text('TERM OVERVIEW', 370, y + 8)
+  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+     .text('Next Term Resumption:', 370, y + 22)
+  const resumptionStr = resumptionDate ? new Date(resumptionDate).toLocaleDateString(undefined, { dateStyle: 'medium' }) : 'To Be Announced'
+  doc.fillColor(darkColor).font('Helvetica-Bold')
+     .text(resumptionStr, 370, y + 33)
+  doc.fillColor(textMuted).font('Helvetica')
+     .text('Early Years Lead:', 370, y + 46)
+  doc.fillColor(darkColor).font('Helvetica-Bold')
+     .text(formTeacherName, 370, y + 57)
+
+  y += remarksHeight + 25
+
+  // 7. Signature Block
+  const sigY = Math.min(y, 715)
+  doc.moveTo(40, sigY).lineTo(220, sigY).stroke(lightBorder)
+  doc.moveTo(375, sigY).lineTo(555, sigY).stroke(lightBorder)
+
+  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+     .text('CLASS TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
+     .text('SCHOOL PRINCIPAL SIGNATURE', 375, sigY + 5, { width: 180, align: 'center' })
+
+  // 8. Footer
+  doc.moveTo(30, 755).lineTo(565, 755).stroke('#e2e8f0')
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
+     .text('Official Qualitative Early Years Report • Zero-Score Montessori Evaluation System • Ugbekun 2.0', 30, 765, { align: 'center', width: 535 })
+     .text(`© ${new Date().getFullYear()} ${schoolName}. All rights reserved.`, 30, 775, { align: 'center', width: 535 })
+}
+
+function generateCommentBasedReportCardPdf(params) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({
+        size: 'A4',
+        margin: 30,
+        info: {
+          Title: `Developmental Report - ${params.studentName || 'Pupil'}`,
+          Author: 'Ugbekun Schools Platform',
+        },
+      })
+
+      const chunks = []
+      doc.on('data', (chunk) => chunks.push(chunk))
+      doc.on('end', () => resolve(Buffer.concat(chunks)))
+      doc.on('error', reject)
+
+      drawCommentBasedReportCard(doc, params)
+      doc.end()
+    } catch (err) {
+      reject(err)
+    }
+  })
+}
+
 function generateReportCardPdf(params) {
   return new Promise((resolve, reject) => {
     try {
@@ -853,7 +1118,13 @@ function generateReportCardPdf(params) {
       doc.on('end', () => resolve(Buffer.concat(chunks)))
       doc.on('error', reject)
 
-      drawStandardReportCard(doc, params)
+      if (params.usesScores === false || params.isCommentBased || (params.subjectComments && params.subjectComments.length > 0)) {
+        drawCommentBasedReportCard(doc, params)
+      } else if (params.isEcd) {
+        drawMontessoriReportCard(doc, params)
+      } else {
+        drawStandardReportCard(doc, params)
+      }
       doc.end()
     } catch (err) {
       reject(err)
@@ -932,7 +1203,9 @@ function generateBatchClassReportCardsPdf(params) {
           ...student
         }
 
-        if (student.isEcd) {
+        if (student.usesScores === false || student.isCommentBased || (student.subjectComments && student.subjectComments.length > 0)) {
+          drawCommentBasedReportCard(doc, studentParams)
+        } else if (student.isEcd) {
           drawMontessoriReportCard(doc, studentParams)
         } else {
           drawStandardReportCard(doc, studentParams)
@@ -1982,6 +2255,7 @@ export {
   generateBatchClassCredentialSlipsPdf,
   generateReportCardPdf,
   generateMontessoriReportCardPdf,
+  generateCommentBasedReportCardPdf,
   generateBatchClassReportCardsPdf,
   generateSingleInvoicePdf,
   generateBatchClassInvoicesPdf,
@@ -1998,6 +2272,7 @@ export default {
   generateBatchClassCredentialSlipsPdf,
   generateReportCardPdf,
   generateMontessoriReportCardPdf,
+  generateCommentBasedReportCardPdf,
   generateBatchClassReportCardsPdf,
   generateSingleInvoicePdf,
   generateBatchClassInvoicesPdf,

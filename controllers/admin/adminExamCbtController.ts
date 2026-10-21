@@ -51,27 +51,57 @@ export async function createExam(req: Request, res: Response): Promise<Response 
   const branchId = req.branchId;
 
   try {
-    const { name, term, sessionId } = req.body;
-    if (!name) {
-      return res.status(400).json({ success: false, message: 'Exam name is required.' });
+    const {
+      name,
+      term,
+      termId,
+      sessionId,
+      examCategory = 'CBT',
+      cbtTotalMarks,
+      totalQuestionCount,
+      manualMarksBreakdown,
+      remark,
+      markDistribution,
+    } = req.body;
+
+    if (!name?.trim()) {
+      return res.status(400).json({ success: false, message: 'Exam Title is required.' });
     }
 
+    const resolvedTermId = termId ? Number(termId) : (term ? Number(term) : 1);
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
+
+    const isCbt = String(examCategory).toUpperCase() === 'CBT';
+    const parsedCbtMarks = cbtTotalMarks !== undefined && cbtTotalMarks !== null ? Number(cbtTotalMarks) : null;
+    const parsedQuestionCount = totalQuestionCount !== undefined && totalQuestionCount !== null ? Number(totalQuestionCount) : null;
+
+    if (isCbt) {
+      if (!parsedCbtMarks || parsedCbtMarks <= 0) {
+        return res.status(400).json({ success: false, message: 'CBT Total Marks must be greater than zero.' });
+      }
+      if (!parsedQuestionCount || parsedQuestionCount <= 0) {
+        return res.status(400).json({ success: false, message: 'Total Question Count must be greater than zero.' });
+      }
+    }
 
     const exam = await prisma.exam.create({
       data: {
         name: name.trim(),
-        termId: term ? Number(term) : 1,
-        typeId: 1,
-        remark: 'Exam',
-        markDistribution: '[]',
+        termId: resolvedTermId,
+        typeId: isCbt ? 3 : 1,
+        examCategory: isCbt ? 'CBT' : 'MANUAL',
+        cbtTotalMarks: isCbt ? parsedCbtMarks : null,
+        totalQuestionCount: isCbt ? parsedQuestionCount : null,
+        manualMarksBreakdown: !isCbt ? (manualMarksBreakdown || []) : null,
+        remark: remark || (isCbt ? `CBT Exam (${parsedCbtMarks} Marks)` : 'Manual Paper Exam'),
+        markDistribution: typeof markDistribution === 'string' ? markDistribution : JSON.stringify(markDistribution || []),
         sessionId: activeSession,
         branchId,
       },
     });
 
-    return res.status(201).json({ success: true, exam, message: 'Exam created successfully.' });
+    return res.status(201).json({ success: true, exam, message: 'Exam Master created successfully.' });
   } catch (error: any) {
     console.error('[ADMIN] Create exam error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to create exam.' });
@@ -85,8 +115,36 @@ export async function getEvaluationMatrices(req: Request, res: Response): Promis
   const branchId = req.branchId;
 
   try {
+    // 1. Precondition check: Hard Dependency Gate (Scenario A)
+    const examCount = await prisma.exam.count({
+      where: branchId ? { branchId } : {},
+    });
+
+    if (examCount === 0) {
+      return res.status(412).json({
+        success: false,
+        code: 'EXAM_MASTER_REQUIRED',
+        message: 'Exam Master definition must be created before Evaluation Matrix becomes accessible.',
+      });
+    }
+
     const matrices = await prisma.evaluationMatrix.findMany({
-      where: { branchId },
+      where: branchId ? { branchId } : {},
+      include: {
+        classes: { select: { id: true, name: true } },
+        columns: {
+          orderBy: { displayOrder: 'asc' },
+          include: {
+            feedItems: {
+              include: {
+                examMaster: {
+                  select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true },
+                },
+              },
+            },
+          },
+        },
+      },
       orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
     });
 
@@ -104,44 +162,140 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
   const branchId = req.branchId;
 
   try {
-    const { name, code, description, totalMarks, isDefault, components } = req.body;
+    // Hard Dependency Gate check (Scenario A)
+    const examCount = await prisma.exam.count({
+      where: branchId ? { branchId } : {},
+    });
+
+    if (examCount === 0) {
+      return res.status(412).json({
+        success: false,
+        code: 'EXAM_MASTER_REQUIRED',
+        message: 'Exam Master definition must be created before Evaluation Matrix becomes accessible.',
+      });
+    }
+
+    const {
+      name,
+      code,
+      description,
+      totalMarks,
+      isDefault,
+      components,
+      columns,
+      classId,
+    } = req.body;
 
     if (!name || !code) {
       return res.status(400).json({ success: false, message: 'Matrix Name and Matrix Code are required.' });
     }
 
-    if (!Array.isArray(components) || components.length === 0) {
-      return res.status(400).json({ success: false, message: 'At least one assessment component is required.' });
+    // Determine final components array & total marks
+    let resolvedComponents = Array.isArray(components) ? components : [];
+    let calculatedTotal = 0;
+
+    if (Array.isArray(columns) && columns.length > 0) {
+      calculatedTotal = columns.reduce((sum: number, col: any) => sum + (Number(col.maxMarks) || 0), 0);
+      if (resolvedComponents.length === 0) {
+        resolvedComponents = columns.map((col: any) => ({
+          name: col.columnLabel || col.name || col.columnKey,
+          code: col.columnKey || col.code,
+          maxMarks: Number(col.maxMarks) || 0,
+          passMarks: Number(col.passMarks) || 0,
+        }));
+      }
+    } else if (resolvedComponents.length > 0) {
+      calculatedTotal = resolvedComponents.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0);
+    } else {
+      return res.status(400).json({ success: false, message: 'At least one assessment component or column is required.' });
     }
 
-    if (isDefault) {
-      await prisma.evaluationMatrix.updateMany({
-        where: { branchId },
-        data: { isDefault: false },
+    const finalTotalMarks =
+      totalMarks !== undefined && totalMarks !== null && !isNaN(Number(totalMarks)) && Number(totalMarks) > 0
+        ? Number(totalMarks)
+        : (calculatedTotal > 0 ? calculatedTotal : 100);
+
+    // Save in transaction to guarantee consistency
+    const matrix = await prisma.$transaction(async (tx) => {
+      if (isDefault && branchId) {
+        await tx.evaluationMatrix.updateMany({
+          where: { branchId },
+          data: { isDefault: false },
+        });
+      }
+
+      const created = await tx.evaluationMatrix.create({
+        data: {
+          branchId: branchId || 1,
+          name: name.trim(),
+          code: code.trim().toUpperCase(),
+          description: description ? description.trim() : null,
+          totalMarks: finalTotalMarks,
+          isDefault: Boolean(isDefault),
+          components: resolvedComponents,
+        },
       });
-    }
 
-    const calculatedTotal = Array.isArray(components)
-      ? components.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0)
-      : 100;
+      // Persist structured columns & feed items if provided
+      if (Array.isArray(columns) && columns.length > 0) {
+        for (let idx = 0; idx < columns.length; idx++) {
+          const col = columns[idx];
+          const createdCol = await tx.evaluationMatrixColumn.create({
+            data: {
+              matrixId: created.id,
+              columnKey: (col.columnKey || col.code || `COL_${idx + 1}`).trim().toUpperCase(),
+              columnLabel: (col.columnLabel || col.name || `Column ${idx + 1}`).trim(),
+              maxMarks: Number(col.maxMarks) || 0,
+              passMarks: Number(col.passMarks) || 0,
+              displayOrder: col.displayOrder !== undefined ? Number(col.displayOrder) : idx + 1,
+            },
+          });
 
-    const finalTotalMarks = totalMarks !== undefined && totalMarks !== null && !isNaN(Number(totalMarks)) && Number(totalMarks) > 0
-      ? Number(totalMarks)
-      : (calculatedTotal > 0 ? calculatedTotal : 100);
+          if (Array.isArray(col.feedItems) && col.feedItems.length > 0) {
+            for (const item of col.feedItems) {
+              await tx.evaluationMatrixItemMapping.create({
+                data: {
+                  columnId: createdCol.id,
+                  componentName: (item.componentName || item.name || 'Component').trim(),
+                  componentType: (item.componentType || 'MANUAL').toUpperCase(),
+                  weightMarks: Number(item.weightMarks) || 0,
+                  examMasterId: item.examMasterId ? Number(item.examMasterId) : null,
+                },
+              });
+            }
+          }
+        }
+      }
 
-    const matrix = await prisma.evaluationMatrix.create({
-      data: {
-        branchId,
-        name: name.trim(),
-        code: code.trim().toUpperCase(),
-        description: description ? description.trim() : null,
-        totalMarks: finalTotalMarks,
-        isDefault: Boolean(isDefault),
-        components: components,
-      },
+      // Link class if classId passed
+      if (classId) {
+        await tx.class.update({
+          where: { id: Number(classId) },
+          data: { evaluationMatrixId: created.id },
+        });
+      }
+
+      return tx.evaluationMatrix.findUnique({
+        where: { id: created.id },
+        include: {
+          classes: { select: { id: true, name: true } },
+          columns: {
+            orderBy: { displayOrder: 'asc' },
+            include: {
+              feedItems: {
+                include: {
+                  examMaster: {
+                    select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true },
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
     });
 
-    return res.json({ success: true, matrix, message: 'Evaluation Matrix created successfully.' });
+    return res.status(201).json({ success: true, matrix, message: 'Evaluation Matrix created successfully.' });
   } catch (error: any) {
     console.error('[ADMIN] Create evaluation matrix error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to create evaluation matrix.' });
@@ -156,41 +310,127 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
 
   try {
     const matrixId = Number(req.params.id);
-    const { name, code, description, totalMarks, isDefault, components } = req.body;
+    const {
+      name,
+      code,
+      description,
+      totalMarks,
+      isDefault,
+      components,
+      columns,
+      classId,
+    } = req.body;
 
     const existing = await prisma.evaluationMatrix.findFirst({
-      where: { id: matrixId, branchId },
+      where: { id: matrixId, ...(branchId ? { branchId } : {}) },
     });
 
     if (!existing) {
       return res.status(404).json({ success: false, message: 'Evaluation Matrix not found.' });
     }
 
-    if (isDefault && !existing.isDefault) {
-      await prisma.evaluationMatrix.updateMany({
-        where: { branchId },
-        data: { isDefault: false },
-      });
+    let resolvedComponents = Array.isArray(components) ? components : existing.components;
+    let calculatedTotal: number | undefined = undefined;
+
+    if (Array.isArray(columns) && columns.length > 0) {
+      calculatedTotal = columns.reduce((sum: number, col: any) => sum + (Number(col.maxMarks) || 0), 0);
+      resolvedComponents = columns.map((col: any) => ({
+        name: col.columnLabel || col.name || col.columnKey,
+        code: col.columnKey || col.code,
+        maxMarks: Number(col.maxMarks) || 0,
+        passMarks: Number(col.passMarks) || 0,
+      }));
+    } else if (Array.isArray(components)) {
+      calculatedTotal = components.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0);
     }
 
-    const calculatedTotal = Array.isArray(components)
-      ? components.reduce((sum: number, c: any) => sum + (Number(c.maxMarks) || 0), 0)
-      : undefined;
+    const finalTotalMarks =
+      totalMarks !== undefined && totalMarks !== null && !isNaN(Number(totalMarks)) && Number(totalMarks) > 0
+        ? Number(totalMarks)
+        : (calculatedTotal !== undefined && calculatedTotal > 0 ? calculatedTotal : Number(existing.totalMarks));
 
-    const finalTotalMarks = totalMarks !== undefined && totalMarks !== null && !isNaN(Number(totalMarks)) && Number(totalMarks) > 0
-      ? Number(totalMarks)
-      : (calculatedTotal !== undefined && calculatedTotal > 0 ? calculatedTotal : existing.totalMarks);
+    const updated = await prisma.$transaction(async (tx) => {
+      if (isDefault && !existing.isDefault && branchId) {
+        await tx.evaluationMatrix.updateMany({
+          where: { branchId },
+          data: { isDefault: false },
+        });
+      }
 
-    const updated = await prisma.evaluationMatrix.update({
-      where: { id: matrixId },
-      data: {
-        name: name ? name.trim() : existing.name,
-        code: code ? code.trim().toUpperCase() : existing.code,
-        description: description !== undefined ? (description ? description.trim() : null) : existing.description,
-        totalMarks: finalTotalMarks,
-        isDefault: isDefault !== undefined ? Boolean(isDefault) : existing.isDefault,
-        components: components !== undefined ? components : existing.components,
-      },
+      await tx.evaluationMatrix.update({
+        where: { id: matrixId },
+        data: {
+          name: name ? name.trim() : existing.name,
+          code: code ? code.trim().toUpperCase() : existing.code,
+          description: description !== undefined ? (description ? description.trim() : null) : existing.description,
+          totalMarks: finalTotalMarks,
+          isDefault: isDefault !== undefined ? Boolean(isDefault) : existing.isDefault,
+          components: resolvedComponents,
+        },
+      });
+
+      // If columns are provided, recreate columns & feed items atomically
+      if (Array.isArray(columns)) {
+        await tx.evaluationMatrixColumn.deleteMany({
+          where: { matrixId },
+        });
+
+        for (let idx = 0; idx < columns.length; idx++) {
+          const col = columns[idx];
+          const createdCol = await tx.evaluationMatrixColumn.create({
+            data: {
+              matrixId,
+              columnKey: (col.columnKey || col.code || `COL_${idx + 1}`).trim().toUpperCase(),
+              columnLabel: (col.columnLabel || col.name || `Column ${idx + 1}`).trim(),
+              maxMarks: Number(col.maxMarks) || 0,
+              passMarks: Number(col.passMarks) || 0,
+              displayOrder: col.displayOrder !== undefined ? Number(col.displayOrder) : idx + 1,
+            },
+          });
+
+          if (Array.isArray(col.feedItems) && col.feedItems.length > 0) {
+            for (const item of col.feedItems) {
+              await tx.evaluationMatrixItemMapping.create({
+                data: {
+                  columnId: createdCol.id,
+                  componentName: (item.componentName || item.name || 'Component').trim(),
+                  componentType: (item.componentType || 'MANUAL').toUpperCase(),
+                  weightMarks: Number(item.weightMarks) || 0,
+                  examMasterId: item.examMasterId ? Number(item.examMasterId) : null,
+                },
+              });
+            }
+          }
+        }
+      }
+
+      if (classId !== undefined) {
+        if (classId) {
+          await tx.class.update({
+            where: { id: Number(classId) },
+            data: { evaluationMatrixId: matrixId },
+          });
+        }
+      }
+
+      return tx.evaluationMatrix.findUnique({
+        where: { id: matrixId },
+        include: {
+          classes: { select: { id: true, name: true } },
+          columns: {
+            orderBy: { displayOrder: 'asc' },
+            include: {
+              feedItems: {
+                include: {
+                  examMaster: {
+                    select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true },
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
     });
 
     return res.json({ success: true, matrix: updated, message: 'Evaluation Matrix updated successfully.' });
@@ -1066,8 +1306,40 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
       return res.status(400).json({ success: false, message: 'End date/time must be after the start date/time.' });
     }
 
+    const { examMasterId } = req.body;
     let resolvedGroupId = groupId ? Number(groupId) : null;
     const bankIds = (Array.isArray(questionBankIds) ? questionBankIds : []).map(Number).filter(Boolean);
+
+    // Hard Question Count Limit Enforcement from Exam Master
+    let targetExamMaster = null;
+    if (examMasterId) {
+      targetExamMaster = await prisma.exam.findFirst({
+        where: { id: Number(examMasterId), ...(branchId ? { branchId } : {}) },
+      });
+    } else if (title) {
+      targetExamMaster = await prisma.exam.findFirst({
+        where: { name: title.trim(), examCategory: 'CBT', ...(branchId ? { branchId } : {}) },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    if (targetExamMaster && targetExamMaster.totalQuestionCount) {
+      let candidateCount = bankIds.length;
+      if (!candidateCount && resolvedGroupId) {
+        const groupRec = await prisma.questionGroup.findUnique({
+          where: { id: resolvedGroupId },
+          select: { questionIds: true },
+        });
+        candidateCount = Array.isArray(groupRec?.questionIds) ? groupRec.questionIds.length : 0;
+      }
+      if (candidateCount > targetExamMaster.totalQuestionCount) {
+        return res.status(400).json({
+          success: false,
+          error: 'QUESTION_LIMIT_EXCEEDED',
+          message: `Maximum of ${targetExamMaster.totalQuestionCount} questions approved for this exam.`,
+        });
+      }
+    }
     if (!resolvedGroupId && bankIds.length > 0) {
       const approved = await prisma.questionBank.findMany({
         where: { id: { in: bankIds }, branchId, status: 'APPROVED' },
@@ -1838,17 +2110,25 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
     }
 
     const companion = await findCompanionOnlineExam(dist);
-    const examIdsToMatch = Array.from(
-      new Set([companion?.id, dist.onlineExamId, dist.id].filter((x): x is number => typeof x === 'number' && x > 0))
-    );
+    const validExamIds = new Set<number>();
+    if (companion?.id) validExamIds.add(companion.id);
+    if (dist.onlineExamId) {
+      const examCheck = await prisma.onlineExam.findFirst({
+        where: { id: dist.onlineExamId, branchId: effectiveBranchId, classId: dist.classId },
+        select: { id: true },
+      });
+      if (examCheck) validExamIds.add(examCheck.id);
+    }
+    const examIdsToMatch = Array.from(validExamIds);
 
     const submissions = examIdsToMatch.length > 0
       ? await prisma.onlineExamSubmission.findMany({
           where: {
             onlineExamId: { in: examIdsToMatch },
+            student: { branchId: effectiveBranchId },
           },
           include: {
-            student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true } },
+            student: { select: { id: true, firstName: true, lastName: true, registerNo: true, active: true, branchId: true } },
           },
           orderBy: { submittedAt: 'desc' },
         })
@@ -1857,15 +2137,26 @@ export async function getCbtDistributionAnalytics(req: Request, res: Response): 
     const activeStudents = enrollments.filter((e) => e.student && e.student.active);
     const seenStudentIds = new Set(activeStudents.map((e) => e.student.id));
 
-    // Ensure all students who submitted are present in the analytics matrix
+    // Only ensure students genuinely enrolled in this class and branch are present in the matrix
     for (const sub of submissions) {
       if (sub.student && !seenStudentIds.has(sub.student.id)) {
-        seenStudentIds.add(sub.student.id);
-        activeStudents.push({
-          student: sub.student,
-          classId: dist.classId,
-          sectionId: dist.sectionId,
-        } as any);
+        if (sub.student.branchId === effectiveBranchId) {
+          const verifyEnroll = await prisma.enroll.findFirst({
+            where: {
+              studentId: sub.student.id,
+              classId: dist.classId,
+              branchId: effectiveBranchId,
+            },
+          });
+          if (verifyEnroll) {
+            seenStudentIds.add(sub.student.id);
+            activeStudents.push({
+              student: sub.student,
+              classId: dist.classId,
+              sectionId: dist.sectionId,
+            } as any);
+          }
+        }
       }
     }
 
@@ -1966,9 +2257,16 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
 
     const effectiveBranchId = dist.branchId || branchId;
     const companion = await findCompanionOnlineExam(dist);
-    const examIdsToMatch = Array.from(
-      new Set([companion?.id, dist.onlineExamId, dist.id].filter((x): x is number => typeof x === 'number' && x > 0))
-    );
+    const validExamIds = new Set<number>();
+    if (companion?.id) validExamIds.add(companion.id);
+    if (dist.onlineExamId) {
+      const examCheck = await prisma.onlineExam.findFirst({
+        where: { id: dist.onlineExamId, branchId: effectiveBranchId, classId: dist.classId },
+        select: { id: true },
+      });
+      if (examCheck) validExamIds.add(examCheck.id);
+    }
+    const examIdsToMatch = Array.from(validExamIds);
 
     const sessionId = await resolveActiveSessionId();
     const examId = await resolveTermExamId(effectiveBranchId, sessionId, req.body?.targetExamId);
@@ -1984,6 +2282,10 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
           where: {
             onlineExamId: { in: examIdsToMatch },
             totalMark: { not: null },
+            student: { branchId: effectiveBranchId },
+          },
+          include: {
+            student: { select: { id: true, branchId: true } },
           },
           orderBy: { submittedAt: 'desc' },
         })
@@ -1999,6 +2301,25 @@ export async function syncCbtMarks(req: Request, res: Response): Promise<Respons
     await prisma.$transaction(async (tx: any) => {
       for (const sub of submissions) {
         if (sub.totalMark === null || sub.totalMark === undefined) continue;
+
+        if (sub.student?.branchId && sub.student.branchId !== effectiveBranchId) {
+          skippedOverrides++;
+          continue;
+        }
+
+        const isEnrolled = await tx.enroll.findFirst({
+          where: {
+            studentId: sub.studentId,
+            classId: dist.classId,
+            branchId: effectiveBranchId,
+          },
+          select: { id: true },
+        });
+
+        if (!isEnrolled) {
+          skippedOverrides++;
+          continue;
+        }
 
         const result = await recordCbtPercentageOnMarksheet({
           studentId: sub.studentId,
@@ -2239,7 +2560,18 @@ export async function updateExam(req: Request, res: Response): Promise<Response 
   const examId = Number(req.params.id);
 
   try {
-    const { name, remark, markDistribution } = req.body;
+    const {
+      name,
+      termId,
+      term,
+      examCategory,
+      cbtTotalMarks,
+      totalQuestionCount,
+      manualMarksBreakdown,
+      remark,
+      markDistribution,
+    } = req.body;
+
     const existing = await prisma.exam.findFirst({
       where: { id: examId, branchId },
     });
@@ -2248,10 +2580,18 @@ export async function updateExam(req: Request, res: Response): Promise<Response 
       return res.status(404).json({ success: false, message: 'Exam not found.' });
     }
 
+    const resolvedTermId = termId !== undefined ? Number(termId) : (term !== undefined ? Number(term) : undefined);
+    const isCbt = (examCategory || existing.examCategory || 'CBT').toUpperCase() === 'CBT';
+
     const updated = await prisma.exam.update({
       where: { id: examId },
       data: {
         ...(name !== undefined && { name: name.trim() }),
+        ...(resolvedTermId !== undefined && { termId: resolvedTermId }),
+        ...(examCategory !== undefined && { examCategory: isCbt ? 'CBT' : 'MANUAL', typeId: isCbt ? 3 : 1 }),
+        ...(cbtTotalMarks !== undefined && { cbtTotalMarks: cbtTotalMarks !== null ? Number(cbtTotalMarks) : null }),
+        ...(totalQuestionCount !== undefined && { totalQuestionCount: totalQuestionCount !== null ? Number(totalQuestionCount) : null }),
+        ...(manualMarksBreakdown !== undefined && { manualMarksBreakdown }),
         ...(remark !== undefined && { remark }),
         ...(markDistribution !== undefined && {
           markDistribution: typeof markDistribution === 'string' ? markDistribution : JSON.stringify(markDistribution),
@@ -2259,7 +2599,7 @@ export async function updateExam(req: Request, res: Response): Promise<Response 
       },
     });
 
-    return res.json({ success: true, exam: updated, message: 'Exam updated successfully.' });
+    return res.json({ success: true, exam: updated, message: 'Exam Master updated successfully.' });
   } catch (error: any) {
     console.error('[ADMIN] Update exam error:', error);
     return res.status(500).json({ success: false, message: error?.message || 'Failed to update exam.' });
