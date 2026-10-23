@@ -14,14 +14,28 @@ import logger, {
 import { cacheGetOrSet } from './lib/cacheService';
 import { normalizeHostname } from './lib/domainService';
 
+import compression from 'compression';
+
 // Register global crash and rejection traps early
 registerProcessErrorHandlers();
 
 const app = express();
 
+// Enable HTTP response compression (gzip / deflate) for low-bandwidth mobile clients
+app.use(compression({
+  threshold: 1024, // Only compress responses larger than 1KB
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  }
+}));
+
 const PORT = process.env.PORT || 5001;
 
 app.set('trust proxy', 1);
+
 
 async function isAllowedCorsOrigin(origin: string): Promise<boolean> {
   const extraAllowedOrigins = (process.env.ALLOWED_HOSTS || process.env.ALLOWED_ORIGINS || '')
