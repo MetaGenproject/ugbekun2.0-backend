@@ -867,7 +867,9 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
   try {
     const parsedClassId = Number(classId);
     const parsedSectionId = Number(sectionId);
+    // COMBINED_CA is the new scope: CA1 + CA2, out of (maxCA1 + maxCA2), rank hidden
     const activeStage = String(stage || 'FULL').toUpperCase();
+    const isCombinedCaScope = activeStage === 'COMBINED_CA';
     const parsedTermId = termId ? Number(termId) : 1;
 
     let sessionId = await resolveReportCardSession(branchId, reqSessionId);
@@ -1111,11 +1113,14 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
     marks.forEach((m) => {
       const parsed = parseMarkScore(m.mark, m.cbtMark);
       if (studentMarksMap[m.studentId]) {
-        // Stage filtering: isolate CA1, CA2, or Exam
+        // Stage filtering: isolate CA1, CA2, Combined CA, or Exam
         let scoreForStage = parsed.total;
         if (activeStage === 'CA1') {
           scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
         } else if (activeStage === 'CA2') {
+          scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
+        } else if (activeStage === 'COMBINED_CA') {
+          // Combined CA: sum CA1 + CA2 component scores (testScore is CA mark)
           scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
         } else if (activeStage === 'EXAM') {
           scoreForStage = parsed.examScore > 0 ? parsed.examScore : parsed.total;
@@ -1127,7 +1132,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
           subjectName: m.subject?.name || 'Subject',
           subjectCode: m.subject?.subjectCode || 'N/A',
           cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-          theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
+          theoryMark: isCombinedCaScope ? null : (parsed.examScore > 0 ? String(parsed.examScore) : null), // strip exam column in COMBINED_CA
           mark: parsed.hasValidScore ? String(parsed.total) : null,
           stageScore: scoreForStage,
           absent: m.absent === '1' || m.absent === 'true',
@@ -1188,8 +1193,9 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         totalMarks: isCommentClass ? null : agg.totalMarks,
         average: isCommentClass ? null : avg,
         grade: isCommentClass ? null : grade,
-        position: isCommentClass ? null : (rk ? `${getOrdinal(rk)} out of ${studentIds.length}` : 'N/A'),
-        rank: isCommentClass ? null : rk,
+        // COMBINED_CA: rank and promotion are strictly hidden per spec
+        position: (isCommentClass || isCombinedCaScope) ? null : (rk ? `${getOrdinal(rk)} out of ${studentIds.length}` : 'N/A'),
+        rank: (isCommentClass || isCombinedCaScope) ? null : rk,
         attendanceDays: att.total > 0 ? `${att.present} / ${att.total} Days` : '0 Days Logged',
         presentCount: att.present,
         absentCount: att.absent,
@@ -1242,6 +1248,10 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       success: true,
       sessionId,
       stage: activeStage,
+      isCombinedCaScope,
+      // maxTotal: for COMBINED_CA scope this should be the sum of CA component maxMarks (e.g. 40 for CA1+CA2 each out of 20)
+      // The frontend uses this to render the /40 header on combined CA report cards
+      maxTotal: isCombinedCaScope ? null : 100, // null = let frontend compute from component weights
       termId: parsedTermId,
       className: cls?.name || 'Classroom',
       classId: parsedClassId,
@@ -1254,6 +1264,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         isPublished: classPub.isPublished,
         releaseCa1: classPub.releaseCa1,
         releaseCa2: classPub.releaseCa2,
+        releaseCombinedCa: classPub.releaseCombinedCa,
         releaseExam: classPub.releaseExam,
         releaseFull: classPub.releaseFull,
         termId: classPub.termId,
@@ -1261,6 +1272,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         isPublished: false,
         releaseCa1: false,
         releaseCa2: false,
+        releaseCombinedCa: false,
         releaseExam: false,
         releaseFull: false,
         termId: parsedTermId,
@@ -2189,6 +2201,7 @@ export async function getReportCardPublishStatus(req: Request, res: Response): P
         isPublished,
         releaseCa1: Boolean(classPub?.releaseCa1),
         releaseCa2: Boolean(classPub?.releaseCa2),
+        releaseCombinedCa: Boolean(classPub?.releaseCombinedCa),
         releaseExam: Boolean(classPub?.releaseExam),
         releaseFull: Boolean(classPub?.releaseFull),
         termId: classPub?.termId || parsedTermId || 1,
@@ -2250,6 +2263,7 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
     publishAllClasses,
     releaseCa1,
     releaseCa2,
+    releaseCombinedCa,
     releaseExam,
     releaseFull,
     termId,
@@ -2261,31 +2275,36 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
 
     let targetCa1 = releaseCa1 !== undefined ? Boolean(releaseCa1) : undefined;
     let targetCa2 = releaseCa2 !== undefined ? Boolean(releaseCa2) : undefined;
+    let targetCombinedCa = releaseCombinedCa !== undefined ? Boolean(releaseCombinedCa) : undefined;
     let targetExam = releaseExam !== undefined ? Boolean(releaseExam) : undefined;
     let targetFull = releaseFull !== undefined ? Boolean(releaseFull) : undefined;
 
     if (targetFull === true) {
       targetCa1 = true;
       targetCa2 = true;
+      targetCombinedCa = true;
       targetExam = true;
       targetFull = true;
-    } else if (publish === false && targetCa1 === undefined && targetCa2 === undefined && targetExam === undefined && targetFull === undefined) {
+    } else if (publish === false && targetCa1 === undefined && targetCa2 === undefined && targetCombinedCa === undefined && targetExam === undefined && targetFull === undefined) {
       targetCa1 = false;
       targetCa2 = false;
+      targetCombinedCa = false;
       targetExam = false;
       targetFull = false;
-    } else if (publish === true && targetCa1 === undefined && targetCa2 === undefined && targetExam === undefined && targetFull === undefined) {
+    } else if (publish === true && targetCa1 === undefined && targetCa2 === undefined && targetCombinedCa === undefined && targetExam === undefined && targetFull === undefined) {
       targetCa1 = true;
       targetCa2 = true;
+      targetCombinedCa = true;
       targetExam = true;
       targetFull = true;
     }
 
     const finalCa1 = targetCa1 ?? false;
     const finalCa2 = targetCa2 ?? false;
+    const finalCombinedCa = targetCombinedCa ?? false;
     const finalExam = targetExam ?? false;
     const finalFull = targetFull ?? false;
-    const finalIsPublished = Boolean(finalCa1 || finalCa2 || finalExam || finalFull);
+    const finalIsPublished = Boolean(finalCa1 || finalCa2 || finalCombinedCa || finalExam || finalFull);
 
     // Option A: Admin chooses to bulk publish/unpublish ALL classes in the session
     if (publishAllClasses) {
@@ -2311,6 +2330,7 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
               isPublished: finalIsPublished,
               releaseCa1: finalCa1,
               releaseCa2: finalCa2,
+              releaseCombinedCa: finalCombinedCa,
               releaseExam: finalExam,
               releaseFull: finalFull,
               termId: parsedTermId,
@@ -2328,6 +2348,7 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
               isPublished: finalIsPublished,
               releaseCa1: finalCa1,
               releaseCa2: finalCa2,
+              releaseCombinedCa: finalCombinedCa,
               releaseExam: finalExam,
               releaseFull: finalFull,
               publishedBy: adminUserId || null,
@@ -2350,13 +2371,14 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
 
       const stagesText = finalFull
         ? 'Full Terminal Report'
-        : [finalCa1 && 'CA1', finalCa2 && 'CA2', finalExam && 'Exam'].filter(Boolean).join(' + ') || 'Draft';
+        : [finalCa1 && 'CA1', finalCa2 && 'CA2', finalCombinedCa && 'Combined CA', finalExam && 'Exam'].filter(Boolean).join(' + ') || 'Draft';
       const actionText = finalIsPublished ? `published (${stagesText}) to students & parents` : 'returned to moderation/draft mode';
       return res.json({
         success: true,
         isPublished: finalIsPublished,
         releaseCa1: finalCa1,
         releaseCa2: finalCa2,
+        releaseCombinedCa: finalCombinedCa,
         releaseExam: finalExam,
         releaseFull: finalFull,
         termId: parsedTermId,
@@ -2393,6 +2415,7 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
           isPublished: finalIsPublished,
           releaseCa1: finalCa1,
           releaseCa2: finalCa2,
+          releaseCombinedCa: finalCombinedCa,
           releaseExam: finalExam,
           releaseFull: finalFull,
           termId: parsedTermId,
@@ -2411,6 +2434,7 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
           isPublished: finalIsPublished,
           releaseCa1: finalCa1,
           releaseCa2: finalCa2,
+          releaseCombinedCa: finalCombinedCa,
           releaseExam: finalExam,
           releaseFull: finalFull,
           publishedBy: adminUserId || null,
@@ -2426,13 +2450,14 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
 
     const stagesText = finalFull
       ? 'Full Terminal Report'
-      : [finalCa1 && 'CA1', finalCa2 && 'CA2', finalExam && 'Exam'].filter(Boolean).join(' + ') || 'Draft';
+      : [finalCa1 && 'CA1', finalCa2 && 'CA2', finalCombinedCa && 'Combined CA', finalExam && 'Exam'].filter(Boolean).join(' + ') || 'Draft';
     const actionText = finalIsPublished ? `published (${stagesText}) to students & parents` : 'returned to draft mode';
     return res.json({
       success: true,
       isPublished: finalIsPublished,
       releaseCa1: finalCa1,
       releaseCa2: finalCa2,
+      releaseCombinedCa: finalCombinedCa,
       releaseExam: finalExam,
       releaseFull: finalFull,
       termId: parsedTermId,

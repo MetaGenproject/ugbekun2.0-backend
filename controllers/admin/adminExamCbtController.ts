@@ -1171,6 +1171,7 @@ export async function getCbtDistributions(req: Request, res: Response): Promise<
         section: { select: { id: true, name: true } },
         subject: { select: { id: true, name: true, subjectCode: true } },
         group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
+        assessmentComponent: { select: { id: true, name: true, type: true, slot: true, weight: true } },
         onlineExam: {
           select: {
             id: true,
@@ -1295,6 +1296,8 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
       startDate,
       endDate,
       questionBankIds,
+      targetSlot,
+      assessmentComponentId,
     } = req.body;
 
     if (!title || !classId || !subjectId) {
@@ -1323,23 +1326,6 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
       });
     }
 
-    if (targetExamMaster && targetExamMaster.totalQuestionCount) {
-      let candidateCount = bankIds.length;
-      if (!candidateCount && resolvedGroupId) {
-        const groupRec = await prisma.questionGroup.findUnique({
-          where: { id: resolvedGroupId },
-          select: { questionIds: true },
-        });
-        candidateCount = Array.isArray(groupRec?.questionIds) ? groupRec.questionIds.length : 0;
-      }
-      if (candidateCount > targetExamMaster.totalQuestionCount) {
-        return res.status(400).json({
-          success: false,
-          error: 'QUESTION_LIMIT_EXCEEDED',
-          message: `Maximum of ${targetExamMaster.totalQuestionCount} questions approved for this exam.`,
-        });
-      }
-    }
     if (!resolvedGroupId && bankIds.length > 0) {
       const approved = await prisma.questionBank.findMany({
         where: { id: { in: bankIds }, branchId, status: 'APPROVED' },
@@ -1371,6 +1357,51 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
       resolvedGroupId = group.id;
     }
 
+    // Strict Question Validation: Prevent distributing CBT tests with zero questions
+    let availableQuestionCount = 0;
+    if (resolvedGroupId) {
+      const groupRec = await prisma.questionGroup.findUnique({
+        where: { id: resolvedGroupId },
+        select: { questionIds: true },
+      });
+      availableQuestionCount = Array.isArray(groupRec?.questionIds) ? groupRec.questionIds.length : 0;
+      if (availableQuestionCount === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'NO_QUESTIONS_AVAILABLE',
+          message: 'The selected Question Bundle contains 0 questions. Please add questions to the bundle before distributing.',
+        });
+      }
+    } else {
+      // "Use Subject Question Bank"
+      const approvedCount = await prisma.questionBank.count({
+        where: {
+          branchId,
+          subjectId: Number(subjectId),
+          status: 'APPROVED',
+        },
+      });
+      if (approvedCount === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'NO_QUESTIONS_AVAILABLE',
+          message: 'Cannot distribute CBT test: No approved questions found in the Question Bank for this subject. Please add and approve questions first.',
+        });
+      }
+      availableQuestionCount = approvedCount;
+    }
+
+    // Hard Question Count Limit Enforcement from Exam Master
+    if (targetExamMaster && targetExamMaster.totalQuestionCount) {
+      if (resolvedGroupId && availableQuestionCount > targetExamMaster.totalQuestionCount) {
+        return res.status(400).json({
+          success: false,
+          error: 'QUESTION_LIMIT_EXCEEDED',
+          message: `Maximum of ${targetExamMaster.totalQuestionCount} questions approved for this exam. (Bundle contains ${availableQuestionCount} questions)`,
+        });
+      }
+    }
+
     let existingDist = null;
     if (id) {
       existingDist = await prisma.cbtDistribution.findFirst({
@@ -1397,6 +1428,8 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           classId: Number(classId),
           sectionId: sectionId ? Number(sectionId) : null,
           subjectId: Number(subjectId),
+          targetSlot: targetSlot ? String(targetSlot).trim() : null,
+          assessmentComponentId: assessmentComponentId ? Number(assessmentComponentId) : null,
           startDate: parsedStart,
           endDate: parsedEnd,
         },
@@ -1405,6 +1438,7 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           section: { select: { id: true, name: true } },
           subject: { select: { id: true, name: true, subjectCode: true } },
           group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
+          assessmentComponent: { select: { id: true, name: true, type: true, slot: true, weight: true } },
         },
       });
     } else {
@@ -1422,6 +1456,8 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           classId: Number(classId),
           sectionId: sectionId ? Number(sectionId) : null,
           subjectId: Number(subjectId),
+          targetSlot: targetSlot ? String(targetSlot).trim() : null,
+          assessmentComponentId: assessmentComponentId ? Number(assessmentComponentId) : null,
           startDate: parsedStart,
           endDate: parsedEnd,
         },
@@ -1430,6 +1466,7 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
           section: { select: { id: true, name: true } },
           subject: { select: { id: true, name: true, subjectCode: true } },
           group: { select: { id: true, title: true, groupCode: true, questionIds: true } },
+          assessmentComponent: { select: { id: true, name: true, type: true, slot: true, weight: true } },
         },
       });
     }

@@ -1677,34 +1677,39 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
       });
     }
 
-    // Exclude students who have since been promoted or enrolled in a higher/different class in this branch
+    // Determine latest enrollments across all sessions to check promotion status
     const candidateStudentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
-    if (candidateStudentIds.length > 0) {
-      const latestEnrolls = await prisma.enroll.findMany({
-        where: {
-          studentId: { in: candidateStudentIds },
-          branchId,
-          isAlumni: 0,
-        },
-        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
-      });
+    const latestEnrolls = candidateStudentIds.length > 0
+      ? await prisma.enroll.findMany({
+          where: {
+            studentId: { in: candidateStudentIds },
+            branchId,
+            isAlumni: 0,
+          },
+          orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          include: {
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+          },
+        })
+      : [];
 
-      const latestClassByStudent = new Map<number, number>();
-      for (const le of latestEnrolls) {
-        if (!latestClassByStudent.has(le.studentId)) {
-          latestClassByStudent.set(le.studentId, le.classId);
-        }
+    const latestEnrollByStudent = new Map<number, any>();
+    for (const le of latestEnrolls) {
+      if (!latestEnrollByStudent.has(le.studentId)) {
+        latestEnrollByStudent.set(le.studentId, le);
       }
-
-      enrolls = enrolls.filter((e) => {
-        const currentActiveClsId = latestClassByStudent.get(e.studentId);
-        return currentActiveClsId === parseInt(classId, 10);
-      });
     }
 
     const studentMap = new Map<number, any>();
     for (const e of enrolls) {
       if (e.student && e.student.active && !studentMap.has(e.student.id)) {
+        const latest = latestEnrollByStudent.get(e.student.id);
+        const isPromoted = latest && (
+          latest.sessionId > e.sessionId || 
+          (latest.sessionId === e.sessionId && latest.classId !== e.classId)
+        );
+
         studentMap.set(e.student.id, {
           enrollId: e.id,
           studentId: e.student.id,
@@ -1716,6 +1721,10 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
           currentClassName: e.class?.name || 'Class',
           currentSectionId: e.sectionId,
           currentSectionName: e.section?.name || 'Section',
+          isAlreadyPromoted: Boolean(isPromoted),
+          latestClassId: latest?.classId || e.classId,
+          latestClassName: latest?.class?.name || e.class?.name || 'Class',
+          latestSessionId: latest?.sessionId || e.sessionId,
         });
       }
     }
@@ -1860,7 +1869,7 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
             branchId,
             sessionId: tSessionId,
           }).catch(() => {});
-        });
+        }, { timeout: 30000, maxWait: 15000 });
 
         successCount++;
       } catch (err) {

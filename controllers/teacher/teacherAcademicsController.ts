@@ -4212,6 +4212,253 @@ export async function exportTeacherClassCredentialsPdf(req: Request, res: Respon
   }
 }
 
+/**
+ * GET /api/teacher/marks-entry/cbt-attempts
+ * Workflow 3 Auto-Fill Endpoint:
+ * Fetches clean roster-indexed scores for a specific CBT slot (e.g. CBT1, CBT2, CBT_EXAM)
+ * or specific assessmentComponentId.
+ */
+export async function getTeacherCbtAttempts(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId, sectionId, subjectId, slot, assessmentComponentId, sessionId } = req.query;
+
+  if (!classId || !subjectId) {
+    return res.status(400).json({ success: false, message: 'classId and subjectId are required.' });
+  }
+
+  const cId = Number(classId);
+  const subId = Number(subjectId);
+  const secId = sectionId ? Number(sectionId) : undefined;
+  const targetSlot = slot ? String(slot).trim().toUpperCase() : undefined;
+  const targetComponentId = assessmentComponentId ? Number(assessmentComponentId) : undefined;
+
+  // Strict permission check for teacher
+  if (req.teacherId) {
+    const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, sessionId ? Number(sessionId) : undefined, req);
+    if (!canAccess) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access Denied: You are not authorized to access marks for this subject and class.',
+      });
+    }
+  }
+
+  try {
+    let activeSession = sessionId ? Number(sessionId) : undefined;
+    if (!activeSession) {
+      const globalSetting = await prisma.globalSettings.findFirst();
+      activeSession = globalSetting?.sessionId || 5;
+    }
+
+    // Step 1: Find matching CbtDistribution
+    let dist: any = null;
+
+    // A. By explicit assessmentComponentId if provided
+    if (targetComponentId) {
+      dist = await prisma.cbtDistribution.findFirst({
+        where: {
+          assessmentComponentId: targetComponentId,
+          classId: cId,
+          subjectId: subId,
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          assessmentComponent: true,
+          onlineExam: {
+            select: { id: true, title: true, questions: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    // B. By explicit targetSlot if not found
+    if (!dist && targetSlot) {
+      dist = await prisma.cbtDistribution.findFirst({
+        where: {
+          classId: cId,
+          subjectId: subId,
+          targetSlot,
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          assessmentComponent: true,
+          onlineExam: {
+            select: { id: true, title: true, questions: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    // C. Fallback: by title pattern matching (e.g. "CBT 1", "CBT 2", "Exam")
+    if (!dist) {
+      const allDists = await prisma.cbtDistribution.findMany({
+        where: {
+          classId: cId,
+          subjectId: subId,
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          assessmentComponent: true,
+          onlineExam: {
+            select: { id: true, title: true, questions: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      });
+
+      if (targetSlot === 'CBT1' || targetSlot === 'CA1') {
+        dist = allDists.find((d) => /cbt[\s_-]*1|ca[\s_-]*1|test[\s_-]*1/i.test(d.title)) || (allDists.length > 0 ? allDists[allDists.length - 1] : null);
+      } else if (targetSlot === 'CBT2' || targetSlot === 'CA2') {
+        dist = allDists.find((d) => /cbt[\s_-]*2|ca[\s_-]*2|test[\s_-]*2/i.test(d.title));
+      } else if (targetSlot === 'CBT_EXAM' || targetSlot === 'EXAM') {
+        dist = allDists.find((d) => /exam|terminal/i.test(d.title));
+      } else if (allDists.length > 0) {
+        dist = allDists[0];
+      }
+    }
+
+    if (!dist) {
+      return res.status(404).json({
+        success: false,
+        message: `No distributed CBT test found for ${targetSlot || 'this assessment slot'} in this subject.`,
+      });
+    }
+
+    // Resolve OnlineExam ID
+    let onlineExamId = dist.onlineExamId;
+    let examTitle = dist.title;
+    let questions = dist.onlineExam?.questions || [];
+
+    if (!onlineExamId) {
+      const candidateOnlineExam = await prisma.onlineExam.findFirst({
+        where: {
+          title: dist.title,
+          classId: dist.classId,
+          subjectId: dist.subjectId,
+          ...(branchId ? { branchId } : {}),
+        },
+        orderBy: { id: 'desc' },
+      });
+      if (candidateOnlineExam) {
+        onlineExamId = candidateOnlineExam.id;
+        examTitle = candidateOnlineExam.title;
+        questions = candidateOnlineExam.questions || [];
+      }
+    }
+
+    // Calculate maximum marks from component or questions
+    let maxMarks = dist.assessmentComponent?.weight ?? 20.0;
+    if (dist.assessmentComponent?.weight) {
+      maxMarks = dist.assessmentComponent.weight;
+    } else if (Array.isArray(questions) && questions.length > 0) {
+      maxMarks = questions.reduce((sum: number, q: any) => sum + (Number(q.marks || q.point || 1)), 0);
+    }
+
+    // Step 2: Fetch enrolled students
+    const enrolls = await prisma.enroll.findMany({
+      where: {
+        classId: cId,
+        sessionId: activeSession,
+        ...(secId ? { sectionId: secId } : {}),
+        ...(branchId ? { branchId } : {}),
+        isAlumni: 0,
+      },
+      include: {
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            registerNo: true,
+          },
+        },
+      },
+      orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    const studentMap = new Map<number, any>();
+    enrolls.forEach((e) => {
+      if (e.student && !studentMap.has(e.studentId)) {
+        studentMap.set(e.studentId, e.student);
+      }
+    });
+
+    const studentIds = Array.from(studentMap.keys());
+
+    // Step 3: Fetch submissions for this online exam
+    let submissions: any[] = [];
+    if (onlineExamId && studentIds.length > 0) {
+      submissions = await prisma.onlineExamSubmission.findMany({
+        where: {
+          onlineExamId,
+          studentId: { in: studentIds },
+        },
+        select: {
+          id: true,
+          studentId: true,
+          totalMark: true,
+          submittedAt: true,
+          createdAt: true,
+        },
+      });
+    }
+
+    const subMap = new Map<number, any>();
+    submissions.forEach((s) => {
+      if (!subMap.has(s.studentId)) {
+        subMap.set(s.studentId, s);
+      }
+    });
+
+    // Step 4: Index scores for all enrolled students
+    const scores = studentIds.map((stId) => {
+      const student = studentMap.get(stId);
+      const sub = subMap.get(stId);
+      const hasSubmission = Boolean(sub && sub.totalMark !== null && sub.totalMark !== undefined);
+      const rawScore = hasSubmission ? Number(Number(sub.totalMark).toFixed(1)) : null;
+      const isAbsent = !hasSubmission;
+      const percentage = (hasSubmission && maxMarks > 0)
+        ? Number(((rawScore! / maxMarks) * 100).toFixed(1))
+        : null;
+
+      return {
+        studentId: stId,
+        firstName: student?.firstName,
+        lastName: student?.lastName,
+        name: `${student?.lastName}, ${student?.firstName}`,
+        registerNo: student?.registerNo || 'N/A',
+        rawScore,
+        isAbsent,
+        percentage,
+        submissionId: sub?.id || null,
+        submittedAt: sub?.submittedAt || sub?.createdAt || null,
+      };
+    });
+
+    return res.json({
+      success: true,
+      slot: targetSlot || dist.targetSlot || 'CBT1',
+      assessmentComponentId: dist.assessmentComponentId || null,
+      distributionId: dist.id,
+      onlineExamId,
+      examTitle,
+      maxMarks,
+      totalStudents: studentIds.length,
+      submittedCount: submissions.length,
+      scores,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Error fetching CBT attempts:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch CBT scores for auto-fill.',
+    });
+  }
+}
+
+
 
 
 

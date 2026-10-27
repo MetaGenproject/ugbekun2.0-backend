@@ -411,7 +411,8 @@ function drawStandardReportCard(doc, params) {
     visibleStages = ['FULL'],
   } = params
 
-  const isProgressSlip = Boolean(isMidTerm || stage === 'CA1' || stage === 'CA2');
+  const isCombinedCa = stage === 'COMBINED_CA';
+  const isProgressSlip = Boolean(isMidTerm || stage === 'CA1' || stage === 'CA2' || isCombinedCa);
 
   // Theme Colors
   const primaryColor = '#1e3a8a'   // Royal Navy Blue
@@ -454,17 +455,21 @@ function drawStandardReportCard(doc, params) {
      .fontSize(9)
      .fillColor('#93c5fd') // Light blue
      .text(
-       isProgressSlip
-         ? `MID-TERM CONTINUOUS ASSESSMENT PROGRESS SLIP • BRANCH: ${branchCode}`
-         : `OFFICIAL TERM REPORT CARD • BRANCH: ${branchCode}`,
+       isCombinedCa
+         ? `COMBINED CONTINUOUS ASSESSMENT PROGRESS REPORT (CA1 + CA2) • BRANCH: ${branchCode}`
+         : (isProgressSlip
+           ? `MID-TERM CONTINUOUS ASSESSMENT PROGRESS SLIP • BRANCH: ${branchCode}`
+           : `OFFICIAL TERM REPORT CARD • BRANCH: ${branchCode}`),
        45,
        64
      )
 
   // Right Header Text (Exam & Session)
-  const examName = isProgressSlip
-    ? (stage === 'CA2' ? 'CA 2 Mid-Term Evaluation' : 'CA 1 Mid-Term Evaluation')
-    : (reportCard[0]?.examName || 'Term Evaluation')
+  const examName = isCombinedCa
+    ? 'Combined CA Evaluation (Out of 40)'
+    : (isProgressSlip
+      ? (stage === 'CA2' ? 'CA 2 Mid-Term Evaluation' : 'CA 1 Mid-Term Evaluation')
+      : (reportCard[0]?.examName || 'Term Evaluation'))
   doc.fillColor('#ffffff')
      .font('Helvetica-Bold')
      .fontSize(12)
@@ -529,7 +534,15 @@ function drawStandardReportCard(doc, params) {
   doc.rect(30, y, 535, 20).fill(primaryColor)
   doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
 
-  if (isProgressSlip) {
+  if (isCombinedCa) {
+    doc.text('SUBJECT CODE', 40, y + 6, { width: 75 })
+       .text('SUBJECT NAME', 115, y + 6, { width: 145 })
+       .text('CA 1 (20)', 265, y + 6, { width: 45, align: 'right' })
+       .text('CA 2 (20)', 315, y + 6, { width: 45, align: 'right' })
+       .text('TOTAL CA (40)', 365, y + 6, { width: 65, align: 'right' })
+       .text('CLASS AVG', 435, y + 6, { width: 60, align: 'right' })
+       .text('GRADE', 500, y + 6, { width: 55, align: 'center' })
+  } else if (isProgressSlip) {
     doc.text('SUBJECT CODE', 40, y + 6, { width: 85 })
        .text('SUBJECT NAME', 130, y + 6, { width: 200 })
        .text('CA SCORE', 340, y + 6, { width: 65, align: 'right' })
@@ -563,7 +576,34 @@ function drawStandardReportCard(doc, params) {
     // Draw row borders
     doc.rect(30, y, 535, rowHeight).stroke(lightBorder)
 
-    if (isProgressSlip) {
+    if (isCombinedCa) {
+      const ca1Val = row.ca1Score !== undefined && row.ca1Score !== null ? String(row.ca1Score) : (row.cbtMark ? String(row.cbtMark) : '-')
+      const ca2Val = row.ca2Score !== undefined && row.ca2Score !== null ? String(row.ca2Score) : '-'
+      const totalVal = row.stageScore !== undefined && row.stageScore !== null ? String(row.stageScore) : (row.mark !== null ? String(row.mark) : '-')
+      
+      let gradeLetter = '-'
+      if (!row.absent && totalVal !== '-') {
+        const tot = parseFloat(totalVal)
+        const pct = (tot / 40) * 100
+        const res = calculateGradeFromRanges(pct, gradingRanges || undefined)
+        gradeLetter = res.grade
+      }
+
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+         .text(row.subjectCode || '-', 40, y + 6, { width: 75 })
+
+      doc.font('Helvetica').fontSize(8.5)
+         .text(row.subjectName || '-', 115, y + 6, { width: 145 })
+
+      doc.font('Helvetica').fontSize(8)
+         .text(row.absent ? '-' : ca1Val, 265, y + 6, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : ca2Val, 315, y + 6, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : totalVal, 365, y + 6, { width: 65, align: 'right' })
+         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 435, y + 6, { width: 60, align: 'right' })
+
+      doc.font('Helvetica-Bold').fontSize(8)
+         .text(row.absent ? 'ABS' : gradeLetter, 500, y + 6, { width: 55, align: 'center' })
+    } else if (isProgressSlip) {
       const caScore = row.cbtMark || row.ca1Score || row.ca2Score || (row.testScore ? String(row.testScore) : '-')
       const statusText = row.absent ? 'ABSENT' : (caScore !== '-' ? 'Completed' : 'Pending')
 

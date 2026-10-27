@@ -107,6 +107,8 @@ model Branch {
   staffConducts   StaffConduct[]
   employmentLetters EmploymentLetter[]
   subjectCommentAssessments SubjectCommentAssessment[]
+  examSetups                ExamSetup[]
+  studentComponentScores    StudentComponentScore[]
 
   @@map("branches")
 }
@@ -176,6 +178,7 @@ model User {
   password     String // Bcrypt-compatible hash — directly migrated
   rawPassword  String?   @map("raw_password")
   role         Int // Legacy tinyint role code
+  department   String?
   photo        String?   @map("photo")
   active       Boolean   @default(true)
   lastLogin    DateTime?
@@ -301,6 +304,7 @@ model Student {
   studentMessages       StudentMessage[]
   studentReminders       StudentReminder[]
   subjectCommentAssessments SubjectCommentAssessment[]
+  studentComponentScores    StudentComponentScore[]
 
   @@map("students")
 }
@@ -617,6 +621,7 @@ model Class {
   cbtDistributions      CbtDistribution[]
   questionGroups        QuestionGroup[]
   subjectCommentAssessments SubjectCommentAssessment[]
+  studentComponentScores StudentComponentScore[]
 
   @@index([branchId])
   @@map("class")
@@ -641,6 +646,7 @@ model Section {
   examScheduleSlots     ExamScheduleSlot[]
 
   cbtDistributions      CbtDistribution[]
+  studentComponentScores StudentComponentScore[]
 
   @@index([branchId])
   @@map("section")
@@ -677,6 +683,7 @@ model Subject {
   questionGroups    QuestionGroup[]
   cbtDistributions  CbtDistribution[]
   subjectCommentAssessments SubjectCommentAssessment[]
+  studentComponentScores StudentComponentScore[]
 
   @@index([branchId])
   @@map("subject")
@@ -749,6 +756,7 @@ model Exam {
   marks                 Mark[]
   montessoriAssessments MontessoriAssessment[]
   matrixMappings        EvaluationMatrixItemMapping[]
+  examSetups            ExamSetup[]
 
   @@index([branchId, sessionId])
   @@map("exam")
@@ -1939,18 +1947,23 @@ model CbtDistribution {
   startDate        DateTime?      @map("start_date")
   endDate          DateTime?      @map("end_date")
 
-  onlineExamId     Int?           @map("online_exam_id")
-  onlineExam       OnlineExam?    @relation(fields: [onlineExamId], references: [id])
+  onlineExamId     Int?                  @map("online_exam_id")
+  onlineExam       OnlineExam?           @relation(fields: [onlineExamId], references: [id])
 
-  branchId         Int            @map("branch_id")
-  branch           Branch         @relation(fields: [branchId], references: [id])
+  assessmentComponentId Int?                  @map("assessment_component_id")
+  assessmentComponent   AssessmentComponent?  @relation(fields: [assessmentComponentId], references: [id])
+  targetSlot            String?               @map("target_slot") // "CBT1" | "CBT2" | "CBT_EXAM"
 
-  createdAt        DateTime       @default(now()) @map("created_at")
-  updatedAt        DateTime?      @updatedAt @map("updated_at")
+  branchId         Int                   @map("branch_id")
+  branch           Branch                @relation(fields: [branchId], references: [id])
+
+  createdAt        DateTime              @default(now()) @map("created_at")
+  updatedAt        DateTime?             @updatedAt @map("updated_at")
 
   @@index([classId, sectionId])
   @@index([branchId])
   @@index([onlineExamId])
+  @@index([assessmentComponentId])
   @@map("cbt_distributions")
 }
 
@@ -2577,6 +2590,7 @@ model ClassReportCardPublication {
   isPublished Boolean   @default(false) @map("is_published")
   releaseCa1  Boolean   @default(false) @map("release_ca1")
   releaseCa2  Boolean   @default(false) @map("release_ca2")
+  releaseCombinedCa Boolean @default(false) @map("release_combined_ca")
   releaseExam Boolean   @default(false) @map("release_exam")
   releaseFull Boolean   @default(false) @map("release_full")
   publishedBy Int?      @map("published_by")
@@ -2612,3 +2626,101 @@ model SubjectCommentAssessment {
   @@index([branchId])
   @@map("subject_comment_assessments")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXAM SETUP & ASSESSMENT COMPONENTS (CBT / MATRIX / HYBRID REPORT CARD)
+// Admin defines the exam configuration for the term:
+// - CBT Hybrid (CBT + Theory) vs Manual / Non-CBT (Theory/CA only)
+// - Dynamic components with customizable names, slots, weights, and categories
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ExamSetup {
+  id          Int                   @id @default(autoincrement())
+  branchId    Int                   @map("branch_id")
+  sessionId   Int                   @map("session_id")
+  termId      Int                   @map("term_id") // 1, 2, 3
+  examId      Int?                  @map("exam_id")
+  title       String
+  schoolMode  String                @default("CBT_HYBRID") @map("school_mode") // "CBT_HYBRID" | "MANUAL_THEORY"
+  isActive    Boolean               @default(true) @map("is_active")
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime?             @updatedAt @map("updated_at")
+
+  branch      Branch                @relation(fields: [branchId], references: [id])
+  exam        Exam?                 @relation(fields: [examId], references: [id])
+  components  AssessmentComponent[]
+
+  @@index([branchId, sessionId, termId])
+  @@map("exam_setups")
+}
+
+model AssessmentComponent {
+  id               Int                     @id @default(autoincrement())
+  examSetupId      Int                     @map("exam_setup_id")
+  name             String                  // Custom admin title e.g. "CBT 1", "Theory/CA 1", "Mid-Term CA", "Terminal Exam"
+  type             String                  // "CBT" | "THEORY" | "COMBINED"
+  slot             String?                 // "CBT1" | "CBT2" | "THEORY1" | "THEORY2" | "EXAM_CBT" | "EXAM_THEORY"
+  weight           Float                   @default(20.0) // 100% admin-configurable weight
+  category         String                  @default("CA") // "CA" | "EXAM"
+  order            Int                     @default(0)
+  createdAt        DateTime                @default(now()) @map("created_at")
+  updatedAt        DateTime?               @updatedAt @map("updated_at")
+
+  examSetup        ExamSetup               @relation(fields: [examSetupId], references: [id], onDelete: Cascade)
+  cbtDistributions CbtDistribution[]
+  scores           StudentComponentScore[]
+
+  @@index([examSetupId])
+  @@map("assessment_components")
+}
+
+model StudentComponentScore {
+  id                    Int                 @id @default(autoincrement())
+  assessmentComponentId Int                 @map("assessment_component_id")
+  studentId             Int                 @map("student_id")
+  subjectId             Int                 @map("subject_id")
+  classId               Int                 @map("class_id")
+  sectionId             Int?                @map("section_id")
+  sessionId             Int                 @map("session_id")
+  termId                Int                 @map("term_id")
+  branchId              Int                 @map("branch_id")
+
+  cbtScore              Float?              @map("cbt_score")
+  theoryScore           Float?              @map("theory_score")
+  totalScore            Float?              @map("total_score")
+  isCbtLocked           Boolean             @default(false) @map("is_cbt_locked")
+  cbtSubmissionId       Int?                @map("cbt_submission_id")
+  teacherId             Int?                @map("teacher_id")
+
+  createdAt             DateTime            @default(now()) @map("created_at")
+  updatedAt             DateTime?           @updatedAt @map("updated_at")
+
+  assessmentComponent   AssessmentComponent @relation(fields: [assessmentComponentId], references: [id], onDelete: Cascade)
+  student               Student             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subject               Subject             @relation(fields: [subjectId], references: [id])
+  class                 Class               @relation(fields: [classId], references: [id])
+  section               Section?            @relation(fields: [sectionId], references: [id])
+  branch                Branch              @relation(fields: [branchId], references: [id])
+
+  @@unique([studentId, subjectId, assessmentComponentId, sessionId, termId])
+  @@index([classId, sectionId, subjectId])
+  @@index([branchId])
+  @@map("student_component_scores")
+}
+
+model StaffMessage {
+  id               Int       @id @default(autoincrement())
+  branchId         Int?      @map("branch_id")
+  senderId         Int?      @map("sender_id")
+  senderType       String?   @map("sender_type")
+  recipientId      Int?      @map("recipient_id")
+  targetDepartment String?   @map("target_department")
+  subject          String?
+  message          String?   @db.Text
+  isMemo           Boolean?  @default(false) @map("is_memo")
+  createdAt        DateTime? @default(now()) @map("created_at")
+
+  @@map("staff_messages")
+}
+
+

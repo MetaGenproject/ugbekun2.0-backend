@@ -204,7 +204,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     }
 
     const isPublished = Boolean(
-      classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseExam || classPub.releaseFull)
+      classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseCombinedCa || classPub.releaseExam || classPub.releaseFull)
     );
 
     if (!isPublished) {
@@ -214,6 +214,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         visibleStages: [],
         releaseCa1: false,
         releaseCa2: false,
+        releaseCombinedCa: false,
         releaseExam: false,
         releaseFull: false,
         reportCard: [],
@@ -227,16 +228,20 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
 
     const releaseCa1 = Boolean(classPub?.releaseCa1);
     const releaseCa2 = Boolean(classPub?.releaseCa2);
+    const releaseCombinedCa = Boolean(classPub?.releaseCombinedCa);
     const releaseExam = Boolean(classPub?.releaseExam);
     const releaseFull = Boolean(classPub?.releaseFull);
 
     const visibleStages: string[] = [];
     if (releaseCa1) visibleStages.push('CA1');
     if (releaseCa2) visibleStages.push('CA2');
+    if (releaseCombinedCa) visibleStages.push('COMBINED_CA');
     if (releaseExam) visibleStages.push('EXAM');
     if (releaseFull) visibleStages.push('FULL');
 
+    // ZERO LEAKAGE RULE: exam scores and ranking MUST NOT be sent when only CA/Combined CA is released
     const isExamReleased = Boolean(releaseExam || releaseFull);
+    const isCombinedCaOnly = releaseCombinedCa && !isExamReleased;
 
     if (isCommentClass) {
       const subjectComments = await prisma.subjectCommentAssessment.findMany({
@@ -432,9 +437,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
+        // ZERO LEAKAGE: CBT/CA marks only if CA stages released
         cbtMark: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? String(parsed.testScore) : null) : null,
         ca1Score: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
         ca2Score: releaseCa2 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
+        // ZERO LEAKAGE: exam/theory marks completely withheld when exam is not released
         theoryMark: isExamReleased ? (parsed.examScore > 0 ? String(parsed.examScore) : null) : null,
         mark: isExamReleased ? (parsed.hasValidScore ? String(parsed.total) : null) : null,
         absent: m.absent === '1' || m.absent === 'true',
@@ -444,11 +451,15 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     });
 
     // Zero Leakage: Withhold overall average if terminal exam is unreleased
+    // For COMBINED_CA only: show CA average, but cap at CA total (e.g. out of 40)
     const overallAverage = isExamReleased && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : null;
+    const combinedCaAverage = isCombinedCaOnly && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : null;
 
     let rank = null;
     let totalClassStudents = 0;
 
+    // ZERO LEAKAGE: Rank MUST NOT be computed or sent for CA-only or Combined CA releases
+    // Rank is ONLY computed and sent on full Terminal Exam report cards
     if (isExamReleased && req.childClassId && req.childSectionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
@@ -513,16 +524,20 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     return res.json({
       success: true,
       isPublished: true,
-      stage: isExamReleased ? 'FULL' : 'MID_TERM',
+      stage: isExamReleased ? 'FULL' : (isCombinedCaOnly ? 'COMBINED_CA' : 'MID_TERM'),
       visibleStages,
       releaseCa1,
       releaseCa2,
+      releaseCombinedCa,
       releaseExam,
       releaseFull,
       reportCard,
-      overallAverage,
+      // ZERO LEAKAGE: omit overallAverage when exam not released; send combinedCaAverage for combined CA
+      overallAverage: isExamReleased ? overallAverage : null,
+      combinedCaAverage: isCombinedCaOnly ? combinedCaAverage : null,
       commentary: commentary?.remark || null,
-      rank,
+      // ZERO LEAKAGE: rank is null unless terminal exam is fully released
+      rank: isExamReleased ? rank : null,
       totalClassStudents,
       nextTermResumptionDate: studentMarks[0]?.exam?.resumptionDate || null,
       nextTermFees: nextTermFeesStr,

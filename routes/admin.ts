@@ -257,6 +257,14 @@ import {
 } from '../controllers/admin/adminMarksReportController';
 
 import {
+  getExamSetups,
+  getExamSetupById,
+  getActiveExamSetup,
+  createOrUpdateExamSetup,
+  deleteExamSetup,
+} from '../controllers/admin/adminExamSetupController';
+
+import {
   getFinanceOverview,
   getFeeTypes,
   createFeeType,
@@ -631,6 +639,16 @@ router.delete('/homeworks/:id', deleteAdminHomework);
 // ============================================================================
 // 7. MARKS ENTRY, COMMENTARY & REPORT CARDS
 // ============================================================================
+
+// Exam Master Setup (CBT / Hybrid / Manual Mode Configuration)
+router.get('/academics/exam-setup/active', getActiveExamSetup);
+router.get('/academics/exam-setup', getExamSetups);
+router.post('/academics/exam-setup', createOrUpdateExamSetup);
+router.put('/academics/exam-setup', createOrUpdateExamSetup);
+router.get('/academics/exam-setup/:id', getExamSetupById);
+router.put('/academics/exam-setup/:id', createOrUpdateExamSetup);
+router.delete('/academics/exam-setup/:id', deleteExamSetup);
+
 router.get('/marks-entry', getMarksEntry);
 router.post('/marks-entry/batch-save', saveMarksEntryBatch);
 router.post('/marks-entry/ai-distribute', aiDistributeMarks);

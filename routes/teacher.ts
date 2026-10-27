@@ -84,6 +84,7 @@ import {
   getEvents,
   getTeacherMarksEntry,
   saveTeacherMarksEntryBatch,
+  getTeacherCbtAttempts,
   getTeacherSubjectComments,
   saveTeacherSubjectCommentsBatch,
   getTeacherEvaluationMatrices,
@@ -153,6 +154,7 @@ router.post('/commentary/batch-save', batchSaveCommentary);
 
 // Gradebook & Score Sheets (Matrix Assessment)
 router.get('/marks-entry', getTeacherMarksEntry);
+router.get('/marks-entry/cbt-attempts', getTeacherCbtAttempts);
 router.post('/marks-entry/batch-save', saveTeacherMarksEntryBatch);
 router.post('/marks-entry/ai-distribute', aiDistributeTeacherMarks);
 router.get('/subject-comments', getTeacherSubjectComments);

@@ -1198,9 +1198,11 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
       return res.status(400).json({ success: false, message: 'Please provide at least one valid student ID for promotion.' });
     }
 
-    const { classId, targetClassId, sectionId, targetSectionId, sessionId: reqSessionId, targetSessionId, action } = req.body;
+    const { classId, targetClassId, sectionId, targetSectionId, sessionId: reqSessionId, targetSessionId, sourceClassId, sourceSessionId, action } = req.body;
     const tClassId = Number(targetClassId || classId);
     const tSectionId = Number(targetSectionId || sectionId);
+    const sClassId = sourceClassId ? Number(sourceClassId) : undefined;
+    const sSessionId = sourceSessionId ? Number(sourceSessionId) : undefined;
 
     if (!tClassId || !tSectionId) {
       return res.status(400).json({ success: false, message: 'Target class and section are required.' });
@@ -1219,10 +1221,24 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
       try {
         await prisma.$transaction(async (tx: any) => {
           // Find active enrollment
-          let currentEnroll = await tx.enroll.findFirst({
-            where: { studentId, branchId, isAlumni: 0 },
-            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
-          });
+          let currentEnroll = null;
+
+          if (sClassId || sSessionId) {
+            const matchWhere: any = { studentId, branchId, isAlumni: 0 };
+            if (sClassId) matchWhere.classId = sClassId;
+            if (sSessionId) matchWhere.sessionId = sSessionId;
+            currentEnroll = await tx.enroll.findFirst({
+              where: matchWhere,
+              orderBy: { id: 'desc' },
+            });
+          }
+
+          if (!currentEnroll) {
+            currentEnroll = await tx.enroll.findFirst({
+              where: { studentId, branchId, isAlumni: 0 },
+              orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+            });
+          }
 
           if (!currentEnroll) {
             currentEnroll = await tx.enroll.findFirst({
@@ -1298,7 +1314,7 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
             branchId,
             sessionId: tSessionId,
           }).catch(() => {});
-        });
+        }, { timeout: 30000, maxWait: 15000 });
 
         successCount++;
       } catch (err: any) {
