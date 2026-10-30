@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import prisma from '../../lib/prisma';
 import {
   isSubjectTeacher as originalIsSubjectTeacher,
@@ -715,8 +716,13 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
       });
     }
 
-    const teacherRecord = await prisma.teacher.findUnique({
-      where: { id: req.teacherId },
+    const teacherRecord = await prisma.teacher.findFirst({
+      where: {
+        OR: [
+          { id: req.teacherId },
+          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+        ],
+      },
       select: {
         id: true,
         name: true,
@@ -725,6 +731,17 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
         photo: true,
         department: true,
         qualifications: true,
+        houseAddress: true,
+        bankName: true,
+        accountNumber: true,
+        accountName: true,
+        userId: true,
+        user: {
+          select: {
+            username: true,
+            email: true,
+          },
+        },
         branch: {
           select: {
             id: true,
@@ -746,13 +763,18 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
 
     return res.json({
       success: true,
-      teacherId: req.teacherId,
+      teacherId: teacherRecord?.id || req.teacherId,
       name: teacherRecord?.name || 'Teacher Account',
-      email: teacherRecord?.email || null,
+      username: teacherRecord?.user?.username || null,
+      email: teacherRecord?.email || teacherRecord?.user?.email || null,
       phone: teacherRecord?.phone || null,
       photo: teacherRecord?.photo || null,
       department: teacherRecord?.department || null,
       qualifications: teacherRecord?.qualifications || null,
+      houseAddress: teacherRecord?.houseAddress || null,
+      bankName: teacherRecord?.bankName || null,
+      accountNumber: teacherRecord?.accountNumber || null,
+      accountName: teacherRecord?.accountName || null,
       branchName,
       branch: teacherRecord?.branch || null,
       isFormTeacher: formAllocations.length > 0,
@@ -784,6 +806,191 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
 }
 
 /**
+ * PUT /api/teacher/profile
+ */
+export async function updateProfile(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const {
+      name,
+      email,
+      phone,
+      qualifications,
+      houseAddress,
+      department,
+      bankName,
+      accountNumber,
+      accountName,
+    } = req.body || {};
+
+    const teacher = await prisma.teacher.findFirst({
+      where: {
+        OR: [
+          { id: req.teacherId },
+          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+        ],
+      },
+      select: { id: true, userId: true },
+    });
+
+    if (!teacher) {
+      return res.status(404).json({ success: false, message: 'Teacher profile not found.' });
+    }
+
+    const updated = await prisma.teacher.update({
+      where: { id: teacher.id },
+      data: {
+        ...(name ? { name: name.trim() } : {}),
+        ...(email !== undefined ? { email: email ? email.trim() : null } : {}),
+        ...(phone !== undefined ? { phone: phone ? phone.trim() : null } : {}),
+        ...(qualifications !== undefined ? { qualifications: qualifications ? qualifications.trim() : null } : {}),
+        ...(houseAddress !== undefined ? { houseAddress: houseAddress ? houseAddress.trim() : null } : {}),
+        ...(department !== undefined ? { department: department ? department.trim() : null } : {}),
+        ...(bankName !== undefined ? { bankName: bankName ? bankName.trim() : null } : {}),
+        ...(accountNumber !== undefined ? { accountNumber: accountNumber ? accountNumber.trim() : null } : {}),
+        ...(accountName !== undefined ? { accountName: accountName ? accountName.trim() : null } : {}),
+        updatedAt: new Date(),
+      },
+    });
+
+    if (teacher.userId) {
+      await prisma.user
+        .update({
+          where: { id: teacher.userId },
+          data: {
+            ...(name ? { name: name.trim() } : {}),
+            ...(email ? { email: email.trim() } : {}),
+            updatedAt: new Date(),
+          },
+        })
+        .catch((e: any) => console.warn('[TEACHER] User sync warning on profile update:', e.message));
+    }
+
+    return res.json({
+      success: true,
+      message: 'Teacher profile updated successfully.',
+      profile: updated,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Update profile error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update profile.' });
+  }
+}
+
+/**
+ * PUT /api/teacher/change-password
+ */
+export async function changePassword(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current and new passwords are required.' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+    }
+
+    const teacher = await prisma.teacher.findFirst({
+      where: {
+        OR: [
+          { id: req.teacherId },
+          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+        ],
+      },
+      select: { id: true, userId: true },
+    });
+
+    const targetUserId = teacher?.userId || req.userId;
+    if (!targetUserId) {
+      return res.status(400).json({ success: false, message: 'User account not linked to teacher.' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: targetUserId } });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User record not found.' });
+    }
+
+    const isBcrypt = user.password.startsWith('$2');
+    const isValid = isBcrypt
+      ? bcrypt.compareSync(currentPassword, user.password)
+      : currentPassword === user.password;
+
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    const hashedPassword = bcrypt.hashSync(newPassword, 10);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { password: hashedPassword, updatedAt: new Date() },
+    });
+
+    return res.json({ success: true, message: 'Password updated successfully.' });
+  } catch (error: any) {
+    console.error('[TEACHER] Change password error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to change password.' });
+  }
+}
+
+/**
+ * PUT /api/teacher/change-username
+ */
+export async function changeUsername(req: Request, res: Response): Promise<Response | void> {
+  try {
+    const { newUsername } = req.body;
+    const clean = typeof newUsername === 'string' ? newUsername.trim() : '';
+    if (!clean || clean.length < 3) {
+      return res.status(400).json({ success: false, message: 'Username must be at least 3 characters long.' });
+    }
+    if (!/^[a-zA-Z0-9._-]+$/.test(clean)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username may only contain letters, numbers, dots, hyphens, and underscores.',
+      });
+    }
+
+    const teacher = await prisma.teacher.findFirst({
+      where: {
+        OR: [
+          { id: req.teacherId },
+          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+        ],
+      },
+      select: { id: true, userId: true },
+    });
+
+    const targetUserId = teacher?.userId || req.userId;
+    if (!targetUserId) {
+      return res.status(400).json({ success: false, message: 'User account not linked to teacher.' });
+    }
+
+    const existing = await prisma.user.findFirst({
+      where: {
+        username: { equals: clean, mode: 'insensitive' },
+        id: { not: targetUserId },
+      },
+    });
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: 'Username is already taken by another account.' });
+    }
+
+    await prisma.user.update({
+      where: { id: targetUserId },
+      data: { username: clean, updatedAt: new Date() },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Username updated successfully.',
+      username: clean,
+    });
+  } catch (error: any) {
+    console.error('[TEACHER] Change username error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to change username.' });
+  }
+}
+
+/**
  * POST /api/teacher/profile/upload-photo
  */
 export async function uploadProfilePhoto(req: Request, res: Response): Promise<Response | void> {
@@ -796,8 +1003,13 @@ export async function uploadProfilePhoto(req: Request, res: Response): Promise<R
       return res.status(400).json({ success: false, message: 'Photograph data is required.' });
     }
 
-    const teacher = await prisma.teacher.findUnique({
-      where: { id: req.teacherId },
+    const teacher = await prisma.teacher.findFirst({
+      where: {
+        OR: [
+          { id: req.teacherId },
+          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+        ],
+      },
       select: { id: true, userId: true, name: true },
     });
 
@@ -808,7 +1020,7 @@ export async function uploadProfilePhoto(req: Request, res: Response): Promise<R
     const photoUrl = await savePhoto(inputPhoto, 'ugbekun2/staff/photos');
 
     const updated = await prisma.teacher.update({
-      where: { id: req.teacherId },
+      where: { id: teacher.id },
       data: { photo: photoUrl },
       select: { id: true, name: true, photo: true },
     });

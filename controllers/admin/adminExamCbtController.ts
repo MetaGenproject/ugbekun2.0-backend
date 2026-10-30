@@ -138,7 +138,7 @@ export async function getEvaluationMatrices(req: Request, res: Response): Promis
             feedItems: {
               include: {
                 examMaster: {
-                  select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true },
+                  select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true, manualMarksBreakdown: true, remark: true },
                 },
               },
             },
@@ -285,7 +285,7 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
               feedItems: {
                 include: {
                   examMaster: {
-                    select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true },
+                    select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true, manualMarksBreakdown: true, remark: true },
                   },
                 },
               },
@@ -423,7 +423,7 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
               feedItems: {
                 include: {
                   examMaster: {
-                    select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true },
+                    select: { id: true, name: true, examCategory: true, cbtTotalMarks: true, totalQuestionCount: true, manualMarksBreakdown: true, remark: true },
                   },
                 },
               },

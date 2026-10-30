@@ -12,6 +12,9 @@ import {
   getMessages,
   sendMessage,
   getProfile,
+  updateProfile,
+  changePassword,
+  changeUsername,
   uploadProfilePhoto,
   getExams,
   getStudents,
@@ -126,8 +129,11 @@ router.delete('/reminders/:id', deleteReminder);
 router.get('/messages', getMessages);
 router.post('/messages', sendMessage);
 
-// Profile
+// Profile & Credentials
 router.get('/profile', getProfile);
+router.put('/profile', updateProfile);
+router.put('/change-password', changePassword);
+router.put('/change-username', changeUsername);
 router.post('/profile/upload-photo', upload.single('file'), uploadProfilePhoto);
 
 // Exams & Student Rosters
