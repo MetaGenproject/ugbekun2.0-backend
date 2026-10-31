@@ -131,7 +131,7 @@ export async function getEvaluationMatrices(req: Request, res: Response): Promis
     const matrices = await prisma.evaluationMatrix.findMany({
       where: branchId ? { branchId } : {},
       include: {
-        classes: { select: { id: true, name: true } },
+        classes: { select: { id: true, name: true, usesScores: true, isEcd: true } },
         columns: {
           orderBy: { displayOrder: 'asc' },
           include: {
@@ -185,6 +185,7 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
       components,
       columns,
       classId,
+      classIds,
     } = req.body;
 
     if (!name || !code) {
@@ -269,10 +270,19 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
         }
       }
 
-      // Link class if classId passed
-      if (classId) {
-        await tx.class.update({
-          where: { id: Number(classId) },
+      // Link classes if classIds array or singular classId passed
+      const resolvedClassIds: number[] = Array.isArray(classIds)
+        ? classIds.map(Number).filter((id) => !isNaN(id) && id > 0)
+        : classId
+        ? [Number(classId)]
+        : [];
+
+      if (resolvedClassIds.length > 0) {
+        await tx.class.updateMany({
+          where: {
+            id: { in: resolvedClassIds },
+            ...(branchId ? { branchId } : {}),
+          },
           data: { evaluationMatrixId: created.id },
         });
       }
@@ -280,7 +290,7 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
       return tx.evaluationMatrix.findUnique({
         where: { id: created.id },
         include: {
-          classes: { select: { id: true, name: true } },
+          classes: { select: { id: true, name: true, usesScores: true, isEcd: true } },
           columns: {
             orderBy: { displayOrder: 'asc' },
             include: {
@@ -322,6 +332,7 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
       components,
       columns,
       classId,
+      classIds,
     } = req.body;
 
     const existing = await prisma.evaluationMatrix.findFirst({
@@ -408,10 +419,31 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
         }
       }
 
-      if (classId !== undefined) {
-        if (classId) {
-          await tx.class.update({
-            where: { id: Number(classId) },
+      // Synchronize classes attached to this matrix
+      if (classIds !== undefined || classId !== undefined) {
+        const resolvedClassIds: number[] = Array.isArray(classIds)
+          ? classIds.map(Number).filter((id) => !isNaN(id) && id > 0)
+          : classId
+          ? [Number(classId)]
+          : [];
+
+        // 1. Detach classes that were previously linked to this matrix but are no longer selected
+        await tx.class.updateMany({
+          where: {
+            evaluationMatrixId: matrixId,
+            id: { notIn: resolvedClassIds },
+            ...(branchId ? { branchId } : {}),
+          },
+          data: { evaluationMatrixId: null },
+        });
+
+        // 2. Attach selected classes to this matrix
+        if (resolvedClassIds.length > 0) {
+          await tx.class.updateMany({
+            where: {
+              id: { in: resolvedClassIds },
+              ...(branchId ? { branchId } : {}),
+            },
             data: { evaluationMatrixId: matrixId },
           });
         }
@@ -420,7 +452,7 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
       return tx.evaluationMatrix.findUnique({
         where: { id: matrixId },
         include: {
-          classes: { select: { id: true, name: true } },
+          classes: { select: { id: true, name: true, usesScores: true, isEcd: true } },
           columns: {
             orderBy: { displayOrder: 'asc' },
             include: {
@@ -503,17 +535,35 @@ export async function setDefaultEvaluationMatrix(req: Request, res: Response): P
  * POST /api/admin/evaluation-matrices/assign-class
  */
 export async function assignMatrixToClass(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
   try {
-    const { classId, evaluationMatrixId } = req.body;
+    const { classId, classIds, evaluationMatrixId } = req.body;
 
-    if (!classId) {
-      return res.status(400).json({ success: false, message: 'Class ID is required.' });
+    const resolvedIds: number[] = Array.isArray(classIds)
+      ? classIds.map(Number).filter((id) => !isNaN(id) && id > 0)
+      : classId
+      ? [Number(classId)]
+      : [];
+
+    if (resolvedIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Class ID or classIds array is required.' });
     }
 
-    const updatedClass = await prisma.class.update({
-      where: { id: Number(classId) },
+    const targetMatrixId = evaluationMatrixId ? Number(evaluationMatrixId) : null;
+
+    await prisma.class.updateMany({
+      where: {
+        id: { in: resolvedIds },
+        ...(branchId ? { branchId } : {}),
+      },
       data: {
-        evaluationMatrixId: evaluationMatrixId ? Number(evaluationMatrixId) : null,
+        evaluationMatrixId: targetMatrixId,
+      },
+    });
+
+    const updatedClasses = await prisma.class.findMany({
+      where: {
+        id: { in: resolvedIds },
       },
       include: {
         evaluationMatrix: true,
@@ -522,8 +572,9 @@ export async function assignMatrixToClass(req: Request, res: Response): Promise<
 
     return res.json({
       success: true,
-      class: updatedClass,
-      message: 'Evaluation Matrix assigned to class successfully.',
+      classes: updatedClasses,
+      class: updatedClasses[0] || null,
+      message: 'Evaluation Matrix assigned to class(es) successfully.',
     });
   } catch (error) {
     console.error('[ADMIN] Assign evaluation matrix to class error:', error);
