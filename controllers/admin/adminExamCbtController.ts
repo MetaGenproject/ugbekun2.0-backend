@@ -178,6 +178,7 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
     const {
       name,
       code,
+      generalHeading,
       description,
       totalMarks,
       isDefault,
@@ -229,6 +230,7 @@ export async function createEvaluationMatrix(req: Request, res: Response): Promi
           branchId: branchId || 1,
           name: name.trim(),
           code: code.trim().toUpperCase(),
+          generalHeading: generalHeading && typeof generalHeading === 'string' && generalHeading.trim() ? generalHeading.trim() : 'Termly Report',
           description: description ? description.trim() : null,
           totalMarks: finalTotalMarks,
           isDefault: Boolean(isDefault),
@@ -313,6 +315,7 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
     const {
       name,
       code,
+      generalHeading,
       description,
       totalMarks,
       isDefault,
@@ -362,6 +365,7 @@ export async function updateEvaluationMatrix(req: Request, res: Response): Promi
         data: {
           name: name ? name.trim() : existing.name,
           code: code ? code.trim().toUpperCase() : existing.code,
+          generalHeading: generalHeading !== undefined ? (generalHeading && typeof generalHeading === 'string' && generalHeading.trim() ? generalHeading.trim() : 'Termly Report') : existing.generalHeading,
           description: description !== undefined ? (description ? description.trim() : null) : existing.description,
           totalMarks: finalTotalMarks,
           isDefault: isDefault !== undefined ? Boolean(isDefault) : existing.isDefault,

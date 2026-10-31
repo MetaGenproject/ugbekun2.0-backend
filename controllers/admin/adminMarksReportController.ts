@@ -59,7 +59,7 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    let matrix = classData.evaluationMatrix;
+    let matrix: any = classData.evaluationMatrix;
     if (!matrix) {
       matrix = await prisma.evaluationMatrix.findFirst({
         where: { branchId, isDefault: true },
@@ -69,6 +69,26 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
       matrix = await prisma.evaluationMatrix.findFirst({
         where: { branchId },
       });
+    }
+    if (matrix) {
+      matrix = {
+        ...matrix,
+        generalHeading: matrix.generalHeading && String(matrix.generalHeading).trim() ? String(matrix.generalHeading).trim() : 'Termly Report',
+      };
+    } else {
+      matrix = {
+        id: 0,
+        name: 'Continuous Assessment & Examination',
+        code: 'CA-EXAM',
+        generalHeading: 'Termly Report',
+        description: 'Standard Assessment Matrix',
+        totalMarks: 100,
+        isDefault: true,
+        components: [
+          { code: 'CA', name: 'Continuous Assessment', maxMarks: 40, passMarks: 20 },
+          { code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, passMarks: 30 },
+        ],
+      };
     }
 
     const globalSetting = await prisma.globalSettings.findFirst();

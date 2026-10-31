@@ -1756,12 +1756,13 @@ model TimetableSlot {
 
 model EvaluationMatrix {
   id          Int       @id @default(autoincrement())
-  name        String
-  code        String    @map("code")
-  description String?   @db.Text
-  totalMarks  Decimal   @default(100) @map("total_marks") @db.Decimal(5, 2)
-  isDefault   Boolean   @default(false) @map("is_default")
-  components  Json      @default("[]")
+  name           String
+  code           String    @map("code")
+  generalHeading String?   @default("Termly Report") @map("general_heading")
+  description    String?   @db.Text
+  totalMarks     Decimal   @default(100) @map("total_marks") @db.Decimal(5, 2)
+  isDefault      Boolean   @default(false) @map("is_default")
+  components     Json      @default("[]")
 
   branchId    Int       @map("branch_id")
   branch      Branch    @relation(fields: [branchId], references: [id])

@@ -524,7 +524,30 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
         : null,
     }));
 
-    return res.json({ success: true, students, assignedClasses });
+    const schoolYears = await prisma.schoolYear.findMany({
+      orderBy: { id: 'desc' },
+      select: { id: true, schoolYear: true },
+    });
+    const matchedSy = schoolYears.find((sy) => sy.id === activeSessionId) || schoolYears[0];
+    const activeSessionName = matchedSy?.schoolYear
+      ? (matchedSy.schoolYear.toLowerCase().includes('session') ? matchedSy.schoolYear : `${matchedSy.schoolYear} Session`)
+      : 'Current Session';
+
+    return res.json({
+      success: true,
+      students,
+      assignedClasses,
+      sessionId: activeSessionId,
+      activeSession: {
+        id: matchedSy ? matchedSy.id : activeSessionId,
+        name: activeSessionName,
+      },
+      sessions: schoolYears.map((sy) => ({
+        id: sy.id,
+        name: sy.schoolYear.toLowerCase().includes('session') ? sy.schoolYear : `${sy.schoolYear} Session`,
+        isCurrent: sy.id === activeSessionId,
+      })),
+    });
   } catch (error) {
     console.error('[TEACHER] Roster error:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch student roster.' });
@@ -659,10 +682,47 @@ export async function sendMessage(req: Request, res: Response): Promise<Response
  */
 export async function getProfile(req: Request, res: Response): Promise<Response | void> {
   try {
+    let teacherId = req.teacherId ? Number(req.teacherId) : undefined;
+    if (!teacherId && req.userId) {
+      const foundTeacher = await prisma.teacher.findFirst({
+        where: { OR: [{ userId: Number(req.userId) }, { id: Number(req.userId) }] },
+        select: { id: true, branchId: true },
+      });
+      if (foundTeacher) {
+        teacherId = foundTeacher.id;
+        if (!req.branchId && foundTeacher.branchId) req.branchId = foundTeacher.branchId;
+      }
+    }
+
+    if (!teacherId) {
+      return res.json({
+        success: true,
+        teacherId: 0,
+        name: 'Teacher Account',
+        username: null,
+        email: null,
+        phone: null,
+        photo: null,
+        department: null,
+        qualifications: null,
+        houseAddress: null,
+        bankName: null,
+        accountNumber: null,
+        accountName: null,
+        branchName: 'School Campus',
+        branch: null,
+        isFormTeacher: false,
+        isClassTeacher: false,
+        isSubjectTeacher: false,
+        formAllocations: [],
+        subjectAssignments: [],
+      });
+    }
+
     const activeSessionId = await resolveTeacherSession(req.branchId);
 
     let formAllocations = await prisma.teacherAllocation.findMany({
-      where: { teacherId: req.teacherId, sessionId: activeSessionId },
+      where: { teacherId, sessionId: activeSessionId },
       include: {
         class: { select: { name: true, isEcd: true } },
         section: { select: { name: true } },
@@ -671,7 +731,7 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
 
     if (formAllocations.length === 0) {
       const fallbackAllocs = await prisma.teacherAllocation.findMany({
-        where: { teacherId: req.teacherId },
+        where: { teacherId },
         orderBy: { sessionId: 'desc' },
         include: {
           class: { select: { name: true, isEcd: true } },
@@ -688,7 +748,7 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
     }
 
     let subjectAssignments = await prisma.subjectAssign.findMany({
-      where: { teacherId: req.teacherId, sessionId: activeSessionId },
+      where: { teacherId, sessionId: activeSessionId },
       include: {
         class: { select: { name: true, isEcd: true } },
         section: { select: { name: true } },
@@ -699,7 +759,7 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
 
     if (subjectAssignments.length === 0) {
       const fallbackAssigns = await prisma.subjectAssign.findMany({
-        where: { teacherId: req.teacherId },
+        where: { teacherId },
         orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
         include: {
           class: { select: { name: true, isEcd: true } },
@@ -719,8 +779,8 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
     const teacherRecord = await prisma.teacher.findFirst({
       where: {
         OR: [
-          { id: req.teacherId },
-          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+          { id: teacherId },
+          ...(req.userId ? [{ userId: Number(req.userId) }, { id: Number(req.userId) }] : []),
         ],
       },
       select: {
@@ -739,7 +799,6 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
         user: {
           select: {
             username: true,
-            email: true,
           },
         },
         branch: {
@@ -763,10 +822,10 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
 
     return res.json({
       success: true,
-      teacherId: teacherRecord?.id || req.teacherId,
+      teacherId: teacherRecord?.id || teacherId,
       name: teacherRecord?.name || 'Teacher Account',
       username: teacherRecord?.user?.username || null,
-      email: teacherRecord?.email || teacherRecord?.user?.email || null,
+      email: teacherRecord?.email || null,
       phone: teacherRecord?.phone || null,
       photo: teacherRecord?.photo || null,
       department: teacherRecord?.department || null,
@@ -782,20 +841,20 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
       isSubjectTeacher: subjectAssignments.length > 0,
       formAllocations: formAllocations.map((a) => ({
         classId: a.classId,
-        className: a.class.name,
+        className: a.class?.name || 'Class',
         sectionId: a.sectionId,
-        sectionName: a.section.name,
-        isEcd: a.class.isEcd,
+        sectionName: a.section?.name || 'Section',
+        isEcd: Boolean(a.class?.isEcd),
         sessionId: a.sessionId,
       })),
       subjectAssignments: subjectAssignments.map((s) => ({
         classId: s.classId,
-        className: s.class.name,
+        className: s.class?.name || 'Class',
         sectionId: s.sectionId,
-        sectionName: s.section.name,
+        sectionName: s.section?.name || 'Section',
         subjectId: s.subjectId,
-        subjectName: s.subject.name,
-        isEcd: s.class.isEcd,
+        subjectName: s.subject?.name || 'Subject',
+        isEcd: Boolean(s.class?.isEcd),
         sessionId: s.sessionId,
       })),
     });
@@ -822,11 +881,20 @@ export async function updateProfile(req: Request, res: Response): Promise<Respon
       accountName,
     } = req.body || {};
 
+    let teacherId = req.teacherId ? Number(req.teacherId) : undefined;
+    if (!teacherId && req.userId) {
+      const foundTeacher = await prisma.teacher.findFirst({
+        where: { OR: [{ userId: Number(req.userId) }, { id: Number(req.userId) }] },
+        select: { id: true },
+      });
+      if (foundTeacher) teacherId = foundTeacher.id;
+    }
+
     const teacher = await prisma.teacher.findFirst({
       where: {
         OR: [
-          { id: req.teacherId },
-          ...(req.userId ? [{ userId: req.userId }, { id: req.userId }] : []),
+          ...(teacherId ? [{ id: teacherId }] : []),
+          ...(req.userId ? [{ userId: Number(req.userId) }, { id: Number(req.userId) }] : []),
         ],
       },
       select: { id: true, userId: true },
@@ -851,19 +919,6 @@ export async function updateProfile(req: Request, res: Response): Promise<Respon
         updatedAt: new Date(),
       },
     });
-
-    if (teacher.userId) {
-      await prisma.user
-        .update({
-          where: { id: teacher.userId },
-          data: {
-            ...(name ? { name: name.trim() } : {}),
-            ...(email ? { email: email.trim() } : {}),
-            updatedAt: new Date(),
-          },
-        })
-        .catch((e: any) => console.warn('[TEACHER] User sync warning on profile update:', e.message));
-    }
 
     return res.json({
       success: true,

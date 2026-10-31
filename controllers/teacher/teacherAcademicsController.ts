@@ -2915,6 +2915,7 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
         id: 0,
         name: 'Continuous Assessment & Examination',
         code: 'CA-EXAM',
+        generalHeading: 'Termly Report',
         description: 'Standard Assessment Matrix',
         totalMarks: 100,
         isDefault: true,
@@ -2923,12 +2924,18 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
           { code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, passMarks: 30 },
         ],
       };
-    } else if (matrix && typeof matrix.components === 'string') {
-      try {
-        matrix.components = JSON.parse(matrix.components);
-      } catch {
-        matrix.components = [];
+    } else {
+      if (typeof matrix.components === 'string') {
+        try {
+          matrix.components = JSON.parse(matrix.components);
+        } catch {
+          matrix.components = [];
+        }
       }
+      matrix = {
+        ...matrix,
+        generalHeading: matrix.generalHeading && String(matrix.generalHeading).trim() ? String(matrix.generalHeading).trim() : 'Termly Report',
+      };
     }
 
     // Fetch all evaluation matrices created by admin for this school branch
@@ -2938,11 +2945,22 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
     });
     const parsedBranchMatrices = branchMatrices.map((m: any) => ({
       ...m,
+      generalHeading: m.generalHeading && String(m.generalHeading).trim() ? String(m.generalHeading).trim() : 'Termly Report',
       components: typeof m.components === 'string' ? JSON.parse(m.components) : m.components,
     }));
 
+    const schoolYears = await prisma.schoolYear.findMany({
+      orderBy: { id: 'desc' },
+      select: { id: true, schoolYear: true },
+    });
+
     const globalSetting = await prisma.globalSettings.findFirst();
-    let activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
+    let activeSession = sessionId ? Number(sessionId) : (globalSetting?.sessionId || schoolYears[0]?.id || 1);
+
+    const matchedSy = schoolYears.find((sy) => sy.id === activeSession) || schoolYears[0];
+    const activeSessionName = matchedSy?.schoolYear
+      ? (matchedSy.schoolYear.toLowerCase().includes('session') ? matchedSy.schoolYear : `${matchedSy.schoolYear} Session`)
+      : 'Current Session';
 
     const enrollWhere: any = {
       classId: cId,
@@ -3092,6 +3110,16 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
       matrix,
       matrices: parsedBranchMatrices,
       gradingScale,
+      sessionId: activeSession,
+      activeSession: {
+        id: matchedSy ? matchedSy.id : activeSession,
+        name: activeSessionName,
+      },
+      sessions: schoolYears.map((sy) => ({
+        id: sy.id,
+        name: sy.schoolYear.toLowerCase().includes('session') ? sy.schoolYear : `${sy.schoolYear} Session`,
+        isCurrent: sy.id === activeSession,
+      })),
       students: enrolls.map((e) => {
         const cbtSub = cbtSubmissionMap[e.studentId];
         const studentMarkData = marksMap[e.studentId] || {};
@@ -3463,7 +3491,10 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
 
   try {
     const globalSetting = await prisma.globalSettings.findFirst();
-    const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
+    const examRecord = exId ? await prisma.exam.findUnique({ where: { id: exId } }) : null;
+    const activeSession = sessionId
+      ? Number(sessionId)
+      : (examRecord?.sessionId || globalSetting?.sessionId || 1);
 
     let savedCount = 0;
     for (const item of rawMarks) {
@@ -3478,9 +3509,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
           classId: cId,
           subjectId: subId,
           studentId: sId,
-          sessionId: activeSession,
-          ...(examId ? { examId: exId } : {}),
-          ...(branchId ? { branchId } : {}),
+          ...(examId ? { examId: exId } : { sessionId: activeSession }),
         },
       });
 
@@ -3490,6 +3519,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
           data: {
             mark: markValue,
             absent: isAbsentStr,
+            sessionId: activeSession,
             ...(examId ? { examId: exId } : {}),
           },
         });
@@ -3533,7 +3563,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
  */
 export async function getTeacherClassReports(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId, examId: reqExamId } = req.query;
+  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId, examId: reqExamId, termId: reqTermId } = req.query;
 
   if (!reqClassId) {
     return res.status(400).json({ success: false, message: 'classId is required.' });
@@ -3552,15 +3582,27 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = reqSessionId ? Number(reqSessionId) : globalSetting?.sessionId || 5;
+    const sessionId = await resolveTeacherSession(branchId, reqSessionId ? Number(reqSessionId) : undefined);
 
-    // Fetch Class with sections, subjects, evaluationMatrix, and gradingScale
+    const schoolYears = await prisma.schoolYear.findMany({
+      orderBy: { id: 'desc' },
+      select: { id: true, schoolYear: true },
+    });
+    const matchedSy = schoolYears.find((sy) => sy.id === sessionId) || schoolYears[0];
+    const activeSessionName = matchedSy?.schoolYear
+      ? (matchedSy.schoolYear.toLowerCase().includes('session') ? matchedSy.schoolYear : `${matchedSy.schoolYear} Session`)
+      : 'Current Session';
+    const sessions = schoolYears.map((sy) => ({
+      id: sy.id,
+      name: sy.schoolYear.toLowerCase().includes('session') ? sy.schoolYear : `${sy.schoolYear} Session`,
+      isCurrent: sy.id === sessionId,
+    }));
+
+    // Fetch Class with sections, evaluationMatrix, and gradingScale
     const cls = await prisma.class.findUnique({
       where: { id: classId },
       include: {
         sections: { include: { section: true } },
-        subjects: { include: { subject: true, teacher: true } },
         evaluationMatrix: true,
         gradingScale: true,
       },
@@ -3570,22 +3612,107 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    // Fetch available exams for selection
-    const exams = await prisma.exam.findMany({
-      where: branchId ? { branchId } : {},
+    // Fetch available exams strictly for this session and branch
+    const examsWhere: any = {
+      sessionId,
+      ...(branchId ? { branchId } : {}),
+    };
+    if (reqTermId) {
+      examsWhere.OR = [
+        { termId: Number(reqTermId) },
+        { termId: null },
+      ];
+    }
+
+    let exams = await prisma.exam.findMany({
+      where: examsWhere,
       select: {
         id: true,
         name: true,
         termId: true,
+        sessionId: true,
       },
       orderBy: { id: 'desc' },
     });
 
-    const selectedExamId = reqExamId
-      ? Number(reqExamId)
-      : exams.length > 0
-      ? exams[0].id
-      : null;
+    // If no exams found for this session and specific term, fallback to all exams for this session
+    if (exams.length === 0) {
+      exams = await prisma.exam.findMany({
+        where: {
+          sessionId,
+          ...(branchId ? { branchId } : {}),
+        },
+        select: {
+          id: true,
+          name: true,
+          termId: true,
+          sessionId: true,
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    // If still no exams found for this session, allow branch fallback
+    if (exams.length === 0) {
+      exams = await prisma.exam.findMany({
+        where: branchId ? { branchId } : {},
+        select: {
+          id: true,
+          name: true,
+          termId: true,
+          sessionId: true,
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    // If reqExamId was explicitly requested, ensure it is found or fetched so the matrix selection is respected
+    let selectedExam: any = null;
+    if (reqExamId) {
+      selectedExam = exams.find((e) => e.id === Number(reqExamId));
+      if (!selectedExam) {
+        selectedExam = await prisma.exam.findUnique({
+          where: { id: Number(reqExamId) },
+          select: {
+            id: true,
+            name: true,
+            termId: true,
+            sessionId: true,
+          },
+        });
+        if (selectedExam) {
+          exams.unshift(selectedExam);
+        }
+      }
+    }
+
+    if (!selectedExam && exams.length > 0) {
+      selectedExam = exams[0];
+    }
+
+    const selectedExamId = selectedExam ? selectedExam.id : null;
+    const activeTermId = reqTermId
+      ? Number(reqTermId)
+      : (selectedExam?.termId || 1);
+
+    // Format exams with descriptive displayName for Examination Matrix dropdown
+    const termNames: Record<number, string> = {
+      1: 'First Term',
+      2: 'Second Term',
+      3: 'Third Term',
+    };
+    const formattedExams = exams.map((ex) => {
+      const termStr = ex.termId && termNames[ex.termId] ? termNames[ex.termId] : ex.termId ? `Term ${ex.termId}` : '';
+      const hasTermInName = termStr && ex.name.toLowerCase().includes(termStr.toLowerCase());
+      const displayName = termStr && !hasTermInName ? `${ex.name} (${termStr})` : ex.name;
+      return {
+        id: ex.id,
+        name: ex.name,
+        displayName,
+        termId: ex.termId,
+        sessionId: ex.sessionId,
+      };
+    });
 
     // Resolve Evaluation Matrix for the class
     let matrix = cls.evaluationMatrix;
@@ -3614,12 +3741,12 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
     // Resolve Grading Scale
     const gradingScaleData = await resolveGradingScale(prisma, branchId || 1, classId);
 
-    // 1. Enrolled students
+    // 1. Enrolled students currently active in this session
     const enrollWhere: any = {
       classId,
-      isAlumni: 0,
-      student: { active: true },
       sessionId,
+      isAlumni: { not: 1 },
+      student: { active: true },
       ...(branchId ? { branchId } : {}),
     };
     if (sectionId) enrollWhere.sectionId = sectionId;
@@ -3644,41 +3771,51 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
     });
 
-    if (enrolls.length === 0) {
-      enrolls = await prisma.enroll.findMany({
+    // Exclude students who have since been promoted or transferred to another class in this session
+    const candidateStudentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
+    if (candidateStudentIds.length > 0) {
+      const latestEnrolls = await prisma.enroll.findMany({
         where: {
-          classId,
-          isAlumni: 0,
-          student: { active: true },
-          ...(sectionId ? { sectionId } : {}),
+          studentId: { in: candidateStudentIds },
+          sessionId,
           ...(branchId ? { branchId } : {}),
+          isAlumni: { not: 1 },
         },
-        include: {
-          student: {
-            include: {
-              parent: {
-                include: {
-                  user: { select: { username: true, rawPassword: true } },
-                },
-              },
-              user: {
-                select: { username: true, rawPassword: true, active: true, lastLogin: true },
-              },
-            },
-          },
-          section: { select: { id: true, name: true } },
-        },
-        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+        orderBy: { id: 'desc' },
+      });
+
+      const latestClassByStudent = new Map<number, number>();
+      for (const le of latestEnrolls) {
+        if (!latestClassByStudent.has(le.studentId)) {
+          latestClassByStudent.set(le.studentId, le.classId);
+        }
+      }
+
+      enrolls = enrolls.filter((e) => {
+        const currentActiveClsId = latestClassByStudent.get(e.studentId);
+        return currentActiveClsId === classId;
       });
     }
 
+    // Deduplicate students by ID
+    const dedupedEnrolls: typeof enrolls = [];
+    const seenStudents = new Set<number>();
+    for (const e of enrolls) {
+      if (e.student && !seenStudents.has(e.student.id)) {
+        seenStudents.add(e.student.id);
+        dedupedEnrolls.push(e);
+      }
+    }
+    enrolls = dedupedEnrolls;
+
     const studentIds = enrolls.map((e) => e.student.id);
 
-    // 2. Attendance stats for this class
+    // 2. Attendance stats strictly for this session and classroom
     const attendances = await prisma.attendance.findMany({
       where: {
         classId,
         studentId: { in: studentIds },
+        sessionId,
         ...(sectionId ? { sectionId } : {}),
         ...(branchId ? { branchId } : {}),
       },
@@ -3713,16 +3850,133 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       }
     });
 
-    // 3. Academic Marks for the Selected Exam
-    const marksWhere: any = {
-      classId,
-      studentId: { in: studentIds },
-      ...(sectionId ? { sectionId } : {}),
-      ...(branchId ? { branchId } : {}),
-    };
-    if (selectedExamId) {
-      marksWhere.examId = selectedExamId;
+    // 3. Subjects currently offered by this class in this session and academic term
+    const classSubjectAssigns = await prisma.subjectAssign.findMany({
+      where: {
+        classId,
+        sessionId,
+        ...(sectionId ? { sectionId } : {}),
+        ...(branchId ? { branchId } : {}),
+      },
+      include: {
+        subject: {
+          select: {
+            id: true,
+            name: true,
+            subjectCode: true,
+          },
+        },
+      },
+      orderBy: { subject: { name: 'asc' } },
+    });
+
+    let effectiveSubjectAssigns = classSubjectAssigns;
+    if (effectiveSubjectAssigns.length === 0 && sectionId) {
+      effectiveSubjectAssigns = await prisma.subjectAssign.findMany({
+        where: {
+          classId,
+          sessionId,
+          ...(branchId ? { branchId } : {}),
+        },
+        include: {
+          subject: {
+            select: {
+              id: true,
+              name: true,
+              subjectCode: true,
+            },
+          },
+        },
+        orderBy: { subject: { name: 'asc' } },
+      });
     }
+
+    // Subjects with marks recorded for this exam / session
+    const markSubjectsWhere: any = {
+      studentId: { in: studentIds },
+      ...(selectedExamId ? { examId: selectedExamId } : { classId, sessionId }),
+    };
+
+    const markSubjects = await prisma.mark.findMany({
+      where: markSubjectsWhere,
+      select: {
+        subjectId: true,
+        subject: {
+          select: {
+            id: true,
+            name: true,
+            subjectCode: true,
+          },
+        },
+      },
+      distinct: ['subjectId'],
+    });
+
+    // Subjects with student component scores for this session and active term
+    const componentSubjects = await prisma.studentComponentScore.findMany({
+      where: {
+        classId,
+        sessionId,
+        studentId: { in: studentIds },
+        termId: activeTermId,
+      },
+      select: {
+        subjectId: true,
+        subject: {
+          select: {
+            id: true,
+            name: true,
+            subjectCode: true,
+          },
+        },
+      },
+      distinct: ['subjectId'],
+    });
+
+    // Combine and deduplicate offered subjects
+    // Include all subjects assigned to this class, plus all subjects with marks entered by teachers for this exam
+    const offeredSubjectMap = new Map<number, { id: number; name: string; code: string; subjectCode: string }>();
+
+    for (const sa of effectiveSubjectAssigns) {
+      if (sa.subject && !offeredSubjectMap.has(sa.subject.id)) {
+        offeredSubjectMap.set(sa.subject.id, {
+          id: sa.subject.id,
+          name: sa.subject.name,
+          code: sa.subject.subjectCode,
+          subjectCode: sa.subject.subjectCode,
+        });
+      }
+    }
+
+    for (const ms of markSubjects) {
+      if (ms.subject && !offeredSubjectMap.has(ms.subject.id)) {
+        offeredSubjectMap.set(ms.subject.id, {
+          id: ms.subject.id,
+          name: ms.subject.name,
+          code: ms.subject.subjectCode,
+          subjectCode: ms.subject.subjectCode,
+        });
+      }
+    }
+
+    for (const cs of componentSubjects) {
+      if (cs.subject && !offeredSubjectMap.has(cs.subject.id)) {
+        offeredSubjectMap.set(cs.subject.id, {
+          id: cs.subject.id,
+          name: cs.subject.name,
+          code: cs.subject.subjectCode,
+          subjectCode: cs.subject.subjectCode,
+        });
+      }
+    }
+
+    const offeredSubjects = Array.from(offeredSubjectMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+    // 4. Academic Marks for the Selected Exam and Session
+    const marksWhere: any = {
+      studentId: { in: studentIds },
+      ...(selectedExamId ? { examId: selectedExamId } : { classId, sessionId }),
+    };
 
     const marks = await prisma.mark.findMany({
       where: marksWhere,
@@ -3731,25 +3985,100 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         studentId: true,
         subjectId: true,
         mark: true,
+        cbtMark: true,
         absent: true,
         examId: true,
       },
     });
 
-    const offeredSubjects = cls.subjects.map((s) => ({
-      id: s.subject.id,
-      name: s.subject.name,
-      code: s.subject.subjectCode,
-      subjectCode: s.subject.subjectCode,
-    }));
+    // Component scores recorded via Evaluation Matrix for this class, session, and active term
+    const compScores = await prisma.studentComponentScore.findMany({
+      where: {
+        classId,
+        studentId: { in: studentIds },
+        sessionId,
+        termId: activeTermId,
+      },
+      select: {
+        studentId: true,
+        subjectId: true,
+        cbtScore: true,
+        theoryScore: true,
+        totalScore: true,
+        assessmentComponent: { select: { slot: true, name: true } },
+      },
+    });
 
-    // Build Tabulation Matrix
+    // Fetch all ExamMarkDistribution records for this branch to resolve friendly component titles
+    const markDistributions = await prisma.examMarkDistribution.findMany({
+      where: branchId ? { branchId } : {},
+      select: { id: true, name: true },
+    });
+    const distMap = new Map<number, string>();
+    markDistributions.forEach((d) => distMap.set(d.id, d.name));
+
+    // Resolve assessment components configured by School Admin (Evaluation Matrix / Mark Distribution)
+    let resolvedComponents: Array<{
+      key: string;
+      code: string;
+      name: string;
+      maxMarks: number;
+      category: 'CA' | 'EXAM';
+    }> = [];
+
+    if (matrixComponents && matrixComponents.length > 0) {
+      resolvedComponents = matrixComponents.map((c: any, idx: number) => {
+        const code = String(c.code || c.key || `CA${idx + 1}`).toUpperCase();
+        const name = c.name || code;
+        const isExam = code.includes('EXAM') || name.toLowerCase().includes('exam');
+        return {
+          key: String(c.key || c.code || idx + 1),
+          code,
+          name,
+          maxMarks: Number(c.maxMarks) || (isExam ? 60 : 20),
+          category: isExam ? 'EXAM' : 'CA',
+        };
+      });
+    } else if (selectedExam?.markDistribution) {
+      try {
+        const distIds = typeof selectedExam.markDistribution === 'string'
+          ? JSON.parse(selectedExam.markDistribution).map(Number)
+          : [];
+        if (Array.isArray(distIds) && distIds.length > 0) {
+          resolvedComponents = distIds.map((dId: number, idx: number) => {
+            const name = distMap.get(dId) || `Assessment ${idx + 1}`;
+            const isExam = name.toLowerCase().includes('exam') || idx === distIds.length - 1;
+            return {
+              key: String(dId),
+              code: isExam ? 'EXAM' : `CA${idx + 1}`,
+              name,
+              maxMarks: isExam ? 60 : 10,
+              category: isExam ? 'EXAM' : 'CA',
+            };
+          });
+        }
+      } catch {
+        // ignore parse error
+      }
+    }
+
+    if (resolvedComponents.length === 0) {
+      resolvedComponents = [
+        { key: 'CA1', code: 'CA1', name: 'Continuous Assessment 1', maxMarks: 20, category: 'CA' },
+        { key: 'CA2', code: 'CA2', name: 'Continuous Assessment 2', maxMarks: 20, category: 'CA' },
+        { key: 'EXAM', code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, category: 'EXAM' },
+      ];
+    }
+
+    // Build Tabulation Matrix & Total Score Summary
     const tabulationRows = enrolls.map((e) => {
       const sId = e.student.id;
       const studentMarks: Record<number, number> = {};
       const subjectBreakdowns: Record<number, any> = {};
       const subjectGrades: Record<number, any> = {};
       let totalScore = 0;
+      let studentTotalCA = 0;
+      let studentTotalExam = 0;
       let subjectCount = 0;
 
       offeredSubjects.forEach((sub) => {
@@ -3757,20 +4086,60 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         let score = 0;
         let componentsMap: Record<string, number> = {};
 
-        if (markRecord && markRecord.mark) {
-          if (markRecord.mark.startsWith('{')) {
-            try {
-              const comp = JSON.parse(markRecord.mark);
-              componentsMap = comp;
-              const compValues: any[] = Object.values(comp);
-              score = compValues.reduce((sum: number, v: any) => sum + (Number(v) || 0), 0);
-            } catch {
-              score = 0;
+        if (markRecord) {
+          const parsed = parseMarkScore(markRecord.mark, markRecord.cbtMark);
+          score = parsed.total;
+          componentsMap = { ...parsed.components };
+
+          // Map numbered distribution keys to component codes
+          resolvedComponents.forEach((rc) => {
+            if (componentsMap[rc.key] !== undefined && componentsMap[rc.code] === undefined) {
+              componentsMap[rc.code] = componentsMap[rc.key];
             }
-          } else {
-            score = Number(markRecord.mark) || 0;
+          });
+
+          // Single numeric string fallback
+          if (Object.keys(parsed.components).length === 0 && score > 0) {
+            componentsMap['EXAM'] = parsed.examScore || score;
+            if (parsed.testScore > 0) {
+              componentsMap['CA1'] = parsed.testScore;
+            }
           }
         }
+
+        // Check evaluation matrix component scores if score is 0 or no markRecord
+        if (score === 0) {
+          const studentComps = compScores.filter((c) => c.studentId === sId && c.subjectId === sub.id);
+          if (studentComps.length > 0) {
+            studentComps.forEach((cs) => {
+              const compKey = cs.assessmentComponent?.slot || cs.assessmentComponent?.name || 'component';
+              const val = Number(cs.totalScore ?? (Number(cs.cbtScore || 0) + Number(cs.theoryScore || 0)));
+              componentsMap[compKey] = val;
+              score += val;
+            });
+          }
+        }
+
+        let subCa = 0;
+        let subExam = 0;
+        resolvedComponents.forEach((rc) => {
+          const v = Number(componentsMap[rc.code] ?? componentsMap[rc.key] ?? 0);
+          if (rc.category === 'EXAM') {
+            subExam += v;
+          } else {
+            subCa += v;
+          }
+        });
+        if (subCa === 0 && subExam === 0 && score > 0) {
+          subExam = score;
+        }
+
+        componentsMap['caTotal'] = Math.round(subCa * 10) / 10;
+        componentsMap['examScore'] = Math.round(subExam * 10) / 10;
+        componentsMap['totalScore'] = Math.round(score * 10) / 10;
+
+        studentTotalCA += subCa;
+        studentTotalExam += subExam;
 
         studentMarks[sub.id] = score;
         subjectBreakdowns[sub.id] = componentsMap;
@@ -3799,6 +4168,8 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         subjectBreakdowns,
         subjectGrades,
         totalScore,
+        totalCA: Math.round(studentTotalCA * 10) / 10,
+        totalExam: Math.round(studentTotalExam * 10) / 10,
         averageScore,
         grade: overallGrade.grade,
         gradeRemark: overallGrade.remark,
@@ -3888,6 +4259,9 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       className: cls.name,
       sectionId,
       sectionName: cls.sections.find((s) => s.sectionId === sectionId)?.section?.name || 'All Sections',
+      sessionId,
+      sessionName: activeSessionName,
+      termId: activeTermId,
       totalStudents,
       classAverage: overallClassAverage,
       highestScore: highestTotalScore,
@@ -3901,7 +4275,15 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       classInfo: summaryPayload,
       classSummary: summaryPayload,
       selectedExamId,
-      exams,
+      sessionId,
+      termId: activeTermId,
+      activeSession: {
+        id: matchedSy ? matchedSy.id : sessionId,
+        name: activeSessionName,
+      },
+      sessions,
+      exams: formattedExams,
+      assessmentComponents: resolvedComponents,
       evaluationMatrix: matrix
         ? {
             id: matrix.id,
@@ -3956,7 +4338,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
  */
 export async function getTeacherClassCredentials(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId: reqClassId, sectionId: reqSectionId } = req.query;
+  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId } = req.query;
 
   if (!reqClassId) {
     return res.status(400).json({ success: false, message: 'classId is required.' });
@@ -3983,12 +4365,11 @@ export async function getTeacherClassCredentials(req: Request, res: Response): P
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveTeacherSession(branchId, reqSessionId ? Number(reqSessionId) : undefined);
 
     const enrollWhere: any = {
       classId,
-      isAlumni: 0,
+      isAlumni: { not: 1 },
       student: { active: true },
       sessionId,
       ...(branchId ? { branchId } : {}),
@@ -4013,31 +4394,16 @@ export async function getTeacherClassCredentials(req: Request, res: Response): P
       orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
     });
 
-    if (enrolls.length === 0) {
-      enrolls = await prisma.enroll.findMany({
-        where: {
-          classId,
-          isAlumni: 0,
-          student: { active: true },
-          ...(sectionId ? { sectionId } : {}),
-          ...(branchId ? { branchId } : {}),
-        },
-        include: {
-          student: {
-            include: {
-              user: { select: { username: true, rawPassword: true, active: true, lastLogin: true } },
-              parent: {
-                include: {
-                  user: { select: { username: true, rawPassword: true, active: true } },
-                },
-              },
-            },
-          },
-          section: { select: { id: true, name: true } },
-        },
-        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
-      });
+    // Deduplicate students
+    const dedupedEnrolls: typeof enrolls = [];
+    const seenStudents = new Set<number>();
+    for (const e of enrolls) {
+      if (e.student && !seenStudents.has(e.student.id)) {
+        seenStudents.add(e.student.id);
+        dedupedEnrolls.push(e);
+      }
     }
+    enrolls = dedupedEnrolls;
 
     const credentials = enrolls.map((e) => {
       const s = e.student;
@@ -4090,7 +4456,7 @@ export async function getTeacherClassCredentials(req: Request, res: Response): P
  */
 export async function exportTeacherClassCredentialsPdf(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
-  const { classId: reqClassId, sectionId: reqSectionId } = req.query;
+  const { classId: reqClassId, sectionId: reqSectionId, sessionId: reqSessionId } = req.query;
 
   if (!reqClassId) {
     return res.status(400).json({ success: false, message: 'classId is required.' });
@@ -4119,8 +4485,7 @@ export async function exportTeacherClassCredentialsPdf(req: Request, res: Respon
 
     const branch = branchId ? await prisma.branch.findUnique({ where: { id: branchId } }) : null;
 
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = await resolveTeacherSession(branchId, reqSessionId ? Number(reqSessionId) : undefined);
 
     const enrollWhere: any = {
       classId,
@@ -4149,31 +4514,16 @@ export async function exportTeacherClassCredentialsPdf(req: Request, res: Respon
       orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
     });
 
-    if (enrolls.length === 0) {
-      enrolls = await prisma.enroll.findMany({
-        where: {
-          classId,
-          isAlumni: 0,
-          student: { active: true },
-          ...(sectionId ? { sectionId } : {}),
-          ...(branchId ? { branchId } : {}),
-        },
-        include: {
-          student: {
-            include: {
-              user: { select: { username: true, rawPassword: true } },
-              parent: {
-                include: {
-                  user: { select: { username: true, rawPassword: true } },
-                },
-              },
-            },
-          },
-          section: { select: { id: true, name: true } },
-        },
-        orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
-      });
+    // Deduplicate students
+    const dedupedEnrolls: typeof enrolls = [];
+    const seenStudents = new Set<number>();
+    for (const e of enrolls) {
+      if (e.student && !seenStudents.has(e.student.id)) {
+        seenStudents.add(e.student.id);
+        dedupedEnrolls.push(e);
+      }
     }
+    enrolls = dedupedEnrolls;
 
     const slips = enrolls.map((e) => {
       const s = e.student;
@@ -4250,113 +4600,7 @@ export async function getTeacherCbtAttempts(req: Request, res: Response): Promis
       activeSession = globalSetting?.sessionId || 5;
     }
 
-    // Step 1: Find matching CbtDistribution
-    let dist: any = null;
-
-    // A. By explicit assessmentComponentId if provided
-    if (targetComponentId) {
-      dist = await prisma.cbtDistribution.findFirst({
-        where: {
-          assessmentComponentId: targetComponentId,
-          classId: cId,
-          subjectId: subId,
-          ...(branchId ? { branchId } : {}),
-        },
-        include: {
-          assessmentComponent: true,
-          onlineExam: {
-            select: { id: true, title: true, questions: true },
-          },
-        },
-        orderBy: { id: 'desc' },
-      });
-    }
-
-    // B. By explicit targetSlot if not found
-    if (!dist && targetSlot) {
-      dist = await prisma.cbtDistribution.findFirst({
-        where: {
-          classId: cId,
-          subjectId: subId,
-          targetSlot,
-          ...(branchId ? { branchId } : {}),
-        },
-        include: {
-          assessmentComponent: true,
-          onlineExam: {
-            select: { id: true, title: true, questions: true },
-          },
-        },
-        orderBy: { id: 'desc' },
-      });
-    }
-
-    // C. Fallback: by title pattern matching (e.g. "CBT 1", "CBT 2", "Exam")
-    if (!dist) {
-      const allDists = await prisma.cbtDistribution.findMany({
-        where: {
-          classId: cId,
-          subjectId: subId,
-          ...(branchId ? { branchId } : {}),
-        },
-        include: {
-          assessmentComponent: true,
-          onlineExam: {
-            select: { id: true, title: true, questions: true },
-          },
-        },
-        orderBy: { id: 'desc' },
-      });
-
-      if (targetSlot === 'CBT1' || targetSlot === 'CA1') {
-        dist = allDists.find((d) => /cbt[\s_-]*1|ca[\s_-]*1|test[\s_-]*1/i.test(d.title)) || (allDists.length > 0 ? allDists[allDists.length - 1] : null);
-      } else if (targetSlot === 'CBT2' || targetSlot === 'CA2') {
-        dist = allDists.find((d) => /cbt[\s_-]*2|ca[\s_-]*2|test[\s_-]*2/i.test(d.title));
-      } else if (targetSlot === 'CBT_EXAM' || targetSlot === 'EXAM') {
-        dist = allDists.find((d) => /exam|terminal/i.test(d.title));
-      } else if (allDists.length > 0) {
-        dist = allDists[0];
-      }
-    }
-
-    if (!dist) {
-      return res.status(404).json({
-        success: false,
-        message: `No distributed CBT test found for ${targetSlot || 'this assessment slot'} in this subject.`,
-      });
-    }
-
-    // Resolve OnlineExam ID
-    let onlineExamId = dist.onlineExamId;
-    let examTitle = dist.title;
-    let questions = dist.onlineExam?.questions || [];
-
-    if (!onlineExamId) {
-      const candidateOnlineExam = await prisma.onlineExam.findFirst({
-        where: {
-          title: dist.title,
-          classId: dist.classId,
-          subjectId: dist.subjectId,
-          ...(branchId ? { branchId } : {}),
-        },
-        orderBy: { id: 'desc' },
-      });
-      if (candidateOnlineExam) {
-        onlineExamId = candidateOnlineExam.id;
-        examTitle = candidateOnlineExam.title;
-        questions = candidateOnlineExam.questions || [];
-      }
-    }
-
-    // Calculate maximum marks from component or questions
-    let maxMarks = dist.assessmentComponent?.weight ?? 20.0;
-    if (dist.assessmentComponent?.weight) {
-      maxMarks = dist.assessmentComponent.weight;
-    } else if (Array.isArray(questions) && questions.length > 0) {
-      maxMarks = questions.reduce((sum: number, q: any) => sum + (Number(q.marks || q.point || 1)), 0);
-    }
-
-    // Step 2: Fetch enrolled students
+    // Step 1: Fetch enrolled students
     const enrolls = await prisma.enroll.findMany({
       where: {
         classId: cId,
@@ -4387,16 +4631,67 @@ export async function getTeacherCbtAttempts(req: Request, res: Response): Promis
 
     const studentIds = Array.from(studentMap.keys());
 
-    // Step 3: Fetch submissions for this online exam
-    let submissions: any[] = [];
-    if (onlineExamId && studentIds.length > 0) {
-      submissions = await prisma.onlineExamSubmission.findMany({
+    // Step 2: Fetch Active Exam Setup configured by School Admin
+    const activeExamSetup = await prisma.examSetup.findFirst({
+      where: {
+        ...(branchId ? { branchId } : {}),
+        ...(activeSession ? { sessionId: activeSession } : {}),
+        isActive: true,
+      },
+      include: {
+        components: {
+          orderBy: { order: 'asc' },
+        },
+      },
+      orderBy: { id: 'desc' },
+    });
+
+    // Step 3: Fetch all CBT Distributions for this class & subject
+    const allDists = await prisma.cbtDistribution.findMany({
+      where: {
+        classId: cId,
+        subjectId: subId,
+        ...(branchId ? { branchId } : {}),
+      },
+      include: {
+        assessmentComponent: true,
+        onlineExam: {
+          select: { id: true, title: true, questions: true },
+        },
+      },
+      orderBy: { id: 'desc' },
+    });
+
+    // Step 4: Fetch all Online Exams for this class & subject
+    const allOnlineExams = await prisma.onlineExam.findMany({
+      where: {
+        classId: cId,
+        subjectId: subId,
+        ...(branchId ? { branchId } : {}),
+      },
+      select: { id: true, title: true, questions: true },
+      orderBy: { id: 'desc' },
+    });
+
+    // Collect all online exam IDs
+    const allExamIds = Array.from(
+      new Set([
+        ...allDists.map((d) => d.onlineExamId).filter(Boolean),
+        ...allOnlineExams.map((e) => e.id),
+      ])
+    ) as number[];
+
+    // Fetch all submissions for these online exams
+    let allSubmissions: any[] = [];
+    if (allExamIds.length > 0 && studentIds.length > 0) {
+      allSubmissions = await prisma.onlineExamSubmission.findMany({
         where: {
-          onlineExamId,
+          onlineExamId: { in: allExamIds },
           studentId: { in: studentIds },
         },
         select: {
           id: true,
+          onlineExamId: true,
           studentId: true,
           totalMark: true,
           submittedAt: true,
@@ -4405,49 +4700,173 @@ export async function getTeacherCbtAttempts(req: Request, res: Response): Promis
       });
     }
 
-    const subMap = new Map<number, any>();
-    submissions.forEach((s) => {
-      if (!subMap.has(s.studentId)) {
-        subMap.set(s.studentId, s);
+    // Index submissions by onlineExamId -> studentId -> submission
+    const examSubMap = new Map<number, Map<number, any>>();
+    for (const sub of allSubmissions) {
+      if (!examSubMap.has(sub.onlineExamId)) {
+        examSubMap.set(sub.onlineExamId, new Map());
       }
-    });
+      examSubMap.get(sub.onlineExamId)!.set(sub.studentId, sub);
+    }
 
-    // Step 4: Index scores for all enrolled students
-    const scores = studentIds.map((stId) => {
-      const student = studentMap.get(stId);
-      const sub = subMap.get(stId);
-      const hasSubmission = Boolean(sub && sub.totalMark !== null && sub.totalMark !== undefined);
-      const rawScore = hasSubmission ? Number(Number(sub.totalMark).toFixed(1)) : null;
-      const isAbsent = !hasSubmission;
-      const percentage = (hasSubmission && maxMarks > 0)
-        ? Number(((rawScore! / maxMarks) * 100).toFixed(1))
-        : null;
+    // Helper to calculate student scores for a given onlineExamId and maxMarks
+    const buildStudentScores = (onlineExamId: number | null, maxMarks: number) => {
+      const subMap = onlineExamId ? examSubMap.get(onlineExamId) : null;
+      return studentIds.map((stId) => {
+        const student = studentMap.get(stId);
+        const sub = subMap ? subMap.get(stId) : null;
+        const hasSubmission = Boolean(sub && sub.totalMark !== null && sub.totalMark !== undefined);
+        const rawScore = hasSubmission ? Number(Number(sub.totalMark).toFixed(1)) : null;
+        const isAbsent = !hasSubmission;
+        const percentage = hasSubmission && maxMarks > 0 ? Number(((rawScore! / maxMarks) * 100).toFixed(1)) : null;
 
-      return {
-        studentId: stId,
-        firstName: student?.firstName,
-        lastName: student?.lastName,
-        name: `${student?.lastName}, ${student?.firstName}`,
-        registerNo: student?.registerNo || 'N/A',
-        rawScore,
-        isAbsent,
-        percentage,
-        submissionId: sub?.id || null,
-        submittedAt: sub?.submittedAt || sub?.createdAt || null,
-      };
-    });
+        return {
+          studentId: stId,
+          firstName: student?.firstName,
+          lastName: student?.lastName,
+          name: `${student?.lastName}, ${student?.firstName}`,
+          registerNo: student?.registerNo || 'N/A',
+          rawScore,
+          isAbsent,
+          percentage,
+          submissionId: sub?.id || null,
+          submittedAt: sub?.submittedAt || sub?.createdAt || null,
+        };
+      });
+    };
+
+    // Step 5: Build dynamic Exam Setup Options
+    const options: Array<{
+      key: string;
+      title: string;
+      slot: string;
+      componentId: number | null;
+      componentName: string;
+      maxMarks: number;
+      category: string;
+      onlineExamId: number | null;
+      attemptsFound: number;
+      scores: any[];
+    }> = [];
+
+    // If activeExamSetup has components, map them directly
+    if (activeExamSetup && activeExamSetup.components && activeExamSetup.components.length > 0) {
+      for (const comp of activeExamSetup.components) {
+        // Find matching distribution
+        const matchedDist =
+          allDists.find((d) => d.assessmentComponentId === comp.id) ||
+          allDists.find((d) => d.targetSlot && comp.slot && d.targetSlot.toUpperCase() === comp.slot.toUpperCase()) ||
+          allDists.find((d) => new RegExp(comp.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(d.title));
+
+        // Find matching online exam
+        const matchedExam =
+          (matchedDist?.onlineExamId ? allOnlineExams.find((e) => e.id === matchedDist.onlineExamId) : null) ||
+          allOnlineExams.find((e) => new RegExp(comp.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(e.title)) ||
+          (matchedDist?.onlineExam ? { id: matchedDist.onlineExam.id, title: matchedDist.onlineExam.title } : null);
+
+        const examId = matchedExam?.id || matchedDist?.onlineExamId || null;
+        const subMap = examId ? examSubMap.get(examId) : null;
+        const attemptsFound = subMap ? subMap.size : 0;
+        const maxMarks = comp.weight || 20.0;
+        const scores = buildStudentScores(examId, maxMarks);
+
+        options.push({
+          key: `setup_${comp.id}`,
+          title: comp.name,
+          slot: comp.slot || (comp.category === 'EXAM' ? 'CBT_EXAM' : 'CBT1'),
+          componentId: comp.id,
+          componentName: comp.name,
+          maxMarks,
+          category: comp.category || 'CA',
+          onlineExamId: examId,
+          attemptsFound,
+          scores,
+        });
+      }
+    }
+
+    // Also include any standalone CBT distributions or online exams not mapped yet
+    for (const dist of allDists) {
+      const alreadyMapped = options.some((o) => o.onlineExamId === dist.onlineExamId || o.title.toLowerCase() === dist.title.toLowerCase());
+      if (!alreadyMapped) {
+        const examId = dist.onlineExamId || null;
+        const subMap = examId ? examSubMap.get(examId) : null;
+        const attemptsFound = subMap ? subMap.size : 0;
+        const maxMarks = dist.assessmentComponent?.weight || 20.0;
+        const scores = buildStudentScores(examId, maxMarks);
+
+        options.push({
+          key: `dist_${dist.id}`,
+          title: dist.title,
+          slot: dist.targetSlot || 'CBT1',
+          componentId: dist.assessmentComponentId || null,
+          componentName: dist.title,
+          maxMarks,
+          category: /exam|terminal/i.test(dist.title) ? 'EXAM' : 'CA',
+          onlineExamId: examId,
+          attemptsFound,
+          scores,
+        });
+      }
+    }
+
+    // Default slots fallback if options is empty
+    if (options.length === 0) {
+      const defaultSlots = [
+        { key: 'CBT1', title: 'CBT 1', slot: 'CBT1', componentName: 'Continuous Assessment 1', maxMarks: 10, category: 'CA' },
+        { key: 'CBT2', title: 'CBT 2', slot: 'CBT2', componentName: 'Continuous Assessment 2', maxMarks: 10, category: 'CA' },
+        { key: 'CBT_EXAM', title: 'Terminal CBT Exam', slot: 'CBT_EXAM', componentName: 'Terminal Examination', maxMarks: 30, category: 'EXAM' },
+      ];
+
+      for (const ds of defaultSlots) {
+        const matchedExam = allOnlineExams.find((e) =>
+          ds.slot === 'CBT1' ? /cbt[\s_-]*1|ca[\s_-]*1/i.test(e.title) :
+          ds.slot === 'CBT2' ? /cbt[\s_-]*2|ca[\s_-]*2/i.test(e.title) :
+          /exam|terminal/i.test(e.title)
+        );
+        const examId = matchedExam?.id || null;
+        const subMap = examId ? examSubMap.get(examId) : null;
+        const attemptsFound = subMap ? subMap.size : 0;
+        const scores = buildStudentScores(examId, ds.maxMarks);
+
+        options.push({
+          key: ds.key,
+          title: ds.title,
+          slot: ds.slot,
+          componentId: null,
+          componentName: ds.componentName,
+          maxMarks: ds.maxMarks,
+          category: ds.category,
+          onlineExamId: examId,
+          attemptsFound,
+          scores,
+        });
+      }
+    }
+
+    // Step 6: Resolve specific target if requested
+    let matchedOption = options[0];
+    if (targetComponentId) {
+      matchedOption = options.find((o) => o.componentId === targetComponentId) || matchedOption;
+    } else if (targetSlot) {
+      matchedOption =
+        options.find((o) => o.slot.toUpperCase() === targetSlot.toUpperCase()) ||
+        options.find((o) => new RegExp(targetSlot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(o.title)) ||
+        matchedOption;
+    }
 
     return res.json({
       success: true,
-      slot: targetSlot || dist.targetSlot || 'CBT1',
-      assessmentComponentId: dist.assessmentComponentId || null,
-      distributionId: dist.id,
-      onlineExamId,
-      examTitle,
-      maxMarks,
+      slot: targetSlot || matchedOption?.slot || 'CBT1',
+      assessmentComponentId: matchedOption?.componentId || null,
+      distributionId: null,
+      onlineExamId: matchedOption?.onlineExamId || null,
+      examTitle: matchedOption?.title || 'CBT Online Assessment',
+      maxMarks: matchedOption?.maxMarks || 20.0,
       totalStudents: studentIds.length,
-      submittedCount: submissions.length,
-      scores,
+      submittedCount: matchedOption?.attemptsFound || 0,
+      scores: matchedOption?.scores || buildStudentScores(null, 20.0),
+      options,
     });
   } catch (error: any) {
     console.error('[TEACHER] Error fetching CBT attempts:', error);
