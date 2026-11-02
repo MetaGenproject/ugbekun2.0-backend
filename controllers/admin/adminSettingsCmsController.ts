@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import jwt from 'jsonwebtoken';
 import prisma from '../../lib/prisma';
-import { cacheDel } from '../../lib/cacheService';
+import { cacheDel, cacheDelPattern } from '../../lib/cacheService';
 import { uploadToCloudinary } from '../../lib/cloudinaryService';
 import { saveLogoBase64, saveSignatureBase64 } from '../onboarding/onboardingController';
 import {
@@ -1190,6 +1190,8 @@ export async function updateLandingPageConfig(req: Request, res: Response): Prom
         twitterUrl,
       },
     });
+
+    await cacheDelPattern('tenant:resolve:*');
 
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },

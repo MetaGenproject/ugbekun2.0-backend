@@ -227,10 +227,14 @@ export function formatLandingPageResponse(branch: any, landingPage: any, customS
 
   return {
     branchId: branch.id,
+    branchName: branch.name,
     branchCode: branch.code,
     schoolName,
     tagline: settings.tagline || 'Excellence in Holistic Education',
     logoUrl: logo,
+    address: settings.address || 'Campus Education Boulevard',
+    email: settings.email || 'admissions@school.edu.ng',
+    phone: settings.phone || '+234 800 UGBEKUN',
     primaryColor,
     secondaryColor,
     subdomain: branch.subdomain,

@@ -104,8 +104,16 @@ export async function getHomepage(req: Request, res: Response): Promise<Response
       });
     }
 
-    const landingPage = branch.landingPage || (await getOrCreateLandingPage(prisma, branch.id));
+    // Always fetch latest landing page for the branch directly from the database so changes take effect immediately
+    const landingPage = (await prisma.schoolLandingPage.findUnique({
+      where: { branchId: branch.id },
+    })) || (await getOrCreateLandingPage(prisma, branch.id));
+
     const responseData = formatLandingPageResponse(branch, landingPage);
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
 
     return res.json({
       success: true,
@@ -127,6 +135,10 @@ export async function getBranding(req: Request, res: Response): Promise<Response
   try {
     const branch = await resolveBranchContext(req);
 
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
     if (!branch) {
       return res.json({
         success: true,
@@ -141,10 +153,16 @@ export async function getBranding(req: Request, res: Response): Promise<Response
       });
     }
 
+    // Always fetch fresh landing page for colors
+    const landingPage = await prisma.schoolLandingPage.findUnique({
+      where: { branchId: branch.id },
+      select: { primaryColor: true, secondaryColor: true }
+    });
+
     const name = branch.systemSetting?.schoolName || branch.name;
     const logo = branch.systemSetting?.logoUrl || (branch as any).logo || (branch as any).systemLogo || null;
-    const primaryColor = branch.landingPage?.primaryColor || (branch as any).idCardPrimaryColor || '#003da5';
-    const secondaryColor = branch.landingPage?.secondaryColor || (branch as any).idCardSecondaryColor || '#009ca6';
+    const primaryColor = landingPage?.primaryColor || branch.landingPage?.primaryColor || (branch as any).idCardPrimaryColor || '#003da5';
+    const secondaryColor = landingPage?.secondaryColor || branch.landingPage?.secondaryColor || (branch as any).idCardSecondaryColor || '#009ca6';
 
     return res.json({
       success: true,
