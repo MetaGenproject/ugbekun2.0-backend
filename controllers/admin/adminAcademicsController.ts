@@ -90,19 +90,30 @@ export async function createClass(req: Request, res: Response): Promise<Response
 
 /**
  * POST /api/admin/classes/toggle-uses-scores
+ * POST /api/admin/classes/:id/toggle-uses-scores
  */
 export async function toggleUsesScores(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
-    const { classId, usesScores } = req.body;
-    if (!classId) {
+    const rawClassId = req.body?.classId ?? req.params?.id ?? req.params?.classId;
+    const classId = Number(rawClassId);
+    if (!classId || isNaN(classId)) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
+    if (branchId) {
+      const existing = await prisma.class.findFirst({
+        where: { id: classId, branchId },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'Class not found in this branch.' });
+      }
+    }
+
     const updatedClass = await prisma.class.update({
-      where: { id: Number(classId), ...(branchId ? { branchId } : {}) },
-      data: { usesScores: Boolean(usesScores) },
+      where: { id: classId },
+      data: { usesScores: Boolean(req.body?.usesScores) },
     });
 
     return res.json({
@@ -232,19 +243,30 @@ export async function seedClassPreset(req: Request, res: Response): Promise<Resp
 
 /**
  * POST /api/admin/classes/toggle-ecd
+ * POST /api/admin/classes/:id/toggle-ecd
  */
 export async function toggleECD(req: Request, res: Response): Promise<Response | void> {
   const branchId = req.branchId;
 
   try {
-    const { classId, isEcd } = req.body;
-    if (!classId) {
+    const rawClassId = req.body?.classId ?? req.params?.id ?? req.params?.classId;
+    const classId = Number(rawClassId);
+    if (!classId || isNaN(classId)) {
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
+    if (branchId) {
+      const existing = await prisma.class.findFirst({
+        where: { id: classId, branchId },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'Class not found in this branch.' });
+      }
+    }
+
     const updatedClass = await prisma.class.update({
-      where: { id: Number(classId), branchId },
-      data: { isEcd: !!isEcd },
+      where: { id: classId },
+      data: { isEcd: Boolean(req.body?.isEcd) },
     });
 
     return res.json({
@@ -298,22 +320,41 @@ export async function createSection(req: Request, res: Response): Promise<Respon
 
 /**
  * POST /api/admin/classes/allocate-sections
+ * POST /api/admin/classes/:id/allocate-sections
+ * POST /api/admin/sections/allocate
  */
 export async function allocateSections(req: Request, res: Response): Promise<Response | void> {
   try {
-    const { classId, sectionIds } = req.body;
-    if (!classId || !Array.isArray(sectionIds)) {
+    const rawClassId = req.body?.classId ?? req.params?.id ?? req.params?.classId;
+    const classId = Number(rawClassId);
+    const { sectionIds } = req.body;
+    if (!classId || isNaN(classId) || !Array.isArray(sectionIds)) {
       return res.status(400).json({ success: false, message: 'Invalid payload: classId and sectionIds array required.' });
     }
+
+    const branchId = req.branchId;
+    if (branchId) {
+      const cls = await prisma.class.findFirst({
+        where: { id: classId, branchId },
+      });
+      if (!cls) {
+        return res.status(404).json({ success: false, message: 'Class not found in this branch.' });
+      }
+    }
+
+    // Deduplicate valid numeric section IDs
+    const uniqueSectionIds = Array.from(
+      new Set(sectionIds.map((sid: any) => Number(sid)).filter((sid: number) => !isNaN(sid) && sid > 0))
+    );
 
     await prisma.$transaction(async (tx: any) => {
       await tx.sectionsAllocation.deleteMany({
         where: { classId },
       });
 
-      if (sectionIds.length > 0) {
+      if (uniqueSectionIds.length > 0) {
         await tx.sectionsAllocation.createMany({
-          data: sectionIds.map((sid: number) => ({
+          data: uniqueSectionIds.map((sid: number) => ({
             classId,
             sectionId: sid,
           })),

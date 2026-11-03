@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import prisma from '../../lib/prisma';
-import { resolveTenantByHost, normalizeHostname } from '../../lib/domainService';
+import { resolveTenantByHost, normalizeHostname, isPlatformHost } from '../../lib/domainService';
 import { getOrCreateLandingPage, formatLandingPageResponse } from '../../lib/schoolCmsService';
 import { cacheGetOrSet } from '../../lib/cacheService';
 import { resolveDisplaySchoolName } from '../../lib/schoolDisplayName';
@@ -14,6 +14,11 @@ export async function resolveBranchContext(req: Request) {
   const querySubdomain = req.query.subdomain as string | undefined;
   const queryBranchId = req.query.branchId ? parseInt(req.query.branchId as string, 10) : null;
   const headerHost = (req.headers['x-tenant-host'] || req.headers['x-tenant-domain'] || req.headers.host) as string | undefined;
+
+  // Central platform hosts (e.g. app.ugbekun.com, ugbekun.com, localhost) are not tenant branches
+  if (!queryBranchId && !queryDomain && !querySubdomain && isPlatformHost(headerHost)) {
+    return null;
+  }
 
   const cacheKey = `tenant:resolve:${queryBranchId || queryDomain || querySubdomain || headerHost || 'default'}`;
 
@@ -74,21 +79,26 @@ async function _resolveBranchContextUncached(req: Request) {
     if (branch) return branch;
   }
 
-  // 4. Resolve by incoming host header
-  if (headerHost) {
+  // 4. Resolve by incoming host header (exclude central SaaS platform domains)
+  if (headerHost && !isPlatformHost(headerHost)) {
     const tenantRes = await resolveTenantByHost(prisma, headerHost);
     if (tenantRes?.branch) return tenantRes.branch;
   }
 
-  // 5. Fallback: Return primary branch
-  const fallback = await prisma.branch.findFirst({
-    where: { active: true },
-    orderBy: { id: 'asc' },
-    include: { landingPage: true, systemSetting: true }
-  });
+  // 5. Fallback: Only return primary branch if explicitly targeted via queryBranchId
+  // NEVER fall back to a random school branch (Branch 5) for unmapped external hosts!
+  if (queryBranchId) {
+    const fallback = await prisma.branch.findFirst({
+      where: { active: true },
+      orderBy: { id: 'asc' },
+      include: { landingPage: true, systemSetting: true }
+    });
+    return fallback;
+  }
 
-  return fallback;
+  return null;
 }
+
 
 /**
  * GET /api/public/tenant/homepage
@@ -144,11 +154,13 @@ export async function getBranding(req: Request, res: Response): Promise<Response
         success: true,
         data: {
           isCustomDomain: false,
-          schoolName: 'Ugbekun Educational Platform',
-          tagline: 'Smart Institutional Management',
+          branchId: 0,
+          branchName: 'Ugbekun Admin Portal',
+          schoolName: 'Ugbekun Admin Portal',
+          tagline: 'SaaS Platform Management & Control Center',
           logoUrl: null,
-          primaryColor: '#003da5',
-          secondaryColor: '#009ca6'
+          primaryColor: '#0b1739',
+          secondaryColor: '#e11d48'
         }
       });
     }
@@ -315,6 +327,38 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
         const token = authHeader.slice('Bearer '.length);
         try {
           const decoded: any = jwt.verify(token, process.env.JWT_SECRET || 'ugbekun_dev_secret_change_in_prod');
+          if (decoded.role === 1) {
+            // Superadmin is the platform master administrator, not a branch tenant
+            return res.json({
+              success: true,
+              data: {
+                branchId: 0,
+                branchCode: 'UGB',
+                branchName: 'Ugbekun Admin Portal',
+                schoolName: 'Ugbekun Admin Portal',
+                tagline: 'SaaS Platform Management & Control Center',
+                address: '',
+                phone: '',
+                email: 'admin@ugbekun.com',
+                whatsappNo: null,
+                website: 'https://ugbekun.com',
+                facebookUrl: null,
+                instagramUrl: null,
+                twitterUrl: null,
+                linkedinUrl: null,
+                youtubeUrl: null,
+                logoUrl: null,
+                principalSignatureUrl: null,
+                primaryColor: '#0b1739',
+                secondaryColor: '#e11d48',
+                idCardTheme: 'EMERALD_MODERN',
+                academicSession: '2025/2026',
+                currentTerm: 'Active Session',
+                currencySymbol: '₦',
+              },
+            });
+          }
+
           let branchId: number | null = decoded.branchId ? Number(decoded.branchId) : null;
           if (!branchId && decoded.role === 7) {
             const studentRecord = await prisma.student.findFirst({
@@ -341,7 +385,7 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
               select: { branchId: true },
             });
             branchId = teacherRecord?.branchId || null;
-          } else if (!branchId && (decoded.role === 2 || decoded.role === 1 || decoded.role === 9)) {
+          } else if (!branchId && (decoded.role === 2 || decoded.role === 9)) {
             const adminUser = await prisma.user.findFirst({
               where: { OR: [{ id: decoded.sub || decoded.id }, { legacyUserId: decoded.legacyUserId || decoded.sub }] },
               select: { teacher: { select: { branchId: true } } },
@@ -366,6 +410,37 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
     // 3. If no branch resolved from query or token, resolve from subdomain/host context
     if (!branch) {
       branch = await resolveBranchContext(req);
+    }
+
+    if (!branch) {
+      return res.json({
+        success: true,
+        data: {
+          branchId: 0,
+          branchCode: 'UGB',
+          branchName: 'Ugbekun Admin Portal',
+          schoolName: 'Ugbekun Admin Portal',
+          tagline: 'SaaS Platform Management & Control Center',
+          address: '',
+          phone: '',
+          email: 'admin@ugbekun.com',
+          whatsappNo: null,
+          website: 'https://ugbekun.com',
+          facebookUrl: null,
+          instagramUrl: null,
+          twitterUrl: null,
+          linkedinUrl: null,
+          youtubeUrl: null,
+          logoUrl: null,
+          principalSignatureUrl: null,
+          primaryColor: '#0b1739',
+          secondaryColor: '#e11d48',
+          idCardTheme: 'EMERALD_MODERN',
+          academicSession: '2025/2026',
+          currentTerm: 'Active Session',
+          currencySymbol: '₦',
+        },
+      });
     }
 
     const settings = branch?.systemSetting;
@@ -402,16 +477,16 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
     return res.json({
       success: true,
       data: {
-        branchId: 1,
-        branchCode: 'UG',
-        branchName: 'School Dashboard',
-        schoolName: 'School Dashboard',
-        tagline: 'Nurturing Excellence, Raising Leaders',
+        branchId: 0,
+        branchCode: 'UGB',
+        branchName: 'Ugbekun Admin Portal',
+        schoolName: 'Ugbekun Admin Portal',
+        tagline: 'SaaS Platform Management & Control Center',
         address: '',
         phone: '',
-        email: '',
+        email: 'admin@ugbekun.com',
         whatsappNo: null,
-        website: null,
+        website: 'https://ugbekun.com',
         facebookUrl: null,
         instagramUrl: null,
         twitterUrl: null,
@@ -419,11 +494,11 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
         youtubeUrl: null,
         logoUrl: null,
         principalSignatureUrl: null,
-        primaryColor: '#0f172a',
-        secondaryColor: '#0284c7',
+        primaryColor: '#0b1739',
+        secondaryColor: '#e11d48',
         idCardTheme: 'EMERALD_MODERN',
         academicSession: '2025/2026',
-        currentTerm: 'First Term',
+        currentTerm: 'Active Session',
         currencySymbol: '₦',
       },
     });

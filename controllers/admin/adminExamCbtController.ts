@@ -2705,18 +2705,58 @@ export async function deleteExam(req: Request, res: Response): Promise<Response 
   const branchId = req.branchId;
   const examId = Number(req.params.id);
 
+  if (!examId || isNaN(examId)) {
+    return res.status(400).json({ success: false, message: 'Invalid Exam ID.' });
+  }
+
   try {
     const existing = await prisma.exam.findFirst({
-      where: { id: examId, branchId },
+      where: { id: examId, ...(branchId ? { branchId } : {}) },
     });
 
     if (!existing) {
       return res.status(404).json({ success: false, message: 'Exam not found.' });
     }
 
-    await prisma.exam.delete({
-      where: { id: examId },
-    });
+    await prisma.$transaction(async (tx) => {
+      // 1. Unlink any evaluation matrix item mappings
+      await tx.evaluationMatrixItemMapping.updateMany({
+        where: { examMasterId: examId },
+        data: { examMasterId: null },
+      });
+
+      // 2. Unlink any exam setups
+      await tx.examSetup.updateMany({
+        where: { examId },
+        data: { examId: null },
+      });
+
+      // 3. Delete any montessori assessments for this exam
+      await tx.montessoriAssessment.deleteMany({
+        where: { examId },
+      });
+
+      // 4. Cascade delete marks and their corrections
+      const marks = await tx.mark.findMany({
+        where: { examId },
+        select: { id: true },
+      });
+      const markIds = marks.map((m) => m.id);
+
+      if (markIds.length > 0) {
+        await tx.markScoreCorrection.deleteMany({
+          where: { markId: { in: markIds } },
+        });
+        await tx.mark.deleteMany({
+          where: { id: { in: markIds } },
+        });
+      }
+
+      // 5. Delete the exam master definition
+      await tx.exam.delete({
+        where: { id: examId },
+      });
+    }, { timeout: 30000 });
 
     return res.json({ success: true, message: 'Exam deleted successfully.' });
   } catch (error: any) {

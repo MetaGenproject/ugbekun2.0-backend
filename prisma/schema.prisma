@@ -791,7 +791,7 @@ model Mark {
   subject     Subject                @relation(fields: [subjectId], references: [id])
   class       Class                  @relation(fields: [classId], references: [id])
   section     Section                @relation(fields: [sectionId], references: [id])
-  exam        Exam                   @relation(fields: [examId], references: [id])
+  exam        Exam                   @relation(fields: [examId], references: [id], onDelete: Cascade)
   corrections MarkScoreCorrection[]
 
   @@index([studentId, examId])
@@ -1070,7 +1070,7 @@ model MontessoriAssessment {
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
   class   Class   @relation(fields: [classId], references: [id])
   section Section @relation(fields: [sectionId], references: [id])
-  exam    Exam    @relation(fields: [examId], references: [id])
+  exam    Exam    @relation(fields: [examId], references: [id], onDelete: Cascade)
 
   @@unique([studentId, examId, sessionId])
   @@index([classId, sectionId])
@@ -1807,7 +1807,7 @@ model EvaluationMatrixItemMapping {
   weightMarks    Float     @map("weight_marks")      // e.g. 10.0 out of 20.0
   
   examMasterId   Int?      @map("exam_master_id")
-  examMaster     Exam?     @relation(fields: [examMasterId], references: [id])
+  examMaster     Exam?     @relation(fields: [examMasterId], references: [id], onDelete: SetNull)
 
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime? @updatedAt @map("updated_at")
@@ -2648,7 +2648,7 @@ model ExamSetup {
   updatedAt   DateTime?             @updatedAt @map("updated_at")
 
   branch      Branch                @relation(fields: [branchId], references: [id])
-  exam        Exam?                 @relation(fields: [examId], references: [id])
+  exam        Exam?                 @relation(fields: [examId], references: [id], onDelete: SetNull)
   components  AssessmentComponent[]
 
   @@index([branchId, sessionId, termId])

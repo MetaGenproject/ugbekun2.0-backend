@@ -144,10 +144,19 @@ export async function resolveTenantByHost(prisma: any, rawHost: string) {
   const host = normalizeHostname(rawHost);
   if (!host) return null;
 
-  // 1. Check if host matches a registered custom domain directly
+  // 1. Check if host matches a registered custom domain directly or with/without www prefix
+  const nonWww = host.startsWith('www.') ? host.slice(4) : host;
+  const withWww = host.startsWith('www.') ? host : `www.${host}`;
+
   let branch = await prisma.branch.findFirst({
     where: {
-      customDomain: host,
+      OR: [
+        { customDomain: host },
+        { customDomain: nonWww },
+        { customDomain: withWww },
+        { subdomain: nonWww },
+        { subdomain: host }
+      ],
       active: true
     },
     include: {
@@ -164,34 +173,52 @@ export async function resolveTenantByHost(prisma: any, rawHost: string) {
     };
   }
 
-  // 2. Check if host has "www." prefix or without "www."
-  if (host.startsWith('www.')) {
-    const nonWww = host.slice(4);
-    branch = await prisma.branch.findFirst({
-      where: {
-        customDomain: nonWww,
-        active: true
-      },
-      include: {
-        landingPage: true,
-        systemSetting: true
+  // 2. Check if host matches website in systemSetting (e.g. https://uniqueintegrityschool.com.ng)
+  const branchByWebsite = await prisma.branch.findFirst({
+    where: {
+      active: true,
+      systemSetting: {
+        website: {
+          contains: nonWww,
+          mode: 'insensitive'
+        }
       }
-    });
-
-    if (branch) {
-      return {
-        type: 'CUSTOM_DOMAIN',
-        host,
-        branch
-      };
+    },
+    include: {
+      landingPage: true,
+      systemSetting: true
     }
+  });
+
+  if (branchByWebsite) {
+    // Self-heal: set customDomain on the branch if not already set
+    if (!branchByWebsite.customDomain) {
+      await prisma.branch.update({
+        where: { id: branchByWebsite.id },
+        data: { customDomain: nonWww, domainStatus: 'ACTIVE' }
+      }).catch(() => {});
+      branchByWebsite.customDomain = nonWww;
+      branchByWebsite.domainStatus = 'ACTIVE';
+    }
+    return {
+      type: 'CUSTOM_DOMAIN',
+      host,
+      branch: branchByWebsite
+    };
   }
 
   // 3. Check for platform subdomain (e.g. uiss.ugbekun.edu.ng or uiss.localhost)
   for (const apex of PLATFORM_APEX_DOMAINS) {
     if (host.endsWith(`.${apex}`)) {
       const subdomainPart = host.replace(`.${apex}`, '');
-      if (subdomainPart && subdomainPart !== 'www' && subdomainPart !== 'api') {
+      // Exclude platform subdomains like 'app', 'api', 'www', 'admin'
+      if (
+        subdomainPart &&
+        subdomainPart !== 'www' &&
+        subdomainPart !== 'api' &&
+        subdomainPart !== 'app' &&
+        subdomainPart !== 'admin'
+      ) {
         branch = await prisma.branch.findFirst({
           where: {
             OR: [
@@ -222,12 +249,37 @@ export async function resolveTenantByHost(prisma: any, rawHost: string) {
   return null;
 }
 
+/**
+ * Checks whether an incoming host is the central platform application rather than a tenant school
+ */
+export function isPlatformHost(rawHost?: string): boolean {
+  if (!rawHost) return true;
+  const host = normalizeHostname(rawHost);
+  if (!host) return true;
+  if (host === 'localhost' || host === '127.0.0.1') return true;
+
+  for (const apex of PLATFORM_APEX_DOMAINS) {
+    if (
+      host === apex ||
+      host === `app.${apex}` ||
+      host === `api.${apex}` ||
+      host === `www.${apex}` ||
+      host === `admin.${apex}`
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export default {
   formatDomainSlug,
   generateDomainVerificationToken,
   normalizeHostname,
   verifyDomainDns,
   resolveTenantByHost,
+  isPlatformHost,
   DEFAULT_DNS_TARGET,
   PLATFORM_APEX_DOMAINS,
 };
+
