@@ -28,6 +28,9 @@ import {
   patchAttendanceRegisterEntries,
   submitAttendanceRegister,
   getAttendanceWeek,
+  getTeacherDailyAttendanceReport,
+  getTeacherMonthlyAttendanceReport,
+  getTeacherTermlyAttendanceReport,
   saveCommentary,
   generateCommentaryAi,
   batchGenerateCommentaryAi,
@@ -149,6 +152,9 @@ router.get('/attendance/register', getAttendanceRegister);
 router.patch('/attendance/register/entries', patchAttendanceRegisterEntries);
 router.post('/attendance/register/submit', submitAttendanceRegister);
 router.get('/attendance/week', getAttendanceWeek);
+router.get('/attendance/daily-report', getTeacherDailyAttendanceReport);
+router.get('/attendance/monthly-report', getTeacherMonthlyAttendanceReport);
+router.get('/attendance/termly-report', getTeacherTermlyAttendanceReport);
 router.post('/attendance', saveAttendance);
 router.get('/attendance', getAttendance);
 
