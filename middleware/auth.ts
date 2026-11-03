@@ -281,13 +281,26 @@ export async function requireTeacher(req: Request, res: Response, next: NextFunc
       return;
     }
 
-    // Admin acting as teacher support via x-admin-teacher-id
+    // Admin acting as teacher support via x-admin-teacher-id or direct admin access
     if (decoded.role === 2 || decoded.role === 1 || decoded.role === 9) {
       const headerTeacherId = req.headers['x-admin-teacher-id'];
       if (headerTeacherId) {
         req.teacherId = Number(headerTeacherId);
       }
-      req.branchId = await resolveBranchForAdmin(decoded);
+      let branchId = await resolveBranchForAdmin(decoded);
+      if (decoded.role === 1) {
+        const headerBranchRaw = req.headers['x-branch-id'];
+        const headerBranchId = Number(Array.isArray(headerBranchRaw) ? headerBranchRaw[0] : headerBranchRaw);
+        if (Number.isFinite(headerBranchId) && headerBranchId > 0) {
+          const branch = await prisma.branch.findUnique({
+            where: { id: headerBranchId },
+            select: { id: true },
+          });
+          if (branch) branchId = branch.id;
+        }
+      }
+      req.branchId = branchId;
+      req.isAdmin = true;
       next();
       return;
     }

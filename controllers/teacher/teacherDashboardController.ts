@@ -33,17 +33,17 @@ export async function savePhoto(photoBase64?: string | null, folder: string = 'u
 }
 
 export async function isSubjectTeacher(db: any, teacherId: any, classId: any, sectionId: any, subjectId: any, req: any) {
-  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
+  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2 || req.userRole === 9)) return true;
   return canTeacherAccessSubject(db, teacherId, classId, sectionId, subjectId, req?.sessionId, req);
 }
 
 export async function isFormTeacher(db: any, teacherId: any, classId: any, sectionId: any, req: any) {
-  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
+  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2 || req.userRole === 9)) return true;
   return originalIsFormTeacher(db, teacherId, classId, sectionId);
 }
 
 export async function hasClassAccess(db: any, teacherId: any, classId: any, sectionId: any, req: any) {
-  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2)) return true;
+  if (req && (req.isAdmin || req.userRole === 1 || req.userRole === 2 || req.userRole === 9)) return true;
   return originalHasClassAccess(db, teacherId, classId, sectionId, req);
 }
 

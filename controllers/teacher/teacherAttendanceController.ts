@@ -104,6 +104,22 @@ function parseClassSection(classId: unknown, sectionId: unknown) {
   return { classId: cId, sectionId: sId };
 }
 
+function isAdminRequest(req: Request): boolean {
+  return Boolean(req.isAdmin || req.userRole === 1 || req.userRole === 2 || req.userRole === 9);
+}
+
+function parseReportScope(classId: unknown, sectionId: unknown) {
+  const rawClass = String(classId ?? '').trim().toLowerCase();
+  const rawSection = String(sectionId ?? '').trim().toLowerCase();
+  const isAllClasses = rawClass === 'all' || rawClass === '0';
+  const isAllSections = isAllClasses || rawSection === 'all' || rawSection === '0' || rawSection === '';
+  const cId = isAllClasses ? 0 : Number(classId);
+  const sId = isAllSections ? 0 : Number(sectionId);
+  if (!isAllClasses && (!Number.isFinite(cId) || cId <= 0)) return null;
+  if (!isAllSections && (!Number.isFinite(sId) || sId <= 0)) return null;
+  return { isAllClasses, isAllSections, classId: cId, sectionId: sId };
+}
+
 /**
  * POST /api/teacher/attendance
  * Existing Phase 0 submit path. Dual-writes the register header + line items (no deleteMany).
@@ -150,27 +166,29 @@ export async function saveAttendance(req: Request, res: Response): Promise<Respo
       });
     });
 
-    await prisma.teacherActivity
-      .create({
-        data: {
-          branchId: req.branchId,
-          teacherId: req.teacherId,
-          activity: 'You marked class roll call attendance',
-          type: 'ATTENDANCE',
-        },
-      })
-      .catch(() => null);
+    if (req.teacherId) {
+      await prisma.teacherActivity
+        .create({
+          data: {
+            branchId: req.branchId,
+            teacherId: req.teacherId,
+            activity: 'You marked class roll call attendance',
+            type: 'ATTENDANCE',
+          },
+        })
+        .catch(() => null);
 
-    gamificationService
-      .checkAttendanceTimeliness(
-        prisma,
-        req.teacherId,
-        ids.classId,
-        ids.sectionId,
-        schoolDateUtcMidnight(dateKey),
-        req.branchId
-      )
-      .catch((err: any) => console.error('[Gamification] Error in attendance trigger:', err.message));
+      gamificationService
+        .checkAttendanceTimeliness(
+          prisma,
+          req.teacherId,
+          ids.classId,
+          ids.sectionId,
+          schoolDateUtcMidnight(dateKey),
+          req.branchId
+        )
+        .catch((err: any) => console.error('[Gamification] Error in attendance trigger:', err.message));
+    }
 
     fireAbsenceAlerts(result.planned.rows, {
       branchId: req.branchId,
@@ -379,29 +397,31 @@ export async function submitAttendanceRegister(req: Request, res: Response): Pro
 
     const isUpdate = Boolean(register.submittedAt);
 
-    await prisma.teacherActivity
-      .create({
-        data: {
-          branchId: req.branchId,
-          teacherId: req.teacherId,
-          activity: isUpdate
-            ? 'You updated class roll call attendance'
-            : 'You marked class roll call attendance',
-          type: 'ATTENDANCE',
-        },
-      })
-      .catch(() => null);
+    if (req.teacherId) {
+      await prisma.teacherActivity
+        .create({
+          data: {
+            branchId: req.branchId,
+            teacherId: req.teacherId,
+            activity: isUpdate
+              ? 'You updated class roll call attendance'
+              : 'You marked class roll call attendance',
+            type: 'ATTENDANCE',
+          },
+        })
+        .catch(() => null);
 
-    gamificationService
-      .checkAttendanceTimeliness(
-        prisma,
-        req.teacherId,
-        ids.classId,
-        ids.sectionId,
-        schoolDateUtcMidnight(dateKey),
-        req.branchId
-      )
-      .catch((err: any) => console.error('[Gamification] Error in attendance trigger:', err.message));
+      gamificationService
+        .checkAttendanceTimeliness(
+          prisma,
+          req.teacherId,
+          ids.classId,
+          ids.sectionId,
+          schoolDateUtcMidnight(dateKey),
+          req.branchId
+        )
+        .catch((err: any) => console.error('[Gamification] Error in attendance trigger:', err.message));
+    }
 
     fireAbsenceAlerts(result.planned.rows, {
       branchId: req.branchId,
@@ -467,12 +487,21 @@ export async function getAttendanceWeek(req: Request, res: Response): Promise<Re
  */
 export async function getTeacherDailyAttendanceReport(req: Request, res: Response): Promise<Response | void> {
   const { classId, sectionId, date } = req.query;
-  const ids = parseClassSection(classId, sectionId);
-  if (!ids) {
-    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  const scope = parseReportScope(classId, sectionId);
+  if (!scope) {
+    return res.status(400).json({ success: false, message: 'Valid classId and sectionId are required.' });
   }
 
-  if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
+  if (scope.isAllClasses || scope.isAllSections) {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: Only school administrators can view all-classes attendance.',
+      });
+    }
+  } else {
+    if (!(await forbidUnlessFormTeacher(req, res, scope.classId, scope.sectionId))) return;
+  }
 
   const dateKey = parseSchoolDateKey(date) || todaySchoolDateKey();
   const described = describeSchoolDate(dateKey);
@@ -481,18 +510,20 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
   try {
     const sessionId = req.query.sessionId
       ? Number(req.query.sessionId)
-      : await activeSessionId(req.branchId, ids.classId);
+      : await activeSessionId(req.branchId, scope.isAllClasses ? undefined : scope.classId);
+
+    const enrollWhere: any = {
+      branchId: req.branchId,
+      sessionId,
+      isAlumni: 0,
+      student: { active: true },
+    };
+    if (!scope.isAllClasses) enrollWhere.classId = scope.classId;
+    if (!scope.isAllSections) enrollWhere.sectionId = scope.sectionId;
 
     // 1. Fetch active enrolled students
     const enrolls = await prisma.enroll.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        isAlumni: 0,
-        student: { active: true },
-      },
+      where: enrollWhere,
       include: {
         student: {
           select: {
@@ -504,40 +535,56 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
             gender: true,
           },
         },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
       },
-      orderBy: [{ roll: 'asc' }, { studentId: 'asc' }],
+      orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
     });
 
     // 2. Fetch register metadata (if created)
-    const register = await prisma.attendanceRegister.findFirst({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        registerDate: schoolDateUtcMidnight(dateKey),
-      },
+    const registerWhere: any = {
+      branchId: req.branchId,
+      sessionId,
+      registerDate: schoolDateUtcMidnight(dateKey),
+    };
+    if (!scope.isAllClasses) registerWhere.classId = scope.classId;
+    if (!scope.isAllSections) registerWhere.sectionId = scope.sectionId;
+
+    const registers = await prisma.attendanceRegister.findMany({
+      where: registerWhere,
       select: {
         id: true,
+        classId: true,
+        sectionId: true,
         status: true,
         version: true,
         submittedAt: true,
         notes: true,
+        takenByTeacher: { select: { name: true } },
       },
     });
+    const register = !scope.isAllClasses && !scope.isAllSections ? (registers[0] || null) : null;
+    const registerByStream = new Map<string, (typeof registers)[0]>();
+    for (const reg of registers) {
+      registerByStream.set(`${reg.classId}:${reg.sectionId}`, reg);
+    }
 
     // 3. Fetch attendance entries for that date
+    const logWhere: any = {
+      branchId: req.branchId,
+      sessionId,
+      attendanceDate: range,
+    };
+    if (!scope.isAllClasses) logWhere.classId = scope.classId;
+    if (!scope.isAllSections) logWhere.sectionId = scope.sectionId;
+
     const logs = await prisma.attendance.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        attendanceDate: range,
-      },
+      where: logWhere,
       select: {
         id: true,
         studentId: true,
+        classId: true,
+        sectionId: true,
         status: true,
         remark: true,
         attendanceDate: true,
@@ -559,33 +606,76 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
     let sickCount = 0;
     let unmarkedCount = 0;
 
+    const streamStatsMap = new Map<
+      string,
+      {
+        classId: number;
+        className: string;
+        sectionId: number;
+        sectionName: string;
+        total: number;
+        present: number;
+        absent: number;
+        late: number;
+        excused: number;
+        sick: number;
+        unmarked: number;
+      }
+    >();
+
     const students = enrolls.map((e, index) => {
       const record = logMap.get(e.studentId);
       const rawStatus = record?.status ? String(record.status).trim() : '';
       let status = 'Unmarked';
+
+      const streamKey = `${e.classId}:${e.sectionId}`;
+      let streamStat = streamStatsMap.get(streamKey);
+      if (!streamStat) {
+        streamStat = {
+          classId: e.classId,
+          className: e.class?.name || `Class #${e.classId}`,
+          sectionId: e.sectionId,
+          sectionName: e.section?.name || 'Main',
+          total: 0,
+          present: 0,
+          absent: 0,
+          late: 0,
+          excused: 0,
+          sick: 0,
+          unmarked: 0,
+        };
+        streamStatsMap.set(streamKey, streamStat);
+      }
+      streamStat.total++;
 
       if (rawStatus) {
         const upper = rawStatus.toUpperCase();
         if (upper === 'PRESENT') {
           status = 'Present';
           presentCount++;
+          streamStat.present++;
         } else if (upper === 'ABSENT') {
           status = 'Absent';
           absentCount++;
+          streamStat.absent++;
         } else if (upper === 'LATE') {
           status = 'Late';
           lateCount++;
+          streamStat.late++;
         } else if (upper === 'EXCUSED') {
           status = 'Excused';
           excusedCount++;
+          streamStat.excused++;
         } else if (upper === 'SICK') {
           status = 'Sick';
           sickCount++;
+          streamStat.sick++;
         } else {
           status = rawStatus;
         }
       } else {
         unmarkedCount++;
+        streamStat.unmarked++;
       }
 
       const nameParts = [e.student.lastName, e.student.firstName].map((s) => String(s || '').trim()).filter(Boolean);
@@ -600,9 +690,26 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
         registerNo: e.student.registerNo,
         photo: e.student.photo,
         gender: e.student.gender,
+        classId: e.classId,
+        className: e.class?.name || '',
+        sectionId: e.sectionId,
+        sectionName: e.section?.name || '',
         status,
         remark: record?.remark || null,
         markedAt: record?.updatedAt || null,
+      };
+    });
+
+    const classBreakdown = Array.from(streamStatsMap.values()).map((st) => {
+      const reg = registerByStream.get(`${st.classId}:${st.sectionId}`);
+      const marked = st.total - st.unmarked;
+      const inAtt = st.present + st.late;
+      const rate = marked > 0 ? Number(((inAtt / marked) * 100).toFixed(1)) : 0;
+      return {
+        ...st,
+        attendanceRate: rate,
+        registerStatus: reg?.status || (marked > 0 ? 'DRAFT' : 'NOT_OPENED'),
+        takenByTeacherName: reg?.takenByTeacher?.name || null,
       };
     });
 
@@ -628,6 +735,7 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
         unmarked: unmarkedCount,
         attendanceRate,
       },
+      classBreakdown,
       students,
     });
   } catch (error: any) {
@@ -641,12 +749,21 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
  */
 export async function getTeacherMonthlyAttendanceReport(req: Request, res: Response): Promise<Response | void> {
   const { classId, sectionId, month } = req.query;
-  const ids = parseClassSection(classId, sectionId);
-  if (!ids) {
-    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  const scope = parseReportScope(classId, sectionId);
+  if (!scope) {
+    return res.status(400).json({ success: false, message: 'Valid classId and sectionId are required.' });
   }
 
-  if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
+  if (scope.isAllClasses || scope.isAllSections) {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: Only school administrators can view all-classes attendance.',
+      });
+    }
+  } else {
+    if (!(await forbidUnlessFormTeacher(req, res, scope.classId, scope.sectionId))) return;
+  }
 
   const monthKey = parseSchoolMonthKey(month) || todaySchoolMonthKey();
   const dateKeys = schoolMonthDateKeys(monthKey);
@@ -662,18 +779,20 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
   try {
     const sessionId = req.query.sessionId
       ? Number(req.query.sessionId)
-      : await activeSessionId(req.branchId, ids.classId);
+      : await activeSessionId(req.branchId, scope.isAllClasses ? undefined : scope.classId);
+
+    const enrollWhere: any = {
+      branchId: req.branchId,
+      sessionId,
+      isAlumni: 0,
+      student: { active: true },
+    };
+    if (!scope.isAllClasses) enrollWhere.classId = scope.classId;
+    if (!scope.isAllSections) enrollWhere.sectionId = scope.sectionId;
 
     // 1. Fetch active students
     const enrolls = await prisma.enroll.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        isAlumni: 0,
-        student: { active: true },
-      },
+      where: enrollWhere,
       include: {
         student: {
           select: {
@@ -684,19 +803,23 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
             photo: true,
           },
         },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
       },
-      orderBy: [{ roll: 'asc' }, { studentId: 'asc' }],
+      orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
     });
 
-    // 2. Fetch all month attendance logs for this class
+    // 2. Fetch all month attendance logs for this class / school
+    const logWhere: any = {
+      branchId: req.branchId,
+      sessionId,
+      attendanceDate: range,
+    };
+    if (!scope.isAllClasses) logWhere.classId = scope.classId;
+    if (!scope.isAllSections) logWhere.sectionId = scope.sectionId;
+
     const logs = await prisma.attendance.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        attendanceDate: range,
-      },
+      where: logWhere,
       select: {
         studentId: true,
         status: true,
@@ -714,7 +837,7 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
       }
     }
 
-    // 3. Compute per-day totals across the class
+    // 3. Compute per-day totals across the class / school
     const daysData = dateKeys.map((dKey, idx) => {
       const dayNum = idx + 1;
       const isWeekend = isWeekendSchoolDate(dKey);
@@ -799,6 +922,10 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
         lastName: e.student.lastName,
         registerNo: e.student.registerNo,
         photo: e.student.photo,
+        classId: e.classId,
+        className: e.class?.name || '',
+        sectionId: e.sectionId,
+        sectionName: e.section?.name || '',
         days: dayStatuses,
         presentCount: pCount,
         absentCount: aCount,
@@ -808,9 +935,9 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
     });
 
     const activeSchoolDaysCount = daysData.filter((d) => d.isSchoolDayHeld).length;
-    const totalPossibleSessions = activeSchoolDaysCount * enrolls.length;
-    const overallRate = totalPossibleSessions > 0
-      ? Number((((grandPresent + grandLate) / totalPossibleSessions) * 100).toFixed(1))
+    const totalMarkedSessions = grandPresent + grandAbsent + grandLate;
+    const overallRate = totalMarkedSessions > 0
+      ? Number((((grandPresent + grandLate) / totalMarkedSessions) * 100).toFixed(1))
       : 0;
 
     return res.json({
@@ -840,31 +967,42 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
  */
 export async function getTeacherTermlyAttendanceReport(req: Request, res: Response): Promise<Response | void> {
   const { classId, sectionId, termId } = req.query;
-  const ids = parseClassSection(classId, sectionId);
-  if (!ids) {
-    return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
+  const scope = parseReportScope(classId, sectionId);
+  if (!scope) {
+    return res.status(400).json({ success: false, message: 'Valid classId and sectionId are required.' });
   }
 
-  if (!(await forbidUnlessFormTeacher(req, res, ids.classId, ids.sectionId))) return;
+  if (scope.isAllClasses || scope.isAllSections) {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: Only school administrators can view all-classes attendance.',
+      });
+    }
+  } else {
+    if (!(await forbidUnlessFormTeacher(req, res, scope.classId, scope.sectionId))) return;
+  }
 
   try {
     let sessionId = req.query.sessionId ? Number(req.query.sessionId) : 0;
     if (!sessionId || isNaN(sessionId)) {
-      sessionId = await activeSessionId(req.branchId, ids.classId);
+      sessionId = await activeSessionId(req.branchId, scope.isAllClasses ? undefined : scope.classId);
     }
 
     const termNum = termId ? Number(termId) : 1;
 
+    const enrollWhere: any = {
+      branchId: req.branchId,
+      sessionId,
+      isAlumni: 0,
+      student: { active: true },
+    };
+    if (!scope.isAllClasses) enrollWhere.classId = scope.classId;
+    if (!scope.isAllSections) enrollWhere.sectionId = scope.sectionId;
+
     // 1. Fetch active students for this session and class section
     let enrolls = await prisma.enroll.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        isAlumni: 0,
-        student: { active: true },
-      },
+      where: enrollWhere,
       include: {
         student: {
           select: {
@@ -875,19 +1013,24 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
             photo: true,
           },
         },
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
       },
-      orderBy: [{ roll: 'asc' }, { studentId: 'asc' }],
+      orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
     });
 
     // Fallback: if no enrollment found with specific sessionId, lookup by class and section
     if (enrolls.length === 0) {
+      const fallbackWhere: any = {
+        ...(req.branchId ? { branchId: req.branchId } : {}),
+        isAlumni: 0,
+        student: { active: true },
+      };
+      if (!scope.isAllClasses) fallbackWhere.classId = scope.classId;
+      if (!scope.isAllSections) fallbackWhere.sectionId = scope.sectionId;
+
       enrolls = await prisma.enroll.findMany({
-        where: {
-          classId: ids.classId,
-          sectionId: ids.sectionId,
-          isAlumni: 0,
-          student: { active: true },
-        },
+        where: fallbackWhere,
         include: {
           student: {
             select: {
@@ -898,18 +1041,22 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
               photo: true,
             },
           },
+          class: { select: { id: true, name: true } },
+          section: { select: { id: true, name: true } },
         },
-        orderBy: [{ roll: 'asc' }, { studentId: 'asc' }],
+        orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
       });
     }
 
-    // 2. Fetch all attendance registers & entries for this class/section
+    // 2. Fetch all attendance registers & entries for this class/section or school
+    const logWhere: any = {
+      ...(req.branchId ? { branchId: req.branchId } : {}),
+    };
+    if (!scope.isAllClasses) logWhere.classId = scope.classId;
+    if (!scope.isAllSections) logWhere.sectionId = scope.sectionId;
+
     const logs = await prisma.attendance.findMany({
-      where: {
-        classId: ids.classId,
-        sectionId: ids.sectionId,
-        ...(req.branchId ? { branchId: req.branchId } : {}),
-      },
+      where: logWhere,
       select: {
         studentId: true,
         status: true,
@@ -965,11 +1112,13 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
       grandAbsent += counts.absent;
       grandLate += counts.late;
 
+      const studentDays = counts.present + counts.absent + counts.late;
+      const denom = scope.isAllClasses ? (studentDays || totalSchoolDaysOpened) : totalSchoolDaysOpened;
       const attended = counts.present + counts.late;
-      const rate = totalSchoolDaysOpened > 0 ? Number(((attended / totalSchoolDaysOpened) * 100).toFixed(1)) : 0;
+      const rate = denom > 0 ? Number(((attended / denom) * 100).toFixed(1)) : 0;
 
       let evaluation = 'Pending';
-      if (totalSchoolDaysOpened > 0) {
+      if (denom > 0 && studentDays > 0) {
         if (rate >= 95) evaluation = 'Excellent';
         else if (rate >= 85) evaluation = 'Good';
         else if (rate >= 75) evaluation = 'Average';
@@ -977,6 +1126,9 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
           evaluation = 'Critical';
           chronicAbsenteeCount++;
         }
+      } else if (!scope.isAllClasses && totalSchoolDaysOpened > 0) {
+        evaluation = 'Critical';
+        chronicAbsenteeCount++;
       }
 
       const nameParts = [e.student.lastName, e.student.firstName].map((s) => String(s || '').trim()).filter(Boolean);
@@ -990,16 +1142,23 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
         lastName: e.student.lastName,
         registerNo: e.student.registerNo,
         photo: e.student.photo,
+        classId: e.classId,
+        className: e.class?.name || '',
+        sectionId: e.sectionId,
+        sectionName: e.section?.name || '',
         presentDays: counts.present,
         absentDays: counts.absent,
         lateDays: counts.late,
-        totalDays: totalSchoolDaysOpened,
+        totalDays: scope.isAllClasses ? (studentDays || totalSchoolDaysOpened) : totalSchoolDaysOpened,
         percentage: rate,
         evaluation,
       };
     });
 
-    const totalPossible = totalSchoolDaysOpened * enrolls.length;
+    const totalMarked = grandPresent + grandAbsent + grandLate;
+    const totalPossible = scope.isAllClasses
+      ? (totalMarked || totalSchoolDaysOpened * enrolls.length)
+      : totalSchoolDaysOpened * enrolls.length;
     const averageClassRate = totalPossible > 0 ? Number((((grandPresent + grandLate) / totalPossible) * 100).toFixed(1)) : 0;
 
     return res.json({

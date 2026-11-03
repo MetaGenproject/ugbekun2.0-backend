@@ -29,21 +29,76 @@ export async function getClassesSections(req: Request, res: Response): Promise<R
   const branchId = req.branchId;
 
   try {
-    const classes = await prisma.class.findMany({
-      where: { branchId },
-      include: {
-        sections: {
-          include: {
-            section: true,
+    const [rawClasses, sections, enrollStreams] = await Promise.all([
+      prisma.class.findMany({
+        where: { branchId },
+        include: {
+          sections: {
+            include: {
+              section: true,
+            },
           },
         },
-      },
-      orderBy: { name: 'asc' },
-    });
+        orderBy: { name: 'asc' },
+      }),
+      prisma.section.findMany({
+        where: { branchId },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.enroll.findMany({
+        where: { branchId, isAlumni: 0, student: { active: true } },
+        select: {
+          classId: true,
+          sectionId: true,
+          section: { select: { id: true, name: true } },
+        },
+        distinct: ['classId', 'sectionId'],
+      }),
+    ]);
 
-    const sections = await prisma.section.findMany({
-      where: { branchId },
-      orderBy: { name: 'asc' },
+    const enrolledSectionsByClass = new Map<number, Array<{ id: number; name: string }>>();
+    for (const row of enrollStreams) {
+      if (!row.classId || !row.section) continue;
+      const list = enrolledSectionsByClass.get(row.classId) || [];
+      if (!list.some((s) => s.id === row.section.id)) {
+        list.push({ id: row.section.id, name: row.section.name });
+      }
+      enrolledSectionsByClass.set(row.classId, list);
+    }
+
+    const classes = rawClasses.map((cls) => {
+      const existingSectionMap = new Map<number, any>();
+      for (const item of cls.sections || []) {
+        if (item.section) {
+          existingSectionMap.set(item.section.id, item);
+        }
+      }
+      const enrolledSecs = enrolledSectionsByClass.get(cls.id) || [];
+      for (const sec of enrolledSecs) {
+        if (!existingSectionMap.has(sec.id)) {
+          existingSectionMap.set(sec.id, {
+            id: 0,
+            classId: cls.id,
+            sectionId: sec.id,
+            branchId,
+            section: sec,
+          });
+        }
+      }
+      if (existingSectionMap.size === 0 && sections.length > 0) {
+        const firstSec = sections[0];
+        existingSectionMap.set(firstSec.id, {
+          id: 0,
+          classId: cls.id,
+          sectionId: firstSec.id,
+          branchId,
+          section: firstSec,
+        });
+      }
+      return {
+        ...cls,
+        sections: Array.from(existingSectionMap.values()),
+      };
     });
 
     return res.json({ success: true, classes, sections });
