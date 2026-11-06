@@ -337,6 +337,7 @@ import {
   exportGateLogsPdfHandler,
   getLandingPageConfig,
   updateLandingPageConfig,
+  uploadAdminLandingPageMedia,
   getDomainConfig,
   updateDomain,
   verifyDns,
@@ -767,6 +768,7 @@ router.get('/myeduride/export/pdf', exportGateLogsPdfHandler);
 router.get('/landing-page', getLandingPageConfig);
 router.put('/landing-page', updateLandingPageConfig);
 router.post('/landing-page', updateLandingPageConfig);
+router.post('/landing-page/upload-media', uploadAdminLandingPageMedia);
 
 router.get('/domain/config', getDomainConfig);
 router.post('/domain/update', updateDomain);

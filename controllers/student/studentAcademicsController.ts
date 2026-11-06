@@ -3,6 +3,7 @@ import prisma from '../../lib/prisma';
 import { generateReportCardPdf, generateMontessoriReportCardPdf } from '../../lib/pdfService';
 import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
 import { parseMarkScore } from '../../lib/markParser';
+import { resolveSchoolReportBranding } from '../../lib/reportCardHelper';
 
 /**
  * GET /api/student/attendance
@@ -156,24 +157,47 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       isEcdClass = !!clsInfo?.isEcd;
     }
 
-    // Per-Class Publication Gating: Verify if the School Admin has released this specific class
-    let isClassPublished = false;
-    if (req.classId && req.sessionId) {
-      const classPub = await prisma.classReportCardPublication.findFirst({
-        where: {
-          classId: req.classId,
-          sessionId: req.sessionId,
-          ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
-          isPublished: true,
-        },
-      });
-      isClassPublished = Boolean(classPub);
-    }
+    // Per-Class Publication Gating + Auto-Publish Support
+    const [classPub, schoolBranding, studentRecord] = await Promise.all([
+      req.classId && req.sessionId
+        ? prisma.classReportCardPublication.findFirst({
+            where: {
+              classId: req.classId,
+              sessionId: req.sessionId,
+              ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
+              isPublished: true,
+            },
+          })
+        : Promise.resolve(null),
+      resolveSchoolReportBranding(prisma, req.branchId, {
+        classId: req.classId || undefined,
+        sectionId: req.sectionId || undefined,
+        sessionId: req.sessionId || undefined,
+      }),
+      req.studentId
+        ? prisma.student.findUnique({
+            where: { id: req.studentId },
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              registerNo: true,
+              photo: true,
+              gender: true,
+              birthday: true,
+            },
+          })
+        : Promise.resolve(null),
+    ]);
+
+    const isClassPublished = Boolean(schoolBranding.autoPublishReportCards !== false || classPub);
 
     if (!isClassPublished) {
       return res.json({
         success: true,
         isPublished: false,
+        schoolBranding,
+        studentBio: studentRecord,
         reportCard: [],
         overallAverage: null,
         commentary: null,
@@ -200,6 +224,8 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         success: true,
         isEcd: true,
         isPublished: true,
+        schoolBranding,
+        studentBio: studentRecord,
         assessment: assessment || null,
       });
     }
@@ -213,7 +239,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
-        exam: { select: { id: true, name: true, publishResult: true } },
+        exam: { select: { id: true, name: true, resumptionDate: true, publishResult: true } },
       },
     });
 
@@ -238,7 +264,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
           },
           include: {
             subject: { select: { id: true, name: true, subjectCode: true } },
-            exam: { select: { id: true, name: true, publishResult: true } },
+            exam: { select: { id: true, name: true, resumptionDate: true, publishResult: true } },
           },
         });
       }
@@ -249,17 +275,22 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         where: {
           studentId: req.studentId,
           sessionId: activeSessionId,
-          status: 'PRINCIPAL_SIGNED_OFF',
         },
-        select: { remark: true },
+        select: { remark: true, reviewNotes: true },
       });
 
       return res.json({
         success: true,
         isPublished: true,
+        schoolBranding,
+        studentBio: studentRecord,
         reportCard: [],
         overallAverage: null,
         commentary: commentary?.remark || null,
+        teacherComment: commentary?.remark || null,
+        principalComment: commentary?.reviewNotes || null,
+        resumptionDate: schoolBranding.resumptionDate || null,
+        nextTermFees: schoolBranding.nextTermFees || null,
         rank: null,
         totalClassStudents: 0,
         message: 'Report cards are published. No subject scores recorded yet for this session.',
@@ -293,9 +324,8 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       where: {
         studentId: req.studentId,
         sessionId: activeSessionId,
-        status: 'PRINCIPAL_SIGNED_OFF',
       },
-      select: { remark: true },
+      select: { remark: true, reviewNotes: true },
     });
 
     let totalScoreSum = 0;
@@ -391,9 +421,15 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
     return res.json({
       success: true,
       isPublished: true,
+      schoolBranding,
+      studentBio: studentRecord,
       reportCard,
       overallAverage,
       commentary: commentary?.remark || null,
+      teacherComment: commentary?.remark || null,
+      principalComment: commentary?.reviewNotes || null,
+      resumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
+      nextTermFees: schoolBranding.nextTermFees || null,
       rank,
       totalClassStudents,
     });
@@ -411,19 +447,26 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
     const { rankingType = 'full', rankingLimit = 3 } = req.query as any;
     const limit = parseInt(rankingLimit as string, 10) || 3;
 
-    // Per-Class Publication Gating: Prevent direct PDF download if class is not released
-    let isClassPublished = false;
-    if (req.classId && req.sessionId) {
-      const classPub = await prisma.classReportCardPublication.findFirst({
-        where: {
-          classId: req.classId,
-          sessionId: req.sessionId,
-          ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
-          isPublished: true,
-        },
-      });
-      isClassPublished = Boolean(classPub);
-    }
+    // Per-Class Publication Gating + Auto-Publish Support
+    const [classPub, schoolBranding] = await Promise.all([
+      req.classId && req.sessionId
+        ? prisma.classReportCardPublication.findFirst({
+            where: {
+              classId: req.classId,
+              sessionId: req.sessionId,
+              ...(req.branchId ? { OR: [{ branchId: req.branchId }, { branchId: null }] } : {}),
+              isPublished: true,
+            },
+          })
+        : Promise.resolve(null),
+      resolveSchoolReportBranding(prisma, req.branchId, {
+        classId: req.classId || undefined,
+        sectionId: req.sectionId || undefined,
+        sessionId: req.sessionId || undefined,
+      }),
+    ]);
+
+    const isClassPublished = Boolean(schoolBranding.autoPublishReportCards !== false || classPub);
 
     if (!isClassPublished) {
       return res.status(403).json({
@@ -702,16 +745,15 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       where: {
         studentId: req.studentId,
         sessionId: req.sessionId,
-        status: 'PRINCIPAL_SIGNED_OFF',
       },
-      select: { remark: true },
+      select: { remark: true, reviewNotes: true },
     });
 
-    const resumptionDate = studentMarks[0]?.exam.resumptionDate || null;
+    const resumptionDate = studentMarks[0]?.exam.resumptionDate || schoolBranding.resumptionDate || null;
 
     const pdfBuffer = await generateReportCardPdf({
-      schoolName: student.branch?.name || 'Ugbekun Schools',
-      branchCode: student.branch?.code || 'GEN',
+      schoolName: schoolBranding.schoolName || student.branch?.name || 'Ugbekun Schools',
+      branchCode: schoolBranding.branchCode || student.branch?.code || 'GEN',
       studentName: `${student.lastName}, ${student.firstName}`,
       registerNo: student.registerNo,
       className,
@@ -720,12 +762,19 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       reportCard,
       overallAverage,
       commentary: commentaryRecord?.remark || '',
+      teacherComment: commentaryRecord?.remark || '',
+      principalComment: commentaryRecord?.reviewNotes || '',
       rank,
       totalClassStudents,
       rankingType,
       rankingLimit: limit,
       resumptionDate,
-      formTeacherName,
+      nextTermFees: schoolBranding.nextTermFees || null,
+      formTeacherName: schoolBranding.classTeacherName || formTeacherName,
+      photo: student.photo || null,
+      gender: student.gender || null,
+      birthday: student.birthday || null,
+      schoolBranding,
     });
 
     const safeLastName = (student.lastName || 'Student').replace(/\s+/g, '_');

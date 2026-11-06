@@ -193,7 +193,7 @@ export async function getSettings(req: Request, res: Response): Promise<Response
   try {
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
-      select: { id: true, name: true, address: true, phone: true, email: true, logo: true, code: true },
+      select: { id: true, name: true, address: true, phone: true, email: true, logo: true, reportCardLogo: true, code: true },
     });
 
     let settings = await prisma.systemSetting.findUnique({
@@ -209,9 +209,11 @@ export async function getSettings(req: Request, res: Response): Promise<Response
           address: branch?.address || '',
           phone: branch?.phone || '',
           email: branch?.email || '',
-          logoUrl: branch?.logo || null,
+          logoUrl: branch?.logo || branch?.reportCardLogo || null,
           website: '',
           regNoPrefix: branch?.code || 'SCH',
+          principalName: 'The Principal',
+          autoPublishReportCards: true,
         },
       });
     } else {
@@ -225,7 +227,7 @@ export async function getSettings(req: Request, res: Response): Promise<Response
             address: settings.address || branch.address,
             phone: settings.phone === '+234 800 000 0000' ? (branch.phone || '') : settings.phone,
             email: settings.email === 'info@ugbekun.edu.ng' ? (branch.email || '') : settings.email,
-            logoUrl: settings.logoUrl || branch.logo,
+            logoUrl: settings.logoUrl || branch.logo || branch.reportCardLogo,
           },
         });
       }
@@ -264,6 +266,13 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       principalSignatureUrl,
       signatureBase64,
       signatureFileName,
+      principalName,
+      defaultTeacherSignatureUrl,
+      teacherSignatureBase64,
+      teacherSignatureFileName,
+      resumptionDate,
+      nextTermFees,
+      autoPublishReportCards,
       primaryColor,
       secondaryColor,
       currencySymbol,
@@ -295,6 +304,12 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       if (uploaded) processedSignatureUrl = uploaded;
     }
 
+    let processedTeacherSignatureUrl = defaultTeacherSignatureUrl;
+    if (teacherSignatureBase64) {
+      const uploaded = await saveSignatureBase64(teacherSignatureBase64, teacherSignatureFileName);
+      if (uploaded) processedTeacherSignatureUrl = uploaded;
+    }
+
     const updated = await prisma.systemSetting.upsert({
       where: { branchId },
       update: {
@@ -312,6 +327,11 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
         ...(youtubeUrl !== undefined && { youtubeUrl }),
         ...(processedLogoUrl !== undefined && { logoUrl: processedLogoUrl }),
         ...(processedSignatureUrl !== undefined && { principalSignatureUrl: processedSignatureUrl }),
+        ...(principalName !== undefined && { principalName }),
+        ...(processedTeacherSignatureUrl !== undefined && { defaultTeacherSignatureUrl: processedTeacherSignatureUrl }),
+        ...(resumptionDate !== undefined && { resumptionDate }),
+        ...(nextTermFees !== undefined && { nextTermFees }),
+        ...(autoPublishReportCards !== undefined && { autoPublishReportCards: Boolean(autoPublishReportCards) }),
         ...(primaryColor !== undefined && { primaryColor }),
         ...(secondaryColor !== undefined && { secondaryColor }),
         ...(currencySymbol !== undefined && { currencySymbol }),
@@ -347,6 +367,11 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
         youtubeUrl: youtubeUrl || null,
         logoUrl: processedLogoUrl || null,
         principalSignatureUrl: processedSignatureUrl || null,
+        principalName: principalName || 'The Principal',
+        defaultTeacherSignatureUrl: processedTeacherSignatureUrl || null,
+        resumptionDate: resumptionDate || null,
+        nextTermFees: nextTermFees || null,
+        autoPublishReportCards: autoPublishReportCards !== undefined ? Boolean(autoPublishReportCards) : true,
         primaryColor: primaryColor || '#0f172a',
         secondaryColor: secondaryColor || '#0284c7',
         currencySymbol: currencySymbol || '₦',
@@ -376,7 +401,7 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
             ...(address && { address }),
             ...(phone && { phone }),
             ...(email && { email }),
-            ...(processedLogoUrl !== undefined && { logo: processedLogoUrl }),
+            ...(processedLogoUrl !== undefined && { logo: processedLogoUrl, reportCardLogo: processedLogoUrl }),
           },
         })
         .catch(() => {});
@@ -1207,6 +1232,44 @@ export async function updateLandingPageConfig(req: Request, res: Response): Prom
   } catch (error: any) {
     console.error('[ADMIN] Update landing page error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to update landing page.' });
+  }
+}
+
+/**
+ * POST /api/admin/landing-page/upload-media
+ */
+export async function uploadAdminLandingPageMedia(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  if (!branchId) {
+    return res.status(401).json({ success: false, message: 'Authentication required.' });
+  }
+
+  try {
+    const { imageBase64, category = 'gallery', caption = '' } = req.body;
+    if (!imageBase64) {
+      return res.status(400).json({ success: false, message: 'Image data is required.' });
+    }
+
+    let url = imageBase64;
+    if (imageBase64.startsWith('data:image')) {
+      const uploadRes = await uploadToCloudinary(imageBase64, `school_${branchId}_cms`);
+      if (uploadRes) {
+        url = uploadRes;
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        url,
+        category,
+        caption,
+        id: Date.now(),
+      },
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Media upload error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to upload media.' });
   }
 }
 

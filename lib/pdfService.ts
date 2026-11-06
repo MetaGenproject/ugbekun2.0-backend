@@ -386,819 +386,1160 @@ function getOrdinalSuffix(i) {
   return 'th';
 }
 
-function drawStandardReportCard(doc, params) {
+function sanitizeHexColor(color, fallback = '#1e3a8a') {
+  if (!color || typeof color !== 'string') return fallback;
+  const trimmed = color.trim();
+  if (/^#[0-9A-Fa-f]{6}$/.test(trimmed) || /^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return fallback;
+}
+
+function formatResumptionDisplay(resumptionDate) {
+  if (!resumptionDate) return 'To Be Announced';
+  if (resumptionDate instanceof Date) {
+    if (Number.isNaN(resumptionDate.getTime())) return 'To Be Announced';
+    return resumptionDate.toLocaleDateString('en-GB', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
+  }
+  const raw = String(resumptionDate).trim();
+  if (!raw || raw === 'To Be Announced') return 'To Be Announced';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const parsed = new Date(`${raw}T00:00:00Z`);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toLocaleDateString('en-GB', {
+        weekday: 'short',
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+        timeZone: 'UTC',
+      });
+    }
+  }
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime()) && raw.includes('-') && raw.length >= 8) {
+    return parsed.toLocaleDateString('en-GB', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
+  }
+  return raw;
+}
+
+function safeDrawPdfImage(doc, buffer, x, y, options) {
+  if (!buffer) return false;
+  try {
+    doc.image(buffer, x, y, options);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function drawBrandedReportHeader(doc, params, colors) {
   const {
     schoolName = 'Ugbekun Schools',
     branchCode = 'GEN',
+    tagline = '',
+    schoolAddress = '',
+    schoolPhone = '',
+    schoolEmail = '',
+    schoolWebsite = '',
+    sessionName = '2025/2026',
+    termName = 'First Term',
+    reportSubtitle = 'OFFICIAL TERMINAL REPORT SHEET',
+    logoBuffer = null,
+  } = params;
+
+  const { primaryColor, secondaryColor } = colors;
+
+  // Main Header Banner (Y: 22 to 94)
+  doc.rect(30, 22, 535, 72).fill(primaryColor);
+  // Secondary Brand Accent Bar at bottom of header
+  doc.rect(30, 90, 535, 4).fill(secondaryColor);
+
+  // Left: School Logo Box (X: 38, Y: 29, W: 54, H: 54)
+  doc.roundedRect(38, 29, 54, 54, 6).fill('#ffffff');
+  const drewLogo = safeDrawPdfImage(doc, logoBuffer, 41, 32, {
+    fit: [48, 48],
+    align: 'center',
+    valign: 'center',
+  });
+  if (!drewLogo) {
+    const initials = String(schoolName || 'S')
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase() || '')
+      .join('');
+    doc.fillColor(primaryColor)
+       .font('Helvetica-Bold')
+       .fontSize(16)
+       .text(initials || 'SCH', 38, 48, { width: 54, align: 'center' });
+  }
+
+  // Center: School Name, Motto, Address & Contact Info
+  const centerX = 100;
+  const centerW = 330;
+
+  doc.fillColor('#ffffff')
+     .font('Helvetica-Bold')
+     .fontSize(13.5)
+     .text(String(schoolName).toUpperCase(), centerX, 28, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
+
+  let infoY = 44;
+  if (tagline) {
+    doc.fillColor('#e0f2fe')
+       .font('Helvetica-Oblique')
+       .fontSize(8)
+       .text(`"${tagline}"`, centerX, infoY, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
+    infoY += 11;
+  }
+
+  if (schoolAddress) {
+    doc.fillColor('#f1f5f9')
+       .font('Helvetica')
+       .fontSize(7.5)
+       .text(schoolAddress, centerX, infoY, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
+    infoY += 10;
+  }
+
+  const contactParts = [];
+  if (schoolPhone) contactParts.push(`Tel: ${schoolPhone}`);
+  if (schoolEmail) contactParts.push(`Email: ${schoolEmail}`);
+  if (schoolWebsite) contactParts.push(schoolWebsite);
+  if (contactParts.length > 0) {
+    doc.fillColor('#cbd5e1')
+       .font('Helvetica')
+       .fontSize(7)
+       .text(contactParts.join('  •  '), centerX, infoY, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
+    infoY += 10;
+  }
+
+  // Report Subtitle Pill
+  doc.fillColor('#ffffff')
+     .font('Helvetica-Bold')
+     .fontSize(7.5)
+     .text(reportSubtitle, centerX, Math.min(infoY + 1, 78), { width: centerW, align: 'left' });
+
+  // Right: Session, Term & Branch Metadata
+  doc.fillColor('#ffffff')
+     .font('Helvetica-Bold')
+     .fontSize(9.5)
+     .text(String(termName || 'Term Report').toUpperCase(), 432, 30, { width: 125, align: 'right' });
+
+  doc.font('Helvetica')
+     .fontSize(8)
+     .fillColor('#e2e8f0')
+     .text(`Session: ${sessionName || 'Active'}`, 432, 45, { width: 125, align: 'right' })
+     .text(`Branch: ${branchCode || 'MAIN'}`, 432, 57, { width: 125, align: 'right' })
+     .text(`Issued: ${new Date().toLocaleDateString('en-GB')}`, 432, 69, { width: 125, align: 'right' });
+}
+
+function drawStudentBioWithPhoto(doc, params, y, colors) {
+  const {
     studentName = 'Student',
     registerNo = '',
     className = '',
     sectionName = '',
-    sessionName = '',
+    gender = '',
+    birthday = '',
+    attendance = null,
+    overallAverage = 0,
+    gpaRating = '-',
+    rankString = '-',
+    isProgressSlip = false,
+    stage = 'FULL',
+    studentPhotoBuffer = null,
+  } = params;
+
+  const { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg } = colors;
+
+  const boxHeight = 72;
+  doc.rect(30, y, 535, boxHeight).fill('#ffffff').stroke(lightBorder);
+  doc.rect(30, y, 4, boxHeight).fill(secondaryColor);
+
+  // Student Passport Photo Frame on the far right (X: 498, Y: y + 6, W: 58, H: 60)
+  const photoX = 498;
+  const photoY = y + 6;
+  const photoW = 58;
+  const photoH = 60;
+  doc.roundedRect(photoX, photoY, photoW, photoH, 4).fill(lightBg).stroke(lightBorder);
+
+  const drewStudentPhoto = safeDrawPdfImage(doc, studentPhotoBuffer, photoX + 2, photoY + 2, {
+    fit: [photoW - 4, photoH - 4],
+    align: 'center',
+    valign: 'center',
+  });
+
+  if (!drewStudentPhoto) {
+    const initials = String(studentName || 'ST')
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase() || '')
+      .join('');
+    doc.fillColor(primaryColor)
+       .font('Helvetica-Bold')
+       .fontSize(14)
+       .text(initials || 'ST', photoX, photoY + 18, { width: photoW, align: 'center' });
+    doc.fillColor(textMuted)
+       .font('Helvetica')
+       .fontSize(6)
+       .text('STUDENT PHOTO', photoX, photoY + 38, { width: photoW, align: 'center' });
+  }
+
+  // Column 1 (X: 42 to 215): Name, Admission No, Class & Arm
+  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+     .text('Student Name:', 42, y + 10)
+     .text('Admission No:', 42, y + 26)
+     .text('Class & Arm:', 42, y + 42)
+     .text('Gender / DOB:', 42, y + 56);
+
+  const dobDisplay = birthday
+    ? (() => {
+        const d = new Date(birthday);
+        return !Number.isNaN(d.getTime()) ? d.toLocaleDateString('en-GB') : String(birthday);
+      })()
+    : 'N/A';
+  const genderDisplay = gender ? String(gender).charAt(0).toUpperCase() + String(gender).slice(1).toLowerCase() : 'N/A';
+
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
+     .text(studentName, 110, y + 10, { width: 165, lineBreak: false, ellipsis: true })
+     .text(registerNo || 'Assigned', 110, y + 26, { width: 165, lineBreak: false })
+     .text(`${className}${sectionName ? ` (${sectionName})` : ''}`, 110, y + 42, { width: 165, lineBreak: false })
+     .font('Helvetica').fontSize(8)
+     .text(`${genderDisplay}  •  ${dobDisplay}`, 110, y + 56, { width: 165, lineBreak: false });
+
+  // Column 2 (X: 285 to 490): Academic & Attendance Summary
+  const attPresent = attendance?.present ?? null;
+  const attTotal = attendance?.totalDays ?? null;
+  const attText =
+    attPresent !== null && attTotal !== null && attTotal > 0
+      ? `${attPresent} / ${attTotal} Days (${Math.round((attPresent / attTotal) * 100)}%)`
+      : 'Recorded';
+
+  if (isProgressSlip) {
+    doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+       .text('Assessment Stage:', 285, y + 10)
+       .text('Report Status:', 285, y + 26)
+       .text('Attendance:', 285, y + 42)
+       .text('Overall Score:', 285, y + 56);
+
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
+       .text(stage === 'CA2' ? 'Continuous Assessment 2' : (stage === 'COMBINED_CA' ? 'Combined CA (1+2)' : 'Continuous Assessment 1'), 372, y + 10)
+       .text('Live Progress Report', 372, y + 26)
+       .text(attText, 372, y + 42)
+       .fillColor(primaryColor)
+       .text(`${overallAverage}%`, 372, y + 56);
+  } else {
+    doc.fillColor(textMuted).font('Helvetica').fontSize(8)
+       .text('Overall Average:', 285, y + 10)
+       .text('Final Grade:', 285, y + 26)
+       .text('Class Position:', 285, y + 42)
+       .text('Attendance:', 285, y + 56);
+
+    doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
+       .text(`${overallAverage}%`, 370, y + 10)
+       .fillColor(darkColor).fontSize(8.5)
+       .text(gpaRating, 370, y + 26)
+       .text(rankString, 370, y + 42)
+       .font('Helvetica').fontSize(8)
+       .text(attText, 370, y + 56);
+  }
+
+  return y + boxHeight;
+}
+
+function drawBrandedRemarksAndSignatures(doc, params, y, colors) {
+  const {
+    schoolName = 'Ugbekun Schools',
+    commentary = '',
+    teacherComment = '',
+    principalComment = '',
+    resumptionDate = null,
+    nextTermFees = 'To Be Announced',
+    formTeacherName = 'Class Teacher',
+    principalName = 'The Principal',
+    teacherSignatureBuffer = null,
+    principalSignatureBuffer = null,
+    isProgressSlip = false,
+  } = params;
+
+  const { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg } = colors;
+
+  // 1. Next Term Resumption & Payment Strip (Height: 24)
+  const resumptionStr = formatResumptionDisplay(resumptionDate);
+  doc.rect(30, y, 535, 24).fill(lightBg).stroke(lightBorder);
+  doc.rect(30, y, 4, 24).fill(primaryColor);
+
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
+     .text('NEXT TERM BEGINS:', 42, y + 8);
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
+     .text(resumptionStr, 128, y + 7.5, { width: 155, lineBreak: false, ellipsis: true });
+
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
+     .text('NEXT TERM PAYMENT / FEES:', 295, y + 8);
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
+     .text(String(nextTermFees || 'To Be Announced'), 415, y + 7.5, { width: 145, lineBreak: false, ellipsis: true });
+
+  y += 30;
+
+  // 2. Dual Remarks Boxes: Class Teacher's Comment (Left) & Principal's Comment (Right)
+  const boxHeight = 62;
+  const leftBoxX = 30;
+  const rightBoxX = 303;
+  const colW = 262;
+
+  doc.rect(leftBoxX, y, colW, boxHeight).fill('#ffffff').stroke(lightBorder);
+  doc.rect(rightBoxX, y, colW, boxHeight).fill('#ffffff').stroke(lightBorder);
+
+  // Header bars inside comment boxes
+  doc.rect(leftBoxX, y, colW, 15).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
+     .text("CLASS TEACHER'S REMARK", leftBoxX + 8, y + 4);
+
+  doc.rect(rightBoxX, y, colW, 15).fill(secondaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
+     .text("PRINCIPAL'S / HEAD TEACHER'S REMARK", rightBoxX + 8, y + 4);
+
+  const resolvedTeacherRemark =
+    teacherComment ||
+    commentary ||
+    (isProgressSlip
+      ? 'Student is making steady continuous assessment progress across active subjects this term.'
+      : 'Good academic effort this term. Keep striving for excellence.');
+
+  const resolvedPrincipalRemark =
+    principalComment ||
+    'A commendable terminal performance. Continue to work diligently in the coming term.';
+
+  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8)
+     .text(`"${resolvedTeacherRemark}"`, leftBoxX + 8, y + 20, { width: colW - 16, height: 38, ellipsis: true });
+
+  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8)
+     .text(`"${resolvedPrincipalRemark}"`, rightBoxX + 8, y + 20, { width: colW - 16, height: 38, ellipsis: true });
+
+  y += boxHeight + 10;
+
+  // 3. Dual Signatures Block (Teacher Signature & Principal Signature)
+  const sigBoxHeight = 52;
+  const sigLineY = Math.min(y + 34, 738);
+
+  // Draw Teacher Signature Image if available
+  if (teacherSignatureBuffer) {
+    safeDrawPdfImage(doc, teacherSignatureBuffer, 85, sigLineY - 28, {
+      fit: [110, 26],
+      align: 'center',
+      valign: 'bottom',
+    });
+  }
+
+  // Draw Principal Signature Image if available
+  if (principalSignatureBuffer) {
+    safeDrawPdfImage(doc, principalSignatureBuffer, 385, sigLineY - 28, {
+      fit: [110, 26],
+      align: 'center',
+      valign: 'bottom',
+    });
+  }
+
+  doc.moveTo(45, sigLineY).lineTo(235, sigLineY).stroke(lightBorder);
+  doc.moveTo(345, sigLineY).lineTo(535, sigLineY).stroke(lightBorder);
+
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+     .text(String(formTeacherName || 'Class Teacher').toUpperCase(), 45, sigLineY + 3, { width: 190, align: 'center' });
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+     .text("CLASS TEACHER'S SIGNATURE", 45, sigLineY + 12, { width: 190, align: 'center' });
+
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+     .text(String(principalName || 'The Principal').toUpperCase(), 345, sigLineY + 3, { width: 190, align: 'center' });
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+     .text("PRINCIPAL'S SIGNATURE & STAMP", 345, sigLineY + 12, { width: 190, align: 'center' });
+
+  // 4. Footer
+  doc.moveTo(30, 758).lineTo(565, 758).stroke('#e2e8f0');
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+     .text(
+       `Official Branded Academic Report Card • ${schoolName} • Generated & Verified on ${new Date().toLocaleDateString('en-GB')}`,
+       30,
+       764,
+       { align: 'center', width: 535 }
+     );
+}
+
+function drawStandardReportCard(doc, params) {
+  const branding = params.schoolBranding || {};
+  const schoolName = params.schoolName || branding.schoolName || 'Ugbekun Schools';
+  const branchCode = params.branchCode || branding.branchCode || 'GEN';
+  const tagline = params.tagline || branding.tagline || '';
+  const schoolAddress = params.schoolAddress || params.address || branding.address || '';
+  const schoolPhone = params.schoolPhone || params.phone || branding.phone || '';
+  const schoolEmail = params.schoolEmail || params.email || branding.email || '';
+  const schoolWebsite = params.schoolWebsite || params.website || branding.website || '';
+  const termName = params.termName || params.currentTerm || branding.currentTerm || (params.reportCard?.[0]?.examName || 'First Term');
+
+  const {
+    studentName = 'Student',
+    registerNo = '',
+    className = '',
+    sectionName = '',
+    sessionName = branding.academicSession || '2025/2026',
+    gender = '',
+    birthday = '',
+    attendance = null,
     reportCard = [],
     overallAverage = 0,
     commentary = '',
+    teacherComment = '',
+    principalComment = '',
     rank = null,
     totalClassStudents = null,
     rankingType = 'full',
     rankingLimit = 3,
-    resumptionDate = null,
-    nextTermFees = '₦125,000',
-    formTeacherName = 'Class Teacher',
+    resumptionDate = branding.resumptionDate || null,
+    nextTermFees = branding.nextTermFees || 'To Be Announced',
+    formTeacherName = branding.classTeacherName || 'Class Teacher',
+    principalName = branding.principalName || 'The Principal',
     gradingRanges = null,
     isMidTerm = false,
     stage = 'FULL',
-    visibleStages = ['FULL'],
-  } = params
+    logoBuffer = null,
+    studentPhotoBuffer = null,
+    teacherSignatureBuffer = null,
+    principalSignatureBuffer = null,
+  } = params;
 
   const isCombinedCa = stage === 'COMBINED_CA';
   const isProgressSlip = Boolean(isMidTerm || stage === 'CA1' || stage === 'CA2' || isCombinedCa);
 
-  // Theme Colors
-  const primaryColor = '#1e3a8a'   // Royal Navy Blue
-  const secondaryColor = '#3b82f6' // Vibrant Blue
-  const darkColor = '#0f172a'      // Slate-900
-  const textMuted = '#475569'      // Slate-600
-  const lightBorder = '#e2e8f0'    // Slate-200
-  const lightBg = '#f8fafc'        // Slate-50
+  // Dynamic School Brand Colors
+  const primaryColor = sanitizeHexColor(params.primaryColor || branding.primaryColor, '#1e3a8a');
+  const secondaryColor = sanitizeHexColor(params.secondaryColor || branding.secondaryColor, '#0284c7');
+  const darkColor = '#0f172a';
+  const textMuted = '#475569';
+  const lightBorder = '#e2e8f0';
+  const lightBg = '#f8fafc';
+
+  const colors = { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg };
 
   // Compute Ranking String (only for terminal reports)
-  let rankString = '-'
+  let rankString = '-';
   if (!isProgressSlip) {
     if (rankingType === 'full' && rank && totalClassStudents) {
-      rankString = `${rank}${getOrdinalSuffix(rank)} of ${totalClassStudents}`
+      rankString = `${rank}${getOrdinalSuffix(rank)} of ${totalClassStudents}`;
     } else if (rankingType === 'topn' && rank && rankingLimit) {
       if (rank <= rankingLimit) {
-        rankString = `${rank}${getOrdinalSuffix(rank)} (Top ${rankingLimit})`
+        rankString = `${rank}${getOrdinalSuffix(rank)} (Top ${rankingLimit})`;
       } else {
-        rankString = 'Graded'
+        rankString = 'Graded';
       }
     } else if (rankingType === 'hidden') {
-      rankString = 'Hidden'
+      rankString = 'Hidden';
     }
   }
 
   // Compute GPA letter grade equivalent using active grading scale
   const gpaInfo = calculateGradeFromRanges(overallAverage, gradingRanges || undefined);
-  const gpaRating = isProgressSlip ? 'In Progress' : gpaInfo.grade;
+  const gpaRating = isProgressSlip ? 'In Progress' : `${gpaInfo.grade} (${gpaInfo.remark || 'Graded'})`;
 
-  // ─── Header Section (Y: 30 to 90) ────────────────────────────────────
-  doc.rect(30, 30, 535, 60).fill(primaryColor)
+  const reportSubtitle = isCombinedCa
+    ? 'COMBINED CONTINUOUS ASSESSMENT REPORT (CA1 + CA2)'
+    : isProgressSlip
+      ? 'MID-TERM CONTINUOUS ASSESSMENT PROGRESS REPORT'
+      : 'OFFICIAL STUDENT TERMINAL REPORT CARD';
 
-  // Left Header Text
-  doc.fillColor('#ffffff')
-     .font('Helvetica-Bold')
-     .fontSize(16)
-     .text(schoolName.toUpperCase(), 45, 42, { width: 350, align: 'left' })
+  // 1. Branded Header with Logo & School Info
+  drawBrandedReportHeader(
+    doc,
+    {
+      schoolName,
+      branchCode,
+      tagline,
+      schoolAddress,
+      schoolPhone,
+      schoolEmail,
+      schoolWebsite,
+      sessionName,
+      termName,
+      reportSubtitle,
+      logoBuffer,
+    },
+    colors
+  );
 
-  doc.font('Helvetica')
-     .fontSize(9)
-     .fillColor('#93c5fd') // Light blue
-     .text(
-       isCombinedCa
-         ? `COMBINED CONTINUOUS ASSESSMENT PROGRESS REPORT (CA1 + CA2) • BRANCH: ${branchCode}`
-         : (isProgressSlip
-           ? `MID-TERM CONTINUOUS ASSESSMENT PROGRESS SLIP • BRANCH: ${branchCode}`
-           : `OFFICIAL TERM REPORT CARD • BRANCH: ${branchCode}`),
-       45,
-       64
-     )
+  // 2. Student Profile Info & Photo Block (Y: 100 to 172)
+  let y = drawStudentBioWithPhoto(
+    doc,
+    {
+      studentName,
+      registerNo,
+      className,
+      sectionName,
+      gender,
+      birthday,
+      attendance,
+      overallAverage,
+      gpaRating,
+      rankString,
+      isProgressSlip,
+      stage,
+      studentPhotoBuffer,
+    },
+    100,
+    colors
+  );
 
-  // Right Header Text (Exam & Session)
-  const examName = isCombinedCa
-    ? 'Combined CA Evaluation (Out of 40)'
-    : (isProgressSlip
-      ? (stage === 'CA2' ? 'CA 2 Mid-Term Evaluation' : 'CA 1 Mid-Term Evaluation')
-      : (reportCard[0]?.examName || 'Term Evaluation'))
-  doc.fillColor('#ffffff')
-     .font('Helvetica-Bold')
-     .fontSize(12)
-     .text(examName.toUpperCase(), 350, 42, { width: 200, align: 'right' })
+  y += 10;
 
-  doc.font('Helvetica')
-     .fontSize(9)
-     .fillColor('#e2e8f0')
-     .text(`Session: ${sessionName || 'Active'}`, 350, 60, { width: 200, align: 'right' })
-     .text(`Date printed: ${new Date().toLocaleDateString()}`, 350, 72, { width: 200, align: 'right' })
-
-  let y = 105
-
-  // ─── Student Profile Info Block (Y: 105 to 175) ─────────────────────
-  doc.rect(30, y, 535, 70).stroke(lightBorder)
-
-  // Left Column
-  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-     .text('Student Name:', 45, y + 12)
-     .text('Registration No:', 45, y + 30)
-     .text('Classroom Room:', 45, y + 48)
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9.5)
-     .text(studentName, 130, y + 12)
-     .text(registerNo || 'Pending', 130, y + 30)
-     .text(`${className} (${sectionName || 'Main'})`, 130, y + 48)
-
-  // Right Column
-  if (isProgressSlip) {
-    doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-       .text('Assessment Stage:', 330, y + 12)
-       .text('Report Type:', 330, y + 30)
-       .text('Evaluation Status:', 330, y + 48)
-
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9.5)
-       .text(stage === 'CA2' ? 'Continuous Assessment 2' : 'Continuous Assessment 1', 430, y + 12)
-       .text('Progress Evaluation Slip', 430, y + 30)
-       .text('Released to Parent', 430, y + 48)
-  } else {
-    doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-       .text('Overall Average:', 330, y + 12)
-       .text('GPA Grade:', 330, y + 30)
-       .text('Class Ranking:', 330, y + 48)
-
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9.5)
-       .text(`${overallAverage}%`, 420, y + 12)
-       .text(gpaRating, 420, y + 30)
-       .text(rankString, 420, y + 48)
-  }
-
-  y += 85
-
-  // ─── Academic Scoreboard Table (Y: 190 onwards) ─────────────────────
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(11).text(
-    isProgressSlip ? 'CONTINUOUS ASSESSMENT PROGRESS SCORES' : 'ACADEMIC SCORE BOARD',
+  // 3. Academic Scoreboard Table
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text(
+    isProgressSlip ? 'CONTINUOUS ASSESSMENT PROGRESS SCORES' : 'COGNITIVE ACADEMIC PERFORMANCE',
     30,
     y
-  )
-  y += 15
+  );
+  y += 13;
 
   // Table Header Row
-  doc.rect(30, y, 535, 20).fill(primaryColor)
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
+  doc.rect(30, y, 535, 19).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8);
 
   if (isCombinedCa) {
-    doc.text('SUBJECT CODE', 40, y + 6, { width: 75 })
-       .text('SUBJECT NAME', 115, y + 6, { width: 145 })
-       .text('CA 1 (20)', 265, y + 6, { width: 45, align: 'right' })
-       .text('CA 2 (20)', 315, y + 6, { width: 45, align: 'right' })
-       .text('TOTAL CA (40)', 365, y + 6, { width: 65, align: 'right' })
-       .text('CLASS AVG', 435, y + 6, { width: 60, align: 'right' })
-       .text('GRADE', 500, y + 6, { width: 55, align: 'center' })
+    doc.text('CODE', 38, y + 5, { width: 65 })
+       .text('SUBJECT', 105, y + 5, { width: 155 })
+       .text('CA 1 (20)', 265, y + 5, { width: 45, align: 'right' })
+       .text('CA 2 (20)', 315, y + 5, { width: 45, align: 'right' })
+       .text('TOTAL (40)', 365, y + 5, { width: 65, align: 'right' })
+       .text('CLASS AVG', 435, y + 5, { width: 60, align: 'right' })
+       .text('GRADE', 500, y + 5, { width: 55, align: 'center' });
   } else if (isProgressSlip) {
-    doc.text('SUBJECT CODE', 40, y + 6, { width: 85 })
-       .text('SUBJECT NAME', 130, y + 6, { width: 200 })
-       .text('CA SCORE', 340, y + 6, { width: 65, align: 'right' })
-       .text('CLASS AVG', 415, y + 6, { width: 65, align: 'right' })
-       .text('STATUS', 490, y + 6, { width: 65, align: 'center' })
+    doc.text('CODE', 38, y + 5, { width: 75 })
+       .text('SUBJECT', 120, y + 5, { width: 210 })
+       .text('CA SCORE', 340, y + 5, { width: 65, align: 'right' })
+       .text('CLASS AVG', 415, y + 5, { width: 65, align: 'right' })
+       .text('STATUS', 490, y + 5, { width: 65, align: 'center' });
   } else {
-    doc.text('SUBJECT CODE', 40, y + 6, { width: 75 })
-       .text('SUBJECT NAME', 115, y + 6, { width: 160 })
-       .text('TEST (40)', 280, y + 6, { width: 45, align: 'right' })
-       .text('EXAM (60)', 330, y + 6, { width: 45, align: 'right' })
-       .text('TOTAL (100)', 380, y + 6, { width: 50, align: 'right' })
-       .text('CLASS AVG', 435, y + 6, { width: 60, align: 'right' })
-       .text('GRADE', 500, y + 6, { width: 55, align: 'center' })
+    doc.text('CODE', 38, y + 5, { width: 62 })
+       .text('SUBJECT', 102, y + 5, { width: 155 })
+       .text('CA (40)', 260, y + 5, { width: 45, align: 'right' })
+       .text('EXAM (60)', 310, y + 5, { width: 48, align: 'right' })
+       .text('TOTAL (100)', 362, y + 5, { width: 55, align: 'right' })
+       .text('CLASS AVG', 420, y + 5, { width: 52, align: 'right' })
+       .text('GRADE', 475, y + 5, { width: 40, align: 'center' })
+       .text('REMARK', 516, y + 5, { width: 45, align: 'center' });
   }
-  
-  y += 20
+
+  y += 19;
 
   // Table Data Rows
-  const rowHeight = 20
-  const maxRows = 12
-  const itemsToRender = reportCard.slice(0, maxRows)
+  const maxRows = 14;
+  const itemsToRender = reportCard.slice(0, maxRows);
+  const rowHeight = itemsToRender.length > 11 ? 17 : 19;
 
   itemsToRender.forEach((row, idx) => {
-    // Alternate row backgrounds
     if (idx % 2 === 0) {
-      doc.rect(30, y, 535, rowHeight).fill(lightBg)
+      doc.rect(30, y, 535, rowHeight).fill(lightBg);
     } else {
-      doc.rect(30, y, 535, rowHeight).fill('#ffffff')
+      doc.rect(30, y, 535, rowHeight).fill('#ffffff');
     }
+    doc.rect(30, y, 535, rowHeight).stroke(lightBorder);
 
-    // Draw row borders
-    doc.rect(30, y, 535, rowHeight).stroke(lightBorder)
+    const textOffsetY = y + Math.max(4, Math.floor((rowHeight - 9) / 2));
 
     if (isCombinedCa) {
-      const ca1Val = row.ca1Score !== undefined && row.ca1Score !== null ? String(row.ca1Score) : (row.cbtMark ? String(row.cbtMark) : '-')
-      const ca2Val = row.ca2Score !== undefined && row.ca2Score !== null ? String(row.ca2Score) : '-'
-      const totalVal = row.stageScore !== undefined && row.stageScore !== null ? String(row.stageScore) : (row.mark !== null ? String(row.mark) : '-')
-      
-      let gradeLetter = '-'
+      const ca1Val = row.ca1Score !== undefined && row.ca1Score !== null ? String(row.ca1Score) : (row.cbtMark ? String(row.cbtMark) : '-');
+      const ca2Val = row.ca2Score !== undefined && row.ca2Score !== null ? String(row.ca2Score) : '-';
+      const totalVal = row.stageScore !== undefined && row.stageScore !== null ? String(row.stageScore) : (row.mark !== null ? String(row.mark) : '-');
+
+      let gradeLetter = '-';
       if (!row.absent && totalVal !== '-') {
-        const tot = parseFloat(totalVal)
-        const pct = (tot / 40) * 100
-        const res = calculateGradeFromRanges(pct, gradingRanges || undefined)
-        gradeLetter = res.grade
+        const tot = parseFloat(totalVal);
+        const pct = (tot / 40) * 100;
+        const res = calculateGradeFromRanges(pct, gradingRanges || undefined);
+        gradeLetter = res.grade;
       }
 
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-         .text(row.subjectCode || '-', 40, y + 6, { width: 75 })
-
-      doc.font('Helvetica').fontSize(8.5)
-         .text(row.subjectName || '-', 115, y + 6, { width: 145 })
-
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+         .text(row.subjectCode || '-', 38, textOffsetY, { width: 65, lineBreak: false });
       doc.font('Helvetica').fontSize(8)
-         .text(row.absent ? '-' : ca1Val, 265, y + 6, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : ca2Val, 315, y + 6, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : totalVal, 365, y + 6, { width: 65, align: 'right' })
-         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 435, y + 6, { width: 60, align: 'right' })
-
-      doc.font('Helvetica-Bold').fontSize(8)
-         .text(row.absent ? 'ABS' : gradeLetter, 500, y + 6, { width: 55, align: 'center' })
+         .text(row.subjectName || '-', 105, textOffsetY, { width: 155, lineBreak: false, ellipsis: true });
+      doc.font('Helvetica').fontSize(8)
+         .text(row.absent ? '-' : ca1Val, 265, textOffsetY, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : ca2Val, 315, textOffsetY, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : totalVal, 365, textOffsetY, { width: 65, align: 'right' })
+         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 435, textOffsetY, { width: 60, align: 'right' });
+      doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
+         .text(row.absent ? 'ABS' : gradeLetter, 500, textOffsetY, { width: 55, align: 'center' });
     } else if (isProgressSlip) {
-      const caScore = row.cbtMark || row.ca1Score || row.ca2Score || (row.testScore ? String(row.testScore) : '-')
-      const statusText = row.absent ? 'ABSENT' : (caScore !== '-' ? 'Completed' : 'Pending')
+      const caScore = row.cbtMark || row.ca1Score || row.ca2Score || (row.testScore ? String(row.testScore) : '-');
+      const statusText = row.absent ? 'ABSENT' : (caScore !== '-' ? 'Completed' : 'Pending');
 
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-         .text(row.subjectCode || '-', 40, y + 6, { width: 85 })
-
-      doc.font('Helvetica').fontSize(8.5)
-         .text(row.subjectName || '-', 130, y + 6, { width: 200 })
-
-      doc.font('Helvetica-Bold').fontSize(8)
-         .text(row.absent ? '-' : String(caScore), 340, y + 6, { width: 65, align: 'right' })
-
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+         .text(row.subjectCode || '-', 38, textOffsetY, { width: 75, lineBreak: false });
       doc.font('Helvetica').fontSize(8)
-         .text(row.absent ? '-' : (row.classAverage !== undefined ? `${row.classAverage}` : '-'), 415, y + 6, { width: 65, align: 'right' })
-
+         .text(row.subjectName || '-', 120, textOffsetY, { width: 210, lineBreak: false, ellipsis: true });
       doc.font('Helvetica-Bold').fontSize(8)
-         .text(statusText, 490, y + 6, { width: 65, align: 'center' })
+         .text(row.absent ? '-' : String(caScore), 340, textOffsetY, { width: 65, align: 'right' });
+      doc.font('Helvetica').fontSize(8)
+         .text(row.absent ? '-' : (row.classAverage !== undefined ? `${row.classAverage}` : '-'), 415, textOffsetY, { width: 65, align: 'right' });
+      doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
+         .text(statusText, 490, textOffsetY, { width: 65, align: 'center' });
     } else {
-      const testScore = row.cbtMark !== undefined && row.cbtMark !== null ? String(row.cbtMark) : '-'
-      const examScore = row.theoryMark !== undefined && row.theoryMark !== null ? String(row.theoryMark) : '-'
-      const totalScore = row.mark !== null ? String(row.mark) : '-'
+      const testScore =
+        row.cbtMark !== undefined && row.cbtMark !== null
+          ? String(row.cbtMark)
+          : row.testScore !== undefined && row.testScore !== null
+            ? String(row.testScore)
+            : '-';
+      const examScore =
+        row.theoryMark !== undefined && row.theoryMark !== null
+          ? String(row.theoryMark)
+          : row.examScore !== undefined && row.examScore !== null
+            ? String(row.examScore)
+            : '-';
+      const totalScore =
+        row.mark !== undefined && row.mark !== null
+          ? String(row.mark)
+          : row.totalScore !== undefined && row.totalScore !== null
+            ? String(row.totalScore)
+            : '-';
 
-      // Grade calculation based on total score using school's active grading scale
-      let gradeLetter = '-'
-      if (!row.absent && row.mark !== null && !isNaN(parseFloat(row.mark))) {
-        const tot = parseFloat(row.mark)
-        const res = calculateGradeFromRanges(tot, gradingRanges || undefined)
-        gradeLetter = res.grade
+      let gradeLetter = row.grade || '-';
+      let gradeRemark = row.remark || '-';
+      if (!row.absent && totalScore !== '-' && !isNaN(parseFloat(totalScore))) {
+        const tot = parseFloat(totalScore);
+        const res = calculateGradeFromRanges(tot, gradingRanges || undefined);
+        gradeLetter = res.grade;
+        gradeRemark = res.remark || gradeLetter;
       }
 
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-         .text(row.subjectCode || '-', 40, y + 6, { width: 75 })
-
-      doc.font('Helvetica').fontSize(8.5)
-         .text(row.subjectName || '-', 115, y + 6, { width: 160 })
-
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+         .text(row.subjectCode || '-', 38, textOffsetY, { width: 62, lineBreak: false });
       doc.font('Helvetica').fontSize(8)
-         .text(row.absent ? '-' : testScore, 280, y + 6, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : examScore, 330, y + 6, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : totalScore, 380, y + 6, { width: 50, align: 'right' })
-         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 435, y + 6, { width: 60, align: 'right' })
-
-      doc.font('Helvetica-Bold').fontSize(8)
-         .text(row.absent ? 'ABS' : gradeLetter, 500, y + 6, { width: 55, align: 'center' })
+         .text(row.subjectName || '-', 102, textOffsetY, { width: 155, lineBreak: false, ellipsis: true });
+      doc.font('Helvetica').fontSize(8)
+         .text(row.absent ? '-' : testScore, 260, textOffsetY, { width: 45, align: 'right' })
+         .text(row.absent ? '-' : examScore, 310, textOffsetY, { width: 48, align: 'right' })
+         .font('Helvetica-Bold')
+         .text(row.absent ? '-' : totalScore, 362, textOffsetY, { width: 55, align: 'right' })
+         .font('Helvetica')
+         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 420, textOffsetY, { width: 52, align: 'right' });
+      doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
+         .text(row.absent ? 'ABS' : gradeLetter, 475, textOffsetY, { width: 40, align: 'center' });
+      doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+         .text(row.absent ? 'Absent' : gradeRemark, 516, textOffsetY, { width: 45, align: 'center', lineBreak: false, ellipsis: true });
     }
 
-    y += rowHeight
-  })
+    y += rowHeight;
+  });
 
-  // Add empty rows if subjects are few, to keep layout structure uniform
   if (itemsToRender.length < 5) {
-    const fillers = 5 - itemsToRender.length
+    const fillers = 5 - itemsToRender.length;
     for (let i = 0; i < fillers; i++) {
-      doc.rect(30, y, 535, rowHeight).stroke(lightBorder)
-      y += rowHeight
+      doc.rect(30, y, 535, rowHeight).stroke(lightBorder);
+      y += rowHeight;
     }
   }
 
-  y += 15
+  y += 10;
 
-  // ─── Summary & Commentary Box ───────────────────────────────────────
-  const remarksHeight = 90
-  doc.rect(30, y, 320, remarksHeight).stroke(lightBorder)
-  doc.rect(360, y, 205, remarksHeight).stroke(lightBorder)
-
-  // Left: Commentary Title & Text
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-     .text(isProgressSlip ? 'CLASS TEACHER MID-TERM OBSERVATION' : 'CLASS TEACHER HOLISTIC COMMENTARY', 40, y + 10)
-  
-  const remarkText = commentary || (isProgressSlip 
-    ? 'Student is making steady continuous assessment progress across active subjects this term.' 
-    : 'No performance remarks or behavioral feedback has been recorded for this term yet.')
-  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8.5)
-     .text(`"${remarkText}"`, 40, y + 26, { width: 300, height: 55, ellipsis: true })
-
-  // Right: Term Overview & Info
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-     .text('TERM OVERVIEW', 370, y + 10)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('Next Term Resumption:', 370, y + 25)
-  
-  const resumptionStr = resumptionDate ? new Date(resumptionDate).toLocaleDateString(undefined, { dateStyle: 'medium' }) : 'To Be Announced'
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(resumptionStr, 370, y + 36)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('Next Term Fees:', 370, y + 48)
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(nextTermFees || '₦125,000', 370, y + 58)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('Class Teacher:', 370, y + 69)
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(formTeacherName, 370, y + 78)
-
-  y += remarksHeight + 20
-
-  // ─── Signature Block ────────────────────────────────────────────────
-  const sigY = 700
-  doc.moveTo(40, sigY).lineTo(220, sigY).stroke(lightBorder)
-  doc.moveTo(375, sigY).lineTo(555, sigY).stroke(lightBorder)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('CLASS TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
-     .text('SCHOOL PRINCIPAL SIGNATURE', 375, sigY + 5, { width: 180, align: 'center' })
-
-  // ─── Footer ─────────────────────────────────────────────────────────
-  doc.moveTo(30, 755).lineTo(565, 755).stroke('#e2e8f0')
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
-     .text('This is an official computer-generated student evaluation record compiled on the Ugbekun 2.0 Portal.', 30, 765, { align: 'center', width: 535 })
-     .text(`© ${new Date().getFullYear()} ${schoolName}. All rights reserved.`, 30, 775, { align: 'center', width: 535 })
+  // 4. Next Term Resumption, Fees, Dual Comments & Signatures
+  drawBrandedRemarksAndSignatures(
+    doc,
+    {
+      schoolName,
+      commentary,
+      teacherComment,
+      principalComment,
+      resumptionDate,
+      nextTermFees,
+      formTeacherName,
+      principalName,
+      teacherSignatureBuffer,
+      principalSignatureBuffer,
+      isProgressSlip,
+    },
+    y,
+    colors
+  );
 }
 
 function drawMontessoriReportCard(doc, params) {
+  const branding = params.schoolBranding || {};
+  const schoolName = params.schoolName || branding.schoolName || 'Ugbekun Schools';
+  const branchCode = params.branchCode || branding.branchCode || 'GEN';
+  const tagline = params.tagline || branding.tagline || '';
+  const schoolAddress = params.schoolAddress || params.address || branding.address || '';
+  const schoolPhone = params.schoolPhone || params.phone || branding.phone || '';
+  const schoolEmail = params.schoolEmail || params.email || branding.email || '';
+  const schoolWebsite = params.schoolWebsite || params.website || branding.website || '';
+
   const {
-    schoolName = 'Ugbekun Schools',
-    branchCode = 'GEN',
     studentName = 'Pupil',
     registerNo = '',
     className = '',
     sectionName = '',
-    sessionName = '',
-    examName = 'Term Evaluation',
+    sessionName = branding.academicSession || '2025/2026',
+    termName = branding.currentTerm || params.examName || 'Term Evaluation',
+    gender = '',
+    birthday = '',
+    attendance = null,
     assessment = {},
-    resumptionDate = null,
-    formTeacherName = 'Class Teacher'
-  } = params
+    commentary = '',
+    teacherComment = '',
+    principalComment = '',
+    resumptionDate = branding.resumptionDate || null,
+    nextTermFees = branding.nextTermFees || 'To Be Announced',
+    formTeacherName = branding.classTeacherName || 'Class Teacher',
+    principalName = branding.principalName || 'The Principal',
+    logoBuffer = null,
+    studentPhotoBuffer = null,
+    teacherSignatureBuffer = null,
+    principalSignatureBuffer = null,
+  } = params;
 
-  // Theme Colors (Montessori / Early Childhood Theme: Emerald and Indigo)
-  const primaryColor = '#059669'   // Emerald Green
-  const secondaryColor = '#4f46e5' // Indigo
-  const darkColor = '#0f172a'      // Slate-900
-  const textMuted = '#475569'      // Slate-600
-  const lightBorder = '#e2e8f0'    // Slate-200
-  const lightBg = '#f8fafc'        // Slate-50
+  const primaryColor = sanitizeHexColor(params.primaryColor || branding.primaryColor, '#059669');
+  const secondaryColor = sanitizeHexColor(params.secondaryColor || branding.secondaryColor, '#4f46e5');
+  const darkColor = '#0f172a';
+  const textMuted = '#475569';
+  const lightBorder = '#e2e8f0';
+  const lightBg = '#f8fafc';
+  const colors = { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg };
 
-  // Helper function to draw rubric progress pill indicators
   const drawRatingPills = (doc, x, y, width, activeRating) => {
-    const rubrics = ['EM', 'DV', 'AC', 'MS']
-    const pillWidth = (width - 15) / 4
-    const pillHeight = 15
+    const rubrics = ['EM', 'DV', 'AC', 'MS'];
+    const pillWidth = (width - 15) / 4;
+    const pillHeight = 14;
 
     rubrics.forEach((code, idx) => {
-      const rx = x + idx * (pillWidth + 5)
-      const isActive = activeRating === code
+      const rx = x + idx * (pillWidth + 5);
+      const isActive = activeRating === code;
 
-      doc.save()
+      doc.save();
       if (isActive) {
-        // Filled active badge
-        doc.roundedRect(rx, y, pillWidth, pillHeight, 3).fill(primaryColor)
-        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
-           .text(code, rx, y + 4, { width: pillWidth, align: 'center' })
+        doc.roundedRect(rx, y, pillWidth, pillHeight, 3).fill(primaryColor);
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
+           .text(code, rx, y + 3.5, { width: pillWidth, align: 'center' });
       } else {
-        // Muted hollow badge
-        doc.roundedRect(rx, y, pillWidth, pillHeight, 3).stroke(lightBorder)
-        doc.fillColor('#94a3b8').font('Helvetica').fontSize(7.5)
-           .text(code, rx, y + 4, { width: pillWidth, align: 'center' })
+        doc.roundedRect(rx, y, pillWidth, pillHeight, 3).stroke(lightBorder);
+        doc.fillColor('#94a3b8').font('Helvetica').fontSize(7)
+           .text(code, rx, y + 3.5, { width: pillWidth, align: 'center' });
       }
-      doc.restore()
-    })
-  }
+      doc.restore();
+    });
+  };
 
-  // ─── Header Section (Y: 30 to 90) ────────────────────────────────────
-  doc.rect(30, 30, 535, 60).fill(primaryColor)
+  drawBrandedReportHeader(
+    doc,
+    {
+      schoolName,
+      branchCode,
+      tagline,
+      schoolAddress,
+      schoolPhone,
+      schoolEmail,
+      schoolWebsite,
+      sessionName,
+      termName,
+      reportSubtitle: 'MONTESSORI & EARLY YEARS DEVELOPMENTAL REPORT',
+      logoBuffer,
+    },
+    colors
+  );
 
-  // Left Header Text
-  doc.fillColor('#ffffff')
-     .font('Helvetica-Bold')
-     .fontSize(16)
-     .text(schoolName.toUpperCase(), 45, 42, { width: 350, align: 'left' })
+  let y = drawStudentBioWithPhoto(
+    doc,
+    {
+      studentName,
+      registerNo,
+      className,
+      sectionName,
+      gender,
+      birthday,
+      attendance,
+      overallAverage: 100,
+      gpaRating: 'Montessori Matrix',
+      rankString: 'Developmental',
+      isProgressSlip: false,
+      studentPhotoBuffer,
+    },
+    100,
+    colors
+  );
 
-  doc.font('Helvetica')
-     .fontSize(9)
-     .fillColor('#d1fae5') // Light emerald green
-     .text(`MONTESSORI & EARLY YEARS EVALUATION • BRANCH: ${branchCode}`, 45, 64)
+  y += 8;
 
-  // Right Header Text (Exam & Session)
-  doc.fillColor('#ffffff')
-     .font('Helvetica-Bold')
-     .fontSize(12)
-     .text(examName.toUpperCase(), 350, 42, { width: 200, align: 'right' })
-
-  doc.font('Helvetica')
-     .fontSize(9)
-     .fillColor('#f0fdf4')
-     .text(`Session: ${sessionName || 'Active'}`, 350, 60, { width: 200, align: 'right' })
-     .text(`Date printed: ${new Date().toLocaleDateString()}`, 350, 72, { width: 200, align: 'right' })
-
-  let y = 105
-
-  // ─── Student Profile Info Block (Y: 105 to 165) ─────────────────────
-  doc.rect(30, y, 535, 60).stroke(lightBorder)
-
-  // Left Column
-  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-     .text('Pupil Name:', 45, y + 14)
-     .text('Registration No:', 45, y + 34)
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(10)
-     .text(studentName, 130, y + 14)
-     .text(registerNo || 'Pending', 130, y + 34)
-
-  // Right Column
-  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-     .text('Class Stage:', 330, y + 14)
-     .text('Assessment Track:', 330, y + 34)
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(10)
-     .text(`${className} (${sectionName || 'Main'})`, 420, y + 14)
-     .text('Montessori Matrix', 420, y + 34)
-
-  y += 75
-
-  // ─── Rubric Legend (Y: 180 to 210) ──────────────────────────────────
-  doc.rect(30, y, 535, 25).fill(lightBg).stroke(lightBorder)
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-     .text('RATING KEY:  ', 40, y + 8, { continued: true })
+  // Rubric Legend
+  doc.rect(30, y, 535, 20).fill(lightBg).stroke(lightBorder);
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+     .text('RATING KEY:  ', 40, y + 6, { continued: true })
      .font('Helvetica').fillColor(textMuted)
-     .text('[EM] Emerging (1)     [DV] Developing (2)     [AC] Achieved (3)     [MS] Mastered (4)', { align: 'left' })
+     .text('[EM] Emerging (1)     [DV] Developing (2)     [AC] Achieved (3)     [MS] Mastered (4)', { align: 'left' });
 
-  y += 35
+  y += 28;
 
-  // ─── Domain 1: Psychomotor Skills (Y: 215 to 370) ───────────────────
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(11).text('1. PSYCHOMOTOR DEVELOPMENT', 30, y)
-  y += 15
+  // Domain 1: Psychomotor Skills
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text('1. PSYCHOMOTOR DEVELOPMENT', 30, y);
+  y += 13;
 
-  // Table Header
-  doc.rect(30, y, 535, 20).fill(primaryColor)
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
-     .text('DEVELOPMENTAL TRAIT', 45, y + 6, { width: 280 })
-     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 6, { width: 210, align: 'center' })
-  y += 20
+  doc.rect(30, y, 535, 18).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
+     .text('DEVELOPMENTAL TRAIT', 45, y + 5, { width: 280 })
+     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 5, { width: 210, align: 'center' });
+  y += 18;
 
   const psychomotorTraits = [
     { label: 'Writing Mastery & Pencil Grip', key: 'writingMastery' },
     { label: 'Drawing & Spatial Shape Capability', key: 'drawingCapability' },
     { label: 'Physical Balance & Coordination', key: 'physicalCoordination' },
-    { label: 'Fine & Gross Motor Skill Progression', key: 'motorSkillProgression' }
-  ]
+    { label: 'Fine & Gross Motor Skill Progression', key: 'motorSkillProgression' },
+  ];
 
   psychomotorTraits.forEach((trait, idx) => {
-    if (idx % 2 === 0) doc.rect(30, y, 535, 24).fill(lightBg)
-    else doc.rect(30, y, 535, 24).fill('#ffffff')
-    doc.rect(30, y, 535, 24).stroke(lightBorder)
+    if (idx % 2 === 0) doc.rect(30, y, 535, 21).fill(lightBg);
+    else doc.rect(30, y, 535, 21).fill('#ffffff');
+    doc.rect(30, y, 535, 21).stroke(lightBorder);
 
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
-       .text(trait.label, 45, y + 7, { width: 280 })
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+       .text(trait.label, 45, y + 6, { width: 280 });
 
-    const val = assessment[trait.key] || 'AC'
-    drawRatingPills(doc, 345, y + 4.5, 205, val)
+    const val = assessment[trait.key] || 'AC';
+    drawRatingPills(doc, 345, y + 3.5, 205, val);
+    y += 21;
+  });
 
-    y += 24
-  })
+  y += 10;
 
-  y += 15
+  // Domain 2: Affective & Behavioral Domain
+  doc.fillColor(secondaryColor).font('Helvetica-Bold').fontSize(10).text('2. AFFECTIVE & SOCIAL BEHAVIOR', 30, y);
+  y += 13;
 
-  // ─── Domain 2: Affective & Behavioral Domain (Y: 385 to 540) ─────────
-  doc.fillColor(secondaryColor).font('Helvetica-Bold').fontSize(11).text('2. AFFECTIVE & SOCIAL BEHAVIOR', 30, y)
-  y += 15
-
-  // Table Header
-  doc.rect(30, y, 535, 20).fill(secondaryColor)
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
-     .text('BEHAVIORAL ATTRIBUTE', 45, y + 6, { width: 280 })
-     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 6, { width: 210, align: 'center' })
-  y += 20
+  doc.rect(30, y, 535, 18).fill(secondaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
+     .text('BEHAVIORAL ATTRIBUTE', 45, y + 5, { width: 280 })
+     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 5, { width: 210, align: 'center' });
+  y += 18;
 
   const affectiveTraits = [
     { label: 'General Punctuality & Attendance', key: 'generalPunctuality' },
     { label: 'Peer Respect & Social Courtesy', key: 'peerRespect' },
     { label: 'Aesthetic Neatness & Material Organization', key: 'aestheticNeatness' },
-    { label: 'Active Group Participation & Curiosity', key: 'activeGroupParticipation' }
-  ]
+    { label: 'Active Group Participation & Curiosity', key: 'activeGroupParticipation' },
+  ];
 
   affectiveTraits.forEach((trait, idx) => {
-    if (idx % 2 === 0) doc.rect(30, y, 535, 24).fill(lightBg)
-    else doc.rect(30, y, 535, 24).fill('#ffffff')
-    doc.rect(30, y, 535, 24).stroke(lightBorder)
+    if (idx % 2 === 0) doc.rect(30, y, 535, 21).fill(lightBg);
+    else doc.rect(30, y, 535, 21).fill('#ffffff');
+    doc.rect(30, y, 535, 21).stroke(lightBorder);
 
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
-       .text(trait.label, 45, y + 7, { width: 280 })
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+       .text(trait.label, 45, y + 6, { width: 280 });
 
-    const val = assessment[trait.key] || 'AC'
-    drawRatingPills(doc, 345, y + 4.5, 205, val)
+    const val = assessment[trait.key] || 'AC';
+    drawRatingPills(doc, 345, y + 3.5, 205, val);
+    y += 21;
+  });
 
-    y += 24
-  })
+  y += 12;
 
-  y += 15
-
-  // ─── Summary & Narrative Box (Y: 555 to 665) ─────────────────────────
-  const remarksHeight = 85
-  doc.rect(30, y, 320, remarksHeight).stroke(lightBorder)
-  doc.rect(360, y, 205, remarksHeight).stroke(lightBorder)
-
-  // Left: Teacher Narrative Feedback
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-     .text('EARLY YEARS TEACHER NARRATIVE FEEDBACK', 40, y + 10)
-  
-  const remarkText = assessment.narrativeComment || 'Pupil displays positive developmental milestones, social adjustment, and active participation in class activities.'
-  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8.5)
-     .text(`"${remarkText}"`, 40, y + 26, { width: 300, height: 50, ellipsis: true })
-
-  // Right: Next Term Resumption & Facilitator Info
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-     .text('TERM OVERVIEW', 370, y + 10)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8.5)
-     .text('Next Term Resumption:', 370, y + 26)
-  
-  const resumptionStr = resumptionDate ? new Date(resumptionDate).toLocaleDateString(undefined, { dateStyle: 'medium' }) : 'To Be Announced'
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(resumptionStr, 370, y + 38)
-
-  doc.fillColor(textMuted).font('Helvetica')
-     .text('Early Years Lead:', 370, y + 54)
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(formTeacherName, 370, y + 66)
-
-  y += remarksHeight + 20
-
-  // ─── Signature Block ────────────────────────────────────────────────
-  const sigY = 710
-  doc.moveTo(40, sigY).lineTo(220, sigY).stroke(lightBorder)
-  doc.moveTo(375, sigY).lineTo(555, sigY).stroke(lightBorder)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('CLASS TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
-     .text('SCHOOL PRINCIPAL SIGNATURE', 375, sigY + 5, { width: 180, align: 'center' })
-
-  // ─── Footer ─────────────────────────────────────────────────────────
-  doc.moveTo(30, 755).lineTo(565, 755).stroke('#e2e8f0')
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
-     .text('This is an official computer-generated student narrative evaluation compiled on the Ugbekun 2.0 Portal.', 30, 765, { align: 'center', width: 535 })
-     .text(`© ${new Date().getFullYear()} ${schoolName}. All rights reserved.`, 30, 775, { align: 'center', width: 535 })
+  drawBrandedRemarksAndSignatures(
+    doc,
+    {
+      schoolName,
+      commentary: assessment.narrativeComment || commentary,
+      teacherComment: teacherComment || assessment.narrativeComment || commentary,
+      principalComment,
+      resumptionDate,
+      nextTermFees,
+      formTeacherName,
+      principalName,
+      teacherSignatureBuffer,
+      principalSignatureBuffer,
+      isProgressSlip: false,
+    },
+    y,
+    colors
+  );
 }
 
 function drawCommentBasedReportCard(doc, params) {
+  const branding = params.schoolBranding || {};
+  const schoolName = params.schoolName || branding.schoolName || 'Ugbekun Schools';
+  const branchCode = params.branchCode || branding.branchCode || 'GEN';
+  const tagline = params.tagline || branding.tagline || '';
+  const schoolAddress = params.schoolAddress || params.address || branding.address || '';
+  const schoolPhone = params.schoolPhone || params.phone || branding.phone || '';
+  const schoolEmail = params.schoolEmail || params.email || branding.email || '';
+  const schoolWebsite = params.schoolWebsite || params.website || branding.website || '';
+
   const {
-    schoolName = 'Ugbekun Schools',
-    branchCode = 'GEN',
     studentName = 'Pupil',
     registerNo = '',
     className = '',
     sectionName = '',
-    sessionName = '',
-    examName = 'Developmental Evaluation',
+    sessionName = branding.academicSession || '2025/2026',
+    termName = branding.currentTerm || params.examName || 'Developmental Evaluation',
+    gender = '',
+    birthday = '',
+    attendance = null,
     subjectComments = [],
     teacherComment = '',
     principalComment = '',
-    resumptionDate = null,
-    nextTermFees = '₦125,000',
-    formTeacherName = 'Class Teacher',
-  } = params
+    resumptionDate = branding.resumptionDate || null,
+    nextTermFees = branding.nextTermFees || 'To Be Announced',
+    formTeacherName = branding.classTeacherName || 'Class Teacher',
+    principalName = branding.principalName || 'The Principal',
+    logoBuffer = null,
+    studentPhotoBuffer = null,
+    teacherSignatureBuffer = null,
+    principalSignatureBuffer = null,
+  } = params;
 
-  const primaryColor = '#0d9488'   // Teal-600
-  const darkColor = '#0f172a'      // Slate-900
-  const textMuted = '#475569'      // Slate-600
-  const lightBorder = '#e2e8f0'    // Slate-200
-  const lightBg = '#f8fafc'        // Slate-50
+  const primaryColor = sanitizeHexColor(params.primaryColor || branding.primaryColor, '#0d9488');
+  const secondaryColor = sanitizeHexColor(params.secondaryColor || branding.secondaryColor, '#0284c7');
+  const darkColor = '#0f172a';
+  const textMuted = '#475569';
+  const lightBorder = '#e2e8f0';
+  const lightBg = '#f8fafc';
+  const colors = { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg };
 
-  // 1. Header (Y: 30 to 90)
-  doc.rect(30, 30, 535, 60).fill(primaryColor)
+  drawBrandedReportHeader(
+    doc,
+    {
+      schoolName,
+      branchCode,
+      tagline,
+      schoolAddress,
+      schoolPhone,
+      schoolEmail,
+      schoolWebsite,
+      sessionName,
+      termName,
+      reportSubtitle: 'EARLY YEARS & MONTESSORI DEVELOPMENTAL REPORT',
+      logoBuffer,
+    },
+    colors
+  );
 
-  doc.fillColor('#ffffff')
-     .font('Helvetica-Bold')
-     .fontSize(16)
-     .text(schoolName.toUpperCase(), 45, 42, { width: 350, align: 'left' })
+  let y = drawStudentBioWithPhoto(
+    doc,
+    {
+      studentName,
+      registerNo,
+      className,
+      sectionName,
+      gender,
+      birthday,
+      attendance,
+      overallAverage: 100,
+      gpaRating: 'Qualitative Rubric',
+      rankString: 'N/A',
+      isProgressSlip: false,
+      studentPhotoBuffer,
+    },
+    100,
+    colors
+  );
 
-  doc.font('Helvetica')
-     .fontSize(9)
-     .fillColor('#ccfbf1')
-     .text(`EARLY YEARS & MONTESSORI DEVELOPMENTAL REPORT • BRANCH: ${branchCode}`, 45, 64)
+  y += 8;
 
-  doc.fillColor('#ffffff')
-     .font('Helvetica-Bold')
-     .fontSize(12)
-     .text(examName.toUpperCase(), 350, 42, { width: 200, align: 'right' })
-
-  doc.font('Helvetica')
-     .fontSize(9)
-     .fillColor('#f0fdfa')
-     .text(`Session: ${sessionName || 'Active'}`, 350, 60, { width: 200, align: 'right' })
-     .text(`Date printed: ${new Date().toLocaleDateString()}`, 350, 72, { width: 200, align: 'right' })
-
-  let y = 100
-
-  // 2. Student Profile Info Block (Y: 100 to 160)
-  doc.rect(30, y, 535, 55).stroke(lightBorder)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-     .text('Pupil Name:', 45, y + 12)
-     .text('Registration No:', 45, y + 30)
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(10)
-     .text(studentName, 130, y + 12)
-     .text(registerNo || 'Pending', 130, y + 30)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(9)
-     .text('Class Stage:', 330, y + 12)
-     .text('Assessment Track:', 330, y + 30)
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(10)
-     .text(`${className} (${sectionName || 'Main'})`, 420, y + 12)
-     .text('Qualitative Zero-Score System', 420, y + 30)
-
-  y += 65
-
-  // 3. Rubric Legend
-  doc.rect(30, y, 535, 22).fill(lightBg).stroke(lightBorder)
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+  // Rubric Legend
+  doc.rect(30, y, 535, 20).fill(lightBg).stroke(lightBorder);
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
      .text('RATING SCALE:  ', 40, y + 6, { continued: true })
      .font('Helvetica').fillColor(textMuted)
-     .text('[1] Emerging     [2] Developing     [3] Satisfactory     [4] Proficient     [5] Advanced', { align: 'left' })
+     .text('[1] Emerging     [2] Developing     [3] Satisfactory     [4] Proficient     [5] Advanced', { align: 'left' });
 
-  y += 30
+  y += 26;
 
-  // 4. Learning Domains Table Header
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(11).text('LEARNING DOMAINS & QUALITATIVE OBSERVATIONS', 30, y)
-  y += 15
+  // Learning Domains Table Header
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text('LEARNING DOMAINS & QUALITATIVE OBSERVATIONS', 30, y);
+  y += 13;
 
-  doc.rect(30, y, 535, 20).fill(primaryColor)
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8.5)
-     .text('LEARNING DOMAIN / SUBJECT', 40, y + 6, { width: 140 })
-     .text('TEACHER QUALITATIVE OBSERVATION', 185, y + 6, { width: 260 })
-     .text('RATING (1-5)', 455, y + 6, { width: 100, align: 'center' })
-  y += 20
+  doc.rect(30, y, 535, 19).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
+     .text('LEARNING DOMAIN / SUBJECT', 40, y + 5, { width: 140 })
+     .text('TEACHER QUALITATIVE OBSERVATION', 185, y + 5, { width: 260 })
+     .text('RATING (1-5)', 455, y + 5, { width: 100, align: 'center' });
+  y += 19;
 
-  // 5. Subject Rows
   if (!subjectComments || subjectComments.length === 0) {
-    doc.rect(30, y, 535, 30).stroke(lightBorder)
-    doc.fillColor(textMuted).font('Helvetica-Oblique').fontSize(9)
-       .text('No qualitative subject assessments recorded for this period.', 40, y + 10, { width: 515, align: 'center' })
-    y += 30
+    doc.rect(30, y, 535, 30).stroke(lightBorder);
+    doc.fillColor(textMuted).font('Helvetica-Oblique').fontSize(8.5)
+       .text('No qualitative subject assessments recorded for this period.', 40, y + 10, { width: 515, align: 'center' });
+    y += 30;
   } else {
-    subjectComments.forEach((item, idx) => {
-      const rowHeight = 36
-      if (idx % 2 === 0) doc.rect(30, y, 535, rowHeight).fill(lightBg)
-      else doc.rect(30, y, 535, rowHeight).fill('#ffffff')
-      doc.rect(30, y, 535, rowHeight).stroke(lightBorder)
+    subjectComments.slice(0, 9).forEach((item, idx) => {
+      const rowHeight = 30;
+      if (idx % 2 === 0) doc.rect(30, y, 535, rowHeight).fill(lightBg);
+      else doc.rect(30, y, 535, rowHeight).fill('#ffffff');
+      doc.rect(30, y, 535, rowHeight).stroke(lightBorder);
 
-      // Domain Name
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(9)
-         .text(item.subjectName || 'Learning Domain', 40, y + 8, { width: 140 })
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
+         .text(item.subjectName || 'Learning Domain', 40, y + 7, { width: 140, lineBreak: false, ellipsis: true });
 
-      // Observation Narrative
-      const obsText = item.comment || 'Pupil demonstrates active participation and positive curiosity.'
-      doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-         .text(obsText, 185, y + 6, { width: 260, height: 26, ellipsis: true })
+      const obsText = item.comment || 'Pupil demonstrates active participation and positive curiosity.';
+      doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
+         .text(obsText, 185, y + 5, { width: 260, height: 22, ellipsis: true });
 
-      // Rating Pill
-      const ratingVal = Number(item.rating) || 3
-      const ratingLabel = item.ratingLabel || `${ratingVal} / 5`
-      const pillWidth = 90
-      const pillX = 460
-      const pillY = y + 9
-      doc.roundedRect(pillX, pillY, pillWidth, 18, 4).fill(primaryColor)
-      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
-         .text(ratingLabel, pillX, pillY + 4, { width: pillWidth, align: 'center' })
+      const ratingVal = Number(item.rating) || 3;
+      const ratingLabel = item.ratingLabel || `${ratingVal} / 5`;
+      const pillWidth = 90;
+      const pillX = 460;
+      const pillY = y + 6;
+      doc.roundedRect(pillX, pillY, pillWidth, 17, 4).fill(primaryColor);
+      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
+         .text(ratingLabel, pillX, pillY + 4, { width: pillWidth, align: 'center' });
 
-      y += rowHeight
-    })
+      y += rowHeight;
+    });
   }
 
-  y += 15
+  y += 10;
 
-  // 6. Summary Remarks Boxes
-  const remarksHeight = 70
-  doc.rect(30, y, 320, remarksHeight).stroke(lightBorder)
-  doc.rect(360, y, 205, remarksHeight).stroke(lightBorder)
+  drawBrandedRemarksAndSignatures(
+    doc,
+    {
+      schoolName,
+      commentary: teacherComment,
+      teacherComment,
+      principalComment,
+      resumptionDate,
+      nextTermFees,
+      formTeacherName,
+      principalName,
+      teacherSignatureBuffer,
+      principalSignatureBuffer,
+      isProgressSlip: false,
+    },
+    y,
+    colors
+  );
+}
 
-  // Teacher feedback
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
-     .text('CLASS TEACHER DEVELOPMENTAL REMARKS', 40, y + 8)
-  const remarkText = teacherComment || 'Pupil demonstrates enthusiastic social adaptation, physical coordination, and consistent milestone progression.'
-  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8)
-     .text(`"${remarkText}"`, 40, y + 22, { width: 300, height: 42, ellipsis: true })
+async function preloadReportCardAssetBuffers(params) {
+  const branding = params.schoolBranding || {};
+  const logoSrc = params.logoUrl || branding.logoUrl || null;
+  const studentPhotoSrc = params.studentPhoto || params.photo || null;
+  const teacherSigSrc =
+    params.teacherSignatureUrl ||
+    branding.classTeacherSignatureUrl ||
+    branding.defaultTeacherSignatureUrl ||
+    null;
+  const principalSigSrc =
+    params.principalSignatureUrl ||
+    branding.principalSignatureUrl ||
+    null;
 
-  // Term Overview
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
-     .text('TERM OVERVIEW', 370, y + 8)
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('Next Term Resumption:', 370, y + 22)
-  const resumptionStr = resumptionDate ? new Date(resumptionDate).toLocaleDateString(undefined, { dateStyle: 'medium' }) : 'To Be Announced'
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(resumptionStr, 370, y + 33)
-  doc.fillColor(textMuted).font('Helvetica')
-     .text('Early Years Lead:', 370, y + 46)
-  doc.fillColor(darkColor).font('Helvetica-Bold')
-     .text(formTeacherName, 370, y + 57)
+  const [logoBuffer, studentPhotoBuffer, teacherSignatureBuffer, principalSignatureBuffer] =
+    await Promise.all([
+      params.logoBuffer ? Promise.resolve(params.logoBuffer) : fetchImage(logoSrc),
+      params.studentPhotoBuffer ? Promise.resolve(params.studentPhotoBuffer) : fetchImage(studentPhotoSrc),
+      params.teacherSignatureBuffer ? Promise.resolve(params.teacherSignatureBuffer) : fetchImage(teacherSigSrc),
+      params.principalSignatureBuffer ? Promise.resolve(params.principalSignatureBuffer) : fetchImage(principalSigSrc),
+    ]);
 
-  y += remarksHeight + 25
-
-  // 7. Signature Block
-  const sigY = Math.min(y, 715)
-  doc.moveTo(40, sigY).lineTo(220, sigY).stroke(lightBorder)
-  doc.moveTo(375, sigY).lineTo(555, sigY).stroke(lightBorder)
-
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('CLASS TEACHER SIGNATURE', 40, sigY + 5, { width: 180, align: 'center' })
-     .text('SCHOOL PRINCIPAL SIGNATURE', 375, sigY + 5, { width: 180, align: 'center' })
-
-  // 8. Footer
-  doc.moveTo(30, 755).lineTo(565, 755).stroke('#e2e8f0')
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
-     .text('Official Qualitative Early Years Report • Zero-Score Montessori Evaluation System • Ugbekun 2.0', 30, 765, { align: 'center', width: 535 })
-     .text(`© ${new Date().getFullYear()} ${schoolName}. All rights reserved.`, 30, 775, { align: 'center', width: 535 })
+  return {
+    ...params,
+    logoBuffer,
+    studentPhotoBuffer,
+    teacherSignatureBuffer,
+    principalSignatureBuffer,
+  };
 }
 
 function generateCommentBasedReportCardPdf(params) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
+      const hydrated = await preloadReportCardAssetBuffers(params);
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 30,
+        margin: 22,
         info: {
-          Title: `Developmental Report - ${params.studentName || 'Pupil'}`,
+          Title: `Developmental Report - ${hydrated.studentName || 'Pupil'}`,
           Author: 'Ugbekun Schools Platform',
         },
-      })
+      });
 
-      const chunks = []
-      doc.on('data', (chunk) => chunks.push(chunk))
-      doc.on('end', () => resolve(Buffer.concat(chunks)))
-      doc.on('error', reject)
+      const chunks = [];
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
 
-      drawCommentBasedReportCard(doc, params)
-      doc.end()
+      drawCommentBasedReportCard(doc, hydrated);
+      doc.end();
     } catch (err) {
-      reject(err)
+      reject(err);
     }
-  })
+  });
 }
 
 function generateReportCardPdf(params) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
+      const hydrated = await preloadReportCardAssetBuffers(params);
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 30,
+        margin: 22,
         info: {
-          Title: `Report Card - ${params.studentName || 'Student'}`,
+          Title: `Report Card - ${hydrated.studentName || 'Student'}`,
           Author: 'Ugbekun Schools Platform',
         },
-      })
+      });
 
-      const chunks = []
-      doc.on('data', (chunk) => chunks.push(chunk))
-      doc.on('end', () => resolve(Buffer.concat(chunks)))
-      doc.on('error', reject)
+      const chunks = [];
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
 
-      if (params.usesScores === false || params.isCommentBased || (params.subjectComments && params.subjectComments.length > 0)) {
-        drawCommentBasedReportCard(doc, params)
-      } else if (params.isEcd) {
-        drawMontessoriReportCard(doc, params)
+      if (hydrated.usesScores === false || hydrated.isCommentBased || (hydrated.subjectComments && hydrated.subjectComments.length > 0)) {
+        drawCommentBasedReportCard(doc, hydrated);
+      } else if (hydrated.isEcd) {
+        drawMontessoriReportCard(doc, hydrated);
       } else {
-        drawStandardReportCard(doc, params)
+        drawStandardReportCard(doc, hydrated);
       }
-      doc.end()
+      doc.end();
     } catch (err) {
-      reject(err)
+      reject(err);
     }
-  })
+  });
 }
 
 function generateMontessoriReportCardPdf(params) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
+      const hydrated = await preloadReportCardAssetBuffers(params);
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 30,
+        margin: 22,
         info: {
-          Title: `Montessori Assessment - ${params.studentName || 'Pupil'}`,
+          Title: `Montessori Assessment - ${hydrated.studentName || 'Pupil'}`,
           Author: 'Ugbekun Schools Platform',
         },
-      })
+      });
 
-      const chunks = []
-      doc.on('data', (chunk) => chunks.push(chunk))
-      doc.on('end', () => resolve(Buffer.concat(chunks)))
-      doc.on('error', reject)
+      const chunks = [];
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
 
-      drawMontessoriReportCard(doc, params)
-      doc.end()
+      drawMontessoriReportCard(doc, hydrated);
+      doc.end();
     } catch (err) {
-      reject(err)
+      reject(err);
     }
-  })
+  });
 }
 
 function generateBatchClassReportCardsPdf(params) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
       const {
         schoolName = 'Ugbekun Schools',
@@ -1206,33 +1547,43 @@ function generateBatchClassReportCardsPdf(params) {
         className = 'Classroom',
         sectionName = '',
         sessionName = '',
-        students = []
-      } = params
+        schoolBranding = {},
+        students = [],
+      } = params;
 
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 30,
+        margin: 22,
         info: {
           Title: `Batch Report Cards - ${className} ${sectionName}`,
           Author: 'Ugbekun Schools Platform',
         },
-      })
+      });
 
-      const chunks = []
-      doc.on('data', (chunk) => chunks.push(chunk))
-      doc.on('end', () => resolve(Buffer.concat(chunks)))
-      doc.on('error', reject)
+      const chunks = [];
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
 
       if (students.length === 0) {
-        doc.fontSize(16).fillColor('#0f172a').text('No student report card records found for this class selection.', 50, 100)
-        doc.end()
-        return
+        doc.fontSize(16).fillColor('#0f172a').text('No student report card records found for this class selection.', 50, 100);
+        doc.end();
+        return;
       }
 
-      students.forEach((student, idx) => {
+      // Preload shared school logo & signatures once for the entire class batch
+      const sharedAssets = await preloadReportCardAssetBuffers({
+        ...params,
+        schoolBranding,
+      });
+
+      for (let idx = 0; idx < students.length; idx++) {
+        const student = students[idx];
         if (idx > 0) {
-          doc.addPage()
+          doc.addPage();
         }
+
+        const studentPhotoBuffer = await fetchImage(student.photo || student.studentPhoto || null);
 
         const studentParams = {
           schoolName,
@@ -1240,30 +1591,52 @@ function generateBatchClassReportCardsPdf(params) {
           className,
           sectionName,
           sessionName,
-          ...student
-        }
+          schoolBranding,
+          logoBuffer: sharedAssets.logoBuffer,
+          teacherSignatureBuffer: sharedAssets.teacherSignatureBuffer,
+          principalSignatureBuffer: sharedAssets.principalSignatureBuffer,
+          ...student,
+          studentPhotoBuffer,
+        };
 
         if (student.usesScores === false || student.isCommentBased || (student.subjectComments && student.subjectComments.length > 0)) {
-          drawCommentBasedReportCard(doc, studentParams)
+          drawCommentBasedReportCard(doc, studentParams);
         } else if (student.isEcd) {
-          drawMontessoriReportCard(doc, studentParams)
+          drawMontessoriReportCard(doc, studentParams);
         } else {
-          drawStandardReportCard(doc, studentParams)
+          drawStandardReportCard(doc, studentParams);
         }
-      })
+      }
 
-      doc.end()
+      doc.end();
     } catch (err) {
-      reject(err)
+      reject(err);
     }
-  })
+  });
 }
 
 function fetchImage(photoPath) {
   return new Promise((resolve) => {
-    if (!photoPath) return resolve(null);
-    if (photoPath.startsWith('/uploads/') || photoPath.startsWith('uploads/')) {
-      const cleanPath = photoPath.startsWith('/') ? photoPath.slice(1) : photoPath;
+    if (!photoPath || typeof photoPath !== 'string') return resolve(null);
+    const trimmed = photoPath.trim();
+    if (!trimmed) return resolve(null);
+
+    // Support Base64 Data URIs (e.g., data:image/png;base64,...)
+    if (trimmed.startsWith('data:image/')) {
+      const commaIdx = trimmed.indexOf(',');
+      if (commaIdx !== -1) {
+        try {
+          const base64Data = trimmed.slice(commaIdx + 1);
+          return resolve(Buffer.from(base64Data, 'base64'));
+        } catch {
+          return resolve(null);
+        }
+      }
+      return resolve(null);
+    }
+
+    if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/')) {
+      const cleanPath = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
       const fullPath = path.join(__dirname, '..', cleanPath);
       fs.readFile(fullPath, (err, data) => {
         if (err) resolve(null);
@@ -1271,8 +1644,9 @@ function fetchImage(photoPath) {
       });
       return;
     }
-    if (photoPath.startsWith('http://') || photoPath.startsWith('https://')) {
-      https.get(photoPath, (res) => {
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      const client = trimmed.startsWith('https://') ? https : require('http');
+      const req = client.get(trimmed, { timeout: 6000 }, (res) => {
         if (res.statusCode !== 200) {
           resolve(null);
           return;
@@ -1281,10 +1655,15 @@ function fetchImage(photoPath) {
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => resolve(Buffer.concat(chunks)));
         res.on('error', () => resolve(null));
-      }).on('error', () => resolve(null));
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
       return;
     }
-    const localFallback = path.join(__dirname, '..', photoPath);
+    const localFallback = path.join(__dirname, '..', trimmed);
     fs.readFile(localFallback, (err, data) => {
       if (!err) resolve(data);
       else resolve(null);

@@ -322,6 +322,7 @@ model Teacher {
   email     String?
   phone          String?
   photo          String?
+  signatureUrl   String?   @map("signature_url") @db.Text
   qualifications String?   @db.Text
   houseAddress   String?   @db.Text
   department     String?
@@ -2311,11 +2312,16 @@ model SystemSetting {
   twitterUrl            String?   @map("twitter_url")
   linkedinUrl           String?   @map("linkedin_url")
   youtubeUrl            String?   @map("youtube_url")
-  logoUrl               String?   @map("logo_url")
-  principalSignatureUrl String?   @map("principal_signature_url")
-  currencySymbol        String    @default("₦") @map("currency_symbol")
-  academicSession       String    @default("2025/2026") @map("academic_session")
-  currentTerm           String    @default("First Term") @map("current_term")
+  logoUrl                    String?   @map("logo_url") @db.Text
+  principalSignatureUrl      String?   @map("principal_signature_url") @db.Text
+  principalName              String?   @default("The Principal") @map("principal_name")
+  defaultTeacherSignatureUrl String?   @map("default_teacher_signature_url") @db.Text
+  resumptionDate             String?   @map("resumption_date")
+  nextTermFees               String?   @map("next_term_fees")
+  autoPublishReportCards     Boolean   @default(true) @map("auto_publish_report_cards")
+  currencySymbol             String    @default("₦") @map("currency_symbol")
+  academicSession            String    @default("2025/2026") @map("academic_session")
+  currentTerm                String    @default("First Term") @map("current_term")
 
   regNoPrefix           String    @default("UGB") @map("reg_no_prefix")
   regNoDigits           Int       @default(4) @map("reg_no_digits")

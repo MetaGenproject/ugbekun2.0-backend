@@ -40,10 +40,10 @@ export function getDefaultBanners(schoolName: string): HeroBannerSlide[] {
     {
       id: 1,
       url: 'https://images.unsplash.com/photo-1580582932707-520aed937b7b?auto=format&fit=crop&w=1600&q=80',
-      caption: `Welcome to ${schoolName} — Shaping Tomorrows Leaders Today`,
+      caption: `Welcome to ${schoolName} — Shaping Tomorrow's Leaders Today`,
       subcaption: 'World-class academic standards, moral integrity, and technological excellence.',
       ctaText: 'Apply for Admission',
-      ctaLink: '/subscribe'
+      ctaLink: '#about'
     },
     {
       id: 2,
@@ -142,11 +142,11 @@ export function getDefaultAnnouncements(): AnnouncementItem[] {
   return [
     {
       id: 1,
-      title: 'Admissions Open for the 2026/2027 Academic Session',
+      title: 'Admissions Open for the New Academic Session',
       date: 'Aug 2026',
       badge: 'Admissions',
       excerpt: 'Entrance examinations and scholarship assessments are currently ongoing. Register your ward online today.',
-      link: '/subscribe'
+      link: '/admissions'
     },
     {
       id: 2,
@@ -220,10 +220,10 @@ export async function getOrCreateLandingPage(prisma: any, branchId: number) {
  */
 export function formatLandingPageResponse(branch: any, landingPage: any, customSettings?: any) {
   const settings = customSettings || branch?.systemSetting || {};
-  const schoolName = settings.schoolName || branch.name || 'Ugbekun Partner School';
-  const logo = settings.logoUrl || null;
-  const primaryColor = landingPage.primaryColor || settings.primaryColor || '#003da5';
-  const secondaryColor = landingPage.secondaryColor || settings.secondaryColor || '#009ca6';
+  const schoolName = settings.schoolName || branch?.name || 'School Academy';
+  const logo = settings.logoUrl || branch?.logo || null;
+  const primaryColor = landingPage?.primaryColor || settings.primaryColor || '#003da5';
+  const secondaryColor = landingPage?.secondaryColor || settings.secondaryColor || '#009ca6';
 
   return {
     branchId: branch.id,
@@ -232,9 +232,9 @@ export function formatLandingPageResponse(branch: any, landingPage: any, customS
     schoolName,
     tagline: settings.tagline || 'Excellence in Holistic Education',
     logoUrl: logo,
-    address: settings.address || 'Campus Education Boulevard',
-    email: settings.email || 'admissions@school.edu.ng',
-    phone: settings.phone || '+234 800 UGBEKUN',
+    address: settings.address || '',
+    email: settings.email || '',
+    phone: settings.phone || '',
     primaryColor,
     secondaryColor,
     subdomain: branch.subdomain,
@@ -243,15 +243,15 @@ export function formatLandingPageResponse(branch: any, landingPage: any, customS
     isEnabled: landingPage.isEnabled ?? true,
     heroHeadline: landingPage.heroHeadline,
     heroSubheadline: landingPage.heroSubheadline,
-    heroBanners: landingPage.heroBanners || [],
+    heroBanners: Array.isArray(landingPage.heroBanners) ? landingPage.heroBanners : [],
     welcomeTitle: landingPage.welcomeTitle,
     welcomeMessage: landingPage.welcomeMessage,
     welcomeAuthor: landingPage.welcomeAuthor,
     welcomePhoto: landingPage.welcomePhoto,
     aboutText: landingPage.aboutText,
-    photoGallery: landingPage.photoGallery || [],
-    academicPrograms: landingPage.academicPrograms || [],
-    announcements: landingPage.announcements || [],
+    photoGallery: Array.isArray(landingPage.photoGallery) ? landingPage.photoGallery : [],
+    academicPrograms: Array.isArray(landingPage.academicPrograms) ? landingPage.academicPrograms : [],
+    announcements: Array.isArray(landingPage.announcements) ? landingPage.announcements : [],
     showAdmissionCta: landingPage.showAdmissionCta ?? true,
     showPortalLoginCta: landingPage.showPortalLoginCta ?? true,
     showGallery: landingPage.showGallery ?? true,
@@ -263,9 +263,9 @@ export function formatLandingPageResponse(branch: any, landingPage: any, customS
       twitter: landingPage.twitterUrl || '',
     },
     contact: {
-      address: settings.address || 'Campus Education Boulevard',
-      email: settings.email || 'admissions@school.edu.ng',
-      phone: settings.phone || '+234 800 UGBEKUN'
+      address: settings.address || '',
+      email: settings.email || '',
+      phone: settings.phone || ''
     }
   };
 }

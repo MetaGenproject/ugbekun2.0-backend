@@ -1637,9 +1637,22 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
         const numClassId = Number(classId);
         const numSectionId = Number(sectionId);
 
-        const existingEnroll = await tx.enroll.findFirst({
-          where: { studentId, sessionId, branchId },
-        });
+        // Check if student already has an active enrollment in this branch
+        // Look first for enrollment matching requested session if provided, or student's latest active enrollment
+        const requestedSession = req.body.sessionId ? Number(req.body.sessionId) : null;
+        let existingEnroll = null;
+        if (requestedSession) {
+          existingEnroll = await tx.enroll.findFirst({
+            where: { studentId, sessionId: requestedSession, branchId, isAlumni: 0 },
+            orderBy: { id: 'desc' },
+          });
+        }
+        if (!existingEnroll) {
+          existingEnroll = await tx.enroll.findFirst({
+            where: { studentId, ...(branchId ? { branchId } : {}), isAlumni: 0 },
+            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          });
+        }
 
         if (existingEnroll) {
           if (existingEnroll.classId !== numClassId || existingEnroll.sectionId !== numSectionId) {
@@ -1653,6 +1666,14 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
             });
           }
         } else {
+          // Only create new enrollment if student has NO active enrollment in this branch
+          const classEnroll = await tx.enroll.findFirst({
+            where: { branchId, classId: numClassId, sectionId: numSectionId, isAlumni: 0 },
+            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+            select: { sessionId: true },
+          });
+          const targetEnrollSession = requestedSession || classEnroll?.sessionId || sessionId;
+
           const maxEnroll = await tx.enroll.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
           await tx.enroll.create({
             data: {
@@ -1660,8 +1681,9 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
               studentId,
               classId: numClassId,
               sectionId: numSectionId,
-              sessionId,
+              sessionId: targetEnrollSession,
               branchId,
+              roll: 0,
               isAlumni: 0,
             },
           });
@@ -2089,12 +2111,36 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
     let targetSessionId = requestedSessionId ? Number(requestedSessionId) : null;
     if (!targetSessionId) {
       const globalSetting = await prisma.globalSettings.findFirst();
-      const defaultSession = globalSetting?.sessionId || 6;
-      const countInDefault = await prisma.enroll.count({
-        where: { branchId, classId: Number(classId), sectionId: Number(sectionId), sessionId: defaultSession, isAlumni: 0 },
+      const defaultSession = globalSetting?.sessionId || 5;
+
+      // Group active enrollments by sessionId to see where students actually are
+      const sessionCohorts = await prisma.enroll.groupBy({
+        by: ['sessionId'],
+        where: {
+          branchId,
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          isAlumni: 0,
+          student: { active: true },
+        },
+        _count: { id: true },
+        orderBy: [
+          { _count: { id: 'desc' } },
+          { sessionId: 'desc' },
+        ],
       });
-      if (countInDefault > 0) {
-        targetSessionId = defaultSession;
+
+      if (sessionCohorts.length > 0) {
+        // If defaultSession has substantial students (e.g. >= any other session), use it.
+        // Otherwise, use the session holding the majority / active cohort of students.
+        const defaultCohort = sessionCohorts.find(s => s.sessionId === defaultSession);
+        const topCohort = sessionCohorts[0];
+
+        if (defaultCohort && defaultCohort._count.id >= topCohort._count.id) {
+          targetSessionId = defaultSession;
+        } else {
+          targetSessionId = topCohort.sessionId;
+        }
       } else {
         const latestWithStudents = await prisma.enroll.findFirst({
           where: { branchId, classId: Number(classId), sectionId: Number(sectionId), isAlumni: 0 },

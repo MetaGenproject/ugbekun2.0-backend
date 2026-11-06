@@ -18,6 +18,12 @@ import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '
 import { parseMarkScore } from '../../lib/markParser';
 import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
 import { getRatingLabel } from '../admin/adminMarksReportController';
+import {
+  resolveSchoolReportBranding,
+  syncReportCardOnScoreSave,
+  buildDefaultRemarksForAverage,
+  computeStudentAttendanceMap,
+} from '../../lib/reportCardHelper';
 
 let Tesseract: any;
 try {
@@ -281,7 +287,20 @@ export async function saveScores(req: Request, res: Response): Promise<Response 
       await prisma.$transaction(operations);
     }
 
-    return res.json({ success: true, message: 'Scores saved successfully.' });
+    await syncReportCardOnScoreSave(prisma, {
+      branchId: req.branchId || 1,
+      classId: Number(classId),
+      sectionId: Number(sectionId),
+      sessionId,
+      studentIds: scores.map((s: any) => Number(s.studentId)).filter(Boolean),
+      publishedBy: req.userId,
+    });
+
+    return res.json({
+      success: true,
+      reportCardUpdatedImmediately: true,
+      message: 'Scores saved successfully. Report cards updated immediately.',
+    });
   } catch (error: any) {
     console.error('[TEACHER] Scores save error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to save scores.' });
@@ -292,7 +311,7 @@ export async function saveScores(req: Request, res: Response): Promise<Response 
  * POST /api/teacher/commentary
  */
 export async function saveCommentary(req: Request, res: Response): Promise<Response | void> {
-  const { studentId, remark, isAiGenerated, isEditedByHuman, status, reviewNotes } = req.body;
+  const { studentId, remark, principalRemark, teacherSignatureUrl, isAiGenerated, isEditedByHuman, status, reviewNotes, classId: reqClassId, sectionId: reqSectionId } = req.body;
   if (!studentId || remark === undefined) {
     return res.status(400).json({ success: false, message: 'studentId and remark are required.' });
   }
@@ -301,25 +320,42 @@ export async function saveCommentary(req: Request, res: Response): Promise<Respo
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
 
-    const studentEnroll = await prisma.enroll.findFirst({
-      where: { studentId: Number(studentId), sessionId, branchId: req.branchId },
-      select: { classId: true, sectionId: true },
+    let studentEnroll = await prisma.enroll.findFirst({
+      where: { studentId: Number(studentId), sessionId, ...(req.branchId ? { branchId: req.branchId } : {}) },
+      select: { classId: true, sectionId: true, sessionId: true },
     });
 
     if (!studentEnroll) {
-      return res.status(404).json({ success: false, message: 'Student enrollment not found in current session.' });
-    }
-
-    const isForm = await isFormTeacher(prisma, req.teacherId, studentEnroll.classId, studentEnroll.sectionId, req);
-    if (!isForm) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Only the Class Teacher can draft qualitative commentary.',
+      studentEnroll = await prisma.enroll.findFirst({
+        where: { studentId: Number(studentId), ...(req.branchId ? { branchId: req.branchId } : {}) },
+        orderBy: { sessionId: 'desc' },
+        select: { classId: true, sectionId: true, sessionId: true },
       });
     }
 
+    const resolvedClassId = Number(reqClassId || studentEnroll?.classId || 1);
+    const resolvedSectionId = Number(reqSectionId || studentEnroll?.sectionId || 1);
+    const resolvedSessionId = studentEnroll?.sessionId || sessionId;
+
+    const hasAccess = await hasClassAccess(prisma, req.teacherId, resolvedClassId, resolvedSectionId, req);
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: You are not allocated to this class.',
+      });
+    }
+
+    if (teacherSignatureUrl && req.teacherId) {
+      await prisma.teacher.update({
+        where: { id: Number(req.teacherId) },
+        data: { signatureUrl: String(teacherSignatureUrl) },
+      }).catch(() => {});
+    }
+
+    const effectivePrincipalNote = principalRemark !== undefined ? principalRemark : reviewNotes;
+
     const existing = await prisma.studentCommentary.findFirst({
-      where: { studentId: Number(studentId), sessionId },
+      where: { studentId: Number(studentId), sessionId: resolvedSessionId },
     });
 
     let saved;
@@ -331,28 +367,28 @@ export async function saveCommentary(req: Request, res: Response): Promise<Respo
           isAiGenerated: isAiGenerated !== undefined ? isAiGenerated : existing.isAiGenerated,
           isEditedByHuman: isEditedByHuman !== undefined ? isEditedByHuman : true,
           status: status || existing.status,
-          reviewNotes: reviewNotes !== undefined ? reviewNotes : existing.reviewNotes,
+          reviewNotes: effectivePrincipalNote !== undefined ? effectivePrincipalNote : existing.reviewNotes,
         },
       });
     } else {
       saved = await prisma.studentCommentary.create({
         data: {
           studentId: Number(studentId),
-          classId: studentEnroll.classId,
-          sectionId: studentEnroll.sectionId,
-          sessionId,
-          branchId: req.branchId,
+          classId: resolvedClassId,
+          sectionId: resolvedSectionId,
+          sessionId: resolvedSessionId,
+          branchId: req.branchId || 1,
           remark,
           originalAiRemark: isAiGenerated ? remark : null,
           isAiGenerated: isAiGenerated || false,
-          isEditedByHuman: isEditedByHuman || false,
-          status: status || 'DRAFT',
-          reviewNotes: reviewNotes || null,
+          isEditedByHuman: isEditedByHuman ?? true,
+          status: status || 'APPROVED',
+          reviewNotes: effectivePrincipalNote || null,
         },
       });
     }
 
-    return res.json({ success: true, message: 'Commentary saved.', commentary: saved });
+    return res.json({ success: true, message: 'Commentary saved to report card immediately.', commentary: saved });
   } catch (error) {
     console.error('[TEACHER] Save commentary error:', error);
     return res.status(500).json({ success: false, message: 'Failed to save commentary.' });
@@ -1063,7 +1099,16 @@ export async function saveSingleGrade(req: Request, res: Response): Promise<Resp
       });
     }
 
-    return res.json({ success: true, mark: saved });
+    await syncReportCardOnScoreSave(prisma, {
+      branchId: req.branchId || 1,
+      classId: Number(classId),
+      sectionId: Number(sectionId),
+      sessionId: existing?.sessionId || sessionId,
+      studentIds: [Number(studentId)],
+      publishedBy: req.userId,
+    });
+
+    return res.json({ success: true, mark: saved, reportCardUpdatedImmediately: true });
   } catch (error) {
     console.error('[TEACHER] Save single grade error:', error);
     return res.status(500).json({ success: false, message: 'Failed to save grade cell.' });
@@ -1138,7 +1183,21 @@ export async function batchSaveGradebook(req: Request, res: Response): Promise<R
       }
     });
 
-    return res.json({ success: true, count, message: `Successfully updated ${count} student scores.` });
+    await syncReportCardOnScoreSave(prisma, {
+      branchId: req.branchId || 1,
+      classId: Number(classId),
+      sectionId: Number(sectionId),
+      sessionId,
+      studentIds: scores.map((s: any) => Number(s.studentId)).filter(Boolean),
+      publishedBy: req.userId,
+    });
+
+    return res.json({
+      success: true,
+      count,
+      reportCardUpdatedImmediately: true,
+      message: `Successfully updated ${count} student scores. Report cards updated immediately.`,
+    });
   } catch (error) {
     console.error('[TEACHER] Batch save gradebook error:', error);
     return res.status(500).json({ success: false, message: 'Failed to batch save grades.' });
@@ -1249,6 +1308,23 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       return res.status(404).json({ success: false, message: 'Student not enrolled in active session.' });
     }
 
+    const [schoolBranding, attendanceMap] = await Promise.all([
+      resolveSchoolReportBranding(prisma, req.branchId || student.branchId, {
+        classId: enroll.classId,
+        sectionId: enroll.sectionId,
+        sessionId,
+      }),
+      computeStudentAttendanceMap(prisma, {
+        classId: enroll.classId,
+        sectionId: enroll.sectionId,
+        sessionId,
+        branchId: req.branchId || student.branchId,
+        studentIds: [Number(studentId)],
+      }),
+    ]);
+
+    const att = attendanceMap.get(Number(studentId)) || { present: 0, absent: 0, late: 0, totalDays: 0 };
+
     if (enroll.class?.isEcd) {
       const assessment = await prisma.montessoriAssessment.findFirst({
         where: {
@@ -1262,23 +1338,24 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         include: { exam: { select: { name: true, resumptionDate: true } } },
       });
 
-      const teacherAlloc = await prisma.teacherAllocation.findFirst({
-        where: { classId: enroll.classId, sectionId: enroll.sectionId, sessionId, branchId: req.branchId },
-        include: { teacher: { select: { name: true } } },
-      });
-
       const pdfBuffer = await generateMontessoriReportCardPdf({
-        schoolName: student.branch?.name || 'Ugbekun Schools',
-        branchCode: student.branch?.code || 'GEN',
+        schoolName: schoolBranding.schoolName || student.branch?.name || 'Ugbekun Schools',
+        branchCode: schoolBranding.branchCode || student.branch?.code || 'GEN',
         studentName: `${student.lastName}, ${student.firstName}`,
         registerNo: student.registerNo,
         className: enroll.class.name,
         sectionName: enroll.section?.name || 'N/A',
-        sessionName: schoolYear?.schoolYear || 'N/A',
+        sessionName: schoolYear?.schoolYear || schoolBranding.academicSession || 'N/A',
         examName: assessment?.exam?.name || 'Term Evaluation',
         assessment: assessment || {},
-        resumptionDate: assessment?.exam?.resumptionDate || null,
-        formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
+        resumptionDate: assessment?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
+        nextTermFees: schoolBranding.nextTermFees || null,
+        formTeacherName: schoolBranding.classTeacherName || 'Class Teacher',
+        photo: student.photo || null,
+        gender: student.gender || null,
+        birthday: student.birthday || null,
+        attendanceSummary: att,
+        schoolBranding,
       });
 
       res.setHeader('Content-Type', 'application/pdf');
@@ -1301,12 +1378,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
 
     const commentaryRecord = await prisma.studentCommentary.findFirst({
       where: { studentId: Number(studentId), sessionId },
-      select: { remark: true },
-    });
-
-    const teacherAlloc = await prisma.teacherAllocation.findFirst({
-      where: { classId: enroll.classId, sectionId: enroll.sectionId, sessionId, branchId: req.branchId },
-      include: { teacher: { select: { name: true } } },
+      select: { remark: true, reviewNotes: true },
     });
 
     let totalScoreSum = 0;
@@ -1337,23 +1409,31 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     const gradingScale = await resolveGradingScale(prisma, req.branchId || student.branchId, enroll.classId);
 
     const pdfBuffer = await generateReportCardPdf({
-      schoolName: student.branch?.name || 'Ugbekun Schools',
-      branchCode: student.branch?.code || 'GEN',
+      schoolName: schoolBranding.schoolName || student.branch?.name || 'Ugbekun Schools',
+      branchCode: schoolBranding.branchCode || student.branch?.code || 'GEN',
       studentName: `${student.lastName}, ${student.firstName}`,
       registerNo: student.registerNo,
       className: enroll.class.name,
       sectionName: enroll.section?.name || 'N/A',
-      sessionName: schoolYear?.schoolYear || 'N/A',
+      sessionName: schoolYear?.schoolYear || schoolBranding.academicSession || 'N/A',
       reportCard,
       overallAverage,
       commentary: commentaryRecord?.remark || '',
+      teacherComment: commentaryRecord?.remark || '',
+      principalComment: commentaryRecord?.reviewNotes || '',
       rank: 1,
       totalClassStudents: 1,
       rankingType,
       rankingLimit: Number(rankingLimit),
-      resumptionDate: studentMarks[0]?.exam?.resumptionDate || null,
-      formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
+      resumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
+      nextTermFees: schoolBranding.nextTermFees || null,
+      formTeacherName: schoolBranding.classTeacherName || 'Class Teacher',
       gradingRanges: gradingScale.ranges,
+      photo: student.photo || null,
+      gender: student.gender || null,
+      birthday: student.birthday || null,
+      attendanceSummary: att,
+      schoolBranding,
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1378,7 +1458,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
 
-    const [enrolls, schoolYear, branch, teacherAlloc] = await Promise.all([
+    const [enrolls, schoolYear, branch, schoolBranding] = await Promise.all([
       prisma.enroll.findMany({
         where: {
           classId: Number(classId),
@@ -1395,7 +1475,10 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
               firstName: true,
               lastName: true,
               registerNo: true,
-              commentaries: { where: { sessionId }, select: { remark: true } },
+              photo: true,
+              gender: true,
+              birthday: true,
+              commentaries: { where: { sessionId }, select: { remark: true, reviewNotes: true } },
             },
           },
           class: { select: { name: true } },
@@ -1405,15 +1488,28 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       }),
       prisma.schoolYear.findUnique({ where: { id: sessionId } }),
       prisma.branch.findUnique({ where: { id: req.branchId }, select: { name: true, code: true } }),
-      prisma.teacherAllocation.findFirst({
-        where: { classId: Number(classId), sectionId: Number(sectionId), sessionId, branchId: req.branchId },
-        include: { teacher: { select: { name: true } } },
+      resolveSchoolReportBranding(prisma, req.branchId, {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId,
       }),
     ]);
 
     if (enrolls.length === 0) {
       return res.status(404).json({ success: false, message: 'No enrolled students found in class.' });
     }
+
+    const studentIds = enrolls.map((e) => e.student.id);
+    const [attendanceMap, gradingScale] = await Promise.all([
+      computeStudentAttendanceMap(prisma, {
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+        sessionId,
+        branchId: req.branchId,
+        studentIds,
+      }),
+      resolveGradingScale(prisma, req.branchId, Number(classId)),
+    ]);
 
     const studentCards = [];
     for (const e of enrolls) {
@@ -1450,29 +1546,37 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       });
 
       const avg = marks.length > 0 ? Number((sum / marks.length).toFixed(1)) : 0;
-
-      const gradingScale = await resolveGradingScale(prisma, req.branchId, Number(classId));
+      const att = attendanceMap.get(e.student.id) || { present: 0, absent: 0, late: 0, totalDays: 0 };
 
       studentCards.push({
         studentName: `${e.student.lastName}, ${e.student.firstName}`,
         registerNo: e.student.registerNo,
         className: e.class.name,
         sectionName: e.section?.name || 'N/A',
-        sessionName: schoolYear?.schoolYear || 'N/A',
+        sessionName: schoolYear?.schoolYear || schoolBranding.academicSession || 'N/A',
         reportCard: rc,
         overallAverage: avg,
         commentary: e.student.commentaries[0]?.remark || '',
+        teacherComment: e.student.commentaries[0]?.remark || '',
+        principalComment: e.student.commentaries[0]?.reviewNotes || '',
         rank: 1,
         totalClassStudents: enrolls.length,
-        resumptionDate: marks[0]?.exam?.resumptionDate || null,
-        formTeacherName: teacherAlloc?.teacher?.name || 'Class Teacher',
+        resumptionDate: marks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
+        nextTermFees: schoolBranding.nextTermFees || null,
+        formTeacherName: schoolBranding.classTeacherName || 'Class Teacher',
         gradingRanges: gradingScale.ranges,
+        photo: e.student.photo || null,
+        gender: e.student.gender || null,
+        birthday: e.student.birthday || null,
+        attendanceSummary: att,
+        schoolBranding,
       });
     }
 
     const pdfBuffer = await generateBatchClassReportCardsPdf({
-      schoolName: branch?.name || 'Ugbekun Schools',
-      branchCode: branch?.code || 'GEN',
+      schoolName: schoolBranding.schoolName || branch?.name || 'Ugbekun Schools',
+      branchCode: schoolBranding.branchCode || branch?.code || 'GEN',
+      schoolBranding,
       students: studentCards,
     });
 
@@ -3352,9 +3456,19 @@ export async function saveTeacherSubjectCommentsBatch(req: Request, res: Respons
       return results;
     });
 
+    await syncReportCardOnScoreSave(prisma, {
+      branchId: effectiveBranchId,
+      classId: cId,
+      sectionId: secId,
+      sessionId: activeSession,
+      studentIds: savedRecords.map((r: any) => Number(r.studentId)),
+      publishedBy: req.userId,
+    });
+
     return res.json({
       success: true,
-      message: `Successfully saved ${savedRecords.length} developmental comment assessments.`,
+      reportCardUpdatedImmediately: true,
+      message: `Successfully saved ${savedRecords.length} developmental comment assessments. Report cards updated immediately.`,
       savedCount: savedRecords.length,
     });
   } catch (error: any) {
@@ -3541,10 +3655,20 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
       savedCount++;
     }
 
+    await syncReportCardOnScoreSave(prisma, {
+      branchId: branchId || 1,
+      classId: cId,
+      sectionId: secId,
+      sessionId: activeSession,
+      studentIds: rawMarks.map((item: any) => Number(item.studentId || item.id)).filter(Boolean),
+      publishedBy: req.userId,
+    });
+
     return res.json({
       success: true,
       savedCount,
-      message: `Scores saved successfully (${savedCount} students updated).`,
+      reportCardUpdatedImmediately: true,
+      message: `Scores saved successfully (${savedCount} students updated). Report cards updated immediately.`,
     });
   } catch (error: any) {
     console.error('[TEACHER] Batch save marks error:', error);
@@ -4070,6 +4194,31 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       ];
     }
 
+    const [commentaries, schoolBranding] = await Promise.all([
+      prisma.studentCommentary.findMany({
+        where: {
+          studentId: { in: studentIds },
+          sessionId,
+        },
+        select: {
+          studentId: true,
+          remark: true,
+          reviewNotes: true,
+          status: true,
+        },
+      }),
+      resolveSchoolReportBranding(prisma, branchId, {
+        classId,
+        sectionId: sectionId || undefined,
+        sessionId,
+      }),
+    ]);
+
+    const commentaryByStudent = new Map<number, { remark: string; reviewNotes: string | null }>();
+    commentaries.forEach((c) => {
+      commentaryByStudent.set(c.studentId, { remark: c.remark, reviewNotes: c.reviewNotes });
+    });
+
     // Build Tabulation Matrix & Total Score Summary
     const tabulationRows = enrolls.map((e) => {
       const sId = e.student.id;
@@ -4153,6 +4302,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
 
       const s = e.student;
       const p = s.parent;
+      const comm = commentaryByStudent.get(sId);
 
       return {
         studentId: sId,
@@ -4162,6 +4312,8 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         registerNo: s.registerNo || 'N/A',
         rollNo: e.roll,
         gender: s.gender || 'N/A',
+        photo: s.photo || null,
+        birthday: s.birthday || null,
         sectionName: e.section?.name || 'Main',
         marks: studentMarks,
         subjectScores: studentMarks,
@@ -4175,6 +4327,9 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         gradeRemark: overallGrade.remark,
         gradeColor: overallGrade.color,
         attendanceRate: attendanceSummary[sId]?.rate ?? 100,
+        attendanceSummary: attendanceSummary[sId] || { present: 0, absent: 0, total: 0, rate: 100 },
+        teacherComment: comm?.remark || '',
+        principalComment: comm?.reviewNotes || '',
         // Credential details
         studentUsername: s.user?.username || `${(s.firstName || '').toLowerCase()}.${(s.lastName || '').toLowerCase()}`,
         studentPassword: s.user?.rawPassword || 'Pass@123',
@@ -4272,6 +4427,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
 
     return res.json({
       success: true,
+      schoolBranding,
       classInfo: summaryPayload,
       classSummary: summaryPayload,
       selectedExamId,

@@ -56,13 +56,25 @@ async function forbidUnlessFormTeacher(
 
 async function activeSessionId(branchId?: number, classId?: number): Promise<number> {
   const globalSetting = await prisma.globalSettings.findFirst();
-  const globalSession = globalSetting?.sessionId || 4;
+  const globalSession = globalSetting?.sessionId || 5;
   if (!branchId) return globalSession;
 
-  const where: any = { branchId, sessionId: globalSession };
-  if (classId) where.classId = classId;
-  const count = await prisma.enroll.count({ where });
-  if (count > 0) return globalSession;
+  if (classId) {
+    const sessionCohorts = await prisma.enroll.groupBy({
+      by: ['sessionId'],
+      where: { branchId, classId, isAlumni: 0 },
+      _count: { id: true },
+      orderBy: [{ _count: { id: 'desc' } }, { sessionId: 'desc' }],
+    });
+    if (sessionCohorts.length > 0) {
+      const defCohort = sessionCohorts.find((s) => s.sessionId === globalSession);
+      const topCohort = sessionCohorts[0];
+      if (defCohort && defCohort._count.id >= topCohort._count.id) {
+        return globalSession;
+      }
+      return topCohort.sessionId;
+    }
+  }
 
   const fallbackWhere: any = { branchId };
   if (classId) fallbackWhere.classId = classId;
