@@ -11,6 +11,7 @@ import {
   hasClassAccess as originalHasClassAccess,
   canTeacherAccessSubject,
   getTeacherAcademicRoles,
+  resolveActiveSessionForClass,
 } from '../../lib/teacherAccess';
 import { uploadBase64Image } from '../../lib/cloudinary';
 import { getRegisterWithEntries, REGISTER_STATUS } from '../../lib/attendanceRegisterService';
@@ -60,17 +61,7 @@ export async function saveMediaFile(file: any) {
 
 async function resolveTeacherSession(branchId?: number, reqSessionId?: number): Promise<number> {
   if (reqSessionId) return Number(reqSessionId);
-  const globalSetting = await prisma.globalSettings.findFirst();
-  if (globalSetting?.sessionId) return globalSetting.sessionId;
-  if (branchId) {
-    const latestEnroll = await prisma.enroll.findFirst({
-      where: { branchId },
-      orderBy: { sessionId: 'desc' },
-      select: { sessionId: true },
-    });
-    if (latestEnroll?.sessionId) return latestEnroll.sessionId;
-  }
-  return 5;
+  return resolveActiveSessionForClass(prisma, branchId, undefined);
 }
 
 export function generateJitsiToken({ roomName, user, isModerator }: { roomName: string; user: any; isModerator: boolean }) {
@@ -170,9 +161,16 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
 
     const teacherSubjectIds = Array.from(uniqueSubjectsMap.keys());
 
-    // Batch 2: everything below only depends on batch 1 — run concurrently.
+    const primaryFormSessionId = formAllocations[0]
+      ? await resolveActiveSessionForClass(prisma, req.branchId, formAllocations[0].classId)
+      : activeSessionId;
+
+    // Batch 2: fetch roster counts per class-section, snapshot, activities and academic metrics concurrently.
+    const classCountMap = new Map<string, number>();
+    const allEnrolledStudentIds = new Set<number>();
+
     const [
-      totalStudentsCount,
+      ,
       snapshot,
       assignmentsCount,
       pendingReviewCount,
@@ -183,19 +181,30 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       dbReminders,
       academicRoles,
     ] = await Promise.all([
-      classSectionPairs.length > 0
-        ? prisma.enroll.count({
+      // Compute accurate active student count for each classSectionPair matching attendance criteria
+      Promise.all(
+        classSectionPairs.map(async (pair) => {
+          const pairKey = `${pair.classId}-${pair.sectionId}`;
+          const cSessionId = await resolveActiveSessionForClass(prisma, req.branchId, pair.classId);
+          const enrolls = await prisma.enroll.findMany({
             where: {
-              sessionId: activeSessionId,
+              classId: pair.classId,
+              sectionId: pair.sectionId,
+              sessionId: cSessionId,
+              isAlumni: 0,
+              student: { active: true },
               ...(req.branchId ? { branchId: req.branchId } : {}),
-              OR: classSectionPairs,
             },
-          })
-        : Promise.resolve(0),
+            select: { studentId: true },
+          });
+          classCountMap.set(pairKey, enrolls.length);
+          enrolls.forEach((e) => allEnrolledStudentIds.add(e.studentId));
+        })
+      ),
       formAllocations[0]
         ? getRegisterWithEntries(prisma, {
             branchId: req.branchId,
-            sessionId: activeSessionId,
+            sessionId: primaryFormSessionId,
             classId: formAllocations[0].classId,
             sectionId: formAllocations[0].sectionId,
             dateKey: todayKey,
@@ -233,6 +242,19 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       getTeacherAcademicRoles(prisma, req.teacherId, req.branchId, req.sessionId ? Number(req.sessionId) : null),
     ]);
 
+    const formClassCounts = formAllocations.map(
+      (fa) => classCountMap.get(`${fa.classId}-${fa.sectionId}`) || 0
+    );
+    const formStudentsCount =
+      formClassCounts.length > 0
+        ? formClassCounts.reduce((sum, c) => sum + c, 0)
+        : allEnrolledStudentIds.size;
+
+    const homeroomRosterCount =
+      snapshot?.roster?.length !== undefined && snapshot.roster.length > 0
+        ? snapshot.roster.length
+        : formStudentsCount;
+
     let attendancePct = 0,
       presentCount = 0,
       lateCount = 0,
@@ -266,18 +288,22 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       return { name: subName, score: agg && agg.count > 0 ? Math.round(agg.total / agg.count) : 0 };
     });
 
-    const myClasses = formAllocations.map((fa) => ({
-      name: `${fa.class?.name || ''} ${fa.section?.name || ''}`.trim(),
-      role: 'Class Teacher',
-      studentsCount: totalStudentsCount,
-    }));
+    const myClasses = formAllocations.map((fa) => {
+      const key = `${fa.classId}-${fa.sectionId}`;
+      return {
+        name: `${fa.class?.name || ''} ${fa.section?.name || ''}`.trim(),
+        role: 'Class Teacher',
+        studentsCount: classCountMap.get(key) || 0,
+      };
+    });
     subjectAssignments.forEach((sa) => {
       const className = `${sa.class?.name || ''} ${sa.section?.name || ''}`.trim();
       if (!myClasses.find((c) => c.name === className)) {
+        const key = `${sa.classId}-${sa.sectionId}`;
         myClasses.push({
           name: className,
           role: 'Subject Teacher',
-          studentsCount: totalStudentsCount,
+          studentsCount: classCountMap.get(key) || 0,
         });
       }
     });
@@ -304,6 +330,38 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       }
     }
 
+    const attendanceDenominator =
+      formAllocations.length > 0 ? homeroomRosterCount : allEnrolledStudentIds.size;
+
+    const subjects = await Promise.all(
+      Array.from(uniqueSubjectsMap.entries()).map(async ([id, name]) => {
+        const matchingAssigns = subjectAssignments.filter((sa) => sa.subject?.id === id);
+        const subStudentIds = new Set<number>();
+        for (const sa of matchingAssigns) {
+          const sSessionId = await resolveActiveSessionForClass(prisma, req.branchId, sa.classId);
+          const enrolls = await prisma.enroll.findMany({
+            where: {
+              classId: sa.classId,
+              sectionId: sa.sectionId,
+              sessionId: sSessionId,
+              isAlumni: 0,
+              student: { active: true },
+              ...(req.branchId ? { branchId: req.branchId } : {}),
+            },
+            select: { studentId: true },
+          });
+          enrolls.forEach((e) => subStudentIds.add(e.studentId));
+        }
+        return {
+          id,
+          name,
+          studentsCount: subStudentIds.size,
+          score: subjectPerformance.find((sp) => sp.name === name)?.score || 0,
+          nextLesson: 'Scheduled on Timetable',
+        };
+      })
+    );
+
     return res.json({
       success: true,
       profile: {
@@ -316,7 +374,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         primaryForm,
       },
       kpi: {
-        studentsCount: totalStudentsCount,
+        studentsCount: formAllocations.length > 0 ? homeroomRosterCount : allEnrolledStudentIds.size,
         presentTodayCount: presentCount,
         subjectsCount,
         assignmentsCount,
@@ -330,9 +388,9 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         presentCount,
         lateCount,
         absentCount,
-        presentPct: totalStudentsCount > 0 ? Math.round((presentCount / totalStudentsCount) * 100) : 0,
-        latePct: totalStudentsCount > 0 ? Math.round((lateCount / totalStudentsCount) * 100) : 0,
-        absentPct: totalStudentsCount > 0 ? Math.round((absentCount / totalStudentsCount) * 100) : 0,
+        presentPct: attendanceDenominator > 0 ? Math.round((presentCount / attendanceDenominator) * 100) : 0,
+        latePct: attendanceDenominator > 0 ? Math.round((lateCount / attendanceDenominator) * 100) : 0,
+        absentPct: attendanceDenominator > 0 ? Math.round((absentCount / attendanceDenominator) * 100) : 0,
       },
       subjectPerformance,
       teachingSummary: {
@@ -341,13 +399,7 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
         testsCreatedCount: testsCount,
         scoresEnteredPct: classAverage > 0 ? 100 : 0,
       },
-      subjects: Array.from(uniqueSubjectsMap.entries()).map(([id, name]) => ({
-        id,
-        name,
-        studentsCount: totalStudentsCount,
-        score: subjectPerformance.find((sp) => sp.name === name)?.score || 0,
-        nextLesson: 'Scheduled on Timetable',
-      })),
+      subjects,
       myClasses,
       academicRoles,
       reminders,
@@ -448,10 +500,15 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
       }
     }
 
-    // Build enroll query where condition
+    // Build enroll query where condition with active non-alumni scoping
+    const targetSessionId = filterClassId
+      ? await resolveActiveSessionForClass(prisma, req.branchId, filterClassId)
+      : activeSessionId;
+
     const whereCondition: any = {
       isAlumni: 0,
-      sessionId: activeSessionId,
+      sessionId: targetSessionId,
+      student: { active: true },
       ...(req.branchId ? { branchId: req.branchId } : {}),
     };
 

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
-import { isSubjectTeacher, isFormTeacher, hasClassAccess, canTeacherAccessSubject } from '../../lib/teacherAccess';
+import { isSubjectTeacher, isFormTeacher, hasClassAccess, canTeacherAccessSubject, resolveActiveSessionForClass } from '../../lib/teacherAccess';
 import { generatePedagogicalLessonPlan } from '../../lib/lessonPlanService';
 import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
 import { generateStudentAiCommentary, generateBatchClassCommentary } from '../../lib/commentaryService';
@@ -15,7 +15,13 @@ import {
 import gamificationService from '../../lib/gamificationService';
 import { generateRegistrationNumber } from '../../lib/studentService';
 import { listSubmittedAttendance, summarizeSubmittedAttendanceByStudent } from '../../lib/attendanceRegisterService';
-import { parseMarkScore } from '../../lib/markParser';
+import {
+  parseMarkScore,
+  resolveClassEvaluationMatrix,
+  resolveActiveMatrixColumnsForStage,
+  mapStudentMarkToMatrix,
+  buildResolvedMatrixFromDbRecord,
+} from '../../lib/markParser';
 import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
 import { getRatingLabel } from '../admin/adminMarksReportController';
 import {
@@ -108,8 +114,9 @@ export async function getStudents(req: Request, res: Response): Promise<Response
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await resolveActiveSessionForClass(prisma, req.branchId, Number(classId));
 
     const enrolls = await prisma.enroll.findMany({
       where: {
@@ -484,8 +491,9 @@ export async function batchGenerateCommentaryAi(req: Request, res: Response): Pr
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await resolveActiveSessionForClass(prisma, req.branchId, Number(classId));
 
     const enrolls = await prisma.enroll.findMany({
       where: {
@@ -635,8 +643,9 @@ export async function getReportCards(req: Request, res: Response): Promise<Respo
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await resolveActiveSessionForClass(prisma, req.branchId, Number(classId));
 
     const enrolls = await prisma.enroll.findMany({
       where: {
@@ -1271,14 +1280,14 @@ export async function uploadGradebookCsv(req: Request, res: Response): Promise<R
  * GET /api/teacher/report-cards/export-pdf
  */
 export async function exportReportCardPdf(req: Request, res: Response): Promise<Response | void> {
-  const { studentId, examId, rankingType = 'full', rankingLimit = 3 } = req.query as any;
+  const { studentId, examId, rankingType = 'full', rankingLimit = 3, stage: reqStage } = req.query as any;
   if (!studentId) {
     return res.status(400).json({ success: false, message: 'studentId is required.' });
   }
 
   try {
     const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId ? Number(req.query.sessionId) : (globalSetting?.sessionId || 5);
 
     const [student, schoolYear] = await Promise.all([
       prisma.student.findUnique({
@@ -1308,7 +1317,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       return res.status(404).json({ success: false, message: 'Student not enrolled in active session.' });
     }
 
-    const [schoolBranding, attendanceMap] = await Promise.all([
+    const [schoolBranding, attendanceMap, dbMatrix, gradingScale] = await Promise.all([
       resolveSchoolReportBranding(prisma, req.branchId || student.branchId, {
         classId: enroll.classId,
         sectionId: enroll.sectionId,
@@ -1321,6 +1330,8 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         branchId: req.branchId || student.branchId,
         studentIds: [Number(studentId)],
       }),
+      resolveClassEvaluationMatrix(prisma, req.branchId || student.branchId, enroll.classId),
+      resolveGradingScale(prisma, req.branchId || student.branchId, enroll.classId),
     ]);
 
     const att = attendanceMap.get(Number(studentId)) || { present: 0, absent: 0, late: 0, totalDays: 0 };
@@ -1371,42 +1382,61 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         ...(examId ? { examId: Number(examId) } : {}),
       },
       include: {
-        subject: { select: { name: true, subjectCode: true } },
-        exam: { select: { name: true, resumptionDate: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
+        exam: { select: { id: true, name: true, examCategory: true, resumptionDate: true } },
       },
     });
+
+    // Determine effective stage from query or selected exam category in DB
+    let effectiveStage = reqStage ? String(reqStage).toUpperCase() : 'FULL';
+    if (!reqStage && studentMarks[0]?.exam) {
+      const exCat = String(studentMarks[0].exam.examCategory || '').toUpperCase();
+      const exName = String(studentMarks[0].exam.name || '');
+      if (exCat === 'CA' || (/^(ca|c\.a|continuous assessment|mid[\s-]*term)/i.test(exName) && !/exam/i.test(exName))) {
+        effectiveStage = 'COMBINED_CA';
+      }
+    }
+
+    const { activeStage, activeColumns, activeMaxMarks, isCaOnlyStage } = resolveActiveMatrixColumnsForStage(
+      dbMatrix,
+      effectiveStage
+    );
 
     const commentaryRecord = await prisma.studentCommentary.findFirst({
       where: { studentId: Number(studentId), sessionId },
       select: { remark: true, reviewNotes: true },
     });
 
-    let totalScoreSum = 0;
+    let totalPercentageSum = 0;
     let marksCount = 0;
 
     const reportCard = studentMarks.map((m) => {
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
-      if (parsed.hasValidScore) {
-        totalScoreSum += parsed.total;
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        totalPercentageSum += mapped.normalizedPercentage;
         marksCount++;
       }
+      const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
 
       return {
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
-        mark: parsed.hasValidScore ? String(parsed.total) : null,
-        absent: m.absent === '1',
-        classAverage: parsed.total,
+        componentScores: mapped.componentScores,
+        cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
+        theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+        mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
+        stageScore: mapped.stageTotal,
+        maxMarks: activeMaxMarks,
+        grade: gradeRes.grade,
+        remark: gradeRes.remark,
+        absent: m.absent === '1' || m.absent === 'true',
+        classAverage: mapped.stageTotal,
       };
     });
 
-    const overallAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
-
-    const gradingScale = await resolveGradingScale(prisma, req.branchId || student.branchId, enroll.classId);
+    const overallAverage = marksCount > 0 ? Number((totalPercentageSum / marksCount).toFixed(1)) : 0;
 
     const pdfBuffer = await generateReportCardPdf({
       schoolName: schoolBranding.schoolName || student.branch?.name || 'Ugbekun Schools',
@@ -1417,11 +1447,15 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       sectionName: enroll.section?.name || 'N/A',
       sessionName: schoolYear?.schoolYear || schoolBranding.academicSession || 'N/A',
       reportCard,
+      assessmentComponents: activeColumns,
+      maxTotal: activeMaxMarks,
+      stage: activeStage,
+      isMidTerm: isCaOnlyStage && activeStage !== 'COMBINED_CA',
       overallAverage,
       commentary: commentaryRecord?.remark || '',
       teacherComment: commentaryRecord?.remark || '',
       principalComment: commentaryRecord?.reviewNotes || '',
-      rank: 1,
+      rank: isCaOnlyStage ? null : 1,
       totalClassStudents: 1,
       rankingType,
       rankingLimit: Number(rankingLimit),
@@ -1449,16 +1483,16 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
  * GET /api/teacher/report-cards/export-batch-pdf
  */
 export async function exportBatchReportCardsPdf(req: Request, res: Response): Promise<Response | void> {
-  const { classId, sectionId, examId } = req.query as any;
+  const { classId, sectionId, examId, stage: reqStage } = req.query as any;
   if (!classId || !sectionId) {
     return res.status(400).json({ success: false, message: 'classId and sectionId are required.' });
   }
 
   try {
     const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId ? Number(req.query.sessionId) : (globalSetting?.sessionId || 5);
 
-    const [enrolls, schoolYear, branch, schoolBranding] = await Promise.all([
+    const [enrolls, schoolYear, branch, schoolBranding, dbMatrix] = await Promise.all([
       prisma.enroll.findMany({
         where: {
           classId: Number(classId),
@@ -1493,6 +1527,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         sectionId: Number(sectionId),
         sessionId,
       }),
+      resolveClassEvaluationMatrix(prisma, req.branchId, Number(classId)),
     ]);
 
     if (enrolls.length === 0) {
@@ -1511,6 +1546,11 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       resolveGradingScale(prisma, req.branchId, Number(classId)),
     ]);
 
+    const { activeStage, activeColumns, activeMaxMarks, isCaOnlyStage } = resolveActiveMatrixColumnsForStage(
+      dbMatrix,
+      reqStage ? String(reqStage) : 'FULL'
+    );
+
     const studentCards = [];
     for (const e of enrolls) {
       const marks = await prisma.mark.findMany({
@@ -1526,26 +1566,34 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         },
       });
 
-      let sum = 0;
+      let pctSum = 0;
+      let validCount = 0;
       const rc = marks.map((m) => {
-        const parsed = parseMarkScore(m.mark, m.cbtMark);
-        if (parsed.hasValidScore) {
-          sum += parsed.total;
+        const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+        if (mapped.hasValidScore) {
+          pctSum += mapped.normalizedPercentage;
+          validCount++;
         }
+        const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
         return {
           id: m.id,
           examName: m.exam.name,
           subjectName: m.subject.name,
           subjectCode: m.subject.subjectCode,
-          cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-          theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
-          mark: parsed.hasValidScore ? String(parsed.total) : null,
-          absent: m.absent === '1',
-          classAverage: parsed.total,
+          componentScores: mapped.componentScores,
+          cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
+          theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+          mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
+          stageScore: mapped.stageTotal,
+          maxMarks: activeMaxMarks,
+          grade: gradeRes.grade,
+          remark: gradeRes.remark,
+          absent: m.absent === '1' || m.absent === 'true',
+          classAverage: mapped.stageTotal,
         };
       });
 
-      const avg = marks.length > 0 ? Number((sum / marks.length).toFixed(1)) : 0;
+      const avg = validCount > 0 ? Number((pctSum / validCount).toFixed(1)) : 0;
       const att = attendanceMap.get(e.student.id) || { present: 0, absent: 0, late: 0, totalDays: 0 };
 
       studentCards.push({
@@ -1555,11 +1603,15 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         sectionName: e.section?.name || 'N/A',
         sessionName: schoolYear?.schoolYear || schoolBranding.academicSession || 'N/A',
         reportCard: rc,
+        assessmentComponents: activeColumns,
+        maxTotal: activeMaxMarks,
+        stage: activeStage,
+        isMidTerm: isCaOnlyStage && activeStage !== 'COMBINED_CA',
         overallAverage: avg,
         commentary: e.student.commentaries[0]?.remark || '',
         teacherComment: e.student.commentaries[0]?.remark || '',
         principalComment: e.student.commentaries[0]?.reviewNotes || '',
-        rank: 1,
+        rank: isCaOnlyStage ? null : 1,
         totalClassStudents: enrolls.length,
         resumptionDate: marks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
         nextTermFees: schoolBranding.nextTermFees || null,
@@ -1599,8 +1651,9 @@ export async function getMontessoriSheet(req: Request, res: Response): Promise<R
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await resolveActiveSessionForClass(prisma, req.branchId, Number(classId));
 
     const enrolls = await prisma.enroll.findMany({
       where: {
@@ -1753,8 +1806,9 @@ export async function scanGrades(req: Request, res: Response): Promise<Response 
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
-    const sessionId = globalSetting?.sessionId || 5;
+    const sessionId = req.query.sessionId
+      ? Number(req.query.sessionId)
+      : await resolveActiveSessionForClass(prisma, req.branchId, Number(classId));
 
     const enrolls = await prisma.enroll.findMany({
       where: {
@@ -2617,11 +2671,14 @@ export async function getTeacherSubjects(req: Request, res: Response): Promise<R
     // Calculate student counts offering each subject in each class-section
     const assignedSubjects = await Promise.all(
       mergedAssigns.map(async (sa) => {
+        const sSessionId = await resolveActiveSessionForClass(prisma, branchId, sa.classId);
         const distinctStudents = await prisma.enroll.findMany({
           where: {
             classId: sa.classId,
             sectionId: sa.sectionId,
+            sessionId: sSessionId,
             isAlumni: 0,
+            student: { active: true },
             ...(branchId ? { branchId } : {}),
           },
           distinct: ['studentId'],
@@ -2689,11 +2746,16 @@ export async function getSubjectStudents(req: Request, res: Response): Promise<R
       return res.status(404).json({ success: false, message: 'Subject assignment not found.' });
     }
 
+    const targetSessionId = subjectAssign.sessionId || (await resolveActiveSessionForClass(prisma, req.branchId, subjectAssign.classId));
+
     const enrolls = await prisma.enroll.findMany({
       where: {
         classId: subjectAssign.classId,
         sectionId: subjectAssign.sectionId,
+        sessionId: targetSessionId,
         isAlumni: 0,
+        student: { active: true },
+        ...(req.branchId ? { branchId: req.branchId } : {}),
       },
       include: {
         student: {
@@ -2991,67 +3053,56 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    // Resolve Active School Evaluation Matrix
-    let matrix: any = null;
-    if (matrixId) {
-      matrix = await prisma.evaluationMatrix.findFirst({
-        where: { id: Number(matrixId), ...(branchId ? { branchId } : {}) },
-      });
-    }
-    if (!matrix && classData.evaluationMatrix) {
-      matrix = classData.evaluationMatrix;
-    }
-    if (!matrix) {
-      matrix = await prisma.evaluationMatrix.findFirst({
-        where: { ...(branchId ? { branchId } : {}), isDefault: true },
-        orderBy: { id: 'desc' },
-      });
-    }
-    if (!matrix) {
-      matrix = await prisma.evaluationMatrix.findFirst({
-        where: branchId ? { branchId } : {},
-        orderBy: { id: 'desc' },
-      });
-    }
-    if (!matrix) {
-      // Default to Standard CA + Examination if no custom matrix exists yet
-      matrix = {
-        id: 0,
-        name: 'Continuous Assessment & Examination',
-        code: 'CA-EXAM',
-        generalHeading: 'Termly Report',
-        description: 'Standard Assessment Matrix',
-        totalMarks: 100,
-        isDefault: true,
-        components: [
-          { code: 'CA', name: 'Continuous Assessment', maxMarks: 40, passMarks: 20 },
-          { code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, passMarks: 30 },
-        ],
-      };
-    } else {
-      if (typeof matrix.components === 'string') {
-        try {
-          matrix.components = JSON.parse(matrix.components);
-        } catch {
-          matrix.components = [];
-        }
-      }
-      matrix = {
-        ...matrix,
-        generalHeading: matrix.generalHeading && String(matrix.generalHeading).trim() ? String(matrix.generalHeading).trim() : 'Termly Report',
-      };
-    }
+    // Resolve Active School Evaluation Matrix strictly from Database
+    const resolvedDbMatrix = await resolveClassEvaluationMatrix(
+      prisma,
+      branchId || classData.branchId,
+      cId,
+      matrixId ? Number(matrixId) : null
+    );
+    const matrix: any = {
+      id: resolvedDbMatrix.id,
+      name: resolvedDbMatrix.name,
+      code: resolvedDbMatrix.code,
+      generalHeading: resolvedDbMatrix.generalHeading,
+      totalMarks: resolvedDbMatrix.fullMaxMarks,
+      caMaxMarks: resolvedDbMatrix.caMaxMarks,
+      examMaxMarks: resolvedDbMatrix.examMaxMarks,
+      isDefault: resolvedDbMatrix.isDefault,
+      components: resolvedDbMatrix.columns,
+    };
 
     // Fetch all evaluation matrices created by admin for this school branch
     const branchMatrices = await prisma.evaluationMatrix.findMany({
       where: branchId ? { branchId } : {},
+      include: {
+        columns: {
+          orderBy: { displayOrder: 'asc' },
+          include: {
+            feedItems: {
+              include: {
+                examMaster: { select: { id: true, name: true, examCategory: true, cbtTotalMarks: true } },
+              },
+            },
+          },
+        },
+      },
       orderBy: [{ isDefault: 'desc' }, { id: 'desc' }],
     });
-    const parsedBranchMatrices = branchMatrices.map((m: any) => ({
-      ...m,
-      generalHeading: m.generalHeading && String(m.generalHeading).trim() ? String(m.generalHeading).trim() : 'Termly Report',
-      components: typeof m.components === 'string' ? JSON.parse(m.components) : m.components,
-    }));
+    const parsedBranchMatrices = branchMatrices.map((m: any) => {
+      const built = buildResolvedMatrixFromDbRecord(m);
+      return {
+        id: built.id,
+        name: built.name,
+        code: built.code,
+        generalHeading: built.generalHeading,
+        totalMarks: built.fullMaxMarks,
+        caMaxMarks: built.caMaxMarks,
+        examMaxMarks: built.examMaxMarks,
+        isDefault: built.isDefault,
+        components: built.columns,
+      };
+    });
 
     const schoolYears = await prisma.schoolYear.findMany({
       orderBy: { id: 'desc' },
@@ -3753,6 +3804,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       select: {
         id: true,
         name: true,
+        examCategory: true,
         termId: true,
         sessionId: true,
       },
@@ -3769,6 +3821,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         select: {
           id: true,
           name: true,
+          examCategory: true,
           termId: true,
           sessionId: true,
         },
@@ -3783,6 +3836,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         select: {
           id: true,
           name: true,
+          examCategory: true,
           termId: true,
           sessionId: true,
         },
@@ -3800,6 +3854,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
           select: {
             id: true,
             name: true,
+            examCategory: true,
             termId: true,
             sessionId: true,
           },
@@ -3832,38 +3887,36 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       return {
         id: ex.id,
         name: ex.name,
+        examCategory: (ex as any).examCategory || null,
         displayName,
         termId: ex.termId,
         sessionId: ex.sessionId,
       };
     });
 
-    // Resolve Evaluation Matrix for the class
-    let matrix = cls.evaluationMatrix;
-    if (!matrix && branchId) {
-      matrix = await prisma.evaluationMatrix.findFirst({
-        where: { branchId, isDefault: true },
-      });
-      if (!matrix) {
-        matrix = await prisma.evaluationMatrix.findFirst({
-          where: { branchId },
-        });
+    // Resolve Evaluation Matrix for the class directly from the database (zero hardcoding)
+    const dbMatrix = await resolveClassEvaluationMatrix(prisma, branchId || cls.branchId, classId);
+
+    // Determine effective stage from explicit req.query.stage or selectedExam's DB examCategory
+    const reqStageParam = (req.query as any)?.stage ? String((req.query as any).stage).trim().toUpperCase() : null;
+    let effectiveStage = reqStageParam || 'FULL';
+    if (!reqStageParam && selectedExam) {
+      const exCat = String(selectedExam.examCategory || '').trim().toUpperCase();
+      const exName = String(selectedExam.name || '').trim();
+      if (exCat === 'CA' || (/^(ca|c\.a|continuous assessment|mid[\s-]*term)/i.test(exName) && !/exam/i.test(exName))) {
+        effectiveStage = 'COMBINED_CA';
       }
     }
 
-    let matrixComponents: Array<{ key: string; name: string; maxMarks: number }> = [];
-    if (matrix?.components) {
-      try {
-        matrixComponents = typeof matrix.components === 'string'
-          ? JSON.parse(matrix.components)
-          : (matrix.components as any);
-      } catch {
-        matrixComponents = [];
-      }
-    }
+    const {
+      activeStage,
+      activeColumns: resolvedComponents,
+      activeMaxMarks: subjectMaxMarks,
+      isCaOnlyStage,
+    } = resolveActiveMatrixColumnsForStage(dbMatrix, effectiveStage);
 
     // Resolve Grading Scale
-    const gradingScaleData = await resolveGradingScale(prisma, branchId || 1, classId);
+    const gradingScaleData = await resolveGradingScale(prisma, branchId || cls.branchId || 1, classId);
 
     // 1. Enrolled students currently active in this session
     const enrollWhere: any = {
@@ -4133,67 +4186,6 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       },
     });
 
-    // Fetch all ExamMarkDistribution records for this branch to resolve friendly component titles
-    const markDistributions = await prisma.examMarkDistribution.findMany({
-      where: branchId ? { branchId } : {},
-      select: { id: true, name: true },
-    });
-    const distMap = new Map<number, string>();
-    markDistributions.forEach((d) => distMap.set(d.id, d.name));
-
-    // Resolve assessment components configured by School Admin (Evaluation Matrix / Mark Distribution)
-    let resolvedComponents: Array<{
-      key: string;
-      code: string;
-      name: string;
-      maxMarks: number;
-      category: 'CA' | 'EXAM';
-    }> = [];
-
-    if (matrixComponents && matrixComponents.length > 0) {
-      resolvedComponents = matrixComponents.map((c: any, idx: number) => {
-        const code = String(c.code || c.key || `CA${idx + 1}`).toUpperCase();
-        const name = c.name || code;
-        const isExam = code.includes('EXAM') || name.toLowerCase().includes('exam');
-        return {
-          key: String(c.key || c.code || idx + 1),
-          code,
-          name,
-          maxMarks: Number(c.maxMarks) || (isExam ? 60 : 20),
-          category: isExam ? 'EXAM' : 'CA',
-        };
-      });
-    } else if (selectedExam?.markDistribution) {
-      try {
-        const distIds = typeof selectedExam.markDistribution === 'string'
-          ? JSON.parse(selectedExam.markDistribution).map(Number)
-          : [];
-        if (Array.isArray(distIds) && distIds.length > 0) {
-          resolvedComponents = distIds.map((dId: number, idx: number) => {
-            const name = distMap.get(dId) || `Assessment ${idx + 1}`;
-            const isExam = name.toLowerCase().includes('exam') || idx === distIds.length - 1;
-            return {
-              key: String(dId),
-              code: isExam ? 'EXAM' : `CA${idx + 1}`,
-              name,
-              maxMarks: isExam ? 60 : 10,
-              category: isExam ? 'EXAM' : 'CA',
-            };
-          });
-        }
-      } catch {
-        // ignore parse error
-      }
-    }
-
-    if (resolvedComponents.length === 0) {
-      resolvedComponents = [
-        { key: 'CA1', code: 'CA1', name: 'Continuous Assessment 1', maxMarks: 20, category: 'CA' },
-        { key: 'CA2', code: 'CA2', name: 'Continuous Assessment 2', maxMarks: 20, category: 'CA' },
-        { key: 'EXAM', code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, category: 'EXAM' },
-      ];
-    }
-
     const [commentaries, schoolBranding] = await Promise.all([
       prisma.studentCommentary.findMany({
         where: {
@@ -4219,7 +4211,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       commentaryByStudent.set(c.studentId, { remark: c.remark, reviewNotes: c.reviewNotes });
     });
 
-    // Build Tabulation Matrix & Total Score Summary
+    // Build Tabulation Matrix & Total Score Summary strictly from the DB EvaluationMatrix
     const tabulationRows = enrolls.map((e) => {
       const sId = e.student.id;
       const studentMarks: Record<number, number> = {};
@@ -4232,72 +4224,42 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
 
       offeredSubjects.forEach((sub) => {
         const markRecord = marks.find((m) => m.studentId === sId && m.subjectId === sub.id);
-        let score = 0;
-        let componentsMap: Record<string, number> = {};
+        const studentComps = compScores
+          .filter((c) => c.studentId === sId && c.subjectId === sub.id)
+          .map((cs) => ({
+            slotOrName: cs.assessmentComponent?.slot || cs.assessmentComponent?.name || 'component',
+            score: Number(cs.totalScore ?? (Number(cs.cbtScore || 0) + Number(cs.theoryScore || 0))),
+          }));
 
-        if (markRecord) {
-          const parsed = parseMarkScore(markRecord.mark, markRecord.cbtMark);
-          score = parsed.total;
-          componentsMap = { ...parsed.components };
+        const mapped = mapStudentMarkToMatrix(markRecord, dbMatrix, activeStage, studentComps);
+        const score = mapped.stageTotal;
 
-          // Map numbered distribution keys to component codes
-          resolvedComponents.forEach((rc) => {
-            if (componentsMap[rc.key] !== undefined && componentsMap[rc.code] === undefined) {
-              componentsMap[rc.code] = componentsMap[rc.key];
-            }
-          });
+        const componentsMap: Record<string, any> = {
+          ...mapped.componentScores,
+          caTotal: mapped.caTotal,
+          examScore: isCaOnlyStage ? 0 : mapped.examTotal,
+          practicalScore: mapped.practicalTotal,
+          totalScore: mapped.stageTotal,
+          fullTotal: mapped.fullTotal,
+          maxMarks: subjectMaxMarks,
+        };
 
-          // Single numeric string fallback
-          if (Object.keys(parsed.components).length === 0 && score > 0) {
-            componentsMap['EXAM'] = parsed.examScore || score;
-            if (parsed.testScore > 0) {
-              componentsMap['CA1'] = parsed.testScore;
-            }
-          }
-        }
-
-        // Check evaluation matrix component scores if score is 0 or no markRecord
-        if (score === 0) {
-          const studentComps = compScores.filter((c) => c.studentId === sId && c.subjectId === sub.id);
-          if (studentComps.length > 0) {
-            studentComps.forEach((cs) => {
-              const compKey = cs.assessmentComponent?.slot || cs.assessmentComponent?.name || 'component';
-              const val = Number(cs.totalScore ?? (Number(cs.cbtScore || 0) + Number(cs.theoryScore || 0)));
-              componentsMap[compKey] = val;
-              score += val;
-            });
-          }
-        }
-
-        let subCa = 0;
-        let subExam = 0;
-        resolvedComponents.forEach((rc) => {
-          const v = Number(componentsMap[rc.code] ?? componentsMap[rc.key] ?? 0);
-          if (rc.category === 'EXAM') {
-            subExam += v;
-          } else {
-            subCa += v;
-          }
-        });
-        if (subCa === 0 && subExam === 0 && score > 0) {
-          subExam = score;
-        }
-
-        componentsMap['caTotal'] = Math.round(subCa * 10) / 10;
-        componentsMap['examScore'] = Math.round(subExam * 10) / 10;
-        componentsMap['totalScore'] = Math.round(score * 10) / 10;
-
-        studentTotalCA += subCa;
-        studentTotalExam += subExam;
+        studentTotalCA += mapped.caTotal;
+        studentTotalExam += isCaOnlyStage ? 0 : mapped.examTotal;
 
         studentMarks[sub.id] = score;
         subjectBreakdowns[sub.id] = componentsMap;
-        subjectGrades[sub.id] = calculateGradeFromRanges(score, gradingScaleData.ranges);
+        subjectGrades[sub.id] = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScaleData.ranges);
         totalScore += score;
-        if (score > 0) subjectCount++;
+        if (mapped.hasValidScore && score > 0) subjectCount++;
       });
 
-      const averageScore = offeredSubjects.length > 0 ? Math.round((totalScore / offeredSubjects.length) * 10) / 10 : 0;
+      const rawAverageScore =
+        offeredSubjects.length > 0 ? Math.round((totalScore / offeredSubjects.length) * 10) / 10 : 0;
+      const averageScore =
+        offeredSubjects.length > 0 && subjectMaxMarks > 0
+          ? Math.round(((rawAverageScore / subjectMaxMarks) * 100) * 10) / 10
+          : rawAverageScore;
       const overallGrade = calculateGradeFromRanges(averageScore, gradingScaleData.ranges);
 
       const s = e.student;
@@ -4319,10 +4281,12 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         subjectScores: studentMarks,
         subjectBreakdowns,
         subjectGrades,
-        totalScore,
+        totalScore: Math.round(totalScore * 10) / 10,
         totalCA: Math.round(studentTotalCA * 10) / 10,
         totalExam: Math.round(studentTotalExam * 10) / 10,
+        rawAverageScore,
         averageScore,
+        subjectMaxMarks,
         grade: overallGrade.grade,
         gradeRemark: overallGrade.remark,
         gradeColor: overallGrade.color,
@@ -4389,19 +4353,21 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       gradeColor: r.gradeColor,
     }));
 
-    // Subject difficulty & average breakdown
+    // Subject difficulty & average breakdown (pass threshold normalized against subjectMaxMarks from DB)
+    const passScoreThreshold = subjectMaxMarks > 0 ? subjectMaxMarks * 0.5 : 50;
     const subjectStats = offeredSubjects.map((sub) => {
       const scores = rankedRows.map((r) => r.marks[sub.id] || 0);
       const subTotal = scores.reduce((a, b) => a + b, 0);
       const avg = totalStudents > 0 ? Math.round((subTotal / totalStudents) * 10) / 10 : 0;
       const highest = scores.length > 0 ? Math.max(...scores) : 0;
-      const subPassCount = scores.filter((s) => s >= 50).length;
+      const subPassCount = scores.filter((s) => s >= passScoreThreshold).length;
       const subPassRate = totalStudents > 0 ? Math.round((subPassCount / totalStudents) * 100) : 0;
       return {
         subjectId: sub.id,
         name: sub.name,
         code: sub.code,
         average: avg,
+        maxMarks: subjectMaxMarks,
         highest,
         passRate: subPassRate,
       };
@@ -4423,6 +4389,10 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       lowestScore: lowestTotalScore,
       passRate,
       passCount,
+      subjectMaxMarks,
+      caMaxMarks: dbMatrix.caMaxMarks,
+      fullMaxMarks: dbMatrix.fullMaxMarks,
+      stage: activeStage,
     };
 
     return res.json({
@@ -4433,6 +4403,12 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       selectedExamId,
       sessionId,
       termId: activeTermId,
+      stage: activeStage,
+      isCaOnlyStage,
+      subjectMaxMarks,
+      caMaxMarks: dbMatrix.caMaxMarks,
+      fullMaxMarks: dbMatrix.fullMaxMarks,
+      examMaxMarks: dbMatrix.examMaxMarks,
       activeSession: {
         id: matchedSy ? matchedSy.id : sessionId,
         name: activeSessionName,
@@ -4440,15 +4416,18 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       sessions,
       exams: formattedExams,
       assessmentComponents: resolvedComponents,
-      evaluationMatrix: matrix
-        ? {
-            id: matrix.id,
-            name: matrix.name,
-            code: matrix.code,
-            totalMarks: Number(matrix.totalMarks) || 100,
-            components: matrixComponents,
-          }
-        : null,
+      allMatrixColumns: dbMatrix.columns,
+      evaluationMatrix: {
+        id: dbMatrix.id,
+        name: dbMatrix.name,
+        code: dbMatrix.code,
+        generalHeading: dbMatrix.generalHeading,
+        totalMarks: dbMatrix.fullMaxMarks,
+        caMaxMarks: dbMatrix.caMaxMarks,
+        examMaxMarks: dbMatrix.examMaxMarks,
+        components: dbMatrix.columns,
+        activeComponents: resolvedComponents,
+      },
       gradingScale: {
         id: gradingScaleData.id,
         name: gradingScaleData.name,

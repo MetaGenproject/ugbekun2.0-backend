@@ -2,7 +2,13 @@ import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { generateReportCardPdf, generateMontessoriReportCardPdf, generateCommentBasedReportCardPdf } from '../../lib/pdfService';
 import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
-import { parseMarkScore } from '../../lib/markParser';
+import {
+  parseMarkScore,
+  resolveClassEvaluationMatrix,
+  resolveActiveMatrixColumnsForStage,
+  mapStudentMarkToMatrix,
+} from '../../lib/markParser';
+import { resolveGradingScale } from '../../lib/gradingService';
 import { getRatingLabel } from '../admin/adminMarksReportController';
 import { resolveSchoolReportBranding, computeStudentAttendanceMap } from '../../lib/reportCardHelper';
 
@@ -408,6 +414,26 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       });
     }
 
+    const [dbMatrix, gradingScale] = await Promise.all([
+      resolveClassEvaluationMatrix(prisma, req.studentBranchId, req.childClassId),
+      resolveGradingScale(prisma, req.studentBranchId, req.childClassId),
+    ]);
+
+    let defaultStage = 'FULL';
+    if (!isExamReleased) {
+      if (releaseCombinedCa || (releaseCa1 && releaseCa2)) defaultStage = 'COMBINED_CA';
+      else if (releaseCa1) defaultStage = 'CA1';
+      else if (releaseCa2) defaultStage = 'CA2';
+      else defaultStage = 'COMBINED_CA';
+    }
+    const requestedStage = String((req.query as any)?.stage || defaultStage).toUpperCase();
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
+
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
     const classMarks = await prisma.mark.findMany({
       where: {
@@ -424,9 +450,9 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 };
       }
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
-      if (parsed.hasValidScore) {
-        classAverageMap[key].sum += parsed.total;
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        classAverageMap[key].sum += mapped.stageTotal;
         classAverageMap[key].count += 1;
       }
     });
@@ -443,10 +469,10 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     let marksCount = 0;
 
     const reportCard = studentMarks.map((m) => {
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
 
-      if (parsed.hasValidScore) {
-        totalScoreSum += parsed.total;
+      if (mapped.hasValidScore) {
+        totalScoreSum += mapped.stageTotal;
         marksCount++;
       }
 
@@ -455,12 +481,12 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       const classAverage =
         avgData && avgData.count > 0
           ? Number((avgData.sum / avgData.count).toFixed(1))
-          : parsed.hasValidScore
-          ? parsed.total
+          : mapped.hasValidScore
+          ? mapped.stageTotal
           : 0;
 
       // ZERO DATA LEAKAGE: When exam/full is not released, sanitize theoryMark, mark (total) and classAverage!
-      const caScore = parsed.testScore > 0 ? String(parsed.testScore) : (parsed.total > 0 && !isExamReleased ? String(parsed.total) : null);
+      const caScore = mapped.caTotal > 0 ? String(mapped.caTotal) : (mapped.stageTotal > 0 && !isExamReleased ? String(mapped.stageTotal) : null);
 
       return {
         id: m.id,
@@ -468,12 +494,14 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
         // ZERO LEAKAGE: CBT/CA marks only if CA stages released
-        cbtMark: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? String(parsed.testScore) : null) : null,
-        ca1Score: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
-        ca2Score: releaseCa2 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
+        cbtMark: releaseCa1 || releaseCombinedCa || isExamReleased ? (mapped.caTotal > 0 ? String(mapped.caTotal) : null) : null,
+        ca1Score: releaseCa1 || releaseCombinedCa || isExamReleased ? (mapped.componentScores['CA1'] ?? (mapped.caTotal > 0 ? mapped.caTotal : null)) : null,
+        ca2Score: releaseCa2 || releaseCombinedCa || isExamReleased ? (mapped.componentScores['CA2'] ?? null) : null,
         // ZERO LEAKAGE: exam/theory marks completely withheld when exam is not released
-        theoryMark: isExamReleased ? (parsed.examScore > 0 ? String(parsed.examScore) : null) : null,
-        mark: isExamReleased ? (parsed.hasValidScore ? String(parsed.total) : null) : null,
+        theoryMark: isExamReleased && !isCaOnlyStage ? (mapped.examTotal > 0 ? String(mapped.examTotal) : null) : null,
+        mark: (isExamReleased || isCombinedCaOnly || isCaOnlyStage) ? (mapped.hasValidScore ? String(mapped.stageTotal) : null) : null,
+        componentScores: mapped.componentScores,
+        maxMarks: activeMaxMarks,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage: isExamReleased ? classAverage : null,
         statusRemark: m.absent === '1' || m.absent === 'true' ? 'Absent' : (caScore ? 'Progress recorded' : 'Pending'),
@@ -481,16 +509,21 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     });
 
     // Zero Leakage: Withhold overall average if terminal exam is unreleased
-    // For COMBINED_CA only: show CA average, but cap at CA total (e.g. out of 40)
-    const overallAverage = isExamReleased && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : null;
-    const combinedCaAverage = isCombinedCaOnly && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : null;
+    // For COMBINED_CA only: show CA average, capped at CA total from DB matrix
+    const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+    const normalizedAverage =
+      marksCount > 0 && activeMaxMarks > 0
+        ? Number((((totalScoreSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
+        : rawAverage;
+    const overallAverage = isExamReleased && marksCount > 0 ? normalizedAverage : null;
+    const combinedCaAverage = (isCombinedCaOnly || isCaOnlyStage) && marksCount > 0 ? rawAverage : null;
 
     let rank = null;
     let totalClassStudents = 0;
 
     // ZERO LEAKAGE: Rank MUST NOT be computed or sent for CA-only or Combined CA releases
     // Rank is ONLY computed and sent on full Terminal Exam report cards
-    if (isExamReleased && req.childClassId && req.childSectionId) {
+    if (isExamReleased && !isCaOnlyStage && req.childClassId && req.childSectionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
           classId: req.childClassId,
@@ -519,9 +552,9 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         });
 
         allMarks.forEach((m) => {
-          const parsed = parseMarkScore(m.mark, m.cbtMark);
-          if (parsed.hasValidScore) {
-            studentAggregates[m.studentId].sum += parsed.total;
+          const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+          if (mapped.hasValidScore) {
+            studentAggregates[m.studentId].sum += mapped.stageTotal;
             studentAggregates[m.studentId].count += 1;
           }
         });
@@ -556,7 +589,14 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       isPublished: true,
       schoolBranding,
       studentBio: studentRecord,
-      stage: isExamReleased ? 'FULL' : (isCombinedCaOnly ? 'COMBINED_CA' : 'MID_TERM'),
+      stage: isExamReleased && !isCaOnlyStage ? 'FULL' : (isCombinedCaOnly || isCaOnlyStage ? 'COMBINED_CA' : 'MID_TERM'),
+      isCaOnlyStage,
+      maxTotal: activeMaxMarks,
+      caMaxMarks: dbMatrix.caMaxMarks,
+      fullMaxMarks: dbMatrix.fullMaxMarks,
+      assessmentComponents: activeColumns,
+      allMatrixColumns: dbMatrix.columns,
+      gradingScale,
       visibleStages,
       releaseCa1,
       releaseCa2,
@@ -565,13 +605,13 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       releaseFull,
       reportCard,
       // ZERO LEAKAGE: omit overallAverage when exam not released; send combinedCaAverage for combined CA
-      overallAverage: isExamReleased ? overallAverage : null,
-      combinedCaAverage: isCombinedCaOnly ? combinedCaAverage : null,
+      overallAverage: isExamReleased && !isCaOnlyStage ? overallAverage : null,
+      combinedCaAverage: isCombinedCaOnly || isCaOnlyStage ? combinedCaAverage : null,
       commentary: commentary?.remark || null,
       teacherComment: commentary?.remark || null,
       principalComment: commentary?.reviewNotes || null,
       // ZERO LEAKAGE: rank is null unless terminal exam is fully released
-      rank: isExamReleased ? rank : null,
+      rank: isExamReleased && !isCaOnlyStage ? rank : null,
       totalClassStudents,
       nextTermResumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
       nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
@@ -882,6 +922,31 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       });
     }
 
+    const [dbMatrix, gradingScale] = await Promise.all([
+      resolveClassEvaluationMatrix(prisma, req.studentBranchId, req.childClassId),
+      resolveGradingScale(prisma, req.studentBranchId, req.childClassId),
+    ]);
+
+    const releaseCombinedCa = Boolean(autoPublished || classPub?.releaseCombinedCa);
+    if (releaseCombinedCa && !visibleStages.includes('COMBINED_CA')) {
+      visibleStages.push('COMBINED_CA');
+    }
+
+    let defaultStage = 'FULL';
+    if (!isExamReleased) {
+      if (releaseCombinedCa || (releaseCa1 && releaseCa2)) defaultStage = 'COMBINED_CA';
+      else if (releaseCa1) defaultStage = 'CA1';
+      else if (releaseCa2) defaultStage = 'CA2';
+      else defaultStage = 'COMBINED_CA';
+    }
+    const requestedStage = String((req.query as any)?.stage || defaultStage).toUpperCase();
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
+
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
     const classMarks = await prisma.mark.findMany({
       where: {
@@ -898,9 +963,9 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 };
       }
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
-      if (parsed.hasValidScore) {
-        classAverageMap[key].sum += parsed.total;
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        classAverageMap[key].sum += mapped.stageTotal;
         classAverageMap[key].count += 1;
       }
     });
@@ -909,10 +974,10 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
     let marksCount = 0;
 
     const reportCard = studentMarks.map((m) => {
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
 
-      if (parsed.hasValidScore) {
-        totalScoreSum += parsed.total;
+      if (mapped.hasValidScore) {
+        totalScoreSum += mapped.stageTotal;
         marksCount++;
       }
 
@@ -921,8 +986,8 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       const classAverage =
         avgData && avgData.count > 0
           ? Number((avgData.sum / avgData.count).toFixed(1))
-          : parsed.hasValidScore
-          ? parsed.total
+          : mapped.hasValidScore
+          ? mapped.stageTotal
           : 0;
 
       // ZERO DATA LEAKAGE IN PDF:
@@ -931,23 +996,30 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         examName: m.exam.name,
         subjectName: m.subject.name,
         subjectCode: m.subject.subjectCode,
-        cbtMark: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? String(parsed.testScore) : null) : null,
-        ca1Score: releaseCa1 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
-        ca2Score: releaseCa2 || isExamReleased ? (parsed.testScore > 0 ? parsed.testScore : null) : null,
-        theoryMark: isExamReleased ? (parsed.examScore > 0 ? String(parsed.examScore) : null) : null,
-        mark: isExamReleased ? (parsed.hasValidScore ? String(parsed.total) : null) : null,
+        cbtMark: releaseCa1 || releaseCombinedCa || isExamReleased ? (mapped.caTotal > 0 ? String(mapped.caTotal) : null) : null,
+        ca1Score: releaseCa1 || releaseCombinedCa || isExamReleased ? (mapped.componentScores['CA1'] ?? (mapped.caTotal > 0 ? mapped.caTotal : null)) : null,
+        ca2Score: releaseCa2 || releaseCombinedCa || isExamReleased ? (mapped.componentScores['CA2'] ?? null) : null,
+        theoryMark: isExamReleased && !isCaOnlyStage ? (mapped.examTotal > 0 ? String(mapped.examTotal) : null) : null,
+        mark: (isExamReleased || isCaOnlyStage) ? (mapped.hasValidScore ? String(mapped.stageTotal) : null) : null,
+        componentScores: mapped.componentScores,
+        maxMarks: activeMaxMarks,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage: isExamReleased ? classAverage : null,
       };
     });
 
-    const overallAverage = isExamReleased && marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+    const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
+    const normalizedAverage =
+      marksCount > 0 && activeMaxMarks > 0
+        ? Number((((totalScoreSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
+        : rawAverage;
+    const overallAverage = (isExamReleased || isCaOnlyStage) && marksCount > 0 ? normalizedAverage : 0;
     const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
 
     let rank = null;
     let totalClassStudents = 0;
 
-    if (isExamReleased && req.childClassId && req.childSectionId) {
+    if (isExamReleased && !isCaOnlyStage && req.childClassId && req.childSectionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
           classId: req.childClassId,
@@ -976,9 +1048,9 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         });
 
         allMarks.forEach((m) => {
-          const parsed = parseMarkScore(m.mark, m.cbtMark);
-          if (parsed.hasValidScore) {
-            studentAggregates[m.studentId].sum += parsed.total;
+          const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+          if (mapped.hasValidScore) {
+            studentAggregates[m.studentId].sum += mapped.stageTotal;
             studentAggregates[m.studentId].count += 1;
           }
         });
@@ -1038,13 +1110,16 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       resumptionDate,
       nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
       formTeacherName: schoolBranding.classTeacherName || formTeacherName,
-      isMidTerm: !isExamReleased,
-      stage: isExamReleased ? 'FULL' : 'CA1',
+      isMidTerm: isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY',
+      stage: activeStage,
       visibleStages,
       photo: student.photo || null,
       gender: student.gender || null,
       birthday: student.birthday || null,
       schoolBranding,
+      gradingRanges: gradingScale.ranges,
+      assessmentComponents: activeColumns,
+      maxTotal: activeMaxMarks,
     });
 
     const safeLastName = (student.lastName || 'Student').replace(/\s+/g, '_');

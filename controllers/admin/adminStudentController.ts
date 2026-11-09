@@ -1214,36 +1214,53 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
     const isRepeat = action === 'REPEAT';
     const actorId = Number(req.userId || 1);
 
+    // Sync PostgreSQL serial sequences for enroll and promotion_history
+    await prisma.$executeRawUnsafe(
+      `SELECT setval(pg_get_serial_sequence('enroll', 'id'), COALESCE((SELECT MAX(id) FROM enroll), 1), true)`
+    ).catch(() => {});
+    await prisma.$executeRawUnsafe(
+      `SELECT setval(pg_get_serial_sequence('promotion_history', 'id'), COALESCE((SELECT MAX(id) FROM promotion_history), 1), true)`
+    ).catch(() => {});
+
+    // Ensure target section is allocated to target class
+    await prisma.sectionsAllocation.upsert({
+      where: { classId_sectionId: { classId: tClassId, sectionId: tSectionId } },
+      update: {},
+      create: { classId: tClassId, sectionId: tSectionId },
+    }).catch(() => {});
+
     let successCount = 0;
     let failureCount = 0;
+    let lastErrorMsg = '';
 
     for (const studentId of studentIds) {
       try {
         await prisma.$transaction(async (tx: any) => {
-          // Find active enrollment
-          let currentEnroll = null;
+          // Find student's latest active enrollment across the branch
+          const latestEnroll = await tx.enroll.findFirst({
+            where: { studentId, branchId, isAlumni: 0 },
+            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          });
 
+          let currentEnroll = null;
           if (sClassId || sSessionId) {
             const matchWhere: any = { studentId, branchId, isAlumni: 0 };
             if (sClassId) matchWhere.classId = sClassId;
             if (sSessionId) matchWhere.sessionId = sSessionId;
             currentEnroll = await tx.enroll.findFirst({
               where: matchWhere,
-              orderBy: { id: 'desc' },
-            });
-          }
-
-          if (!currentEnroll) {
-            currentEnroll = await tx.enroll.findFirst({
-              where: { studentId, branchId, isAlumni: 0 },
               orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
             });
           }
 
           if (!currentEnroll) {
+            currentEnroll = latestEnroll;
+          }
+
+          if (!currentEnroll) {
             currentEnroll = await tx.enroll.findFirst({
               where: { studentId, branchId },
-              orderBy: { id: 'desc' },
+              orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
             });
           }
 
@@ -1251,23 +1268,40 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
             throw new Error(`No active enrollment found for student #${studentId}`);
           }
 
+          const effectiveSessionId = Math.max(
+            tSessionId,
+            currentEnroll.sessionId,
+            latestEnroll?.sessionId || 0
+          );
+
+          const maxPromo = await tx.promotionHistory.findFirst({
+            orderBy: { id: 'desc' },
+            select: { id: true },
+          });
+          const nextPromoId = (maxPromo?.id || 0) + 1;
+
           // Record promotion history audit
           await tx.promotionHistory.create({
             data: {
+              id: nextPromoId,
               studentId,
               fromClassId: currentEnroll.classId,
               fromSectionId: currentEnroll.sectionId,
               toClassId: tClassId,
               toSectionId: tSectionId,
               promotedBy: actorId,
-              sessionId: tSessionId,
+              sessionId: effectiveSessionId,
             },
           });
 
-          if (tSessionId === currentEnroll.sessionId) {
+          if (effectiveSessionId === currentEnroll.sessionId) {
             // Same session reassignment/promotion
-            await tx.enroll.update({
-              where: { id: currentEnroll.id },
+            await tx.enroll.updateMany({
+              where: {
+                studentId,
+                branchId,
+                sessionId: effectiveSessionId,
+              },
               data: {
                 classId: tClassId,
                 sectionId: tSectionId,
@@ -1277,13 +1311,14 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
             });
           } else {
             // Cross session promotion
-            const existingTargetEnroll = await tx.enroll.findFirst({
-              where: { studentId, sessionId: tSessionId, branchId },
+            const existingTargetEnrolls = await tx.enroll.findMany({
+              where: { studentId, sessionId: effectiveSessionId, branchId },
+              orderBy: { id: 'desc' },
             });
 
-            if (existingTargetEnroll) {
-              await tx.enroll.update({
-                where: { id: existingTargetEnroll.id },
+            if (existingTargetEnrolls.length > 0) {
+              await tx.enroll.updateMany({
+                where: { studentId, sessionId: effectiveSessionId, branchId },
                 data: {
                   classId: tClassId,
                   sectionId: tSectionId,
@@ -1292,13 +1327,20 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
                 },
               });
             } else {
+              const maxEnroll = await tx.enroll.findFirst({
+                orderBy: { id: 'desc' },
+                select: { id: true },
+              });
+              const nextEnrollId = (maxEnroll?.id || 0) + 1;
+
               await tx.enroll.create({
                 data: {
+                  id: nextEnrollId,
                   studentId,
                   classId: tClassId,
                   sectionId: tSectionId,
                   roll: currentEnroll.roll || 0,
-                  sessionId: tSessionId,
+                  sessionId: effectiveSessionId,
                   branchId,
                   isAlumni: 0,
                 },
@@ -1306,25 +1348,29 @@ export async function promoteStudent(req: Request, res: Response): Promise<Respo
             }
           }
 
-          await wipeEvaluationMatrix(tx, { studentId, sessionId: tSessionId }).catch(() => {});
+          await wipeEvaluationMatrix(tx, { studentId, sessionId: effectiveSessionId }).catch(() => {});
           await bindEvaluationMatrix(tx, {
             studentId,
             classId: tClassId,
             sectionId: tSectionId,
             branchId,
-            sessionId: tSessionId,
+            sessionId: effectiveSessionId,
           }).catch(() => {});
         }, { timeout: 30000, maxWait: 15000 });
 
         successCount++;
       } catch (err: any) {
         console.error(`[ADMIN] Promotion failure for student #${studentId}:`, err);
+        lastErrorMsg = err?.message || 'Database error during promotion';
         failureCount++;
       }
     }
 
     if (successCount === 0 && failureCount > 0) {
-      return res.status(500).json({ success: false, message: 'Failed to promote the selected student(s).' });
+      return res.status(500).json({
+        success: false,
+        message: `Failed to promote the selected student(s): ${lastErrorMsg}`,
+      });
     }
 
     const actionText = isRepeat ? 'repeated' : 'promoted';
@@ -2108,55 +2154,20 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
       });
     }
 
-    let targetSessionId = requestedSessionId ? Number(requestedSessionId) : null;
-    if (!targetSessionId) {
-      const globalSetting = await prisma.globalSettings.findFirst();
-      const defaultSession = globalSetting?.sessionId || 5;
+    const parsedClassId = Number(classId);
+    const parsedSectionId = Number(sectionId);
+    const explicitSessionId = requestedSessionId ? Number(requestedSessionId) : null;
 
-      // Group active enrollments by sessionId to see where students actually are
-      const sessionCohorts = await prisma.enroll.groupBy({
-        by: ['sessionId'],
-        where: {
-          branchId,
-          classId: Number(classId),
-          sectionId: Number(sectionId),
-          isAlumni: 0,
-          student: { active: true },
-        },
-        _count: { id: true },
-        orderBy: [
-          { _count: { id: 'desc' } },
-          { sessionId: 'desc' },
-        ],
-      });
-
-      if (sessionCohorts.length > 0) {
-        // If defaultSession has substantial students (e.g. >= any other session), use it.
-        // Otherwise, use the session holding the majority / active cohort of students.
-        const defaultCohort = sessionCohorts.find(s => s.sessionId === defaultSession);
-        const topCohort = sessionCohorts[0];
-
-        if (defaultCohort && defaultCohort._count.id >= topCohort._count.id) {
-          targetSessionId = defaultSession;
-        } else {
-          targetSessionId = topCohort.sessionId;
-        }
-      } else {
-        const latestWithStudents = await prisma.enroll.findFirst({
-          where: { branchId, classId: Number(classId), sectionId: Number(sectionId), isAlumni: 0 },
-          orderBy: { sessionId: 'desc' },
-          select: { sessionId: true },
-        });
-        targetSessionId = latestWithStudents?.sessionId || defaultSession;
-      }
-    }
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const defaultSession = globalSetting?.sessionId || 5;
+    const targetSessionId = explicitSessionId || defaultSession;
 
     let enrollments = await prisma.enroll.findMany({
       where: {
         branchId,
-        sessionId: targetSessionId,
-        classId: Number(classId),
-        sectionId: Number(sectionId),
+        ...(explicitSessionId ? { sessionId: explicitSessionId } : {}),
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
         isAlumni: 0,
         student: { active: true },
       },
@@ -2174,54 +2185,25 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
         },
       },
       orderBy: [
+        { sessionId: 'desc' },
         { student: { lastName: 'asc' } },
         { id: 'desc' },
       ],
     });
 
-    if (enrollments.length === 0) {
-      enrollments = await prisma.enroll.findMany({
-        where: {
-          branchId,
-          classId: Number(classId),
-          sectionId: Number(sectionId),
-          isAlumni: 0,
-          student: { active: true },
-        },
-        include: {
-          student: {
-            include: {
-              parent: true,
-              user: {
-                select: {
-                  id: true,
-                  username: true,
-                },
-              },
-            },
-          },
-        },
-        orderBy: [
-          { sessionId: 'desc' },
-          { student: { lastName: 'asc' } },
-          { id: 'desc' },
-        ],
-      });
-    }
-
     const formTeacherAllocation = await prisma.teacherAllocation.findFirst({
       where: {
-        classId: Number(classId),
-        sectionId: Number(sectionId),
-        sessionId: targetSessionId,
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
         branchId,
       },
+      orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
       include: {
         teacher: true,
       },
     });
 
-    // Exclude students who have since been promoted or enrolled in a higher/different class in this branch
+    // Exclude students who have since been promoted or enrolled in a different class or section in this branch
     const candidateStudentIds = Array.from(new Set(enrollments.map((e) => e.studentId)));
     if (candidateStudentIds.length > 0) {
       const latestEnrolls = await prisma.enroll.findMany({
@@ -2233,16 +2215,17 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
         orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
       });
 
-      const latestClassByStudent = new Map<number, number>();
+      const latestPlaceByStudent = new Map<number, { classId: number; sectionId: number }>();
       for (const le of latestEnrolls) {
-        if (!latestClassByStudent.has(le.studentId)) {
-          latestClassByStudent.set(le.studentId, le.classId);
+        if (!latestPlaceByStudent.has(le.studentId)) {
+          latestPlaceByStudent.set(le.studentId, { classId: le.classId, sectionId: le.sectionId });
         }
       }
 
       enrollments = enrollments.filter((e) => {
-        const currentActiveClsId = latestClassByStudent.get(e.studentId);
-        return currentActiveClsId === Number(classId);
+        const latestPlace = latestPlaceByStudent.get(e.studentId);
+        if (!latestPlace) return true;
+        return latestPlace.classId === parsedClassId && latestPlace.sectionId === parsedSectionId;
       });
     }
 

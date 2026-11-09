@@ -7,13 +7,19 @@ import prisma from '../../lib/prisma';
  */
 export async function getTimetableSessions(req: Request, res: Response): Promise<Response | void> {
   try {
-    const schoolYears = await prisma.schoolYear.findMany({
-      orderBy: { id: 'desc' },
-    });
+    const [schoolYears, globalSetting] = await Promise.all([
+      prisma.schoolYear.findMany({
+        orderBy: { id: 'desc' },
+      }),
+      prisma.globalSettings.findFirst(),
+    ]);
+
+    const activeSessionId = globalSetting?.sessionId || null;
 
     const sessions = schoolYears.map((s) => ({
       id: s.id,
       name: s.schoolYear.includes('Session') ? s.schoolYear : `${s.schoolYear} Academic Session`,
+      isCurrent: s.id === activeSessionId,
     }));
 
     return res.json({ success: true, sessions });

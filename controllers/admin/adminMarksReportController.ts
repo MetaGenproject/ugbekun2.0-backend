@@ -13,8 +13,13 @@ import {
   summarizeSubmittedAttendanceByStudent,
   summarizeSubmittedLogs,
 } from '../../lib/attendanceRegisterService';
-import { parseMarkScore } from '../../lib/markParser';
-import { resolveGradingScale } from '../../lib/gradingService';
+import {
+  parseMarkScore,
+  resolveClassEvaluationMatrix,
+  resolveActiveMatrixColumnsForStage,
+  mapStudentMarkToMatrix,
+} from '../../lib/markParser';
+import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
 import {
   resolveSchoolReportBranding,
   syncReportCardOnScoreSave,
@@ -57,44 +62,32 @@ export async function getMarksEntry(req: Request, res: Response): Promise<Respon
 
     const classData = await prisma.class.findFirst({
       where: { id: cId, branchId },
-      include: { evaluationMatrix: true },
     });
 
     if (!classData) {
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    let matrix: any = classData.evaluationMatrix;
-    if (!matrix) {
-      matrix = await prisma.evaluationMatrix.findFirst({
-        where: { branchId, isDefault: true },
-      });
-    }
-    if (!matrix) {
-      matrix = await prisma.evaluationMatrix.findFirst({
-        where: { branchId },
-      });
-    }
-    if (matrix) {
-      matrix = {
-        ...matrix,
-        generalHeading: matrix.generalHeading && String(matrix.generalHeading).trim() ? String(matrix.generalHeading).trim() : 'Termly Report',
-      };
-    } else {
-      matrix = {
-        id: 0,
-        name: 'Continuous Assessment & Examination',
-        code: 'CA-EXAM',
-        generalHeading: 'Termly Report',
-        description: 'Standard Assessment Matrix',
-        totalMarks: 100,
-        isDefault: true,
-        components: [
-          { code: 'CA', name: 'Continuous Assessment', maxMarks: 40, passMarks: 20 },
-          { code: 'EXAM', name: 'Terminal Examination', maxMarks: 60, passMarks: 30 },
-        ],
-      };
-    }
+    const dbMatrix = await resolveClassEvaluationMatrix(prisma, branchId, cId);
+    const matrix: any = {
+      id: dbMatrix.id,
+      name: dbMatrix.name,
+      code: dbMatrix.code,
+      generalHeading: dbMatrix.generalHeading,
+      description: dbMatrix.description,
+      totalMarks: dbMatrix.totalMarks,
+      isDefault: dbMatrix.isDefault,
+      components: dbMatrix.columns.map((c) => ({
+        key: c.key,
+        code: c.code,
+        name: c.label || c.name,
+        label: c.label || c.name,
+        maxMarks: c.maxMarks,
+        passMarks: c.passMarks,
+        category: c.category,
+        displayOrder: c.displayOrder,
+      })),
+    };
 
     const globalSetting = await prisma.globalSettings.findFirst();
     let activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
@@ -910,14 +903,12 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
   try {
     const parsedClassId = Number(classId);
     const parsedSectionId = Number(sectionId);
-    // COMBINED_CA is the new scope: CA1 + CA2, out of (maxCA1 + maxCA2), rank hidden
-    const activeStage = String(stage || 'FULL').toUpperCase();
-    const isCombinedCaScope = activeStage === 'COMBINED_CA';
+    const requestedStage = String(stage || 'FULL').toUpperCase();
     const parsedTermId = termId ? Number(termId) : 1;
 
     let sessionId = await resolveReportCardSession(branchId, reqSessionId);
 
-    const [cls, sec, schoolBranding] = await Promise.all([
+    const [cls, sec, schoolBranding, dbMatrix, gradingScale] = await Promise.all([
       prisma.class.findUnique({
         where: { id: parsedClassId },
         select: { name: true, isEcd: true, usesScores: true },
@@ -931,7 +922,17 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         sectionId: parsedSectionId,
         sessionId,
       }),
+      resolveClassEvaluationMatrix(prisma, branchId, parsedClassId),
+      resolveGradingScale(prisma, branchId, parsedClassId),
     ]);
+
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
+    const isCombinedCaScope = isCaOnlyStage;
 
     let enrolls = await prisma.enroll.findMany({
       where: {
@@ -1167,34 +1168,48 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       studentAggregates[id] = { sum: 0, count: 0, totalMarks: 0 };
     });
 
+    // Compute class averages per subject for the active stage
+    const classSubjectTotals: Record<string, { sum: number; count: number }> = {};
     marks.forEach((m) => {
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        const subKey = String(m.subject?.id || m.subjectId);
+        if (!classSubjectTotals[subKey]) classSubjectTotals[subKey] = { sum: 0, count: 0 };
+        classSubjectTotals[subKey].sum += mapped.stageTotal;
+        classSubjectTotals[subKey].count += 1;
+      }
+    });
+
+    marks.forEach((m) => {
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       if (studentMarksMap[m.studentId]) {
-        // Stage filtering: isolate CA1, CA2, Combined CA, or Exam
-        let scoreForStage = parsed.total;
-        if (activeStage === 'CA1') {
-          scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
-        } else if (activeStage === 'CA2') {
-          scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
-        } else if (activeStage === 'COMBINED_CA') {
-          // Combined CA: sum CA1 + CA2 component scores (testScore is CA mark)
-          scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
-        } else if (activeStage === 'EXAM') {
-          scoreForStage = parsed.examScore > 0 ? parsed.examScore : parsed.total;
-        }
+        const scoreForStage = mapped.stageTotal;
+        const subKey = String(m.subject?.id || m.subjectId);
+        const cAvgObj = classSubjectTotals[subKey];
+        const classAvg =
+          cAvgObj && cAvgObj.count > 0
+            ? Number((cAvgObj.sum / cAvgObj.count).toFixed(1))
+            : scoreForStage;
+
+        const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
 
         studentMarksMap[m.studentId].push({
           id: m.id,
           examName: m.exam?.name || 'Evaluation',
           subjectName: m.subject?.name || 'Subject',
           subjectCode: m.subject?.subjectCode || 'N/A',
-          cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-          theoryMark: isCombinedCaScope ? null : (parsed.examScore > 0 ? String(parsed.examScore) : null), // strip exam column in COMBINED_CA
-          mark: parsed.hasValidScore ? String(parsed.total) : null,
+          cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
+          theoryMark: isCombinedCaScope ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+          mark: mapped.hasValidScore ? String(scoreForStage) : null,
           stageScore: scoreForStage,
+          maxMarks: activeMaxMarks,
+          componentScores: mapped.componentScores,
+          grade: mapped.hasValidScore ? gradeRes.grade : '-',
+          remark: mapped.hasValidScore ? gradeRes.remark : '-',
+          classAverage: classAvg,
           absent: m.absent === '1' || m.absent === 'true',
         });
-        if (parsed.hasValidScore) {
+        if (mapped.hasValidScore) {
           studentAggregates[m.studentId].sum += scoreForStage;
           studentAggregates[m.studentId].count += 1;
           studentAggregates[m.studentId].totalMarks += scoreForStage;
@@ -1216,19 +1231,19 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
     const studentList = dedupedEnrolls.map((e) => {
       const st = e.student;
       const agg = studentAggregates[st.id] || { sum: 0, count: 0, totalMarks: 0 };
-      const avg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
+      const rawAvg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
+      const normalizedAvg =
+        agg.count > 0 && activeMaxMarks > 0
+          ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
+          : rawAvg;
       const rk = rankMap[st.id] || null;
       const comm = commMap[st.id];
       const mont = montMap[st.id];
       const att = attMap[st.id] || { total: 0, present: 0, absent: 0, late: 0 };
       const subComments = studentCommentsMap[st.id] || [];
 
-      let grade = 'F';
-      if (avg >= 70) grade = 'A';
-      else if (avg >= 60) grade = 'B';
-      else if (avg >= 50) grade = 'C';
-      else if (avg >= 45) grade = 'D';
-      else if (avg >= 40) grade = 'E';
+      const overallGradeRes = calculateGradeFromRanges(normalizedAvg, gradingScale.ranges);
+      const grade = overallGradeRes.grade;
 
       const getOrdinal = (n: number) => {
         const s = ['th', 'st', 'nd', 'rd'];
@@ -1236,7 +1251,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         return n + (s[(v - 20) % 10] || s[v] || s[0]);
       };
 
-      const defaults = buildDefaultRemarksForAverage(avg, st.firstName || 'Student');
+      const defaults = buildDefaultRemarksForAverage(normalizedAvg, st.firstName || 'Student');
 
       return {
         id: st.id,
@@ -1253,7 +1268,9 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         usesScores: !isCommentClass,
         isCommentBased: isCommentClass,
         totalMarks: isCommentClass ? null : agg.totalMarks,
-        average: isCommentClass ? null : avg,
+        average: isCommentClass ? null : normalizedAvg,
+        rawAverage: isCommentClass ? null : rawAvg,
+        maxMarksPerSubject: activeMaxMarks,
         grade: isCommentClass ? null : grade,
         // COMBINED_CA: rank and promotion are strictly hidden per spec
         position: (isCommentClass || isCombinedCaScope) ? null : (rk ? `${getOrdinal(rk)} out of ${studentIds.length}` : 'N/A'),
@@ -1308,7 +1325,21 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       sessionId,
       stage: activeStage,
       isCombinedCaScope,
-      maxTotal: isCombinedCaScope ? null : 100,
+      maxTotal: activeMaxMarks,
+      caMaxMarks: dbMatrix.caMaxMarks,
+      fullMaxMarks: dbMatrix.fullMaxMarks,
+      examMaxMarks: dbMatrix.examMaxMarks,
+      evaluationMatrix: {
+        id: dbMatrix.id,
+        name: dbMatrix.name,
+        code: dbMatrix.code,
+        generalHeading: dbMatrix.generalHeading,
+        totalMarks: dbMatrix.totalMarks,
+        components: dbMatrix.columns,
+      },
+      assessmentComponents: activeColumns,
+      allMatrixColumns: dbMatrix.columns,
+      gradingScale,
       termId: parsedTermId,
       className: cls?.name || 'Classroom',
       sectionName: sec?.name || 'Main',
@@ -1522,6 +1553,19 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       return res.send(pdfBuffer);
     }
 
+    const [dbMatrix, gradingScale] = await Promise.all([
+      resolveClassEvaluationMatrix(prisma, branchId, parsedClassId),
+      resolveGradingScale(prisma, branchId, parsedClassId),
+    ]);
+    const requestedStage = String((req.query as any)?.stage || 'FULL').toUpperCase();
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
+    const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
+
     const marks = await prisma.mark.findMany({
       where: { studentId: parsedStudentId, sessionId, branchId },
       include: {
@@ -1538,9 +1582,9 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     allClassMarks.forEach((m) => {
       const k = `${m.examId}-${m.subjectId}`;
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
-      if (parsed.hasValidScore) {
-        avgMap[k].sum += parsed.total;
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        avgMap[k].sum += mapped.stageTotal;
         avgMap[k].count += 1;
       }
     });
@@ -1548,30 +1592,36 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     let totalSum = 0;
     let marksCount = 0;
     const reportCard = marks.map((m) => {
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
-      if (parsed.hasValidScore) {
-        totalSum += parsed.total;
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        totalSum += mapped.stageTotal;
         marksCount += 1;
       }
 
       const k = `${m.examId}-${m.subjectId}`;
       const cAvg =
-        avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : parsed.total;
+        avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : mapped.stageTotal;
 
       return {
         id: m.id,
         examName: m.exam?.name || 'Term Evaluation',
         subjectName: m.subject?.name || 'Subject',
         subjectCode: m.subject?.subjectCode || 'N/A',
-        cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-        theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
-        mark: parsed.hasValidScore ? String(parsed.total) : null,
+        cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
+        theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+        mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
+        componentScores: mapped.componentScores,
+        maxMarks: activeMaxMarks,
         absent: m.absent === '1' || m.absent === 'true',
         classAverage: cAvg,
       };
     });
 
-    const overallAverage = marksCount > 0 ? Number((totalSum / marksCount).toFixed(1)) : 0;
+    const rawAverage = marksCount > 0 ? Number((totalSum / marksCount).toFixed(1)) : 0;
+    const overallAverage =
+      marksCount > 0 && activeMaxMarks > 0
+        ? Number((((totalSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
+        : rawAverage;
 
     const enrolls = await prisma.enroll.findMany({
       where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId },
@@ -1584,9 +1634,9 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     });
     allClassMarks.forEach((m) => {
       if (aggMap[m.studentId]) {
-        const parsed = parseMarkScore(m.mark, m.cbtMark);
-        if (parsed.hasValidScore) {
-          aggMap[m.studentId].sum += parsed.total;
+        const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+        if (mapped.hasValidScore) {
+          aggMap[m.studentId].sum += mapped.stageTotal;
           aggMap[m.studentId].count += 1;
         }
       }
@@ -1599,15 +1649,12 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       .sort((a, b) => b.avg - a.avg);
 
     const rankIdx = scoreRankList.findIndex((s) => s.id === parsedStudentId);
-    const rank = rankIdx !== -1 ? rankIdx + 1 : null;
+    const rank = isCaOnlyStage ? null : (rankIdx !== -1 ? rankIdx + 1 : null);
 
     const comm = await prisma.studentCommentary.findFirst({
       where: { studentId: parsedStudentId, sessionId, branchId },
     });
 
-    const gradingScale = await resolveGradingScale(prisma, branchId, parsedClassId);
-    const activeStage = String((req.query as any)?.stage || 'FULL').toUpperCase();
-    const isMidTerm = activeStage === 'CA1' || activeStage === 'CA2';
     const defaults = buildDefaultRemarksForAverage(overallAverage, student.firstName || 'Student');
 
     const pdfBuffer = await generateReportCardPdf({
@@ -1640,6 +1687,8 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       gradingRanges: gradingScale.ranges,
       isMidTerm,
       stage: activeStage,
+      assessmentComponents: activeColumns,
+      maxTotal: activeMaxMarks,
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1668,8 +1717,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
   try {
     const parsedClassId = Number(classId);
     const parsedSectionId = Number(sectionId);
-    const activeStage = String(stage || 'FULL').toUpperCase();
-    const isMidTerm = activeStage === 'CA1' || activeStage === 'CA2';
+    const requestedStage = String(stage || 'FULL').toUpperCase();
 
     let sessionId = reqSessionId ? Number(reqSessionId) : 0;
     if (!sessionId) {
@@ -1681,7 +1729,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       sessionId = classEnroll?.sessionId || (await resolveReportCardSession(branchId));
     }
 
-    const [cls, sec, sess, schoolBranding] = await Promise.all([
+    const [cls, sec, sess, schoolBranding, dbMatrix] = await Promise.all([
       prisma.class.findUnique({ where: { id: parsedClassId }, select: { name: true, isEcd: true, usesScores: true } }),
       prisma.section.findUnique({ where: { id: parsedSectionId }, select: { name: true } }),
       prisma.schoolYear.findUnique({ where: { id: sessionId }, select: { schoolYear: true } }),
@@ -1690,7 +1738,16 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         sectionId: parsedSectionId,
         sessionId,
       }),
+      resolveClassEvaluationMatrix(prisma, branchId, parsedClassId),
     ]);
+
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
+    const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
 
     const className = cls?.name || 'Classroom';
     const sectionName = sec?.name || 'Main';
@@ -1741,9 +1798,9 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     allMarks.forEach((m) => {
       const k = `${m.examId}-${m.subjectId}`;
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
-      if (parsed.hasValidScore) {
-        avgMap[k].sum += parsed.total;
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      if (mapped.hasValidScore) {
+        avgMap[k].sum += mapped.stageTotal;
         avgMap[k].count += 1;
       }
     });
@@ -1756,36 +1813,30 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     });
 
     allMarks.forEach((m) => {
-      const parsed = parseMarkScore(m.mark, m.cbtMark);
+      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
 
       if (studentMarksMap[m.studentId]) {
+        const scoreForStage = mapped.stageTotal;
         const k = `${m.examId}-${m.subjectId}`;
         const cAvg =
-          avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : parsed.total;
-
-        let scoreForStage = parsed.total;
-        if (activeStage === 'CA1') {
-          scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
-        } else if (activeStage === 'CA2') {
-          scoreForStage = parsed.testScore > 0 ? parsed.testScore : parsed.total;
-        } else if (activeStage === 'EXAM') {
-          scoreForStage = parsed.examScore > 0 ? parsed.examScore : parsed.total;
-        }
+          avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : scoreForStage;
 
         studentMarksMap[m.studentId].push({
           id: m.id,
           examName: m.exam?.name || 'Evaluation',
           subjectName: m.subject?.name || 'Subject',
           subjectCode: m.subject?.subjectCode || 'N/A',
-          cbtMark: parsed.testScore > 0 ? String(parsed.testScore) : null,
-          theoryMark: parsed.examScore > 0 ? String(parsed.examScore) : null,
-          mark: parsed.hasValidScore ? String(parsed.total) : null,
+          cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
+          theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+          mark: mapped.hasValidScore ? String(scoreForStage) : null,
           stageScore: scoreForStage,
+          componentScores: mapped.componentScores,
+          maxMarks: activeMaxMarks,
           absent: m.absent === '1' || m.absent === 'true',
           classAverage: cAvg,
         });
 
-        if (parsed.hasValidScore) {
+        if (mapped.hasValidScore) {
           studentAggregates[m.studentId].sum += scoreForStage;
           studentAggregates[m.studentId].count += 1;
         }
@@ -1860,11 +1911,15 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     const batchStudents = enrolls.map((e) => {
       const st = e.student;
       const agg = studentAggregates[st.id] || { sum: 0, count: 0 };
-      const avg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
-      const rk = rankMap[st.id] || null;
+      const rawAvg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
+      const normalizedAvg =
+        agg.count > 0 && activeMaxMarks > 0
+          ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
+          : rawAvg;
+      const rk = isCaOnlyStage ? null : (rankMap[st.id] || null);
       const comm = commMap[st.id];
       const mont = montMap[st.id];
-      const defaults = buildDefaultRemarksForAverage(avg, st.firstName || 'Student');
+      const defaults = buildDefaultRemarksForAverage(normalizedAvg, st.firstName || 'Student');
       const attSummary = attByStudent.get(st.id) || summarizeSubmittedLogs([]);
 
       return {
@@ -1884,7 +1939,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         isCommentBased: isCommentClass,
         reportCard: isCommentClass ? [] : (studentMarksMap[st.id] || []),
         subjectComments: subjectCommentsByStudent[st.id] || [],
-        overallAverage: isCommentClass ? 0 : avg,
+        overallAverage: isCommentClass ? 0 : normalizedAvg,
         commentary: comm?.remark || defaults.teacherComment,
         teacherComment: comm?.remark || defaults.teacherComment,
         principalComment: comm?.reviewNotes || defaults.principalComment,
@@ -1901,6 +1956,8 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         gradingRanges: gradingScale.ranges,
         isMidTerm,
         stage: activeStage,
+        assessmentComponents: activeColumns,
+        maxTotal: activeMaxMarks,
       };
     });
 

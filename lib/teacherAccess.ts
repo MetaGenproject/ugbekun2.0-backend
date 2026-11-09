@@ -191,6 +191,50 @@ export async function canTeacherUseClassSubject(
   return canTeacherAccessSubject(prisma, teacherId, classId, null, subjectId);
 }
 
+export async function resolveActiveSessionForClass(
+  prisma: any,
+  branchId?: number | null,
+  classId?: number | null
+): Promise<number> {
+  const globalSetting = await prisma.globalSettings.findFirst();
+  const globalSession = globalSetting?.sessionId || 5;
+  if (!branchId) return globalSession;
+
+  if (classId) {
+    const sessionCohorts = await prisma.enroll.groupBy({
+      by: ['sessionId'],
+      where: {
+        branchId,
+        classId,
+        isAlumni: 0,
+        student: { active: true },
+      },
+      _count: { id: true },
+      orderBy: [{ _count: { id: 'desc' } }, { sessionId: 'desc' }],
+    });
+    if (sessionCohorts.length > 0) {
+      const defCohort = sessionCohorts.find((s: any) => s.sessionId === globalSession);
+      const topCohort = sessionCohorts[0];
+      if (defCohort && defCohort._count.id >= topCohort._count.id) {
+        return globalSession;
+      }
+      return topCohort.sessionId;
+    }
+  }
+
+  const latest = await prisma.enroll.findFirst({
+    where: {
+      branchId,
+      ...(classId ? { classId } : {}),
+      isAlumni: 0,
+      student: { active: true },
+    },
+    orderBy: { sessionId: 'desc' },
+    select: { sessionId: true },
+  });
+  return latest?.sessionId ?? globalSession;
+}
+
 /**
  * Returns comprehensive overview of teacher's roles and scopes:
  * - Classes where teacher is Class Teacher (with all subjects offered)
@@ -241,11 +285,17 @@ export async function getTeacherAcademicRoles(
         },
       });
 
+      const targetSessionId = sessionId
+        ? Number(sessionId)
+        : await resolveActiveSessionForClass(prisma, branchId, fa.classId);
+
       const studentCount = await prisma.enroll.count({
         where: {
           classId: fa.classId,
           sectionId: fa.sectionId,
+          sessionId: targetSessionId,
           isAlumni: 0,
+          student: { active: true },
           ...(branchId ? { branchId } : {}),
         },
       });
@@ -321,11 +371,17 @@ export async function getTeacherAcademicRoles(
       });
     }
 
+    const targetSessionId = sessionId
+      ? Number(sessionId)
+      : await resolveActiveSessionForClass(prisma, branchId, sa.classId);
+
     const studentCount = await prisma.enroll.count({
       where: {
         classId: sa.classId,
         sectionId: sa.sectionId,
+        sessionId: targetSessionId,
         isAlumni: 0,
+        student: { active: true },
         ...(branchId ? { branchId } : {}),
       },
     });
@@ -434,6 +490,7 @@ export default {
   hasClassAccess,
   canTeacherAccessSubject,
   canTeacherUseClassSubject,
+  resolveActiveSessionForClass,
   getTeacherAcademicRoles,
   getTeacherClassSubjectScope,
   teacherScopedContentOr,

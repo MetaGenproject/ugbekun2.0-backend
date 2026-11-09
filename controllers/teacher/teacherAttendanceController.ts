@@ -26,6 +26,10 @@ import {
   toLegacyAttendancePayload,
   upsertEntries,
 } from '../../lib/attendanceRegisterService';
+import {
+  loadBranchCalendarEvents,
+  classifySchoolDateFromEvents,
+} from '../../lib/schoolCalendarService';
 
 function registerErrorResponse(res: Response, error: unknown) {
   if (error instanceof AttendanceRegisterError) {
@@ -520,6 +524,9 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
   const range = schoolDateStoredRange(dateKey);
 
   try {
+    const calendarEvents = await loadBranchCalendarEvents(prisma, req.branchId || 0);
+    const classification = classifySchoolDateFromEvents(dateKey, calendarEvents, described.isWeekend);
+
     const sessionId = req.query.sessionId
       ? Number(req.query.sessionId)
       : await activeSessionId(req.branchId, scope.isAllClasses ? undefined : scope.classId);
@@ -735,6 +742,9 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
       date: dateKey,
       weekday: described.weekday,
       isWeekend: described.isWeekend,
+      isHoliday: classification.isHoliday,
+      holidayTitle: classification.holidayTitle,
+      isSchoolDay: classification.isSchoolDay,
       isToday: described.isToday,
       register: register || null,
       summary: {
@@ -849,10 +859,16 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
       }
     }
 
+    // Load branch calendar events (holidays, school events, closures)
+    const calendarEvents = await loadBranchCalendarEvents(prisma, req.branchId || 0);
+
     // 3. Compute per-day totals across the class / school
     const daysData = dateKeys.map((dKey, idx) => {
       const dayNum = idx + 1;
       const isWeekend = isWeekendSchoolDate(dKey);
+      const classification = classifySchoolDateFromEvents(dKey, calendarEvents, isWeekend);
+      const isHoliday = classification.isHoliday;
+      const isNonSchoolDay = isWeekend || isHoliday;
       let dayPresent = 0;
       let dayAbsent = 0;
       let dayLate = 0;
@@ -874,12 +890,14 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
         day: dayNum,
         dateKey: dKey,
         isWeekend,
+        isHoliday,
+        holidayTitle: classification.holidayTitle,
         isSchoolDayHeld,
         totals: {
           present: dayPresent,
           absent: dayAbsent,
           late: dayLate,
-          holiday: isWeekend ? 1 : 0,
+          holiday: isNonSchoolDay ? 1 : 0,
         },
       };
     });
@@ -908,11 +926,13 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
           } else if (upper === 'LATE') {
             dayStatuses[String(dayItem.day)] = 'L';
             lCount++;
+          } else if (upper === 'HOLIDAY') {
+            dayStatuses[String(dayItem.day)] = 'H';
           } else {
             dayStatuses[String(dayItem.day)] = raw.slice(0, 1).toUpperCase();
           }
         } else {
-          dayStatuses[String(dayItem.day)] = dayItem.isWeekend ? 'H' : '—';
+          dayStatuses[String(dayItem.day)] = (dayItem.isWeekend || dayItem.isHoliday) ? 'H' : '—';
         }
       }
 
@@ -963,7 +983,7 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
         totalPresent: grandPresent,
         totalAbsent: grandAbsent,
         totalLate: grandLate,
-        totalHoliday: daysData.filter((d) => d.isWeekend).length,
+        totalHoliday: daysData.filter((d) => d.isWeekend || d.isHoliday).length,
         averageAttendanceRate: overallRate,
       },
       students,

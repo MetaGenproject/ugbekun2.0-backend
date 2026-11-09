@@ -556,6 +556,7 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
     rankString = '-',
     isProgressSlip = false,
     stage = 'FULL',
+    stageLabel = '',
     studentPhotoBuffer = null,
   } = params;
 
@@ -633,7 +634,7 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
        .text('Overall Score:', 285, y + 56);
 
     doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
-       .text(stage === 'CA2' ? 'Continuous Assessment 2' : (stage === 'COMBINED_CA' ? 'Combined CA (1+2)' : 'Continuous Assessment 1'), 372, y + 10)
+       .text(stageLabel || (stage === 'COMBINED_CA' || stage === 'CA_ONLY' ? 'Continuous Assessment' : stage), 372, y + 10, { width: 120, lineBreak: false, ellipsis: true })
        .text('Live Progress Report', 372, y + 26)
        .text(attText, 372, y + 42)
        .fillColor(primaryColor)
@@ -810,14 +811,36 @@ function drawStandardReportCard(doc, params) {
     gradingRanges = null,
     isMidTerm = false,
     stage = 'FULL',
+    assessmentComponents = null,
+    maxTotal = null,
     logoBuffer = null,
     studentPhotoBuffer = null,
     teacherSignatureBuffer = null,
     principalSignatureBuffer = null,
   } = params;
 
-  const isCombinedCa = stage === 'COMBINED_CA';
-  const isProgressSlip = Boolean(isMidTerm || stage === 'CA1' || stage === 'CA2' || isCombinedCa);
+  const isCombinedCa = stage === 'COMBINED_CA' || stage === 'CA_ONLY';
+  const isProgressSlip = Boolean(isMidTerm || (stage && stage !== 'FULL'));
+
+  // Resolve dynamic matrix columns from DB (via assessmentComponents)
+  const resolvedComponents = Array.isArray(assessmentComponents) && assessmentComponents.length > 0
+    ? assessmentComponents
+    : [];
+
+  const resolvedMaxTotal =
+    typeof maxTotal === 'number' && maxTotal > 0
+      ? maxTotal
+      : resolvedComponents.length > 0
+        ? resolvedComponents.reduce((sum, c) => sum + (Number(c.maxMarks) || 0), 0)
+        : (Number(reportCard?.[0]?.maxMarks) || 0);
+
+  const stageLabel = isCombinedCa
+    ? resolvedComponents.length === 1
+      ? `${resolvedComponents[0].label || resolvedComponents[0].code} (${resolvedMaxTotal})`
+      : `Continuous Assessment (${resolvedComponents.map((c) => c.code || c.label).join(' + ')})`
+    : isProgressSlip
+      ? (resolvedComponents[0]?.label || resolvedComponents[0]?.code || stage)
+      : 'Terminal Evaluation';
 
   // Dynamic School Brand Colors
   const primaryColor = sanitizeHexColor(params.primaryColor || branding.primaryColor, '#1e3a8a');
@@ -847,12 +870,12 @@ function drawStandardReportCard(doc, params) {
 
   // Compute GPA letter grade equivalent using active grading scale
   const gpaInfo = calculateGradeFromRanges(overallAverage, gradingRanges || undefined);
-  const gpaRating = isProgressSlip ? 'In Progress' : `${gpaInfo.grade} (${gpaInfo.remark || 'Graded'})`;
+  const gpaRating = `${gpaInfo.grade} (${gpaInfo.remark || 'Graded'})`;
 
   const reportSubtitle = isCombinedCa
-    ? 'COMBINED CONTINUOUS ASSESSMENT REPORT (CA1 + CA2)'
+    ? `CONTINUOUS ASSESSMENT REPORT (${resolvedComponents.map((c) => c.code || c.label).join(' + ') || 'CA'})`
     : isProgressSlip
-      ? 'MID-TERM CONTINUOUS ASSESSMENT PROGRESS REPORT'
+      ? 'CONTINUOUS ASSESSMENT PROGRESS REPORT'
       : 'OFFICIAL STUDENT TERMINAL REPORT CARD';
 
   // 1. Branded Header with Logo & School Info
@@ -890,6 +913,7 @@ function drawStandardReportCard(doc, params) {
       rankString,
       isProgressSlip,
       stage,
+      stageLabel,
       studentPhotoBuffer,
     },
     100,
@@ -900,42 +924,85 @@ function drawStandardReportCard(doc, params) {
 
   // 3. Academic Scoreboard Table
   doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text(
-    isProgressSlip ? 'CONTINUOUS ASSESSMENT PROGRESS SCORES' : 'COGNITIVE ACADEMIC PERFORMANCE',
+    isProgressSlip ? 'CONTINUOUS ASSESSMENT PERFORMANCE' : 'COGNITIVE ACADEMIC PERFORMANCE',
     30,
     y
   );
   y += 13;
 
-  // Table Header Row
+  // Table Header Row (Dynamic DB EvaluationMatrix Columns)
   doc.rect(30, y, 535, 19).fill(primaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5);
 
-  if (isCombinedCa) {
-    doc.text('CODE', 38, y + 5, { width: 65 })
-       .text('SUBJECT', 105, y + 5, { width: 155 })
-       .text('CA 1 (20)', 265, y + 5, { width: 45, align: 'right' })
-       .text('CA 2 (20)', 315, y + 5, { width: 45, align: 'right' })
-       .text('TOTAL (40)', 365, y + 5, { width: 65, align: 'right' })
-       .text('CLASS AVG', 435, y + 5, { width: 60, align: 'right' })
-       .text('GRADE', 500, y + 5, { width: 55, align: 'center' });
-  } else if (isProgressSlip) {
-    doc.text('CODE', 38, y + 5, { width: 75 })
-       .text('SUBJECT', 120, y + 5, { width: 210 })
-       .text('CA SCORE', 340, y + 5, { width: 65, align: 'right' })
-       .text('CLASS AVG', 415, y + 5, { width: 65, align: 'right' })
-       .text('STATUS', 490, y + 5, { width: 65, align: 'center' });
-  } else {
-    doc.text('CODE', 38, y + 5, { width: 62 })
-       .text('SUBJECT', 102, y + 5, { width: 155 })
-       .text('CA (40)', 260, y + 5, { width: 45, align: 'right' })
-       .text('EXAM (60)', 310, y + 5, { width: 48, align: 'right' })
-       .text('TOTAL (100)', 362, y + 5, { width: 55, align: 'right' })
-       .text('CLASS AVG', 420, y + 5, { width: 52, align: 'right' })
-       .text('GRADE', 475, y + 5, { width: 40, align: 'center' })
-       .text('REMARK', 516, y + 5, { width: 45, align: 'center' });
-  }
+  const numCompCols = resolvedComponents.length;
+  const codeX = 36;
+  const codeW = 46;
+  const totalW = 48;
+  const classAvgW = 44;
+  const gradeW = 36;
+  const remarkW = 48;
+  const fixedRightW = totalW + classAvgW + gradeW + remarkW; // 176
+  const totalUsableW = 524; // 36 to 560
+  const remainingForSubAndComps = totalUsableW - codeW - fixedRightW; // 302
+  const compW = numCompCols > 0
+    ? Math.min(48, Math.max(32, Math.floor(168 / numCompCols)))
+    : 0;
+  const subjectX = codeX + codeW + 2;
+  const subjectW = Math.max(110, remainingForSubAndComps - (compW * numCompCols) - 4);
+  const firstCompX = subjectX + subjectW + 2;
+  const totalX = firstCompX + (compW * numCompCols);
+  const classAvgX = totalX + totalW;
+  const gradeX = classAvgX + classAvgW;
+  const remarkX = gradeX + gradeW;
+
+  doc.text('CODE', codeX, y + 5, { width: codeW, lineBreak: false })
+     .text('SUBJECT', subjectX, y + 5, { width: subjectW, lineBreak: false });
+
+  resolvedComponents.forEach((comp, cIdx) => {
+    const rawHeader = String(comp.label || comp.name || comp.code || comp.key || '').trim();
+    const shortHeader = rawHeader.length <= 10 ? rawHeader.toUpperCase() : String(comp.code || comp.key || rawHeader).toUpperCase();
+    const compHeader = comp.maxMarks ? `${shortHeader} (${comp.maxMarks})` : shortHeader;
+    doc.text(compHeader, firstCompX + cIdx * compW, y + 5, {
+      width: compW - 2,
+      align: 'right',
+      lineBreak: false,
+    });
+  });
+
+  const totalHeaderLabel = resolvedMaxTotal > 0 ? `TOTAL (${resolvedMaxTotal})` : 'TOTAL';
+  doc.text(totalHeaderLabel, totalX, y + 5, { width: totalW - 2, align: 'right', lineBreak: false })
+     .text('CLASS AVG', classAvgX, y + 5, { width: classAvgW - 2, align: 'right', lineBreak: false })
+     .text('GRADE', gradeX, y + 5, { width: gradeW, align: 'center', lineBreak: false })
+     .text('REMARK', remarkX, y + 5, { width: remarkW, align: 'center', lineBreak: false });
 
   y += 19;
+
+  // Helper to extract component score from row
+  const getComponentDisplayScore = (row, comp, compIdx) => {
+    if (row.absent) return '-';
+    const scoresMap = row.componentScores || {};
+    const candidates = [comp.code, comp.key, comp.label, comp.name].filter(Boolean);
+    for (const cand of candidates) {
+      if (scoresMap[cand] !== undefined && scoresMap[cand] !== null) {
+        return String(scoresMap[cand]);
+      }
+      const upper = String(cand).toUpperCase();
+      for (const [k, v] of Object.entries(scoresMap)) {
+        if (k.toUpperCase() === upper && v !== undefined && v !== null) {
+          return String(v);
+        }
+      }
+    }
+    // Legacy fallback if componentScores was not populated
+    const cat = String(comp.category || '').toUpperCase();
+    if (cat === 'EXAM' && row.theoryMark !== undefined && row.theoryMark !== null) {
+      return String(row.theoryMark);
+    }
+    if (cat === 'CA' && compIdx === 0 && row.cbtMark !== undefined && row.cbtMark !== null) {
+      return String(row.cbtMark);
+    }
+    return '-';
+  };
 
   // Table Data Rows
   const maxRows = 14;
@@ -952,89 +1019,45 @@ function drawStandardReportCard(doc, params) {
 
     const textOffsetY = y + Math.max(4, Math.floor((rowHeight - 9) / 2));
 
-    if (isCombinedCa) {
-      const ca1Val = row.ca1Score !== undefined && row.ca1Score !== null ? String(row.ca1Score) : (row.cbtMark ? String(row.cbtMark) : '-');
-      const ca2Val = row.ca2Score !== undefined && row.ca2Score !== null ? String(row.ca2Score) : '-';
-      const totalVal = row.stageScore !== undefined && row.stageScore !== null ? String(row.stageScore) : (row.mark !== null ? String(row.mark) : '-');
-
-      let gradeLetter = '-';
-      if (!row.absent && totalVal !== '-') {
-        const tot = parseFloat(totalVal);
-        const pct = (tot / 40) * 100;
-        const res = calculateGradeFromRanges(pct, gradingRanges || undefined);
-        gradeLetter = res.grade;
-      }
-
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-         .text(row.subjectCode || '-', 38, textOffsetY, { width: 65, lineBreak: false });
-      doc.font('Helvetica').fontSize(8)
-         .text(row.subjectName || '-', 105, textOffsetY, { width: 155, lineBreak: false, ellipsis: true });
-      doc.font('Helvetica').fontSize(8)
-         .text(row.absent ? '-' : ca1Val, 265, textOffsetY, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : ca2Val, 315, textOffsetY, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : totalVal, 365, textOffsetY, { width: 65, align: 'right' })
-         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 435, textOffsetY, { width: 60, align: 'right' });
-      doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
-         .text(row.absent ? 'ABS' : gradeLetter, 500, textOffsetY, { width: 55, align: 'center' });
-    } else if (isProgressSlip) {
-      const caScore = row.cbtMark || row.ca1Score || row.ca2Score || (row.testScore ? String(row.testScore) : '-');
-      const statusText = row.absent ? 'ABSENT' : (caScore !== '-' ? 'Completed' : 'Pending');
-
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-         .text(row.subjectCode || '-', 38, textOffsetY, { width: 75, lineBreak: false });
-      doc.font('Helvetica').fontSize(8)
-         .text(row.subjectName || '-', 120, textOffsetY, { width: 210, lineBreak: false, ellipsis: true });
-      doc.font('Helvetica-Bold').fontSize(8)
-         .text(row.absent ? '-' : String(caScore), 340, textOffsetY, { width: 65, align: 'right' });
-      doc.font('Helvetica').fontSize(8)
-         .text(row.absent ? '-' : (row.classAverage !== undefined ? `${row.classAverage}` : '-'), 415, textOffsetY, { width: 65, align: 'right' });
-      doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
-         .text(statusText, 490, textOffsetY, { width: 65, align: 'center' });
-    } else {
-      const testScore =
-        row.cbtMark !== undefined && row.cbtMark !== null
-          ? String(row.cbtMark)
-          : row.testScore !== undefined && row.testScore !== null
-            ? String(row.testScore)
-            : '-';
-      const examScore =
-        row.theoryMark !== undefined && row.theoryMark !== null
-          ? String(row.theoryMark)
-          : row.examScore !== undefined && row.examScore !== null
-            ? String(row.examScore)
-            : '-';
-      const totalScore =
-        row.mark !== undefined && row.mark !== null
+    const totalScore =
+      row.stageScore !== undefined && row.stageScore !== null
+        ? String(row.stageScore)
+        : row.mark !== undefined && row.mark !== null
           ? String(row.mark)
           : row.totalScore !== undefined && row.totalScore !== null
             ? String(row.totalScore)
             : '-';
 
-      let gradeLetter = row.grade || '-';
-      let gradeRemark = row.remark || '-';
-      if (!row.absent && totalScore !== '-' && !isNaN(parseFloat(totalScore))) {
-        const tot = parseFloat(totalScore);
-        const res = calculateGradeFromRanges(tot, gradingRanges || undefined);
-        gradeLetter = res.grade;
-        gradeRemark = res.remark || gradeLetter;
-      }
-
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-         .text(row.subjectCode || '-', 38, textOffsetY, { width: 62, lineBreak: false });
-      doc.font('Helvetica').fontSize(8)
-         .text(row.subjectName || '-', 102, textOffsetY, { width: 155, lineBreak: false, ellipsis: true });
-      doc.font('Helvetica').fontSize(8)
-         .text(row.absent ? '-' : testScore, 260, textOffsetY, { width: 45, align: 'right' })
-         .text(row.absent ? '-' : examScore, 310, textOffsetY, { width: 48, align: 'right' })
-         .font('Helvetica-Bold')
-         .text(row.absent ? '-' : totalScore, 362, textOffsetY, { width: 55, align: 'right' })
-         .font('Helvetica')
-         .text(row.absent ? '-' : `${row.classAverage || '-'}`, 420, textOffsetY, { width: 52, align: 'right' });
-      doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
-         .text(row.absent ? 'ABS' : gradeLetter, 475, textOffsetY, { width: 40, align: 'center' });
-      doc.fillColor(textMuted).font('Helvetica').fontSize(7)
-         .text(row.absent ? 'Absent' : gradeRemark, 516, textOffsetY, { width: 45, align: 'center', lineBreak: false, ellipsis: true });
+    const rowMax = Number(row.maxMarks) || resolvedMaxTotal;
+    let gradeLetter = row.grade || '-';
+    let gradeRemark = row.remark || '-';
+    if (!row.absent && totalScore !== '-' && !isNaN(parseFloat(totalScore))) {
+      const tot = parseFloat(totalScore);
+      const pct = rowMax > 0 ? (tot / rowMax) * 100 : tot;
+      const res = calculateGradeFromRanges(pct, gradingRanges || undefined);
+      gradeLetter = res.grade;
+      gradeRemark = res.remark || gradeLetter;
     }
+
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
+       .text(row.subjectCode || '-', codeX, textOffsetY, { width: codeW, lineBreak: false });
+    doc.font('Helvetica').fontSize(8)
+       .text(row.subjectName || '-', subjectX, textOffsetY, { width: subjectW, lineBreak: false, ellipsis: true });
+
+    resolvedComponents.forEach((comp, cIdx) => {
+      const valStr = getComponentDisplayScore(row, comp, cIdx);
+      doc.fillColor(darkColor).font('Helvetica').fontSize(8)
+         .text(valStr, firstCompX + cIdx * compW, textOffsetY, { width: compW - 2, align: 'right', lineBreak: false });
+    });
+
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
+       .text(row.absent ? '-' : totalScore, totalX, textOffsetY, { width: totalW - 2, align: 'right', lineBreak: false })
+       .font('Helvetica')
+       .text(row.absent ? '-' : `${row.classAverage ?? '-'}`, classAvgX, textOffsetY, { width: classAvgW - 2, align: 'right', lineBreak: false });
+    doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
+       .text(row.absent ? 'ABS' : gradeLetter, gradeX, textOffsetY, { width: gradeW, align: 'center', lineBreak: false });
+    doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+       .text(row.absent ? 'Absent' : gradeRemark, remarkX, textOffsetY, { width: remarkW, align: 'center', lineBreak: false, ellipsis: true });
 
     y += rowHeight;
   });

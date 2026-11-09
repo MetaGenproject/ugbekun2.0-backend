@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { schoolWeekDateKeys, todaySchoolDateKey } from '../../lib/schoolDate';
+import { resolveActiveSessionForClass } from '../../lib/teacherAccess';
 
 type AssignRow = {
   classId: number;
@@ -291,12 +292,24 @@ export async function getSubjectTeacherDashboard(req: Request, res: Response): P
       FRIDAY: weekKeys[4],
     };
 
+    const classSectionSessionOr = await Promise.all(
+      classSectionPairs.map(async (pair) => {
+        const sId = await resolveActiveSessionForClass(prisma, branchId, pair.classId);
+        return {
+          classId: pair.classId,
+          sectionId: pair.sectionId,
+          sessionId: sId,
+        };
+      })
+    );
+
     const [enrolls, homeworks, onlineExams, marks, timetableSlots, questionBankCount, staffInbox] = await Promise.all([
       prisma.enroll.findMany({
         where: {
           isAlumni: 0,
+          student: { active: true },
           ...(branchId ? { branchId } : {}),
-          OR: classSectionPairs,
+          OR: classSectionSessionOr,
         },
         include: {
           student: {

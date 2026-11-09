@@ -1711,29 +1711,31 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
       return res.status(400).json({ success: false, message: 'Class ID is required.' });
     }
 
+    const parsedClassId = parseInt(classId, 10);
+    const parsedSectionId = sectionId && sectionId !== 'ALL' ? parseInt(sectionId, 10) : null;
+    const requestedSessionId = sessionId ? parseInt(sessionId, 10) : null;
+
     const activeSessionId = await resolveAdminSession(
       branchId,
-      parseInt(classId, 10),
-      sessionId ? parseInt(sessionId, 10) : null
+      parsedClassId,
+      requestedSessionId
     );
 
     const baseWhere: any = {
       branchId,
-      classId: parseInt(classId, 10),
+      classId: parsedClassId,
       isAlumni: 0,
       student: { active: true },
     };
 
-    if (sectionId && sectionId !== 'ALL') {
-      baseWhere.sectionId = parseInt(sectionId, 10);
+    if (parsedSectionId) {
+      baseWhere.sectionId = parsedSectionId;
     }
 
-    let enrolls = await prisma.enroll.findMany({
-      where: {
-        ...baseWhere,
-        sessionId: activeSessionId,
-      },
-      orderBy: [{ student: { firstName: 'asc' } }, { roll: 'asc' }],
+    // Fetch all non-alumni active student enrollments for this class (ordered newest session first)
+    const allClassEnrolls = await prisma.enroll.findMany({
+      where: baseWhere,
+      orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
       include: {
         student: {
           select: {
@@ -1751,30 +1753,8 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
       },
     });
 
-    if (enrolls.length === 0) {
-      enrolls = await prisma.enroll.findMany({
-        where: baseWhere,
-        orderBy: [{ student: { firstName: 'asc' } }, { roll: 'asc' }],
-        include: {
-          student: {
-            select: {
-              id: true,
-              registerNo: true,
-              firstName: true,
-              lastName: true,
-              gender: true,
-              photo: true,
-              active: true,
-            },
-          },
-          class: { select: { id: true, name: true } },
-          section: { select: { id: true, name: true } },
-        },
-      });
-    }
-
-    // Determine latest enrollments across all sessions to check promotion status
-    const candidateStudentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));
+    // Determine latest enrollments across all classes/sessions in this branch for these students
+    const candidateStudentIds = Array.from(new Set(allClassEnrolls.map((e) => e.studentId)));
     const latestEnrolls = candidateStudentIds.length > 0
       ? await prisma.enroll.findMany({
           where: {
@@ -1798,34 +1778,48 @@ export async function getPromotionsClassStudents(req: Request, res: Response): P
     }
 
     const studentMap = new Map<number, any>();
-    for (const e of enrolls) {
-      if (e.student && e.student.active && !studentMap.has(e.student.id)) {
-        const latest = latestEnrollByStudent.get(e.student.id);
-        const isPromoted = latest && (
-          latest.sessionId > e.sessionId || 
-          (latest.sessionId === e.sessionId && latest.classId !== e.classId)
-        );
+    for (const e of allClassEnrolls) {
+      if (!e.student || !e.student.active || studentMap.has(e.student.id)) continue;
 
-        studentMap.set(e.student.id, {
-          enrollId: e.id,
-          studentId: e.student.id,
-          registerNo: e.student.registerNo || `REG-${e.student.id}`,
-          fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
-          gender: e.student.gender || 'N/A',
-          roll: e.roll,
-          currentClassId: e.classId,
-          currentClassName: e.class?.name || 'Class',
-          currentSectionId: e.sectionId,
-          currentSectionName: e.section?.name || 'Section',
-          isAlreadyPromoted: Boolean(isPromoted),
-          latestClassId: latest?.classId || e.classId,
-          latestClassName: latest?.class?.name || e.class?.name || 'Class',
-          latestSessionId: latest?.sessionId || e.sessionId,
-        });
+      const latest = latestEnrollByStudent.get(e.student.id);
+      const isCurrentlyInThisClass =
+        !latest ||
+        (latest.classId === parsedClassId &&
+          (!parsedSectionId || latest.sectionId === parsedSectionId));
+
+      // If the student is no longer in this class, only display them as "Already Promoted"
+      // if they were enrolled in this class in the selected/active session and promoted to a higher session.
+      const wasPromotedToHigherSession =
+        !isCurrentlyInThisClass &&
+        latest &&
+        latest.sessionId > e.sessionId &&
+        e.sessionId === activeSessionId;
+
+      if (!isCurrentlyInThisClass && !wasPromotedToHigherSession) {
+        continue;
       }
+
+      studentMap.set(e.student.id, {
+        enrollId: e.id,
+        studentId: e.student.id,
+        registerNo: e.student.registerNo || `REG-${e.student.id}`,
+        fullName: `${e.student.firstName || ''} ${e.student.lastName || ''}`.trim() || 'Student',
+        gender: e.student.gender || 'N/A',
+        roll: e.roll,
+        currentClassId: e.classId,
+        currentClassName: e.class?.name || 'Class',
+        currentSectionId: e.sectionId,
+        currentSectionName: e.section?.name || 'Section',
+        isAlreadyPromoted: !isCurrentlyInThisClass,
+        latestClassId: latest?.classId || e.classId,
+        latestClassName: latest?.class?.name || e.class?.name || 'Class',
+        latestSessionId: latest?.sessionId || e.sessionId,
+      });
     }
 
-    const activeStudents = Array.from(studentMap.values());
+    const activeStudents = Array.from(studentMap.values()).sort((a, b) =>
+      a.fullName.localeCompare(b.fullName)
+    );
 
     return res.json({
       success: true,
@@ -1851,73 +1845,116 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
       return res.status(400).json({ success: false, message: 'Please select at least one student for promotion.' });
     }
 
-    if (!targetClassId || !targetSectionId || !targetSessionId) {
+    if (!targetClassId || !targetSectionId) {
       return res
         .status(400)
-        .json({ success: false, message: 'Target Class, Section, and Academic Session are required.' });
+        .json({ success: false, message: 'Target Class and Section are required.' });
     }
+
+    const globalSetting = await prisma.globalSettings.findFirst();
+    const defaultSession = globalSetting?.sessionId || 5;
 
     const tClassId = parseInt(targetClassId, 10);
     const tSectionId = parseInt(targetSectionId, 10);
-    const tSessionId = parseInt(targetSessionId, 10);
+    const tSessionId = targetSessionId ? parseInt(targetSessionId, 10) : defaultSession;
     const sClassId = sourceClassId ? parseInt(sourceClassId, 10) : undefined;
     const sSessionId = sourceSessionId ? parseInt(sourceSessionId, 10) : undefined;
     const promotionAction = action === 'REPEAT' ? 'REPEAT' : 'PROMOTE';
     const actorId = Number(req.userId || 1);
 
+    // Ensure PostgreSQL sequences for enroll and promotion_history are synced with MAX(id)
+    // because onboarding/import endpoints insert explicit IDs into enroll.
+    await prisma.$executeRawUnsafe(
+      `SELECT setval(pg_get_serial_sequence('enroll', 'id'), COALESCE((SELECT MAX(id) FROM enroll), 1), true)`
+    ).catch(() => {});
+    await prisma.$executeRawUnsafe(
+      `SELECT setval(pg_get_serial_sequence('promotion_history', 'id'), COALESCE((SELECT MAX(id) FROM promotion_history), 1), true)`
+    ).catch(() => {});
+
+    // Ensure target section is allocated to target class
+    await prisma.sectionsAllocation.upsert({
+      where: { classId_sectionId: { classId: tClassId, sectionId: tSectionId } },
+      update: {},
+      create: { classId: tClassId, sectionId: tSectionId },
+    }).catch(() => {});
+
     let successCount = 0;
     let failureCount = 0;
+    let lastErrorMsg = '';
 
     for (const id of studentIds) {
       const studentId = parseInt(id, 10);
+      if (isNaN(studentId) || studentId <= 0) continue;
+
       try {
         await prisma.$transaction(async (tx: any) => {
-          let currentEnroll = null;
+          // Always find the student's true latest active enrollment across the branch
+          const latestEnroll = await tx.enroll.findFirst({
+            where: { studentId, branchId, isAlumni: 0 },
+            orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+          });
 
+          let currentEnroll = null;
           if (sClassId || sSessionId) {
             const matchWhere: any = { studentId, branchId, isAlumni: 0 };
             if (sClassId) matchWhere.classId = sClassId;
             if (sSessionId) matchWhere.sessionId = sSessionId;
             currentEnroll = await tx.enroll.findFirst({
               where: matchWhere,
-              orderBy: { id: 'desc' },
-            });
-          }
-
-          if (!currentEnroll) {
-            currentEnroll = await tx.enroll.findFirst({
-              where: { studentId, branchId, isAlumni: 0 },
               orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
             });
           }
 
           if (!currentEnroll) {
+            currentEnroll = latestEnroll;
+          }
+
+          if (!currentEnroll) {
             currentEnroll = await tx.enroll.findFirst({
               where: { studentId, branchId },
-              orderBy: { id: 'desc' },
+              orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
             });
           }
 
           if (!currentEnroll) {
-            throw new Error(`No active enrollment record for student ID ${studentId}`);
+            throw new Error(`No enrollment record found for student ID ${studentId}`);
           }
+
+          // Never write a promotion into a session older than the student's current/latest active enrollment,
+          // otherwise orderBy: [{ sessionId: 'desc' }, { id: 'desc' }] would keep the student in their old class.
+          const effectiveSessionId = Math.max(
+            tSessionId,
+            currentEnroll.sessionId,
+            latestEnroll?.sessionId || 0
+          );
+
+          const maxPromo = await tx.promotionHistory.findFirst({
+            orderBy: { id: 'desc' },
+            select: { id: true },
+          });
+          const nextPromoId = (maxPromo?.id || 0) + 1;
 
           await tx.promotionHistory.create({
             data: {
+              id: nextPromoId,
               studentId,
               fromClassId: currentEnroll.classId,
               fromSectionId: currentEnroll.sectionId,
               toClassId: tClassId,
               toSectionId: tSectionId,
               promotedBy: actorId,
-              sessionId: tSessionId,
+              sessionId: effectiveSessionId,
             },
           });
 
-          if (tSessionId === currentEnroll.sessionId) {
-            // Same session promotion / reassignment: update current enrollment directly
-            await tx.enroll.update({
-              where: { id: currentEnroll.id },
+          if (effectiveSessionId === currentEnroll.sessionId) {
+            // Same-session promotion/reassignment: update all active enrollments in this session for this student
+            await tx.enroll.updateMany({
+              where: {
+                studentId,
+                branchId,
+                sessionId: effectiveSessionId,
+              },
               data: {
                 classId: tClassId,
                 sectionId: tSectionId,
@@ -1926,15 +1963,16 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
               },
             });
           } else {
-            // Cross session promotion: Preserve currentEnroll in its historical session/class!
-            // Create or update the enrollment specifically in the new target academic session.
-            const existingTargetEnroll = await tx.enroll.findFirst({
-              where: { studentId, sessionId: tSessionId, branchId },
+            // Cross-session promotion: preserve historical enrollment in currentEnroll.sessionId,
+            // and create or update enrollment in effectiveSessionId.
+            const existingTargetEnrolls = await tx.enroll.findMany({
+              where: { studentId, sessionId: effectiveSessionId, branchId },
+              orderBy: { id: 'desc' },
             });
 
-            if (existingTargetEnroll) {
-              await tx.enroll.update({
-                where: { id: existingTargetEnroll.id },
+            if (existingTargetEnrolls.length > 0) {
+              await tx.enroll.updateMany({
+                where: { studentId, sessionId: effectiveSessionId, branchId },
                 data: {
                   classId: tClassId,
                   sectionId: tSectionId,
@@ -1943,13 +1981,20 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
                 },
               });
             } else {
+              const maxEnroll = await tx.enroll.findFirst({
+                orderBy: { id: 'desc' },
+                select: { id: true },
+              });
+              const nextEnrollId = (maxEnroll?.id || 0) + 1;
+
               await tx.enroll.create({
                 data: {
+                  id: nextEnrollId,
                   studentId,
                   classId: tClassId,
                   sectionId: tSectionId,
                   roll: currentEnroll.roll || 0,
-                  sessionId: tSessionId,
+                  sessionId: effectiveSessionId,
                   branchId,
                   isAlumni: 0,
                 },
@@ -1957,21 +2002,31 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
             }
           }
 
-          await wipeEvaluationMatrix(tx, { studentId, sessionId: tSessionId }).catch(() => {});
+          await wipeEvaluationMatrix(tx, { studentId, sessionId: effectiveSessionId }).catch(() => {});
           await bindEvaluationMatrix(tx, {
             studentId,
             classId: tClassId,
             sectionId: tSectionId,
             branchId,
-            sessionId: tSessionId,
+            sessionId: effectiveSessionId,
           }).catch(() => {});
         }, { timeout: 30000, maxWait: 15000 });
 
         successCount++;
-      } catch (err) {
+      } catch (err: any) {
         console.error(`[PROMOTIONS] Error processing student ${id}:`, err);
+        lastErrorMsg = err?.message || 'Database error during promotion';
         failureCount++;
       }
+    }
+
+    if (successCount === 0 && failureCount > 0) {
+      return res.status(500).json({
+        success: false,
+        message: `Failed to promote selected student(s): ${lastErrorMsg}`,
+        processedCount: 0,
+        failedCount: failureCount,
+      });
     }
 
     return res.json({
@@ -1992,23 +2047,31 @@ export async function batchPromoteStudents(req: Request, res: Response): Promise
  * GET /api/admin/promotions/history
  */
 export async function getPromotionHistory(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
   try {
     const { search, classId } = (req.query || {}) as any;
 
+    const branchStudents = await prisma.student.findMany({
+      where: { branchId },
+      select: { id: true, registerNo: true, firstName: true, lastName: true },
+    });
+    const branchStudentIds = branchStudents.map((s) => s.id);
+
+    if (branchStudentIds.length === 0) {
+      return res.json({ success: true, data: [], totalCount: 0 });
+    }
+
     const history = await prisma.promotionHistory.findMany({
+      where: { studentId: { in: branchStudentIds } },
       orderBy: { promotedAt: 'desc' },
-      take: 100,
+      take: 200,
     });
 
-    const studentIds = [...new Set(history.map((h: any) => h.studentId))];
     const classIds = [...new Set(history.flatMap((h: any) => [h.fromClassId, h.toClassId]))];
     const sectionIds = [...new Set(history.flatMap((h: any) => [h.fromSectionId, h.toSectionId]))];
 
-    const [students, classes, sections] = await Promise.all([
-      prisma.student.findMany({
-        where: { id: { in: studentIds } },
-        select: { id: true, registerNo: true, firstName: true, lastName: true },
-      }),
+    const [classes, sections] = await Promise.all([
       prisma.class.findMany({
         where: { id: { in: classIds } },
         select: { id: true, name: true },
@@ -2019,7 +2082,7 @@ export async function getPromotionHistory(req: Request, res: Response): Promise<
       }),
     ]);
 
-    const studentMap = new Map(students.map((s: any) => [s.id, s]));
+    const studentMap = new Map(branchStudents.map((s: any) => [s.id, s]));
     const classMap = new Map(classes.map((c: any) => [c.id, c.name]));
     const sectionMap = new Map(sections.map((sec: any) => [sec.id, sec.name]));
 
