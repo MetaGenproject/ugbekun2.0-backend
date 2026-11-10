@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client';
 import { classifySchoolDates, type SchoolDayClassification } from './schoolCalendarService';
+import { excludePromotedOutStudents } from './teacherAccess';
 import prisma from './prisma';
 import {
   describeSchoolDate,
@@ -450,7 +451,8 @@ async function loadEnrolledStudentIds(
     select: { studentId: true, roll: true },
     orderBy: [{ roll: 'asc' }, { studentId: 'asc' }],
   });
-  return enrolls.map((row) => row.studentId);
+  const current = await excludePromotedOutStudents(db, args, enrolls);
+  return current.map((row) => row.studentId);
 }
 
 async function loadRoster(
@@ -480,7 +482,8 @@ async function loadRoster(
     orderBy: [{ roll: 'asc' }, { studentId: 'asc' }],
   });
 
-  return enrolls.map((row) => ({
+  const current = await excludePromotedOutStudents(db, args, enrolls);
+  return current.map((row) => ({
     studentId: row.student.id,
     roll: row.roll,
     registerNo: row.student.registerNo,

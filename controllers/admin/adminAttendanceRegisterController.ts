@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { parseSchoolDateKey } from '../../lib/schoolDate';
+import { resolveActiveSessionForClass } from '../../lib/teacherAccess';
 import {
   AttendanceRegisterError,
   getRegisterWithEntries,
@@ -25,26 +26,8 @@ function registerErrorResponse(res: Response, error: unknown) {
  * Priority: explicit param > global_settings > most recent enrolled session for the branch/class.
  */
 async function activeSessionId(branchId?: number, classId?: number): Promise<number> {
-  const globalSetting = await prisma.globalSettings.findFirst();
-  const globalSession = globalSetting?.sessionId || 4;
-
-  if (!branchId) return globalSession;
-
-  // Verify this session actually has enrollment data for this branch+class
-  const where: any = { branchId, sessionId: globalSession };
-  if (classId) where.classId = classId;
-  const sessionCheck = await prisma.enroll.count({ where });
-  if (sessionCheck > 0) return globalSession;
-
-  // Smart fallback: find the most recent session with enrollment data for this branch+class
-  const fallbackWhere: any = { branchId };
-  if (classId) fallbackWhere.classId = classId;
-  const latest = await prisma.enroll.findFirst({
-    where: fallbackWhere,
-    orderBy: { sessionId: 'desc' },
-    select: { sessionId: true },
-  });
-  return latest?.sessionId ?? globalSession;
+  // Same resolver as the teacher attendance suite so admin and teacher always agree.
+  return resolveActiveSessionForClass(prisma, branchId, classId);
 }
 
 /**

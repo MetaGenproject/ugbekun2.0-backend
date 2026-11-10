@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import gamificationService from '../../lib/gamificationService';
 import { isFormTeacher } from './teacherDashboardController';
+import { resolveActiveSessionForClass, excludePromotedOutStudents } from '../../lib/teacherAccess';
 import { notifyParentsOfSubmittedAbsences } from '../../lib/attendanceAbsenceNotifier';
 import {
   parseSchoolDateKey,
@@ -59,35 +60,43 @@ async function forbidUnlessFormTeacher(
 }
 
 async function activeSessionId(branchId?: number, classId?: number): Promise<number> {
-  const globalSetting = await prisma.globalSettings.findFirst();
-  const globalSession = globalSetting?.sessionId || 5;
-  if (!branchId) return globalSession;
+  // Single source of truth: ignores historical enroll rows of promoted-out students.
+  return resolveActiveSessionForClass(prisma, branchId, classId);
+}
 
-  if (classId) {
-    const sessionCohorts = await prisma.enroll.groupBy({
-      by: ['sessionId'],
-      where: { branchId, classId, isAlumni: 0 },
-      _count: { id: true },
-      orderBy: [{ _count: { id: 'desc' } }, { sessionId: 'desc' }],
-    });
-    if (sessionCohorts.length > 0) {
-      const defCohort = sessionCohorts.find((s) => s.sessionId === globalSession);
-      const topCohort = sessionCohorts[0];
-      if (defCohort && defCohort._count.id >= topCohort._count.id) {
-        return globalSession;
-      }
-      return topCohort.sessionId;
-    }
+/**
+ * Drops enroll rows for students who have since been promoted / moved, i.e. whose latest
+ * active enrollment in the branch is in a newer session or a different class/section.
+ * Each row is evaluated against its own (sessionId, classId, sectionId), so this works for
+ * single-class and all-classes report scopes alike.
+ */
+async function filterCurrentEnrollRows<
+  T extends { studentId: number; classId: number; sectionId: number; sessionId: number }
+>(branchId: number | undefined, rows: T[]): Promise<T[]> {
+  if (!branchId || !rows.length) return rows;
+  const groups = new Map<string, T[]>();
+  for (const row of rows) {
+    const key = `${row.sessionId}:${row.classId}:${row.sectionId}`;
+    const list = groups.get(key) || [];
+    list.push(row);
+    groups.set(key, list);
   }
-
-  const fallbackWhere: any = { branchId };
-  if (classId) fallbackWhere.classId = classId;
-  const latest = await prisma.enroll.findFirst({
-    where: fallbackWhere,
-    orderBy: { sessionId: 'desc' },
-    select: { sessionId: true },
+  const keep = new Set<T>();
+  for (const list of groups.values()) {
+    const first = list[0];
+    const current = await excludePromotedOutStudents(
+      prisma,
+      { branchId, sessionId: first.sessionId, classId: first.classId, sectionId: first.sectionId },
+      list
+    );
+    current.forEach((row) => keep.add(row));
+  }
+  const seen = new Set<number>();
+  return rows.filter((row) => {
+    if (!keep.has(row) || seen.has(row.studentId)) return false;
+    seen.add(row.studentId);
+    return true;
   });
-  return latest?.sessionId ?? globalSession;
 }
 
 async function fireAbsenceAlerts(
@@ -540,8 +549,8 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
     if (!scope.isAllClasses) enrollWhere.classId = scope.classId;
     if (!scope.isAllSections) enrollWhere.sectionId = scope.sectionId;
 
-    // 1. Fetch active enrolled students
-    const enrolls = await prisma.enroll.findMany({
+    // 1. Fetch active enrolled students (excluding promoted-out historical rows)
+    const enrolls = await filterCurrentEnrollRows(req.branchId, await prisma.enroll.findMany({
       where: enrollWhere,
       include: {
         student: {
@@ -558,7 +567,7 @@ export async function getTeacherDailyAttendanceReport(req: Request, res: Respons
         section: { select: { id: true, name: true } },
       },
       orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
-    });
+    }));
 
     // 2. Fetch register metadata (if created)
     const registerWhere: any = {
@@ -812,8 +821,8 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
     if (!scope.isAllClasses) enrollWhere.classId = scope.classId;
     if (!scope.isAllSections) enrollWhere.sectionId = scope.sectionId;
 
-    // 1. Fetch active students
-    const enrolls = await prisma.enroll.findMany({
+    // 1. Fetch active students (excluding promoted-out historical rows)
+    const enrolls = await filterCurrentEnrollRows(req.branchId, await prisma.enroll.findMany({
       where: enrollWhere,
       include: {
         student: {
@@ -829,7 +838,7 @@ export async function getTeacherMonthlyAttendanceReport(req: Request, res: Respo
         section: { select: { id: true, name: true } },
       },
       orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
-    });
+    }));
 
     // 2. Fetch all month attendance logs for this class / school
     const logWhere: any = {
@@ -1079,6 +1088,9 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
         orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
       });
     }
+
+    // Drop promoted-out historical rows (and de-duplicate students across sessions)
+    enrolls = await filterCurrentEnrollRows(req.branchId, enrolls);
 
     // 2. Fetch all attendance registers & entries for this class/section or school
     const logWhere: any = {

@@ -191,6 +191,83 @@ export async function canTeacherUseClassSubject(
   return canTeacherAccessSubject(prisma, teacherId, classId, null, subjectId);
 }
 
+/**
+ * Returns a map of studentId -> that student's latest active (non-alumni) enrollment
+ * in the branch (highest sessionId, then highest id).
+ */
+export async function loadLatestPlacementByStudent(
+  prisma: any,
+  branchId: number,
+  studentIds: number[]
+): Promise<Map<number, { classId: number; sectionId: number; sessionId: number }>> {
+  const latest = new Map<number, { classId: number; sectionId: number; sessionId: number }>();
+  if (!studentIds.length) return latest;
+  const rows = await prisma.enroll.findMany({
+    where: { branchId, studentId: { in: studentIds }, isAlumni: 0 },
+    orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+    select: { studentId: true, classId: true, sectionId: true, sessionId: true },
+  });
+  for (const row of rows) {
+    if (!latest.has(row.studentId)) {
+      latest.set(row.studentId, { classId: row.classId, sectionId: row.sectionId, sessionId: row.sessionId });
+    }
+  }
+  return latest;
+}
+
+/**
+ * Counts, per session, the students whose latest active enrollment in the branch
+ * is this class (and that same session). Promoted-out historical rows are ignored.
+ */
+export async function countCurrentCohortsBySession(
+  prisma: any,
+  branchId: number,
+  classId: number
+): Promise<Map<number, number>> {
+  const classRows = await prisma.enroll.findMany({
+    where: { branchId, classId, isAlumni: 0, student: { active: true } },
+    select: { studentId: true, sessionId: true },
+  });
+  const counts = new Map<number, number>();
+  if (!classRows.length) return counts;
+
+  const studentIds = Array.from(new Set<number>(classRows.map((r: any) => r.studentId)));
+  const latest = await loadLatestPlacementByStudent(prisma, branchId, studentIds);
+  const counted = new Set<number>();
+  for (const row of classRows) {
+    const place = latest.get(row.studentId);
+    if (!place || place.classId !== classId || place.sessionId !== row.sessionId) continue;
+    if (counted.has(row.studentId)) continue;
+    counted.add(row.studentId);
+    counts.set(row.sessionId, (counts.get(row.sessionId) || 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Removes students from a (session, class, section) roster when they have since been
+ * promoted / moved: i.e. they have an active enrollment in a NEWER session, or a newer
+ * enrollment in the same session for a different class/section.
+ */
+export async function excludePromotedOutStudents<T extends { studentId: number }>(
+  prisma: any,
+  args: { branchId: number; sessionId: number; classId: number; sectionId: number },
+  rows: T[]
+): Promise<T[]> {
+  if (!rows.length) return rows;
+  const studentIds = Array.from(new Set(rows.map((r) => r.studentId)));
+  const latest = await loadLatestPlacementByStudent(prisma, args.branchId, studentIds);
+  return rows.filter((row) => {
+    const place = latest.get(row.studentId);
+    if (!place) return true;
+    if (place.sessionId > args.sessionId) return false;
+    if (place.sessionId === args.sessionId && (place.classId !== args.classId || place.sectionId !== args.sectionId)) {
+      return false;
+    }
+    return true;
+  });
+}
+
 export async function resolveActiveSessionForClass(
   prisma: any,
   branchId?: number | null,
@@ -201,24 +278,21 @@ export async function resolveActiveSessionForClass(
   if (!branchId) return globalSession;
 
   if (classId) {
-    const sessionCohorts = await prisma.enroll.groupBy({
-      by: ['sessionId'],
-      where: {
-        branchId,
-        classId,
-        isAlumni: 0,
-        student: { active: true },
-      },
-      _count: { id: true },
-      orderBy: [{ _count: { id: 'desc' } }, { sessionId: 'desc' }],
-    });
-    if (sessionCohorts.length > 0) {
-      const defCohort = sessionCohorts.find((s: any) => s.sessionId === globalSession);
-      const topCohort = sessionCohorts[0];
-      if (defCohort && defCohort._count.id >= topCohort._count.id) {
+    // Count only students whose LATEST active enrollment in this branch is in this class.
+    // Historical enroll rows of students who have since been promoted (e.g. a 2024/25
+    // Reception row for a child now in Nursery 1) must never inflate an old session's
+    // cohort, otherwise the class would resolve to the old session and teachers would
+    // see last year's (promoted-out) children on their register.
+    const cohortCounts = await countCurrentCohortsBySession(prisma, branchId, classId);
+    if (cohortCounts.size > 0) {
+      const ranked = Array.from(cohortCounts.entries())
+        .map(([sId, count]) => ({ sessionId: sId, count }))
+        .sort((a, b) => b.count - a.count || b.sessionId - a.sessionId);
+      const globalCount = cohortCounts.get(globalSession) || 0;
+      if (globalCount > 0 && globalCount >= ranked[0].count) {
         return globalSession;
       }
-      return topCohort.sessionId;
+      return ranked[0].sessionId;
     }
   }
 
@@ -289,7 +363,7 @@ export async function getTeacherAcademicRoles(
         ? Number(sessionId)
         : await resolveActiveSessionForClass(prisma, branchId, fa.classId);
 
-      const studentCount = await prisma.enroll.count({
+      const enrollRows = await prisma.enroll.findMany({
         where: {
           classId: fa.classId,
           sectionId: fa.sectionId,
@@ -298,7 +372,12 @@ export async function getTeacherAcademicRoles(
           student: { active: true },
           ...(branchId ? { branchId } : {}),
         },
+        select: { studentId: true },
       });
+      const validEnrollRows = branchId
+        ? await excludePromotedOutStudents(prisma, { branchId, sessionId: targetSessionId, classId: fa.classId, sectionId: fa.sectionId }, enrollRows)
+        : enrollRows;
+      const studentCount = validEnrollRows.length;
 
       return {
         allocationId: fa.id,
@@ -375,7 +454,7 @@ export async function getTeacherAcademicRoles(
       ? Number(sessionId)
       : await resolveActiveSessionForClass(prisma, branchId, sa.classId);
 
-    const studentCount = await prisma.enroll.count({
+    const subEnrollRows = await prisma.enroll.findMany({
       where: {
         classId: sa.classId,
         sectionId: sa.sectionId,
@@ -384,7 +463,12 @@ export async function getTeacherAcademicRoles(
         student: { active: true },
         ...(branchId ? { branchId } : {}),
       },
+      select: { studentId: true },
     });
+    const validSubEnrollRows = branchId
+      ? await excludePromotedOutStudents(prisma, { branchId, sessionId: targetSessionId, classId: sa.classId, sectionId: sa.sectionId }, subEnrollRows)
+      : subEnrollRows;
+    const studentCount = validSubEnrollRows.length;
 
     subjectMap.get(sId)!.classes.push({
       assignmentId: sa.id,
@@ -491,6 +575,9 @@ export default {
   canTeacherAccessSubject,
   canTeacherUseClassSubject,
   resolveActiveSessionForClass,
+  loadLatestPlacementByStudent,
+  countCurrentCohortsBySession,
+  excludePromotedOutStudents,
   getTeacherAcademicRoles,
   getTeacherClassSubjectScope,
   teacherScopedContentOr,

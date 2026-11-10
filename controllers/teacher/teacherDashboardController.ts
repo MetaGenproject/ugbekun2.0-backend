@@ -12,6 +12,7 @@ import {
   canTeacherAccessSubject,
   getTeacherAcademicRoles,
   resolveActiveSessionForClass,
+  excludePromotedOutStudents,
 } from '../../lib/teacherAccess';
 import { uploadBase64Image } from '../../lib/cloudinary';
 import { getRegisterWithEntries, REGISTER_STATUS } from '../../lib/attendanceRegisterService';
@@ -197,8 +198,11 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
             },
             select: { studentId: true },
           });
-          classCountMap.set(pairKey, enrolls.length);
-          enrolls.forEach((e) => allEnrolledStudentIds.add(e.studentId));
+          const validEnrolls = req.branchId
+            ? await excludePromotedOutStudents(prisma, { branchId: req.branchId, sessionId: cSessionId, classId: pair.classId, sectionId: pair.sectionId }, enrolls)
+            : enrolls;
+          classCountMap.set(pairKey, validEnrolls.length);
+          validEnrolls.forEach((e) => allEnrolledStudentIds.add(e.studentId));
         })
       ),
       formAllocations[0]
@@ -350,7 +354,10 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
             },
             select: { studentId: true },
           });
-          enrolls.forEach((e) => subStudentIds.add(e.studentId));
+          const validEnrolls = req.branchId
+            ? await excludePromotedOutStudents(prisma, { branchId: req.branchId, sessionId: sSessionId, classId: sa.classId, sectionId: sa.sectionId }, enrolls)
+            : enrolls;
+          validEnrolls.forEach((e) => subStudentIds.add(e.studentId));
         }
         return {
           id,
@@ -556,7 +563,24 @@ export async function getRoster(req: Request, res: Response): Promise<Response |
       orderBy: [{ class: { name: 'asc' } }, { roll: 'asc' }, { student: { lastName: 'asc' } }],
     });
 
-    const students = enrolls.map((e) => ({
+    const validEnrolls = req.branchId
+      ? await (async () => {
+          const studentIds = enrolls.map((e) => e.studentId);
+          const { loadLatestPlacementByStudent } = await import('../../lib/teacherAccess');
+          const latest = await loadLatestPlacementByStudent(prisma, req.branchId, studentIds);
+          return enrolls.filter((e) => {
+            const place = latest.get(e.studentId);
+            if (!place) return true;
+            if (place.sessionId > e.sessionId) return false;
+            if (place.sessionId === e.sessionId && (place.classId !== e.classId || place.sectionId !== e.sectionId)) {
+              return false;
+            }
+            return true;
+          });
+        })()
+      : enrolls;
+
+    const students = validEnrolls.map((e) => ({
       id: e.student.id,
       registerNo: e.student.registerNo,
       rollNo: e.roll,
