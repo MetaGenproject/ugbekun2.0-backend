@@ -665,7 +665,7 @@ function drawBrandedRemarksAndSignatures(doc, params, y, colors) {
     teacherComment = '',
     principalComment = '',
     resumptionDate = null,
-    nextTermFees = 'To Be Announced',
+    nextTermFees = '',
     formTeacherName = 'Class Teacher',
     principalName = 'The Principal',
     teacherSignatureBuffer = null,
@@ -688,7 +688,7 @@ function drawBrandedRemarksAndSignatures(doc, params, y, colors) {
   doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
      .text('NEXT TERM PAYMENT / FEES:', 295, y + 8);
   doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
-     .text(String(nextTermFees || 'To Be Announced'), 415, y + 7.5, { width: 145, lineBreak: false, ellipsis: true });
+     .text(String(nextTermFees || '—'), 415, y + 7.5, { width: 145, lineBreak: false, ellipsis: true });
 
   y += 30;
 
@@ -805,7 +805,7 @@ function drawStandardReportCard(doc, params) {
     rankingType = 'full',
     rankingLimit = 3,
     resumptionDate = branding.resumptionDate || null,
-    nextTermFees = branding.nextTermFees || 'To Be Announced',
+    nextTermFees = branding.nextTermFees || '',
     formTeacherName = branding.classTeacherName || 'Class Teacher',
     principalName = branding.principalName || 'The Principal',
     gradingRanges = null,
@@ -1118,7 +1118,7 @@ function drawMontessoriReportCard(doc, params) {
     teacherComment = '',
     principalComment = '',
     resumptionDate = branding.resumptionDate || null,
-    nextTermFees = branding.nextTermFees || 'To Be Announced',
+    nextTermFees = branding.nextTermFees || '',
     formTeacherName = branding.classTeacherName || 'Class Teacher',
     principalName = branding.principalName || 'The Principal',
     logoBuffer = null,
@@ -1315,7 +1315,7 @@ function drawCommentBasedReportCard(doc, params) {
     teacherComment = '',
     principalComment = '',
     resumptionDate = branding.resumptionDate || null,
-    nextTermFees = branding.nextTermFees || 'To Be Announced',
+    nextTermFees = branding.nextTermFees || '',
     formTeacherName = branding.classTeacherName || 'Class Teacher',
     principalName = branding.principalName || 'The Principal',
     logoBuffer = null,

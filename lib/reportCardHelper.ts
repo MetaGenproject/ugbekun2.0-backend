@@ -65,10 +65,34 @@ export function formatResumptionDateLabel(raw?: string | Date | null): string {
 }
 
 /**
+ * Helper to format fee string cleanly with currency symbol
+ */
+export function formatFeeString(raw: string, currencySymbol: string = '₦'): string {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return '';
+  const cleaned = trimmed.replace(/,/g, '').replace(/^[^\d]+/, '');
+  const numericOnly = Number(cleaned);
+  if (!Number.isNaN(numericOnly) && numericOnly > 0 && /^[\d,]+(\.\d+)?$/.test(trimmed.replace(/^[^\d\s]+/, '').trim())) {
+    const hasSymbol = /^[^\d\s]/.test(trimmed);
+    if (!hasSymbol) {
+      return `${currencySymbol}${numericOnly.toLocaleString()}`;
+    }
+  }
+  return trimmed;
+}
+
+/**
  * Resolves Next Term Fees for a class/branch:
  * 1. Explicit `SystemSetting.nextTermFees` if configured by the school admin under School Settings
+ *    - Supports JSON format with per-class mappings and class fee groups:
+ *      {
+ *        default?: string,
+ *        byClass?: Record<string, string>,
+ *        groups?: Array<{ id: string; name?: string; amount: string; classIds: number[] }>
+ *      }
+ *    - Or simple string fallback for backward compatibility
  * 2. Sum of active `FeeAssignment` records for the class/branch
- * 3. Fallback `'To Be Announced'`
+ * 3. Fallback `''` (blank if not set)
  */
 export async function resolveNextTermPaymentLabel(
   prisma: typeof prismaDefault,
@@ -80,12 +104,44 @@ export async function resolveNextTermPaymentLabel(
 ): Promise<string> {
   if (systemNextTermFees && String(systemNextTermFees).trim().length > 0) {
     const raw = String(systemNextTermFees).trim();
-    // If the user typed a pure number like "150000", format with currency symbol
-    const numericOnly = Number(raw.replace(/,/g, ''));
-    if (!Number.isNaN(numericOnly) && numericOnly > 0 && /^[\d,]+(\.\d+)?$/.test(raw)) {
-      return `${currencySymbol}${numericOnly.toLocaleString()}`;
+
+    // Check if JSON containing class mappings
+    if (raw.startsWith('{') && raw.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          // 1. Direct match on classId in byClass or classes
+          if (classId) {
+            const classKey = String(classId);
+            const classFee = parsed.byClass?.[classKey] || parsed.classes?.[classKey] || parsed[classKey];
+            if (classFee && String(classFee).trim().length > 0) {
+              return formatFeeString(String(classFee), currencySymbol);
+            }
+
+            // 2. Search groups for classId
+            if (Array.isArray(parsed.groups)) {
+              const matchedGroup = parsed.groups.find(
+                (g: any) => Array.isArray(g.classIds) && g.classIds.map(Number).includes(Number(classId))
+              );
+              if (matchedGroup?.amount && String(matchedGroup.amount).trim().length > 0) {
+                return formatFeeString(String(matchedGroup.amount), currencySymbol);
+              }
+            }
+          }
+
+          // 3. Fallback to default in JSON
+          if (parsed.default && String(parsed.default).trim().length > 0) {
+            return formatFeeString(String(parsed.default), currencySymbol);
+          }
+
+          return '';
+        }
+      } catch {
+        // Fall back to plain string
+      }
     }
-    return raw;
+
+    return formatFeeString(raw, currencySymbol);
   }
 
   try {
@@ -110,7 +166,7 @@ export async function resolveNextTermPaymentLabel(
     // ignore and fall through
   }
 
-  return 'To Be Announced';
+  return '';
 }
 
 /**

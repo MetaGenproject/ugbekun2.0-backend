@@ -10,7 +10,7 @@ import {
 } from '../../lib/markParser';
 import { resolveGradingScale } from '../../lib/gradingService';
 import { getRatingLabel } from '../admin/adminMarksReportController';
-import { resolveSchoolReportBranding, computeStudentAttendanceMap } from '../../lib/reportCardHelper';
+import { resolveSchoolReportBranding, computeStudentAttendanceMap, resolveNextTermPaymentLabel } from '../../lib/reportCardHelper';
 
 /**
  * GET /api/parent/child/:studentId/attendance
@@ -152,8 +152,26 @@ export async function getChildTasks(req: Request, res: Response): Promise<Respon
  * GET /api/parent/child/:studentId/grades
  */
 async function resolveNextTermFees(branchId?: number | null, classId?: number | null): Promise<string> {
-  if (!branchId) return '₦125,000';
+  if (!branchId) return '';
   try {
+    const settings = await prisma.systemSetting.findUnique({
+      where: { branchId },
+      select: { nextTermFees: true, currencySymbol: true },
+    });
+    if (settings?.nextTermFees) {
+      const label = await resolveNextTermPaymentLabel(
+        prisma,
+        branchId,
+        5,
+        classId || undefined,
+        settings.nextTermFees,
+        settings.currencySymbol || '₦'
+      );
+      if (label && label.trim().length > 0 && label !== 'To Be Announced') {
+        return label;
+      }
+    }
+
     const feeAssignments = await prisma.feeAssignment.findMany({
       where: {
         branchId,
@@ -178,7 +196,7 @@ async function resolveNextTermFees(branchId?: number | null, classId?: number | 
   } catch {
     // fallback
   }
-  return '₦125,000';
+  return '';
 }
 
 /**

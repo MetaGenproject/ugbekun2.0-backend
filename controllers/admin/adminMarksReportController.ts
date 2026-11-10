@@ -860,7 +860,7 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
 }
 
 async function resolveNextTermFees(prismaClient: any, branchId?: number | null, classId?: number | null): Promise<string> {
-  if (!branchId) return '₦125,000';
+  if (!branchId) return '';
   try {
     const feeAssignments = await prismaClient.feeAssignment.findMany({
       where: {
@@ -886,7 +886,7 @@ async function resolveNextTermFees(prismaClient: any, branchId?: number | null, 
   } catch {
     // fallback
   }
-  return '₦125,000';
+  return '';
 }
 
 /**
