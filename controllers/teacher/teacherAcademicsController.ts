@@ -1374,18 +1374,35 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       return res.send(pdfBuffer);
     }
 
-    const studentMarks = await prisma.mark.findMany({
+    const numericExamId = examId && !isNaN(Number(examId)) ? Number(examId) : null;
+    let studentMarks = await prisma.mark.findMany({
       where: {
         studentId: Number(studentId),
         sessionId,
-        branchId: req.branchId,
-        ...(examId ? { examId: Number(examId) } : {}),
+        ...(req.branchId ? { branchId: req.branchId } : {}),
+        ...(numericExamId ? { examId: numericExamId } : {}),
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
         exam: { select: { id: true, name: true, examCategory: true, resumptionDate: true } },
       },
+      orderBy: { id: 'desc' },
     });
+
+    if (studentMarks.length === 0 && numericExamId) {
+      studentMarks = await prisma.mark.findMany({
+        where: {
+          studentId: Number(studentId),
+          sessionId,
+          ...(req.branchId ? { branchId: req.branchId } : {}),
+        },
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+          exam: { select: { id: true, name: true, examCategory: true, resumptionDate: true } },
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
 
     // Determine effective stage from query or selected exam category in DB
     let effectiveStage = reqStage ? String(reqStage).toUpperCase() : 'FULL';
@@ -3213,7 +3230,7 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
 
     const marksMap: Record<number, any> = {};
     existingMarks.forEach((m) => {
-      let parsedComponents = {};
+      let parsedComponents: Record<string, any> = {};
       try {
         if (m.mark && m.mark.startsWith('{')) {
           parsedComponents = JSON.parse(m.mark);
@@ -3224,15 +3241,27 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
       const hasCbtMark = m.cbtMark !== null && m.cbtMark !== undefined && String(m.cbtMark).trim() !== '';
       const effectiveCbt = hasCbtMark ? String(m.cbtMark) : cbtSub && cbtSub.totalMark !== null ? String(cbtSub.totalMark) : null;
 
-      marksMap[m.studentId] = {
-        id: m.id,
-        mark: m.mark,
-        cbtMark: effectiveCbt,
-        cbtSource: m.cbtSource || (cbtSub ? 'ONLINE_EXAM_SUBMISSION' : null),
-        cbtExamTitle: cbtSub?.onlineExam?.title || null,
-        absent: m.absent === '1' || m.absent === 'true',
-        components: parsedComponents,
-      };
+      if (!marksMap[m.studentId]) {
+        marksMap[m.studentId] = {
+          id: m.id,
+          mark: m.mark,
+          cbtMark: effectiveCbt,
+          cbtSource: m.cbtSource || (cbtSub ? 'ONLINE_EXAM_SUBMISSION' : null),
+          cbtExamTitle: cbtSub?.onlineExam?.title || null,
+          absent: m.absent === '1' || m.absent === 'true',
+          components: parsedComponents,
+        };
+      } else {
+        const existingEntry = marksMap[m.studentId];
+        for (const [k, v] of Object.entries(parsedComponents)) {
+          if (v !== '' && v !== null && v !== undefined) {
+            existingEntry.components[k] = v;
+          }
+        }
+        if (effectiveCbt && !existingEntry.cbtMark) {
+          existingEntry.cbtMark = effectiveCbt;
+        }
+      }
     });
 
     const parsedTermId = req.query.termId ? Number(req.query.termId) : 1;
@@ -3787,126 +3816,82 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    // Fetch available exams strictly for this session and branch
-    const examsWhere: any = {
-      sessionId,
-      ...(branchId ? { branchId } : {}),
-    };
-    if (reqTermId) {
-      examsWhere.OR = [
-        { termId: Number(reqTermId) },
-        { termId: null },
-      ];
-    }
-
-    let exams = await prisma.exam.findMany({
-      where: examsWhere,
-      select: {
-        id: true,
-        name: true,
-        examCategory: true,
-        termId: true,
-        sessionId: true,
-      },
-      orderBy: { id: 'desc' },
-    });
-
-    // If no exams found for this session and specific term, fallback to all exams for this session
-    if (exams.length === 0) {
-      exams = await prisma.exam.findMany({
-        where: {
-          sessionId,
-          ...(branchId ? { branchId } : {}),
-        },
-        select: {
-          id: true,
-          name: true,
-          examCategory: true,
-          termId: true,
-          sessionId: true,
-        },
-        orderBy: { id: 'desc' },
-      });
-    }
-
-    // If still no exams found for this session, allow branch fallback
-    if (exams.length === 0) {
-      exams = await prisma.exam.findMany({
-        where: branchId ? { branchId } : {},
-        select: {
-          id: true,
-          name: true,
-          examCategory: true,
-          termId: true,
-          sessionId: true,
-        },
-        orderBy: { id: 'desc' },
-      });
-    }
-
-    // If reqExamId was explicitly requested, ensure it is found or fetched so the matrix selection is respected
-    let selectedExam: any = null;
-    if (reqExamId) {
-      selectedExam = exams.find((e) => e.id === Number(reqExamId));
-      if (!selectedExam) {
-        selectedExam = await prisma.exam.findUnique({
-          where: { id: Number(reqExamId) },
-          select: {
-            id: true,
-            name: true,
-            examCategory: true,
-            termId: true,
-            sessionId: true,
-          },
-        });
-        if (selectedExam) {
-          exams.unshift(selectedExam);
-        }
-      }
-    }
-
-    if (!selectedExam && exams.length > 0) {
-      selectedExam = exams[0];
-    }
-
-    const selectedExamId = selectedExam ? selectedExam.id : null;
-    const activeTermId = reqTermId
-      ? Number(reqTermId)
-      : (selectedExam?.termId || 1);
-
-    // Format exams with descriptive displayName for Examination Matrix dropdown
-    const termNames: Record<number, string> = {
-      1: 'First Term',
-      2: 'Second Term',
-      3: 'Third Term',
-    };
-    const formattedExams = exams.map((ex) => {
-      const termStr = ex.termId && termNames[ex.termId] ? termNames[ex.termId] : ex.termId ? `Term ${ex.termId}` : '';
-      const hasTermInName = termStr && ex.name.toLowerCase().includes(termStr.toLowerCase());
-      const displayName = termStr && !hasTermInName ? `${ex.name} (${termStr})` : ex.name;
-      return {
-        id: ex.id,
-        name: ex.name,
-        examCategory: (ex as any).examCategory || null,
-        displayName,
-        termId: ex.termId,
-        sessionId: ex.sessionId,
-      };
-    });
-
     // Resolve Evaluation Matrix for the class directly from the database (zero hardcoding)
     const dbMatrix = await resolveClassEvaluationMatrix(prisma, branchId || cls.branchId, classId);
 
-    // Determine effective stage from explicit req.query.stage or selectedExam's DB examCategory
+    // Build authoritative Evaluation Matrix options for the Examination selector
+    // (Teachers see the admin-configured evaluation components: e.g. Tabulation, CA1, CA2, Exam)
+    const evaluationMatrixExams: Array<{
+      id: string;
+      name: string;
+      displayName: string;
+      stage: string;
+      maxMarks: number;
+      category: string;
+      termId?: number | null;
+      sessionId?: number;
+    }> = [
+      {
+        id: 'FULL',
+        name: `Tabulation Sheet (${dbMatrix.fullMaxMarks} Marks)`,
+        displayName: `Tabulation Sheet (Terminal Exam / ${dbMatrix.fullMaxMarks} Marks)`,
+        stage: 'FULL',
+        maxMarks: dbMatrix.fullMaxMarks,
+        category: 'FULL',
+        termId: reqTermId ? Number(reqTermId) : 1,
+        sessionId,
+      },
+    ];
+
+    if (dbMatrix.caColumns.length > 1) {
+      evaluationMatrixExams.push({
+        id: 'COMBINED_CA',
+        name: `Continuous Assessment (${dbMatrix.caMaxMarks} Marks)`,
+        displayName: `All Continuous Assessments (${dbMatrix.caMaxMarks} Marks)`,
+        stage: 'COMBINED_CA',
+        maxMarks: dbMatrix.caMaxMarks,
+        category: 'CA',
+        termId: reqTermId ? Number(reqTermId) : 1,
+        sessionId,
+      });
+    }
+
+    for (const col of dbMatrix.columns) {
+      const catLabel = col.category === 'EXAM' ? 'Terminal Examination' : 'Continuous Assessment';
+      evaluationMatrixExams.push({
+        id: col.code,
+        name: `${col.label || col.name || catLabel} (${col.code} - ${col.maxMarks} Marks)`,
+        displayName: `${col.label || col.name || catLabel} (${col.code} - ${col.maxMarks} Marks)`,
+        stage: col.code,
+        maxMarks: col.maxMarks,
+        category: col.category,
+        termId: reqTermId ? Number(reqTermId) : 1,
+        sessionId,
+      });
+    }
+
+    const activeTermId = reqTermId ? Number(reqTermId) : 1;
+
+    // Determine effective stage from req.query.stage or reqExamId (or evaluation matrix component)
     const reqStageParam = (req.query as any)?.stage ? String((req.query as any).stage).trim().toUpperCase() : null;
-    let effectiveStage = reqStageParam || 'FULL';
-    if (!reqStageParam && selectedExam) {
-      const exCat = String(selectedExam.examCategory || '').trim().toUpperCase();
-      const exName = String(selectedExam.name || '').trim();
-      if (exCat === 'CA' || (/^(ca|c\.a|continuous assessment|mid[\s-]*term)/i.test(exName) && !/exam/i.test(exName))) {
-        effectiveStage = 'COMBINED_CA';
+    const reqExamParam = reqExamId ? String(reqExamId).trim() : null;
+
+    let effectiveStage = 'FULL';
+    if (reqStageParam && reqStageParam !== '' && reqStageParam !== 'UNDEFINED') {
+      effectiveStage = reqStageParam;
+    } else if (reqExamParam && reqExamParam !== '' && reqExamParam !== 'UNDEFINED') {
+      const matchedOpt = evaluationMatrixExams.find(
+        (opt) => opt.id.toUpperCase() === reqExamParam.toUpperCase() || opt.stage.toUpperCase() === reqExamParam.toUpperCase()
+      );
+      if (matchedOpt) {
+        effectiveStage = matchedOpt.stage;
+      } else if (reqExamParam === 'FULL' || reqExamParam === 'COMBINED_CA' || reqExamParam === 'EXAM' || reqExamParam === 'CA') {
+        effectiveStage = reqExamParam;
       }
     }
+
+    const selectedExamId: any = effectiveStage;
+    const formattedExams = evaluationMatrixExams;
 
     const {
       activeStage,
@@ -4068,14 +4053,13 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       });
     }
 
-    // Subjects with marks recorded for this exam / session
-    const markSubjectsWhere: any = {
-      studentId: { in: studentIds },
-      ...(selectedExamId ? { examId: selectedExamId } : { classId, sessionId }),
-    };
-
+    // Subjects with marks recorded for this class and session
     const markSubjects = await prisma.mark.findMany({
-      where: markSubjectsWhere,
+      where: {
+        studentId: { in: studentIds },
+        classId,
+        sessionId,
+      },
       select: {
         subjectId: true,
         subject: {
@@ -4149,14 +4133,13 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
 
     const offeredSubjects = Array.from(offeredSubjectMap.values()).sort((a, b) => a.name.localeCompare(b.name));
 
-    // 4. Academic Marks for the Selected Exam and Session
-    const marksWhere: any = {
-      studentId: { in: studentIds },
-      ...(selectedExamId ? { examId: selectedExamId } : { classId, sessionId }),
-    };
-
-    const marks = await prisma.mark.findMany({
-      where: marksWhere,
+    // 4. Academic Marks for this Class and Session (unified across all exam records)
+    const rawMarks = await prisma.mark.findMany({
+      where: {
+        studentId: { in: studentIds },
+        classId,
+        sessionId,
+      },
       select: {
         id: true,
         studentId: true,
@@ -4166,7 +4149,76 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         absent: true,
         examId: true,
       },
+      orderBy: { id: 'desc' },
     });
+
+    // Group and merge marks by studentId and subjectId to unify scores saved across any exam record
+    const marksByStudentSubject = new Map<string, any[]>();
+    for (const r of rawMarks) {
+      const key = `${r.studentId}_${r.subjectId}`;
+      if (!marksByStudentSubject.has(key)) {
+        marksByStudentSubject.set(key, []);
+      }
+      marksByStudentSubject.get(key)!.push(r);
+    }
+
+    const mergedMarkByStudentSubject = new Map<string, any>();
+    for (const [key, recordList] of marksByStudentSubject.entries()) {
+      if (recordList.length === 1) {
+        mergedMarkByStudentSubject.set(key, recordList[0]);
+        continue;
+      }
+
+      const mergedComponents: Record<string, any> = {};
+      let hasValidScore = false;
+      let cbtMarkVal: string | null = null;
+      let isAbsent: string | boolean | null = null;
+
+      for (const r of recordList) {
+        if (r.absent === '1' || r.absent === true) isAbsent = '1';
+        if (r.cbtMark && !cbtMarkVal) cbtMarkVal = r.cbtMark;
+
+        if (r.mark) {
+          const trimmed = String(r.mark).trim();
+          if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (parsed && typeof parsed === 'object') {
+                for (const [k, v] of Object.entries(parsed)) {
+                  if (v !== null && v !== undefined && String(v).trim() !== '') {
+                    const num = parseFloat(String(v));
+                    if (!isNaN(num)) {
+                      if (mergedComponents[k] === undefined || (mergedComponents[k] === 0 && num > 0)) {
+                        mergedComponents[k] = num;
+                        hasValidScore = true;
+                      }
+                    }
+                  }
+                }
+              }
+            } catch {
+              // ignore
+            }
+          } else {
+            const num = parseFloat(trimmed);
+            if (!isNaN(num) && num > 0 && Object.keys(mergedComponents).length === 0) {
+              mergedComponents['EXAM'] = num;
+              hasValidScore = true;
+            }
+          }
+        }
+      }
+
+      mergedMarkByStudentSubject.set(key, {
+        id: recordList[0].id,
+        studentId: recordList[0].studentId,
+        subjectId: recordList[0].subjectId,
+        mark: hasValidScore ? JSON.stringify(mergedComponents) : recordList[0].mark,
+        cbtMark: cbtMarkVal || recordList[0].cbtMark,
+        absent: isAbsent,
+        examId: recordList[0].examId,
+      });
+    }
 
     // Component scores recorded via Evaluation Matrix for this class, session, and active term
     const compScores = await prisma.studentComponentScore.findMany({
@@ -4223,7 +4275,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       let subjectCount = 0;
 
       offeredSubjects.forEach((sub) => {
-        const markRecord = marks.find((m) => m.studentId === sId && m.subjectId === sub.id);
+        const markRecord = mergedMarkByStudentSubject.get(`${sId}_${sub.id}`) || null;
         const studentComps = compScores
           .filter((c) => c.studentId === sId && c.subjectId === sub.id)
           .map((cs) => ({
