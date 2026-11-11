@@ -32,6 +32,38 @@ export interface ResolveBrandingOptions {
   customNextTermFees?: string | null;
 }
 
+export interface TeacherSignatureConfig {
+  general?: string | null;
+  byClass?: Record<string, string | null>;
+}
+
+/**
+ * Parses the teacher signature configuration stored in SystemSetting.defaultTeacherSignatureUrl.
+ * Supports:
+ * 1. JSON: { general?: string | null, byClass?: Record<classId, string | 'DISABLED' | null> }
+ * 2. Legacy string: "https://.../teacher_sig.png" (treated as general)
+ */
+export function parseTeacherSignatureConfig(raw?: string | null): TeacherSignatureConfig {
+  if (!raw || typeof raw !== 'string') {
+    return { general: null, byClass: {} };
+  }
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') {
+        return {
+          general: parsed.general || null,
+          byClass: parsed.byClass && typeof parsed.byClass === 'object' ? parsed.byClass : {},
+        };
+      }
+    } catch {
+      // fallback
+    }
+  }
+  return { general: trimmed || null, byClass: {} };
+}
+
 /**
  * Formats an ISO date string (e.g. "2026-09-14") into a readable date if valid,
  * or returns the raw string when the admin typed a freeform phrase (e.g. "Monday, 14th Sept 2026").
@@ -206,41 +238,62 @@ export async function resolveSchoolReportBranding(
 
   const sessionId = options.sessionId || globalSettings?.sessionId || 5;
 
+  const teacherSigConfig = parseTeacherSignatureConfig(settings?.defaultTeacherSignatureUrl);
+  const generalTeacherSignature = teacherSigConfig.general || null;
+
   // Resolve Class / Form Teacher if classId is provided
   let classTeacherName = 'Class Teacher';
   let classTeacherSignatureUrl: string | null = null;
+  let isClassTeacherUnavailable = false;
 
   if (options.classId) {
-    const allocation = await prisma.teacherAllocation.findFirst({
-      where: {
-        branchId,
-        classId: options.classId,
-        ...(options.sectionId ? { sectionId: options.sectionId } : {}),
-      },
-      include: {
-        teacher: {
-          select: { id: true, name: true, signatureUrl: true },
-        },
-      },
-      orderBy: { id: 'desc' },
-    }).catch(() => null);
+    const classKey = String(options.classId);
+    const classOverride = teacherSigConfig.byClass?.[classKey];
 
-    if (allocation?.teacher) {
-      classTeacherName = allocation.teacher.name || 'Class Teacher';
-      classTeacherSignatureUrl = allocation.teacher.signatureUrl || null;
+    if (classOverride === 'DISABLED' || classOverride === 'UNAVAILABLE' || classOverride === 'NONE' || classOverride === null) {
+      // Admin explicitly marked that teacher signature is removed / unavailable for this class
+      isClassTeacherUnavailable = true;
+      classTeacherSignatureUrl = null;
+    } else if (typeof classOverride === 'string' && classOverride.trim().length > 0) {
+      // Admin uploaded a custom signature for this specific class
+      classTeacherSignatureUrl = classOverride.trim();
     } else {
-      // Fallback: check any teacher allocated to this class in this branch
-      const anyAllocation = await prisma.teacherAllocation.findFirst({
-        where: { branchId, classId: options.classId },
-        include: {
-          teacher: { select: { id: true, name: true, signatureUrl: true } },
+      // No custom class override; check allocated teacher profile, then fallback to general
+      const allocation = await prisma.teacherAllocation.findFirst({
+        where: {
+          branchId,
+          classId: options.classId,
+          ...(options.sectionId ? { sectionId: options.sectionId } : {}),
         },
+        include: {
+          teacher: {
+            select: { id: true, name: true, signatureUrl: true },
+          },
+        },
+        orderBy: { id: 'desc' },
       }).catch(() => null);
-      if (anyAllocation?.teacher) {
-        classTeacherName = anyAllocation.teacher.name || 'Class Teacher';
-        classTeacherSignatureUrl = anyAllocation.teacher.signatureUrl || null;
+
+      if (allocation?.teacher) {
+        classTeacherName = allocation.teacher.name || 'Class Teacher';
+        classTeacherSignatureUrl = allocation.teacher.signatureUrl || generalTeacherSignature;
+      } else {
+        // Fallback: check any teacher allocated to this class in this branch
+        const anyAllocation = await prisma.teacherAllocation.findFirst({
+          where: { branchId, classId: options.classId },
+          include: {
+            teacher: { select: { id: true, name: true, signatureUrl: true } },
+          },
+        }).catch(() => null);
+        if (anyAllocation?.teacher) {
+          classTeacherName = anyAllocation.teacher.name || 'Class Teacher';
+          classTeacherSignatureUrl = anyAllocation.teacher.signatureUrl || generalTeacherSignature;
+        } else {
+          classTeacherSignatureUrl = generalTeacherSignature;
+        }
       }
     }
+  } else {
+    classTeacherSignatureUrl = generalTeacherSignature;
   }
 
   const genericNames = ['ugbekun international academy', 'school dashboard', 'ugbekun'];
@@ -301,9 +354,9 @@ export async function resolveSchoolReportBranding(
     nextTermFees,
     principalName: settings?.principalName || 'The Principal',
     principalSignatureUrl: settings?.principalSignatureUrl || null,
-    defaultTeacherSignatureUrl: settings?.defaultTeacherSignatureUrl || null,
+    defaultTeacherSignatureUrl: isClassTeacherUnavailable ? null : generalTeacherSignature,
     classTeacherName,
-    classTeacherSignatureUrl: classTeacherSignatureUrl || settings?.defaultTeacherSignatureUrl || null,
+    classTeacherSignatureUrl: isClassTeacherUnavailable ? null : (classTeacherSignatureUrl || generalTeacherSignature || null),
     autoPublishReportCards: settings?.autoPublishReportCards ?? true,
     branchCode: branch?.code || settings?.regNoPrefix || 'SCH',
   };

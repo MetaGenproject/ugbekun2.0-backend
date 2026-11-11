@@ -6,6 +6,7 @@ import prisma from '../../lib/prisma';
 import { cacheDel, cacheDelPattern } from '../../lib/cacheService';
 import { uploadToCloudinary } from '../../lib/cloudinaryService';
 import { saveLogoBase64, saveSignatureBase64 } from '../onboarding/onboardingController';
+import { parseTeacherSignatureConfig } from '../../lib/reportCardHelper';
 import {
   getMyEduRideConfig,
   saveMyEduRideConfig,
@@ -270,6 +271,7 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       defaultTeacherSignatureUrl,
       teacherSignatureBase64,
       teacherSignatureFileName,
+      classTeacherSignatures,
       resumptionDate,
       nextTermFees,
       autoPublishReportCards,
@@ -305,7 +307,59 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
     }
 
     let processedTeacherSignatureUrl = defaultTeacherSignatureUrl;
-    if (teacherSignatureBase64) {
+    if (
+      teacherSignatureBase64 ||
+      classTeacherSignatures ||
+      (defaultTeacherSignatureUrl && typeof defaultTeacherSignatureUrl === 'string' && defaultTeacherSignatureUrl.startsWith('{'))
+    ) {
+      const currentSetting = await prisma.systemSetting.findUnique({
+        where: { branchId },
+        select: { defaultTeacherSignatureUrl: true },
+      });
+      const sigConfig = parseTeacherSignatureConfig(
+        defaultTeacherSignatureUrl || currentSetting?.defaultTeacherSignatureUrl
+      );
+
+      if (teacherSignatureBase64) {
+        const uploaded = await saveSignatureBase64(teacherSignatureBase64, teacherSignatureFileName);
+        if (uploaded) sigConfig.general = uploaded;
+      } else if (defaultTeacherSignatureUrl !== undefined && !defaultTeacherSignatureUrl?.startsWith('{')) {
+        sigConfig.general = defaultTeacherSignatureUrl || null;
+      }
+
+      if (classTeacherSignatures && typeof classTeacherSignatures === 'object') {
+        if (!sigConfig.byClass) sigConfig.byClass = {};
+        for (const [cId, item] of Object.entries(classTeacherSignatures)) {
+          if (!item) continue;
+          if (typeof item === 'string') {
+            sigConfig.byClass[cId] = item;
+          } else if (typeof item === 'object') {
+            const classItem = item as any;
+            if (classItem.action === 'MARK_UNAVAILABLE' || classItem.status === 'DISABLED' || classItem.disabled) {
+              sigConfig.byClass[cId] = 'DISABLED';
+            } else if (classItem.action === 'REMOVE_TO_GENERAL' || classItem.action === 'CLEAR') {
+              delete sigConfig.byClass[cId];
+            } else if (classItem.base64) {
+              const uploadedClassSig = await saveSignatureBase64(classItem.base64, classItem.fileName || `class_${cId}_teacher_sig.png`);
+              if (uploadedClassSig) {
+                sigConfig.byClass[cId] = uploadedClassSig;
+              }
+            } else if (classItem.url !== undefined) {
+              sigConfig.byClass[cId] = classItem.url;
+            }
+          }
+        }
+      }
+
+      if (Object.keys(sigConfig.byClass || {}).length > 0) {
+        processedTeacherSignatureUrl = JSON.stringify({
+          general: sigConfig.general || null,
+          byClass: sigConfig.byClass,
+        });
+      } else {
+        processedTeacherSignatureUrl = sigConfig.general || null;
+      }
+    } else if (teacherSignatureBase64) {
       const uploaded = await saveSignatureBase64(teacherSignatureBase64, teacherSignatureFileName);
       if (uploaded) processedTeacherSignatureUrl = uploaded;
     }
@@ -1565,6 +1619,18 @@ export async function deleteBrandingAsset(req: Request, res: Response): Promise<
       }).catch(() => {});
     } else if (assetType === 'signature') {
       updateData = { principalSignatureUrl: null };
+    } else if (assetType === 'teacher-signature') {
+      const current = await prisma.systemSetting.findUnique({
+        where: { branchId },
+        select: { defaultTeacherSignatureUrl: true },
+      });
+      const sigConfig = parseTeacherSignatureConfig(current?.defaultTeacherSignatureUrl);
+      sigConfig.general = null;
+      if (Object.keys(sigConfig.byClass || {}).length > 0) {
+        updateData = { defaultTeacherSignatureUrl: JSON.stringify(sigConfig) };
+      } else {
+        updateData = { defaultTeacherSignatureUrl: null };
+      }
     } else if (assetType === 'colors') {
       updateData = { primaryColor: '#0f172a', secondaryColor: '#0284c7', idCardTheme: 'EMERALD_MODERN' };
     } else {
@@ -1587,5 +1653,178 @@ export async function deleteBrandingAsset(req: Request, res: Response): Promise<
   } catch (error: any) {
     console.error('[SETTINGS] Delete branding asset error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to remove branding asset.' });
+  }
+}
+
+/**
+ * GET /api/admin/settings/class-signatures
+ * Returns a comprehensive matrix of all classes, their allocated teacher,
+ * their custom class signature, and the effective signature that appears on report cards.
+ */
+export async function getClassTeacherSignatures(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  if (!branchId) {
+    return res.status(400).json({ success: false, message: 'branchId is required.' });
+  }
+
+  try {
+    const [settings, classes, allocations] = await Promise.all([
+      prisma.systemSetting.findUnique({
+        where: { branchId },
+        select: { defaultTeacherSignatureUrl: true },
+      }),
+      prisma.class.findMany({
+        where: { branchId },
+        select: { id: true, name: true },
+        orderBy: { id: 'asc' },
+      }),
+      prisma.teacherAllocation.findMany({
+        where: { branchId },
+        include: {
+          teacher: {
+            select: { id: true, name: true, signatureUrl: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      }),
+    ]);
+
+    const sigConfig = parseTeacherSignatureConfig(settings?.defaultTeacherSignatureUrl);
+    const generalSignatureUrl = sigConfig.general || null;
+
+    const result = classes.map((cls) => {
+      const classKey = String(cls.id);
+      const override = sigConfig.byClass?.[classKey];
+      const alloc = allocations.find((a) => a.classId === cls.id && a.teacher);
+
+      let effectiveSignatureUrl: string | null = null;
+      let source: 'CLASS_CUSTOM' | 'GENERAL' | 'TEACHER_PROFILE' | 'UNAVAILABLE' | 'NONE' = 'NONE';
+      let isUnavailable = false;
+
+      if (override === 'DISABLED' || override === 'UNAVAILABLE' || override === 'NONE' || override === null) {
+        isUnavailable = true;
+        effectiveSignatureUrl = null;
+        source = 'UNAVAILABLE';
+      } else if (typeof override === 'string' && override.trim().length > 0) {
+        effectiveSignatureUrl = override.trim();
+        source = 'CLASS_CUSTOM';
+      } else if (alloc?.teacher?.signatureUrl) {
+        effectiveSignatureUrl = alloc.teacher.signatureUrl;
+        source = 'TEACHER_PROFILE';
+      } else if (generalSignatureUrl) {
+        effectiveSignatureUrl = generalSignatureUrl;
+        source = 'GENERAL';
+      }
+
+      return {
+        classId: cls.id,
+        className: cls.name,
+        allocatedTeacher: alloc?.teacher ? { id: alloc.teacher.id, name: alloc.teacher.name } : null,
+        generalSignatureUrl,
+        customSignatureUrl: typeof override === 'string' && override !== 'DISABLED' ? override : null,
+        isUnavailable,
+        effectiveSignatureUrl,
+        source,
+      };
+    });
+
+    return res.json({
+      success: true,
+      generalSignatureUrl,
+      classes: result,
+    });
+  } catch (error: any) {
+    console.error('[SETTINGS] Get class teacher signatures error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to fetch signatures.' });
+  }
+}
+
+/**
+ * POST /api/admin/settings/class-signatures
+ * Updates or removes a class teacher's signature by class.
+ * Actions:
+ * - 'UPLOAD': Uploads a custom signature for that specific class.
+ * - 'MARK_UNAVAILABLE': Admin marks teacher as unavailable, explicitly disabling signature for this class.
+ * - 'REMOVE_TO_GENERAL' / 'CLEAR': Removes custom override so class inherits the school general signature.
+ */
+export async function updateClassTeacherSignature(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  const { classId, action, signatureBase64, signatureFileName } = req.body || {};
+
+  if (!branchId) {
+    return res.status(400).json({ success: false, message: 'branchId is required.' });
+  }
+  if (!classId) {
+    return res.status(400).json({ success: false, message: 'classId is required.' });
+  }
+
+  try {
+    const settings = await prisma.systemSetting.findUnique({
+      where: { branchId },
+      select: { defaultTeacherSignatureUrl: true },
+    });
+
+    const sigConfig = parseTeacherSignatureConfig(settings?.defaultTeacherSignatureUrl);
+    const classKey = String(classId);
+
+    let message = '';
+    if (action === 'UPLOAD') {
+      if (!signatureBase64) {
+        return res.status(400).json({ success: false, message: 'signatureBase64 is required for UPLOAD.' });
+      }
+      const uploadedUrl = await saveSignatureBase64(
+        signatureBase64,
+        signatureFileName || `class_${classId}_teacher_signature.png`
+      );
+      if (!uploadedUrl) {
+        return res.status(500).json({ success: false, message: 'Failed to upload class signature image.' });
+      }
+      if (!sigConfig.byClass) sigConfig.byClass = {};
+      sigConfig.byClass[classKey] = uploadedUrl;
+      message = 'Class teacher signature uploaded successfully.';
+    } else if (action === 'MARK_UNAVAILABLE') {
+      if (!sigConfig.byClass) sigConfig.byClass = {};
+      sigConfig.byClass[classKey] = 'DISABLED';
+      message = 'Class teacher marked as unavailable. Signature removed from this class report card.';
+    } else if (action === 'REMOVE_TO_GENERAL' || action === 'CLEAR') {
+      if (sigConfig.byClass) {
+        delete sigConfig.byClass[classKey];
+      }
+      message = 'Class custom signature cleared. Now using school general signature.';
+    } else {
+      return res.status(400).json({ success: false, message: 'Invalid action specified.' });
+    }
+
+    let payload: string | null = null;
+    if (Object.keys(sigConfig.byClass || {}).length > 0) {
+      payload = JSON.stringify({
+        general: sigConfig.general || null,
+        byClass: sigConfig.byClass,
+      });
+    } else {
+      payload = sigConfig.general || null;
+    }
+
+    await prisma.systemSetting.update({
+      where: { branchId },
+      data: {
+        defaultTeacherSignatureUrl: payload,
+        updatedAt: new Date(),
+      },
+    });
+
+    return res.json({
+      success: true,
+      message,
+      classId,
+      status: sigConfig.byClass?.[classKey] || (sigConfig.general ? 'GENERAL' : 'NONE'),
+      signatureUrl:
+        sigConfig.byClass?.[classKey] && sigConfig.byClass[classKey] !== 'DISABLED'
+          ? sigConfig.byClass[classKey]
+          : sigConfig.general || null,
+    });
+  } catch (error: any) {
+    console.error('[SETTINGS] Update class teacher signature error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update class signature.' });
   }
 }

@@ -314,6 +314,8 @@ import {
   deleteEvent,
   getSettings,
   updateSettings,
+  getClassTeacherSignatures,
+  updateClassTeacherSignature,
   resetSchoolInfo,
   deleteBrandingAsset,
   uploadLogo,
@@ -735,6 +737,8 @@ router.delete('/sessions/:id', deleteAcademicSession);
 
 router.get('/settings', getSettings);
 router.post('/settings', updateSettings);
+router.get('/settings/class-signatures', getClassTeacherSignatures);
+router.post('/settings/class-signatures', updateClassTeacherSignature);
 router.put('/settings/school-info', updateSettings);
 router.delete('/settings/school-info', resetSchoolInfo);
 router.put('/settings/branding', updateSettings);
