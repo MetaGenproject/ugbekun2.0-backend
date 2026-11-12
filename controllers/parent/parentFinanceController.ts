@@ -94,7 +94,7 @@ export async function getChildInvoices(req: Request, res: Response): Promise<Res
 async function parentEmail(req: Request) {
   const parent = await prisma.parent.findFirst({
     where: {
-      OR: [{ id: Number(req.parentId) }, { userId: Number(req.userId) }],
+      ...(req.parentId ? { id: Number(req.parentId) } : { userId: Number(req.userId) }),
     },
     select: { email: true },
   });

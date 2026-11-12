@@ -38,10 +38,16 @@ async function resolveUserBranch(user: { id: number; role: number; username: str
         if (branch) branchInfo = branch;
       }
       if (!branchInfo) {
-        const teacherRecord = await prisma.teacher.findFirst({
-          where: { OR: [{ userId: user.id }, { id: user.id }] },
+        let teacherRecord = await prisma.teacher.findFirst({
+          where: { userId: user.id },
           select: { branchId: true },
         });
+        if (!teacherRecord) {
+          teacherRecord = await prisma.teacher.findFirst({
+            where: { id: user.id, userId: null },
+            select: { branchId: true },
+          });
+        }
         if (teacherRecord?.branchId) {
           const branch = await prisma.branch.findUnique({
             where: { id: teacherRecord.branchId },

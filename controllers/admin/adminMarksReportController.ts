@@ -812,6 +812,7 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
         sessionId,
         isPublished: true,
         ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+        ...(req.query.termId ? { termId: Number(req.query.termId) } : {}),
       },
       select: { classId: true, sectionId: true },
     });
@@ -1310,15 +1311,22 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       where: {
         classId: parsedClassId,
         sessionId,
+        termId: parsedTermId,
         ...(parsedSectionId ? { OR: [{ sectionId: parsedSectionId }, { sectionId: null }] } : {}),
         ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
       },
       orderBy: { id: 'desc' },
     });
-    const isPublished = Boolean(
-      schoolBranding.autoPublishReportCards ||
-      (classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseExam || classPub.releaseFull))
-    );
+    const isPublished = classPub
+      ? Boolean(
+          classPub.isPublished &&
+            (classPub.releaseCa1 ||
+              classPub.releaseCa2 ||
+              classPub.releaseCombinedCa ||
+              classPub.releaseExam ||
+              classPub.releaseFull)
+        )
+      : Boolean(schoolBranding.autoPublishReportCards);
 
     return res.json({
       success: true,
@@ -1352,23 +1360,32 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       schoolBranding,
       resumptionDate: schoolBranding.resumptionDate,
       nextTermFees: schoolBranding.nextTermFees,
-      publication: classPub ? {
-        isPublished: classPub.isPublished || schoolBranding.autoPublishReportCards,
-        releaseCa1: classPub.releaseCa1,
-        releaseCa2: classPub.releaseCa2,
-        releaseCombinedCa: classPub.releaseCombinedCa,
-        releaseExam: classPub.releaseExam,
-        releaseFull: classPub.releaseFull || schoolBranding.autoPublishReportCards,
-        termId: classPub.termId,
-      } : {
-        isPublished: schoolBranding.autoPublishReportCards,
-        releaseCa1: false,
-        releaseCa2: false,
-        releaseCombinedCa: false,
-        releaseExam: false,
-        releaseFull: schoolBranding.autoPublishReportCards,
-        termId: parsedTermId,
-      },
+      publication: classPub
+        ? {
+            isPublished: Boolean(
+              classPub.isPublished &&
+                (classPub.releaseCa1 ||
+                  classPub.releaseCa2 ||
+                  classPub.releaseCombinedCa ||
+                  classPub.releaseExam ||
+                  classPub.releaseFull)
+            ),
+            releaseCa1: Boolean(classPub.isPublished && classPub.releaseCa1),
+            releaseCa2: Boolean(classPub.isPublished && classPub.releaseCa2),
+            releaseCombinedCa: Boolean(classPub.isPublished && classPub.releaseCombinedCa),
+            releaseExam: Boolean(classPub.isPublished && classPub.releaseExam),
+            releaseFull: Boolean(classPub.isPublished && classPub.releaseFull),
+            termId: classPub.termId,
+          }
+        : {
+            isPublished: Boolean(schoolBranding.autoPublishReportCards),
+            releaseCa1: Boolean(schoolBranding.autoPublishReportCards),
+            releaseCa2: Boolean(schoolBranding.autoPublishReportCards),
+            releaseCombinedCa: Boolean(schoolBranding.autoPublishReportCards),
+            releaseExam: Boolean(schoolBranding.autoPublishReportCards),
+            releaseFull: Boolean(schoolBranding.autoPublishReportCards),
+            termId: parsedTermId,
+          },
       totalStudents: studentList.length,
       students: studentList,
     });
@@ -2412,7 +2429,13 @@ export async function getReportCardPublishStatus(req: Request, res: Response): P
       });
 
       const isPublished = Boolean(
-        classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseExam || classPub.releaseFull)
+        classPub &&
+          classPub.isPublished &&
+          (classPub.releaseCa1 ||
+            classPub.releaseCa2 ||
+            classPub.releaseCombinedCa ||
+            classPub.releaseExam ||
+            classPub.releaseFull)
       );
 
       return res.json({
@@ -2421,11 +2444,11 @@ export async function getReportCardPublishStatus(req: Request, res: Response): P
         classId: parsedClassId,
         className: cls?.name || 'Class',
         isPublished,
-        releaseCa1: Boolean(classPub?.releaseCa1),
-        releaseCa2: Boolean(classPub?.releaseCa2),
-        releaseCombinedCa: Boolean(classPub?.releaseCombinedCa),
-        releaseExam: Boolean(classPub?.releaseExam),
-        releaseFull: Boolean(classPub?.releaseFull),
+        releaseCa1: isPublished ? Boolean(classPub?.releaseCa1) : false,
+        releaseCa2: isPublished ? Boolean(classPub?.releaseCa2) : false,
+        releaseCombinedCa: isPublished ? Boolean(classPub?.releaseCombinedCa) : false,
+        releaseExam: isPublished ? Boolean(classPub?.releaseExam) : false,
+        releaseFull: isPublished ? Boolean(classPub?.releaseFull) : false,
         termId: classPub?.termId || parsedTermId || 1,
       });
     }
@@ -2501,18 +2524,18 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
     let targetExam = releaseExam !== undefined ? Boolean(releaseExam) : undefined;
     let targetFull = releaseFull !== undefined ? Boolean(releaseFull) : undefined;
 
-    if (targetFull === true) {
-      targetCa1 = true;
-      targetCa2 = true;
-      targetCombinedCa = true;
-      targetExam = true;
-      targetFull = true;
-    } else if (publish === false && targetCa1 === undefined && targetCa2 === undefined && targetCombinedCa === undefined && targetExam === undefined && targetFull === undefined) {
+    if (publish === false) {
       targetCa1 = false;
       targetCa2 = false;
       targetCombinedCa = false;
       targetExam = false;
       targetFull = false;
+    } else if (targetFull === true) {
+      targetCa1 = true;
+      targetCa2 = true;
+      targetCombinedCa = true;
+      targetExam = true;
+      targetFull = true;
     } else if (publish === true && targetCa1 === undefined && targetCa2 === undefined && targetCombinedCa === undefined && targetExam === undefined && targetFull === undefined) {
       targetCa1 = true;
       targetCa2 = true;
@@ -2590,6 +2613,14 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
           publishResult: finalIsPublished ? 1 : 0,
         },
       });
+
+      // Synchronize school-wide auto-publish setting when applying to all classes
+      if (branchId) {
+        await prisma.systemSetting.updateMany({
+          where: { branchId },
+          data: { autoPublishReportCards: finalIsPublished ? finalFull : false },
+        });
+      }
 
       const stagesText = finalFull
         ? 'Full Terminal Report'

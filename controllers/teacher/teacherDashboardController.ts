@@ -765,10 +765,16 @@ export async function getProfile(req: Request, res: Response): Promise<Response 
   try {
     let teacherId = req.teacherId ? Number(req.teacherId) : undefined;
     if (!teacherId && req.userId) {
-      const foundTeacher = await prisma.teacher.findFirst({
-        where: { OR: [{ userId: Number(req.userId) }, { id: Number(req.userId) }] },
+      let foundTeacher = await prisma.teacher.findFirst({
+        where: { userId: Number(req.userId) },
         select: { id: true, branchId: true },
       });
+      if (!foundTeacher) {
+        foundTeacher = await prisma.teacher.findFirst({
+          where: { id: Number(req.userId), userId: null },
+          select: { id: true, branchId: true },
+        });
+      }
       if (foundTeacher) {
         teacherId = foundTeacher.id;
         if (!req.branchId && foundTeacher.branchId) req.branchId = foundTeacher.branchId;
@@ -964,19 +970,22 @@ export async function updateProfile(req: Request, res: Response): Promise<Respon
 
     let teacherId = req.teacherId ? Number(req.teacherId) : undefined;
     if (!teacherId && req.userId) {
-      const foundTeacher = await prisma.teacher.findFirst({
-        where: { OR: [{ userId: Number(req.userId) }, { id: Number(req.userId) }] },
+      let foundTeacher = await prisma.teacher.findFirst({
+        where: { userId: Number(req.userId) },
         select: { id: true },
       });
+      if (!foundTeacher) {
+        foundTeacher = await prisma.teacher.findFirst({
+          where: { id: Number(req.userId), userId: null },
+          select: { id: true },
+        });
+      }
       if (foundTeacher) teacherId = foundTeacher.id;
     }
 
     const teacher = await prisma.teacher.findFirst({
       where: {
-        OR: [
-          ...(teacherId ? [{ id: teacherId }] : []),
-          ...(req.userId ? [{ userId: Number(req.userId) }, { id: Number(req.userId) }] : []),
-        ],
+        ...(teacherId ? { id: teacherId } : { userId: Number(req.userId) }),
       },
       select: { id: true, userId: true },
     });

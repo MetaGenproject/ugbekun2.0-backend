@@ -196,7 +196,18 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         : Promise.resolve(null),
     ]);
 
-    const isClassPublished = Boolean(schoolBranding.autoPublishReportCards !== false || classPub);
+    const hasExplicitPub = Boolean(classPub);
+    const isClassPublished = hasExplicitPub
+      ? Boolean(
+          classPub &&
+            classPub.isPublished &&
+            (classPub.releaseCa1 ||
+              classPub.releaseCa2 ||
+              classPub.releaseCombinedCa ||
+              classPub.releaseExam ||
+              classPub.releaseFull)
+        )
+      : Boolean(schoolBranding.autoPublishReportCards !== false);
 
     if (!isClassPublished) {
       return res.json({
@@ -308,11 +319,11 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       resolveGradingScale(prisma, req.branchId, req.classId),
     ]);
 
-    const releaseCa1 = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseCa1);
-    const releaseCa2 = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseCa2);
-    const releaseCombinedCa = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseCombinedCa);
-    const releaseExam = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseExam);
-    const releaseFull = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseFull || classPub?.isPublished);
+    const releaseCa1 = hasExplicitPub ? Boolean(classPub?.releaseCa1) : true;
+    const releaseCa2 = hasExplicitPub ? Boolean(classPub?.releaseCa2) : true;
+    const releaseCombinedCa = hasExplicitPub ? Boolean(classPub?.releaseCombinedCa) : true;
+    const releaseExam = hasExplicitPub ? Boolean(classPub?.releaseExam) : true;
+    const releaseFull = hasExplicitPub ? Boolean(classPub?.releaseFull) : true;
     const isExamReleased = Boolean(releaseExam || releaseFull);
 
     let defaultStage = 'FULL';
@@ -512,7 +523,18 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       }),
     ]);
 
-    const isClassPublished = Boolean(schoolBranding.autoPublishReportCards !== false || classPub);
+    const hasExplicitPub = Boolean(classPub);
+    const isClassPublished = hasExplicitPub
+      ? Boolean(
+          classPub &&
+            classPub.isPublished &&
+            (classPub.releaseCa1 ||
+              classPub.releaseCa2 ||
+              classPub.releaseCombinedCa ||
+              classPub.releaseExam ||
+              classPub.releaseFull)
+        )
+      : Boolean(schoolBranding.autoPublishReportCards !== false);
 
     if (!isClassPublished) {
       return res.status(403).json({
@@ -680,11 +702,11 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       resolveGradingScale(prisma, req.branchId, req.classId),
     ]);
 
-    const releaseCa1 = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseCa1);
-    const releaseCa2 = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseCa2);
-    const releaseCombinedCa = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseCombinedCa);
-    const releaseExam = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseExam);
-    const releaseFull = Boolean(schoolBranding.autoPublishReportCards !== false || classPub?.releaseFull || classPub?.isPublished);
+    const releaseCa1 = hasExplicitPub ? Boolean(classPub?.releaseCa1) : true;
+    const releaseCa2 = hasExplicitPub ? Boolean(classPub?.releaseCa2) : true;
+    const releaseCombinedCa = hasExplicitPub ? Boolean(classPub?.releaseCombinedCa) : true;
+    const releaseExam = hasExplicitPub ? Boolean(classPub?.releaseExam) : true;
+    const releaseFull = hasExplicitPub ? Boolean(classPub?.releaseFull) : true;
     const isExamReleased = Boolean(releaseExam || releaseFull);
 
     let defaultStage = 'FULL';

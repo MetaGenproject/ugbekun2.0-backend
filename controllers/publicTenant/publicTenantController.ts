@@ -360,17 +360,31 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
           }
 
           let branchId: number | null = decoded.branchId ? Number(decoded.branchId) : null;
+          const userSubId = Number(decoded.sub || decoded.id);
+
           if (!branchId && decoded.role === 7) {
-            const studentRecord = await prisma.student.findFirst({
-              where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
+            let studentRecord = await prisma.student.findUnique({
+              where: { userId: userSubId },
               select: { branchId: true },
             });
+            if (!studentRecord && decoded.legacyUserId) {
+              studentRecord = await prisma.student.findFirst({
+                where: { id: Number(decoded.legacyUserId), OR: [{ userId: null }, { userId: userSubId }] },
+                select: { branchId: true },
+              });
+            }
             branchId = studentRecord?.branchId || null;
           } else if (!branchId && decoded.role === 6) {
-            const parentRecord = await prisma.parent.findFirst({
-              where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
+            let parentRecord = await prisma.parent.findUnique({
+              where: { userId: userSubId },
               select: { id: true, branchId: true },
             });
+            if (!parentRecord && decoded.legacyUserId) {
+              parentRecord = await prisma.parent.findFirst({
+                where: { id: Number(decoded.legacyUserId), OR: [{ userId: null }, { userId: userSubId }] },
+                select: { id: true, branchId: true },
+              });
+            }
             const childRecord = parentRecord
               ? await prisma.student.findFirst({
                   where: { parentId: parentRecord.id, active: true },
@@ -380,10 +394,16 @@ export async function getPublicSchoolInfo(req: Request, res: Response): Promise<
               : null;
             branchId = childRecord?.branchId || parentRecord?.branchId || null;
           } else if (!branchId && decoded.role === 3) {
-            const teacherRecord = await prisma.teacher.findFirst({
-              where: { OR: [{ userId: decoded.sub || decoded.id }, { id: decoded.sub || decoded.id }] },
+            let teacherRecord = await prisma.teacher.findFirst({
+              where: { userId: userSubId },
               select: { branchId: true },
             });
+            if (!teacherRecord && decoded.legacyUserId) {
+              teacherRecord = await prisma.teacher.findFirst({
+                where: { id: Number(decoded.legacyUserId), OR: [{ userId: null }, { userId: userSubId }] },
+                select: { branchId: true },
+              });
+            }
             branchId = teacherRecord?.branchId || null;
           } else if (!branchId && (decoded.role === 2 || decoded.role === 9)) {
             const adminUser = await prisma.user.findFirst({

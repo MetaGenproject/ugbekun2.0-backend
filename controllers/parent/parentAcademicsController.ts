@@ -248,17 +248,18 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         : Promise.resolve(null),
     ]);
 
-    const autoPublished = schoolBranding.autoPublishReportCards !== false;
-    const isPublished = Boolean(
-      autoPublished ||
-        (classPub &&
-          (classPub.isPublished ||
-            classPub.releaseCa1 ||
-            classPub.releaseCa2 ||
-            classPub.releaseCombinedCa ||
-            classPub.releaseExam ||
-            classPub.releaseFull))
-    );
+    const hasExplicitPub = Boolean(classPub);
+    const isPublished = hasExplicitPub
+      ? Boolean(
+          classPub &&
+            classPub.isPublished &&
+            (classPub.releaseCa1 ||
+              classPub.releaseCa2 ||
+              classPub.releaseCombinedCa ||
+              classPub.releaseExam ||
+              classPub.releaseFull)
+        )
+      : Boolean(schoolBranding.autoPublishReportCards !== false);
 
     if (!isPublished) {
       return res.json({
@@ -281,11 +282,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       });
     }
 
-    const releaseCa1 = Boolean(autoPublished || classPub?.releaseCa1);
-    const releaseCa2 = Boolean(autoPublished || classPub?.releaseCa2);
-    const releaseCombinedCa = Boolean(autoPublished || classPub?.releaseCombinedCa);
-    const releaseExam = Boolean(autoPublished || classPub?.releaseExam);
-    const releaseFull = Boolean(autoPublished || classPub?.releaseFull);
+    const releaseCa1 = hasExplicitPub ? Boolean(classPub?.releaseCa1) : true;
+    const releaseCa2 = hasExplicitPub ? Boolean(classPub?.releaseCa2) : true;
+    const releaseCombinedCa = hasExplicitPub ? Boolean(classPub?.releaseCombinedCa) : true;
+    const releaseExam = hasExplicitPub ? Boolean(classPub?.releaseExam) : true;
+    const releaseFull = hasExplicitPub ? Boolean(classPub?.releaseFull) : true;
 
     const visibleStages: string[] = [];
     if (releaseCa1) visibleStages.push('CA1');
@@ -666,11 +667,18 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       }),
     ]);
 
-    const autoPublished = schoolBranding.autoPublishReportCards !== false;
-    const isPublished = Boolean(
-      autoPublished ||
-        (classPub && (classPub.isPublished || classPub.releaseCa1 || classPub.releaseCa2 || classPub.releaseExam || classPub.releaseFull))
-    );
+    const hasExplicitPub = Boolean(classPub);
+    const isPublished = hasExplicitPub
+      ? Boolean(
+          classPub &&
+            classPub.isPublished &&
+            (classPub.releaseCa1 ||
+              classPub.releaseCa2 ||
+              classPub.releaseCombinedCa ||
+              classPub.releaseExam ||
+              classPub.releaseFull)
+        )
+      : Boolean(schoolBranding.autoPublishReportCards !== false);
 
     if (!isPublished) {
       return res.status(403).json({
@@ -679,10 +687,10 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       });
     }
 
-    const releaseCa1 = Boolean(autoPublished || classPub?.releaseCa1);
-    const releaseCa2 = Boolean(autoPublished || classPub?.releaseCa2);
-    const releaseExam = Boolean(autoPublished || classPub?.releaseExam);
-    const releaseFull = Boolean(autoPublished || classPub?.releaseFull);
+    const releaseCa1 = hasExplicitPub ? Boolean(classPub?.releaseCa1) : true;
+    const releaseCa2 = hasExplicitPub ? Boolean(classPub?.releaseCa2) : true;
+    const releaseExam = hasExplicitPub ? Boolean(classPub?.releaseExam) : true;
+    const releaseFull = hasExplicitPub ? Boolean(classPub?.releaseFull) : true;
 
     const visibleStages: string[] = [];
     if (releaseCa1) visibleStages.push('CA1');
@@ -945,7 +953,7 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       resolveGradingScale(prisma, req.studentBranchId, req.childClassId),
     ]);
 
-    const releaseCombinedCa = Boolean(autoPublished || classPub?.releaseCombinedCa);
+    const releaseCombinedCa = hasExplicitPub ? Boolean(classPub?.releaseCombinedCa) : true;
     if (releaseCombinedCa && !visibleStages.includes('COMBINED_CA')) {
       visibleStages.push('COMBINED_CA');
     }
