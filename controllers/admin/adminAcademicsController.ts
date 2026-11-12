@@ -19,6 +19,7 @@ import { getAiModel, requireDeepseekClient } from '../../lib/aiClient';
 import { generatePedagogicalLessonPlan } from '../../lib/lessonPlanService';
 import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
 import gamificationService from '../../lib/gamificationService';
+import { excludePromotedOutStudents } from '../../lib/teacherAccess';
 
 const openai = { chat: { completions: { create: (args: any) => requireDeepseekClient().chat.completions.create({ ...args, model: args.model || getAiModel() }) } } };
 
@@ -1231,7 +1232,7 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
       });
     }
 
-    const enrolls = await prisma.enroll.findMany({
+    let enrolls = await prisma.enroll.findMany({
       where: {
         branchId,
         classId: cId,
@@ -1257,6 +1258,14 @@ export async function getStudentAttendance(req: Request, res: Response): Promise
       },
       orderBy: [{ roll: 'asc' }],
     });
+
+    if (branchId) {
+      enrolls = await excludePromotedOutStudents(
+        prisma,
+        { branchId, sessionId: activeSession, classId: cId, sectionId: 0 },
+        enrolls
+      );
+    }
 
     const students = enrolls.map((e) => ({
       id: e.student.id,
@@ -1529,7 +1538,7 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
     const requestedSession = req.query.sessionId ? Number(req.query.sessionId) : null;
     const activeSession = await resolveAdminSession(branchId, classId || undefined, requestedSession);
 
-    const enrolls = await prisma.enroll.findMany({
+    let enrolls = await prisma.enroll.findMany({
       where: {
         branchId,
         sessionId: activeSession,
@@ -1547,6 +1556,14 @@ export async function getMonthlyAttendanceReport(req: Request, res: Response): P
       },
       orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
     });
+
+    if (branchId) {
+      enrolls = await excludePromotedOutStudents(
+        prisma,
+        { branchId, sessionId: activeSession, classId: classId || 0, sectionId: sectionId || 0 },
+        enrolls
+      );
+    }
 
     const { logs } = await listSubmittedAttendance(prisma, {
       branchId,

@@ -261,7 +261,11 @@ export async function excludePromotedOutStudents<T extends { studentId: number }
     const place = latest.get(row.studentId);
     if (!place) return true;
     if (place.sessionId > args.sessionId) return false;
-    if (place.sessionId === args.sessionId && (place.classId !== args.classId || place.sectionId !== args.sectionId)) {
+    if (
+      place.sessionId === args.sessionId &&
+      ((args.classId > 0 && place.classId !== args.classId) ||
+        (args.sectionId > 0 && place.sectionId !== args.sectionId))
+    ) {
       return false;
     }
     return true;

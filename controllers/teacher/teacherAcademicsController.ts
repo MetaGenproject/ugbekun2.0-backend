@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
-import { isSubjectTeacher, isFormTeacher, hasClassAccess, canTeacherAccessSubject, resolveActiveSessionForClass } from '../../lib/teacherAccess';
+import { isSubjectTeacher, isFormTeacher, hasClassAccess, canTeacherAccessSubject, resolveActiveSessionForClass, excludePromotedOutStudents } from '../../lib/teacherAccess';
 import { generatePedagogicalLessonPlan } from '../../lib/lessonPlanService';
 import { extractLessonSourceMaterial } from '../../lib/lessonMaterialExtract';
 import { generateStudentAiCommentary, generateBatchClassCommentary } from '../../lib/commentaryService';
@@ -776,7 +776,35 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
       orderBy: { student: { lastName: 'asc' } },
     });
 
-    // Fallback: if 0 enrolled students in current session, query across sessions for this class and section
+    // Fallback: if 0 enrolled students in current session, resolve active session for this class
+    if (enrolls.length === 0) {
+      const targetSession = await resolveActiveSessionForClass(prisma, req.branchId, Number(classId));
+      if (targetSession && targetSession !== sessionId) {
+        enrolls = await prisma.enroll.findMany({
+          where: {
+            classId: Number(classId),
+            sectionId: Number(sectionId),
+            sessionId: targetSession,
+            isAlumni: 0,
+            student: { active: true },
+            ...(req.branchId ? { branchId: req.branchId } : {}),
+          },
+          include: {
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true,
+                photo: true,
+              },
+            },
+          },
+          orderBy: { student: { lastName: 'asc' } },
+        });
+      }
+    }
+
     if (enrolls.length === 0) {
       enrolls = await prisma.enroll.findMany({
         where: {
@@ -784,6 +812,7 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
           sectionId: Number(sectionId),
           isAlumni: 0,
           student: { active: true },
+          ...(req.branchId ? { branchId: req.branchId } : {}),
         },
         include: {
           student: {
@@ -800,27 +829,13 @@ export async function getGradebookSheet(req: Request, res: Response): Promise<Re
       });
     }
 
-    // Fallback 2: if 0 enrolled students for this specific section, query all students in this class
-    if (enrolls.length === 0) {
-      enrolls = await prisma.enroll.findMany({
-        where: {
-          classId: Number(classId),
-          isAlumni: 0,
-          student: { active: true },
-        },
-        include: {
-          student: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              registerNo: true,
-              photo: true,
-            },
-          },
-        },
-        orderBy: { student: { lastName: 'asc' } },
-      });
+    // Exclude students who have since been promoted to higher classes
+    if (req.branchId) {
+      enrolls = await excludePromotedOutStudents(
+        prisma,
+        { branchId: req.branchId, sessionId, classId: Number(classId), sectionId: Number(sectionId) },
+        enrolls
+      );
     }
 
     // Deduplicate students
@@ -3154,6 +3169,24 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
     });
 
     if (enrolls.length === 0) {
+      const resolvedSession = await resolveActiveSessionForClass(prisma, branchId, cId);
+      if (resolvedSession && resolvedSession !== activeSession) {
+        activeSession = resolvedSession;
+        enrollWhere.sessionId = resolvedSession;
+        enrolls = await prisma.enroll.findMany({
+          where: enrollWhere,
+          include: {
+            student: {
+              select: { id: true, firstName: true, lastName: true, registerNo: true, gender: true, photo: true },
+            },
+            section: { select: { id: true, name: true } },
+          },
+          orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+        });
+      }
+    }
+
+    if (enrolls.length === 0) {
       enrolls = await prisma.enroll.findMany({
         where: { classId: cId, isAlumni: 0, ...(secId ? { sectionId: secId } : {}), ...(branchId ? { branchId } : {}) },
         include: {
@@ -3164,6 +3197,15 @@ export async function getTeacherMarksEntry(req: Request, res: Response): Promise
         },
         orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
       });
+    }
+
+    // Exclude students who have since been promoted to higher classes
+    if (branchId) {
+      enrolls = await excludePromotedOutStudents(
+        prisma,
+        { branchId, sessionId: activeSession, classId: cId, sectionId: secId || 0 },
+        enrolls
+      );
     }
 
     const studentIds = Array.from(new Set(enrolls.map((e) => e.studentId)));

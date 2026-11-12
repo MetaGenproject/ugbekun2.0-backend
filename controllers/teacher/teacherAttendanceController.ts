@@ -1060,7 +1060,33 @@ export async function getTeacherTermlyAttendanceReport(req: Request, res: Respon
       orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
     });
 
-    // Fallback: if no enrollment found with specific sessionId, lookup by class and section
+    // Fallback: if no enrollment found with specific sessionId, resolve the active session with enrollments
+    if (enrolls.length === 0) {
+      const resolvedSession = await activeSessionId(req.branchId, scope.isAllClasses ? undefined : scope.classId);
+      if (resolvedSession && resolvedSession !== sessionId) {
+        sessionId = resolvedSession;
+        enrollWhere.sessionId = resolvedSession;
+        enrolls = await prisma.enroll.findMany({
+          where: enrollWhere,
+          include: {
+            student: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                registerNo: true,
+                photo: true,
+              },
+            },
+            class: { select: { id: true, name: true } },
+            section: { select: { id: true, name: true } },
+          },
+          orderBy: [{ classId: 'asc' }, { sectionId: 'asc' }, { roll: 'asc' }, { studentId: 'asc' }],
+        });
+      }
+    }
+
+    // Secondary fallback: if still no enrollments, query class and section
     if (enrolls.length === 0) {
       const fallbackWhere: any = {
         ...(req.branchId ? { branchId: req.branchId } : {}),
