@@ -468,6 +468,14 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       }
     }
 
+    const montAssessmentForJson = await prisma.montessoriAssessment.findFirst({
+      where: {
+        studentId: req.studentId,
+        sessionId: req.sessionId,
+      },
+      orderBy: { id: 'desc' },
+    });
+
     return res.json({
       success: true,
       isPublished: true,
@@ -485,6 +493,18 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       commentary: commentary?.remark || null,
       teacherComment: commentary?.remark || null,
       principalComment: commentary?.reviewNotes || null,
+      psychomotor: {
+        writingMastery: montAssessmentForJson?.writingMastery || 'AC',
+        drawingCapability: montAssessmentForJson?.drawingCapability || 'AC',
+        physicalCoordination: montAssessmentForJson?.physicalCoordination || 'AC',
+        motorSkillProgression: montAssessmentForJson?.motorSkillProgression || 'AC',
+      },
+      affective: {
+        generalPunctuality: montAssessmentForJson?.generalPunctuality || 'AC',
+        peerRespect: montAssessmentForJson?.peerRespect || 'AC',
+        aestheticNeatness: montAssessmentForJson?.aestheticNeatness || 'AC',
+        activeGroupParticipation: montAssessmentForJson?.activeGroupParticipation || 'AC',
+      },
       resumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
       nextTermFees: schoolBranding.nextTermFees || null,
       rank,
@@ -842,13 +862,22 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       }
     }
 
-    const commentaryRecord = await prisma.studentCommentary.findFirst({
-      where: {
-        studentId: req.studentId,
-        sessionId: req.sessionId,
-      },
-      select: { remark: true, reviewNotes: true },
-    });
+    const [commentaryRecord, montAssessment] = await Promise.all([
+      prisma.studentCommentary.findFirst({
+        where: {
+          studentId: req.studentId,
+          sessionId: req.sessionId,
+        },
+        select: { remark: true, reviewNotes: true },
+      }),
+      prisma.montessoriAssessment.findFirst({
+        where: {
+          studentId: req.studentId,
+          sessionId: req.sessionId,
+        },
+        orderBy: { id: 'desc' },
+      }),
+    ]);
 
     const resumptionDate = studentMarks[0]?.exam.resumptionDate || schoolBranding.resumptionDate || null;
 
@@ -881,6 +910,19 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       isMidTerm: isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY',
       assessmentComponents: activeColumns,
       maxTotal: activeMaxMarks,
+      assessment: montAssessment || {},
+      psychomotor: {
+        writingMastery: montAssessment?.writingMastery || 'AC',
+        drawingCapability: montAssessment?.drawingCapability || 'AC',
+        physicalCoordination: montAssessment?.physicalCoordination || 'AC',
+        motorSkillProgression: montAssessment?.motorSkillProgression || 'AC',
+      },
+      affective: {
+        generalPunctuality: montAssessment?.generalPunctuality || 'AC',
+        peerRespect: montAssessment?.peerRespect || 'AC',
+        aestheticNeatness: montAssessment?.aestheticNeatness || 'AC',
+        activeGroupParticipation: montAssessment?.activeGroupParticipation || 'AC',
+      },
     });
 
     const safeLastName = (student.lastName || 'Student').replace(/\s+/g, '_');

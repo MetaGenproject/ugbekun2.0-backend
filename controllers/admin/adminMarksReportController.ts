@@ -18,6 +18,7 @@ import {
   resolveClassEvaluationMatrix,
   resolveActiveMatrixColumnsForStage,
   mapStudentMarkToMatrix,
+  consolidateMarksByStudentAndSubject,
 } from '../../lib/markParser';
 import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
 import {
@@ -1169,9 +1170,11 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       studentAggregates[id] = { sum: 0, count: 0, totalMarks: 0 };
     });
 
+    const consolidatedMarks = consolidateMarksByStudentAndSubject(marks, dbMatrix);
+
     // Compute class averages per subject for the active stage
     const classSubjectTotals: Record<string, { sum: number; count: number }> = {};
-    marks.forEach((m) => {
+    consolidatedMarks.forEach((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       if (mapped.hasValidScore) {
         const subKey = String(m.subject?.id || m.subjectId);
@@ -1181,7 +1184,7 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       }
     });
 
-    marks.forEach((m) => {
+    consolidatedMarks.forEach((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       if (studentMarksMap[m.studentId]) {
         const scoreForStage = mapped.stageTotal;
@@ -1583,21 +1586,23 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
     const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
 
-    const marks = await prisma.mark.findMany({
+    const rawMarks = await prisma.mark.findMany({
       where: { studentId: parsedStudentId, sessionId, branchId },
       include: {
-        subject: { select: { name: true, subjectCode: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
         exam: { select: { name: true, resumptionDate: true } },
       },
     });
+    const marks = consolidateMarksByStudentAndSubject(rawMarks, dbMatrix);
 
-    const allClassMarks = await prisma.mark.findMany({
+    const rawClassMarks = await prisma.mark.findMany({
       where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId },
-      select: { examId: true, subjectId: true, mark: true, cbtMark: true, studentId: true },
+      select: { id: true, examId: true, subjectId: true, mark: true, cbtMark: true, absent: true, studentId: true },
     });
+    const allClassMarks = consolidateMarksByStudentAndSubject(rawClassMarks, dbMatrix);
     const avgMap: Record<string, any> = {};
     allClassMarks.forEach((m) => {
-      const k = `${m.examId}-${m.subjectId}`;
+      const k = String(m.subjectId);
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       if (mapped.hasValidScore) {
@@ -1615,7 +1620,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         marksCount += 1;
       }
 
-      const k = `${m.examId}-${m.subjectId}`;
+      const k = String(m.subjectId || m.subject?.id);
       const cAvg =
         avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : mapped.stageTotal;
 
@@ -1668,9 +1673,15 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     const rankIdx = scoreRankList.findIndex((s) => s.id === parsedStudentId);
     const rank = isCaOnlyStage ? null : (rankIdx !== -1 ? rankIdx + 1 : null);
 
-    const comm = await prisma.studentCommentary.findFirst({
-      where: { studentId: parsedStudentId, sessionId, branchId },
-    });
+    const [comm, montAssessment] = await Promise.all([
+      prisma.studentCommentary.findFirst({
+        where: { studentId: parsedStudentId, sessionId, branchId },
+      }),
+      prisma.montessoriAssessment.findFirst({
+        where: { studentId: parsedStudentId, sessionId, branchId },
+        orderBy: { id: 'desc' },
+      }),
+    ]);
 
     const defaults = buildDefaultRemarksForAverage(overallAverage, student.firstName || 'Student');
 
@@ -1706,6 +1717,19 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       stage: activeStage,
       assessmentComponents: activeColumns,
       maxTotal: activeMaxMarks,
+      assessment: montAssessment || {},
+      psychomotor: {
+        writingMastery: montAssessment?.writingMastery || 'AC',
+        drawingCapability: montAssessment?.drawingCapability || 'AC',
+        physicalCoordination: montAssessment?.physicalCoordination || 'AC',
+        motorSkillProgression: montAssessment?.motorSkillProgression || 'AC',
+      },
+      affective: {
+        generalPunctuality: montAssessment?.generalPunctuality || 'AC',
+        peerRespect: montAssessment?.peerRespect || 'AC',
+        aestheticNeatness: montAssessment?.aestheticNeatness || 'AC',
+        activeGroupParticipation: montAssessment?.activeGroupParticipation || 'AC',
+      },
     });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1803,17 +1827,18 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       return res.status(404).json({ success: false, message: 'No enrolled students found in this class/section.' });
     }
 
-    const allMarks = await prisma.mark.findMany({
+    const rawAllMarks = await prisma.mark.findMany({
       where: { studentId: { in: studentIds }, sessionId, branchId },
       include: {
-        subject: { select: { name: true, subjectCode: true } },
+        subject: { select: { id: true, name: true, subjectCode: true } },
         exam: { select: { name: true, resumptionDate: true } },
       },
     });
+    const allMarks = consolidateMarksByStudentAndSubject(rawAllMarks, dbMatrix);
 
     const avgMap: Record<string, any> = {};
     allMarks.forEach((m) => {
-      const k = `${m.examId}-${m.subjectId}`;
+      const k = String(m.subjectId || m.subject?.id);
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       if (mapped.hasValidScore) {
@@ -1834,7 +1859,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
 
       if (studentMarksMap[m.studentId]) {
         const scoreForStage = mapped.stageTotal;
-        const k = `${m.examId}-${m.subjectId}`;
+        const k = String(m.subjectId || m.subject?.id);
         const cAvg =
           avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : scoreForStage;
 
@@ -2091,6 +2116,54 @@ export async function saveReportCardCommentary(req: Request, res: Response): Pro
           principalName: principalName ? String(principalName) : 'The Principal',
           principalSignatureUrl: principalSignatureUrl ? String(principalSignatureUrl) : null,
           defaultTeacherSignatureUrl: teacherSignatureUrl ? String(teacherSignatureUrl) : null,
+        },
+      }).catch(() => {});
+    }
+
+    if (req.body?.psychomotor || req.body?.affective) {
+      const psychomotor = req.body.psychomotor || {};
+      const affective = req.body.affective || {};
+      const exam = await prisma.exam.findFirst({
+        where: { branchId, sessionId },
+        select: { id: true },
+      });
+      const examId = exam?.id || 1;
+      await prisma.montessoriAssessment.upsert({
+        where: {
+          studentId_examId_sessionId: {
+            studentId: Number(studentId),
+            examId,
+            sessionId,
+          },
+        },
+        update: {
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          ...(psychomotor.writingMastery && { writingMastery: psychomotor.writingMastery }),
+          ...(psychomotor.drawingCapability && { drawingCapability: psychomotor.drawingCapability }),
+          ...(psychomotor.physicalCoordination && { physicalCoordination: psychomotor.physicalCoordination }),
+          ...(psychomotor.motorSkillProgression && { motorSkillProgression: psychomotor.motorSkillProgression }),
+          ...(affective.generalPunctuality && { generalPunctuality: affective.generalPunctuality }),
+          ...(affective.peerRespect && { peerRespect: affective.peerRespect }),
+          ...(affective.aestheticNeatness && { aestheticNeatness: affective.aestheticNeatness }),
+          ...(affective.activeGroupParticipation && { activeGroupParticipation: affective.activeGroupParticipation }),
+          branchId,
+        },
+        create: {
+          studentId: Number(studentId),
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          examId,
+          sessionId,
+          writingMastery: psychomotor.writingMastery || 'AC',
+          drawingCapability: psychomotor.drawingCapability || 'AC',
+          physicalCoordination: psychomotor.physicalCoordination || 'AC',
+          motorSkillProgression: psychomotor.motorSkillProgression || 'AC',
+          generalPunctuality: affective.generalPunctuality || 'AC',
+          peerRespect: affective.peerRespect || 'AC',
+          aestheticNeatness: affective.aestheticNeatness || 'AC',
+          activeGroupParticipation: affective.activeGroupParticipation || 'AC',
+          branchId,
         },
       }).catch(() => {});
     }

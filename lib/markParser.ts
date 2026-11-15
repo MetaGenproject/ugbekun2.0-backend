@@ -837,3 +837,81 @@ export function mapStudentMarkToMatrix(
     hasValidScore,
   };
 }
+
+/**
+ * Consolidates multiple Mark records for the same (studentId, subjectId) across exams within a session/term
+ * into a single canonical Mark record per subject by merging non-zero component scores across exams.
+ * Prevents duplicate subject rows on report cards and prevents empty exam rows from diluting student/class averages.
+ */
+export function consolidateMarksByStudentAndSubject<T extends Record<string, any>>(
+  marks: T[],
+  dbMatrix: ResolvedClassMatrix
+): T[] {
+  if (!Array.isArray(marks) || marks.length <= 1) return marks;
+
+  const groups = new Map<string, T[]>();
+  for (const m of marks) {
+    const studentKey = String(m.studentId ?? 'SINGLE');
+    const subjectKey = String(
+      m.subjectId ?? m.subject?.id ?? m.subject?.subjectCode ?? m.subject?.name ?? m.id
+    )
+      .trim()
+      .toUpperCase();
+    const key = `${studentKey}::${subjectKey}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(m);
+    } else {
+      groups.set(key, [m]);
+    }
+  }
+
+  const consolidated: T[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      consolidated.push(group[0]);
+      continue;
+    }
+
+    const mappedList = group.map((item) => ({
+      raw: item,
+      mapped: mapStudentMarkToMatrix(item, dbMatrix, 'FULL'),
+    }));
+
+    // Pick primary record with highest fullTotal as base metadata holder
+    mappedList.sort((a, b) => b.mapped.fullTotal - a.mapped.fullTotal);
+    const base = { ...mappedList[0].raw };
+
+    const mergedJson: Record<string, number> = {};
+    let hasAnyComponent = false;
+
+    for (const col of dbMatrix.columns) {
+      let bestVal: number | null = null;
+      for (const entry of mappedList) {
+        const v = entry.mapped.componentScores[col.code] ?? entry.mapped.componentScores[col.key];
+        if (v !== null && v !== undefined && !isNaN(Number(v))) {
+          const num = Number(v);
+          if (bestVal === null || num > bestVal) {
+            bestVal = num;
+          }
+        }
+      }
+      if (bestVal !== null) {
+        mergedJson[col.code] = bestVal;
+        hasAnyComponent = true;
+      }
+    }
+
+    if (hasAnyComponent) {
+      (base as any).mark = JSON.stringify(mergedJson);
+      (base as any).cbtMark = null;
+    }
+
+    const allAbsent = group.every((g) => g.absent === '1' || g.absent === 'true' || g.absent === true);
+    (base as any).absent = allAbsent && !hasAnyComponent ? '1' : '0';
+
+    consolidated.push(base);
+  }
+
+  return consolidated;
+}

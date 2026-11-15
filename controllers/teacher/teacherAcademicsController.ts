@@ -395,6 +395,54 @@ export async function saveCommentary(req: Request, res: Response): Promise<Respo
       });
     }
 
+    if (req.body?.psychomotor || req.body?.affective) {
+      const psychomotor = req.body.psychomotor || {};
+      const affective = req.body.affective || {};
+      const exam = await prisma.exam.findFirst({
+        where: { branchId: req.branchId || 1, sessionId: resolvedSessionId },
+        select: { id: true },
+      });
+      const examId = exam?.id || 1;
+      await prisma.montessoriAssessment.upsert({
+        where: {
+          studentId_examId_sessionId: {
+            studentId: Number(studentId),
+            examId,
+            sessionId: resolvedSessionId,
+          },
+        },
+        update: {
+          classId: resolvedClassId,
+          sectionId: resolvedSectionId,
+          ...(psychomotor.writingMastery && { writingMastery: psychomotor.writingMastery }),
+          ...(psychomotor.drawingCapability && { drawingCapability: psychomotor.drawingCapability }),
+          ...(psychomotor.physicalCoordination && { physicalCoordination: psychomotor.physicalCoordination }),
+          ...(psychomotor.motorSkillProgression && { motorSkillProgression: psychomotor.motorSkillProgression }),
+          ...(affective.generalPunctuality && { generalPunctuality: affective.generalPunctuality }),
+          ...(affective.peerRespect && { peerRespect: affective.peerRespect }),
+          ...(affective.aestheticNeatness && { aestheticNeatness: affective.aestheticNeatness }),
+          ...(affective.activeGroupParticipation && { activeGroupParticipation: affective.activeGroupParticipation }),
+          branchId: req.branchId || 1,
+        },
+        create: {
+          studentId: Number(studentId),
+          classId: resolvedClassId,
+          sectionId: resolvedSectionId,
+          examId,
+          sessionId: resolvedSessionId,
+          writingMastery: psychomotor.writingMastery || 'AC',
+          drawingCapability: psychomotor.drawingCapability || 'AC',
+          physicalCoordination: psychomotor.physicalCoordination || 'AC',
+          motorSkillProgression: psychomotor.motorSkillProgression || 'AC',
+          generalPunctuality: affective.generalPunctuality || 'AC',
+          peerRespect: affective.peerRespect || 'AC',
+          aestheticNeatness: affective.aestheticNeatness || 'AC',
+          activeGroupParticipation: affective.activeGroupParticipation || 'AC',
+          branchId: req.branchId || 1,
+        },
+      }).catch(() => {});
+    }
+
     return res.json({ success: true, message: 'Commentary saved to report card immediately.', commentary: saved });
   } catch (error) {
     console.error('[TEACHER] Save commentary error:', error);
@@ -1434,10 +1482,16 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       effectiveStage
     );
 
-    const commentaryRecord = await prisma.studentCommentary.findFirst({
-      where: { studentId: Number(studentId), sessionId },
-      select: { remark: true, reviewNotes: true },
-    });
+    const [commentaryRecord, montAssessment] = await Promise.all([
+      prisma.studentCommentary.findFirst({
+        where: { studentId: Number(studentId), sessionId },
+        select: { remark: true, reviewNotes: true },
+      }),
+      prisma.montessoriAssessment.findFirst({
+        where: { studentId: Number(studentId), sessionId },
+        orderBy: { id: 'desc' },
+      }),
+    ]);
 
     let totalPercentageSum = 0;
     let marksCount = 0;
@@ -1498,7 +1552,21 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       photo: student.photo || null,
       gender: student.gender || null,
       birthday: student.birthday || null,
+      attendance: att,
       attendanceSummary: att,
+      assessment: montAssessment || {},
+      psychomotor: {
+        writingMastery: montAssessment?.writingMastery || 'AC',
+        drawingCapability: montAssessment?.drawingCapability || 'AC',
+        physicalCoordination: montAssessment?.physicalCoordination || 'AC',
+        motorSkillProgression: montAssessment?.motorSkillProgression || 'AC',
+      },
+      affective: {
+        generalPunctuality: montAssessment?.generalPunctuality || 'AC',
+        peerRespect: montAssessment?.peerRespect || 'AC',
+        aestheticNeatness: montAssessment?.aestheticNeatness || 'AC',
+        activeGroupParticipation: montAssessment?.activeGroupParticipation || 'AC',
+      },
       schoolBranding,
     });
 
@@ -1567,7 +1635,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     }
 
     const studentIds = enrolls.map((e) => e.student.id);
-    const [attendanceMap, gradingScale] = await Promise.all([
+    const [attendanceMap, gradingScale, montessoriRows] = await Promise.all([
       computeStudentAttendanceMap(prisma, {
         classId: Number(classId),
         sectionId: Number(sectionId),
@@ -1576,7 +1644,13 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         studentIds,
       }),
       resolveGradingScale(prisma, req.branchId, Number(classId)),
+      prisma.montessoriAssessment.findMany({
+        where: { studentId: { in: studentIds }, sessionId },
+      }),
     ]);
+
+    const montMap = new Map<number, any>();
+    montessoriRows.forEach((m) => montMap.set(m.studentId, m));
 
     const { activeStage, activeColumns, activeMaxMarks, isCaOnlyStage } = resolveActiveMatrixColumnsForStage(
       dbMatrix,
@@ -1627,6 +1701,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
 
       const avg = validCount > 0 ? Number((pctSum / validCount).toFixed(1)) : 0;
       const att = attendanceMap.get(e.student.id) || { present: 0, absent: 0, late: 0, totalDays: 0 };
+      const mont = montMap.get(e.student.id);
 
       studentCards.push({
         studentName: `${e.student.lastName}, ${e.student.firstName}`,
@@ -1652,7 +1727,21 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         photo: e.student.photo || null,
         gender: e.student.gender || null,
         birthday: e.student.birthday || null,
+        attendance: att,
         attendanceSummary: att,
+        assessment: mont || {},
+        psychomotor: {
+          writingMastery: mont?.writingMastery || 'AC',
+          drawingCapability: mont?.drawingCapability || 'AC',
+          physicalCoordination: mont?.physicalCoordination || 'AC',
+          motorSkillProgression: mont?.motorSkillProgression || 'AC',
+        },
+        affective: {
+          generalPunctuality: mont?.generalPunctuality || 'AC',
+          peerRespect: mont?.peerRespect || 'AC',
+          aestheticNeatness: mont?.aestheticNeatness || 'AC',
+          activeGroupParticipation: mont?.activeGroupParticipation || 'AC',
+        },
         schoolBranding,
       });
     }
@@ -4280,7 +4369,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       },
     });
 
-    const [commentaries, schoolBranding] = await Promise.all([
+    const [commentaries, schoolBranding, montessoriRows] = await Promise.all([
       prisma.studentCommentary.findMany({
         where: {
           studentId: { in: studentIds },
@@ -4298,11 +4387,22 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         sectionId: sectionId || undefined,
         sessionId,
       }),
+      prisma.montessoriAssessment.findMany({
+        where: {
+          studentId: { in: studentIds },
+          sessionId,
+        },
+      }),
     ]);
 
     const commentaryByStudent = new Map<number, { remark: string; reviewNotes: string | null }>();
     commentaries.forEach((c) => {
       commentaryByStudent.set(c.studentId, { remark: c.remark, reviewNotes: c.reviewNotes });
+    });
+
+    const montByStudent = new Map<number, any>();
+    montessoriRows.forEach((m) => {
+      montByStudent.set(m.studentId, m);
     });
 
     // Build Tabulation Matrix & Total Score Summary strictly from the DB EvaluationMatrix
@@ -4359,6 +4459,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       const s = e.student;
       const p = s.parent;
       const comm = commentaryByStudent.get(sId);
+      const mont = montByStudent.get(sId);
 
       return {
         studentId: sId,
@@ -4388,6 +4489,18 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         attendanceSummary: attendanceSummary[sId] || { present: 0, absent: 0, total: 0, rate: 100 },
         teacherComment: comm?.remark || '',
         principalComment: comm?.reviewNotes || '',
+        psychomotor: {
+          writingMastery: mont?.writingMastery || 'AC',
+          drawingCapability: mont?.drawingCapability || 'AC',
+          physicalCoordination: mont?.physicalCoordination || 'AC',
+          motorSkillProgression: mont?.motorSkillProgression || 'AC',
+        },
+        affective: {
+          generalPunctuality: mont?.generalPunctuality || 'AC',
+          peerRespect: mont?.peerRespect || 'AC',
+          aestheticNeatness: mont?.aestheticNeatness || 'AC',
+          activeGroupParticipation: mont?.activeGroupParticipation || 'AC',
+        },
         // Credential details
         studentUsername: s.user?.username || `${(s.firstName || '').toLowerCase()}.${(s.lastName || '').toLowerCase()}`,
         studentPassword: s.user?.rawPassword || 'Pass@123',

@@ -442,6 +442,84 @@ function safeDrawPdfImage(doc, buffer, x, y, options) {
   }
 }
 
+function formatCompactRemark(rawRemark) {
+  const str = String(rawRemark || '-').trim();
+  if (!str) return '-';
+  if (/needs\s*improvement\s*\/\s*fail/i.test(str)) return 'Needs Improvement';
+  if (/very\s*good/i.test(str) && str.length > 14) return 'Very Good';
+  return str;
+}
+
+function deduplicateReportCardSubjects(reportCard, resolvedComponents) {
+  if (!Array.isArray(reportCard) || reportCard.length <= 1) return reportCard || [];
+  const map = new Map();
+
+  for (const row of reportCard) {
+    const key = String(row.subjectId || row.subjectCode || row.subjectName || row.id || '')
+      .trim()
+      .toUpperCase();
+    if (!key) {
+      map.set(Symbol(), row);
+      continue;
+    }
+
+    if (!map.has(key)) {
+      map.set(key, {
+        ...row,
+        componentScores: row.componentScores ? { ...row.componentScores } : {},
+      });
+    } else {
+      const existing = map.get(key);
+      const mergedScores = { ...(existing.componentScores || {}) };
+      const incomingScores = row.componentScores || {};
+
+      for (const [k, v] of Object.entries(incomingScores)) {
+        if (v !== null && v !== undefined && !isNaN(Number(v))) {
+          const prev = mergedScores[k];
+          if (prev === null || prev === undefined || isNaN(Number(prev)) || Number(v) > Number(prev)) {
+            mergedScores[k] = Number(v);
+          }
+        }
+      }
+
+      const prevTotal = parseFloat(String(existing.stageScore ?? existing.mark ?? existing.totalScore ?? 0)) || 0;
+      const incomingTotal = parseFloat(String(row.stageScore ?? row.mark ?? row.totalScore ?? 0)) || 0;
+
+      let recomputedTotal = Math.max(prevTotal, incomingTotal);
+      if (Array.isArray(resolvedComponents) && resolvedComponents.length > 0) {
+        let compSum = 0;
+        let foundAny = false;
+        for (const comp of resolvedComponents) {
+          const cVal = mergedScores[comp.code] ?? mergedScores[comp.key];
+          if (cVal !== null && cVal !== undefined && !isNaN(Number(cVal))) {
+            compSum += Number(cVal);
+            foundAny = true;
+          }
+        }
+        if (foundAny && compSum > recomputedTotal) {
+          recomputedTotal = compSum;
+        }
+      }
+
+      const prevAvg = parseFloat(String(existing.classAverage ?? 0)) || 0;
+      const incAvg = parseFloat(String(row.classAverage ?? 0)) || 0;
+
+      map.set(key, {
+        ...existing,
+        ...(incomingTotal > prevTotal ? row : {}),
+        componentScores: mergedScores,
+        stageScore: recomputedTotal,
+        mark: String(recomputedTotal),
+        totalScore: recomputedTotal,
+        classAverage: Math.max(prevAvg, incAvg, recomputedTotal),
+        absent: Boolean(existing.absent && row.absent && recomputedTotal === 0),
+      });
+    }
+  }
+
+  return Array.from(map.values());
+}
+
 function drawBrandedReportHeader(doc, params, colors) {
   const {
     schoolName = 'Ugbekun Schools',
@@ -453,20 +531,21 @@ function drawBrandedReportHeader(doc, params, colors) {
     schoolWebsite = '',
     sessionName = '2025/2026',
     termName = 'First Term',
-    reportSubtitle = 'OFFICIAL TERMINAL REPORT SHEET',
+    reportSubtitle = 'OFFICIAL STUDENT TERMINAL REPORT CARD',
     logoBuffer = null,
   } = params;
 
   const { primaryColor, secondaryColor } = colors;
 
-  // Main Header Banner (Y: 22 to 94)
-  doc.rect(30, 22, 535, 72).fill(primaryColor);
-  // Secondary Brand Accent Bar at bottom of header
-  doc.rect(30, 90, 535, 4).fill(secondaryColor);
+  // Institutional A4 Header Banner (Y: 16 to 84, Height: 68pt, X: 24, W: 547)
+  const headerY = 16;
+  const headerH = 68;
+  doc.rect(24, headerY, 547, headerH).fill(primaryColor);
+  doc.rect(24, headerY + headerH - 3, 547, 3).fill(secondaryColor);
 
-  // Left: School Logo Box (X: 38, Y: 29, W: 54, H: 54)
-  doc.roundedRect(38, 29, 54, 54, 6).fill('#ffffff');
-  const drewLogo = safeDrawPdfImage(doc, logoBuffer, 41, 32, {
+  // Left: School Logo Box (X: 31, Y: 22, W: 52, H: 52)
+  doc.roundedRect(31, 22, 52, 52, 5).fill('#ffffff');
+  const drewLogo = safeDrawPdfImage(doc, logoBuffer, 33, 24, {
     fit: [48, 48],
     align: 'center',
     valign: 'center',
@@ -480,66 +559,114 @@ function drawBrandedReportHeader(doc, params, colors) {
       .join('');
     doc.fillColor(primaryColor)
        .font('Helvetica-Bold')
-       .fontSize(16)
-       .text(initials || 'SCH', 38, 48, { width: 54, align: 'center' });
+       .fontSize(14)
+       .text(initials || 'SCH', 31, 41, { width: 52, height: 16, align: 'center', lineBreak: false });
   }
 
-  // Center: School Name, Motto, Address & Contact Info
-  const centerX = 100;
-  const centerW = 330;
+  // Center: School Name, Motto, Address, Contact & Report Subtitle (strictly non-overlapping Y slots)
+  const centerX = 91;
+  const centerW = 340;
 
+  // Slot 1 (Y: 20): School Name
   doc.fillColor('#ffffff')
      .font('Helvetica-Bold')
-     .fontSize(13.5)
-     .text(String(schoolName).toUpperCase(), centerX, 28, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
+     .fontSize(12)
+     .text(String(schoolName).toUpperCase(), centerX, 20, {
+       width: centerW,
+       height: 14,
+       align: 'left',
+       lineBreak: false,
+       ellipsis: true,
+     });
 
-  let infoY = 44;
+  // Slot 2 (Y: 34): Tagline / Motto
   if (tagline) {
     doc.fillColor('#e0f2fe')
        .font('Helvetica-Oblique')
-       .fontSize(8)
-       .text(`"${tagline}"`, centerX, infoY, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
-    infoY += 11;
+       .fontSize(7.5)
+       .text(`"${tagline}"`, centerX, 34, {
+         width: centerW,
+         height: 10,
+         align: 'left',
+         lineBreak: false,
+         ellipsis: true,
+       });
   }
 
-  if (schoolAddress) {
+  // Slot 3 (Y: 45): Physical Address
+  const contactItems = [];
+  if (schoolPhone) contactItems.push(`Tel: ${schoolPhone}`);
+  if (schoolEmail) contactItems.push(schoolEmail);
+  if (schoolWebsite) contactItems.push(schoolWebsite);
+  const contactLine = contactItems.join('  •  ');
+
+  if (schoolAddress && contactLine) {
     doc.fillColor('#f1f5f9')
        .font('Helvetica')
-       .fontSize(7.5)
-       .text(schoolAddress, centerX, infoY, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
-    infoY += 10;
-  }
-
-  const contactParts = [];
-  if (schoolPhone) contactParts.push(`Tel: ${schoolPhone}`);
-  if (schoolEmail) contactParts.push(`Email: ${schoolEmail}`);
-  if (schoolWebsite) contactParts.push(schoolWebsite);
-  if (contactParts.length > 0) {
-    doc.fillColor('#cbd5e1')
+       .fontSize(6.8)
+       .text(String(schoolAddress), centerX, 45, {
+         width: centerW,
+         height: 9,
+         align: 'left',
+         lineBreak: false,
+         ellipsis: true,
+       });
+    // Slot 4 (Y: 55): Phone / Email / Website on its own dedicated line
+    doc.fillColor('#e2e8f0')
        .font('Helvetica')
-       .fontSize(7)
-       .text(contactParts.join('  •  '), centerX, infoY, { width: centerW, align: 'left', lineBreak: false, ellipsis: true });
-    infoY += 10;
+       .fontSize(6.6)
+       .text(contactLine, centerX, 55, {
+         width: centerW,
+         height: 9,
+         align: 'left',
+         lineBreak: false,
+         ellipsis: true,
+       });
+  } else if (schoolAddress || contactLine) {
+    doc.fillColor('#f1f5f9')
+       .font('Helvetica')
+       .fontSize(6.8)
+       .text(String(schoolAddress || contactLine), centerX, 46, {
+         width: centerW,
+         height: 9,
+         align: 'left',
+         lineBreak: false,
+         ellipsis: true,
+       });
   }
 
-  // Report Subtitle Pill
+  // Slot 5 (Y: 67): Official Report Subtitle
   doc.fillColor('#ffffff')
      .font('Helvetica-Bold')
-     .fontSize(7.5)
-     .text(reportSubtitle, centerX, Math.min(infoY + 1, 78), { width: centerW, align: 'left' });
+     .fontSize(7.3)
+     .text(reportSubtitle, centerX, 67, {
+       width: centerW,
+       height: 10,
+       align: 'left',
+       lineBreak: false,
+       ellipsis: true,
+     });
 
-  // Right: Session, Term & Branch Metadata
+  // Right: Term, Session, Branch & Issue Date Metadata (X: 435, W: 129)
   doc.fillColor('#ffffff')
      .font('Helvetica-Bold')
-     .fontSize(9.5)
-     .text(String(termName || 'Term Report').toUpperCase(), 432, 30, { width: 125, align: 'right' });
+     .fontSize(8.5)
+     .text(String(termName || 'Term Report').toUpperCase(), 435, 22, {
+       width: 129,
+       height: 11,
+       align: 'right',
+       lineBreak: false,
+       ellipsis: true,
+     });
 
   doc.font('Helvetica')
-     .fontSize(8)
+     .fontSize(7.2)
      .fillColor('#e2e8f0')
-     .text(`Session: ${sessionName || 'Active'}`, 432, 45, { width: 125, align: 'right' })
-     .text(`Branch: ${branchCode || 'MAIN'}`, 432, 57, { width: 125, align: 'right' })
-     .text(`Issued: ${new Date().toLocaleDateString('en-GB')}`, 432, 69, { width: 125, align: 'right' });
+     .text(`Session: ${sessionName || 'Active'}`, 435, 36, { width: 129, height: 10, align: 'right', lineBreak: false })
+     .text(`Branch: ${branchCode || 'MAIN'}`, 435, 48, { width: 129, height: 10, align: 'right', lineBreak: false })
+     .text(`Issued: ${new Date().toLocaleDateString('en-GB')}`, 435, 60, { width: 129, height: 10, align: 'right', lineBreak: false });
+
+  return headerY + headerH;
 }
 
 function drawStudentBioWithPhoto(doc, params, y, colors) {
@@ -558,19 +685,19 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
     stage = 'FULL',
     stageLabel = '',
     studentPhotoBuffer = null,
+    boxHeight = 62,
   } = params;
 
   const { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg } = colors;
 
-  const boxHeight = 72;
-  doc.rect(30, y, 535, boxHeight).fill('#ffffff').stroke(lightBorder);
-  doc.rect(30, y, 4, boxHeight).fill(secondaryColor);
+  doc.rect(24, y, 547, boxHeight).fill('#ffffff').stroke(lightBorder);
+  doc.rect(24, y, 4, boxHeight).fill(secondaryColor);
 
-  // Student Passport Photo Frame on the far right (X: 498, Y: y + 6, W: 58, H: 60)
-  const photoX = 498;
-  const photoY = y + 6;
-  const photoW = 58;
-  const photoH = 60;
+  // Student Passport Photo Frame on the far right (X: 512, W: 52, H: boxHeight - 10)
+  const photoW = 52;
+  const photoH = Math.min(52, boxHeight - 10);
+  const photoX = 512;
+  const photoY = y + Math.floor((boxHeight - photoH) / 2);
   doc.roundedRect(photoX, photoY, photoW, photoH, 4).fill(lightBg).stroke(lightBorder);
 
   const drewStudentPhoto = safeDrawPdfImage(doc, studentPhotoBuffer, photoX + 2, photoY + 2, {
@@ -581,27 +708,32 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
 
   if (!drewStudentPhoto) {
     const initials = String(studentName || 'ST')
-      .split(/\s+/)
+      .split(/[\s,]+/)
       .filter(Boolean)
       .slice(0, 2)
       .map((w) => w[0]?.toUpperCase() || '')
       .join('');
     doc.fillColor(primaryColor)
        .font('Helvetica-Bold')
-       .fontSize(14)
-       .text(initials || 'ST', photoX, photoY + 18, { width: photoW, align: 'center' });
+       .fontSize(12)
+       .text(initials || 'ST', photoX, photoY + 14, { width: photoW, height: 14, align: 'center', lineBreak: false });
     doc.fillColor(textMuted)
        .font('Helvetica')
-       .fontSize(6)
-       .text('STUDENT PHOTO', photoX, photoY + 38, { width: photoW, align: 'center' });
+       .fontSize(5.5)
+       .text('PHOTO', photoX, photoY + 31, { width: photoW, height: 8, align: 'center', lineBreak: false });
   }
 
-  // Column 1 (X: 42 to 215): Name, Admission No, Class & Arm
-  doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-     .text('Student Name:', 42, y + 10)
-     .text('Admission No:', 42, y + 26)
-     .text('Class & Arm:', 42, y + 42)
-     .text('Gender / DOB:', 42, y + 56);
+  const r1 = y + 8;
+  const r2 = y + 21.5;
+  const r3 = y + 35;
+  const r4 = y + 48.5;
+
+  // Column 1 (X: 34 to 275): Name, Admission No, Class & Arm, Gender/DOB
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7.4)
+     .text('Student Name:', 34, r1, { lineBreak: false })
+     .text('Admission No:', 34, r2, { lineBreak: false })
+     .text('Class & Arm:', 34, r3, { lineBreak: false })
+     .text('Gender / DOB:', 34, r4, { lineBreak: false });
 
   const dobDisplay = birthday
     ? (() => {
@@ -611,14 +743,17 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
     : 'N/A';
   const genderDisplay = gender ? String(gender).charAt(0).toUpperCase() + String(gender).slice(1).toLowerCase() : 'N/A';
 
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
-     .text(studentName, 110, y + 10, { width: 165, lineBreak: false, ellipsis: true })
-     .text(registerNo || 'Assigned', 110, y + 26, { width: 165, lineBreak: false })
-     .text(`${className}${sectionName ? ` (${sectionName})` : ''}`, 110, y + 42, { width: 165, lineBreak: false })
-     .font('Helvetica').fontSize(8)
-     .text(`${genderDisplay}  •  ${dobDisplay}`, 110, y + 56, { width: 165, lineBreak: false });
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.2)
+     .text(studentName, 98, r1, { width: 174, height: 11, lineBreak: false, ellipsis: true })
+     .text(registerNo || 'Assigned', 98, r2, { width: 174, height: 11, lineBreak: false })
+     .text(`${className}${sectionName ? ` (${sectionName})` : ''}`, 98, r3, { width: 174, height: 11, lineBreak: false, ellipsis: true })
+     .font('Helvetica').fontSize(7.6)
+     .text(`${genderDisplay}  •  ${dobDisplay}`, 98, r4, { width: 174, height: 11, lineBreak: false });
 
-  // Column 2 (X: 285 to 490): Academic & Attendance Summary
+  // Vertical divider between Column 1 and Column 2
+  doc.moveTo(278, y + 6).lineTo(278, y + boxHeight - 6).stroke('#e2e8f0');
+
+  // Column 2 (X: 288 to 506): Academic & Attendance Summary
   const attPresent = attendance?.present ?? null;
   const attTotal = attendance?.totalDays ?? null;
   const attText =
@@ -627,35 +762,192 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
       : 'Recorded';
 
   if (isProgressSlip) {
-    doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-       .text('Assessment Stage:', 285, y + 10)
-       .text('Report Status:', 285, y + 26)
-       .text('Attendance:', 285, y + 42)
-       .text('Overall Score:', 285, y + 56);
+    doc.fillColor(textMuted).font('Helvetica').fontSize(7.4)
+       .text('Assessment Stage:', 288, r1, { lineBreak: false })
+       .text('Report Status:', 288, r2, { lineBreak: false })
+       .text('Attendance:', 288, r3, { lineBreak: false })
+       .text('Overall Score:', 288, r4, { lineBreak: false });
 
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
-       .text(stageLabel || (stage === 'COMBINED_CA' || stage === 'CA_ONLY' ? 'Continuous Assessment' : stage), 372, y + 10, { width: 120, lineBreak: false, ellipsis: true })
-       .text('Live Progress Report', 372, y + 26)
-       .text(attText, 372, y + 42)
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.2)
+       .text(stageLabel || (stage === 'COMBINED_CA' || stage === 'CA_ONLY' ? 'Continuous Assessment' : stage), 366, r1, { width: 140, height: 11, lineBreak: false, ellipsis: true })
+       .text('Live Progress Report', 366, r2, { width: 140, height: 11, lineBreak: false })
+       .text(attText, 366, r3, { width: 140, height: 11, lineBreak: false })
        .fillColor(primaryColor)
-       .text(`${overallAverage}%`, 372, y + 56);
+       .text(`${overallAverage}%`, 366, r4, { width: 140, height: 11, lineBreak: false });
   } else {
-    doc.fillColor(textMuted).font('Helvetica').fontSize(8)
-       .text('Overall Average:', 285, y + 10)
-       .text('Final Grade:', 285, y + 26)
-       .text('Class Position:', 285, y + 42)
-       .text('Attendance:', 285, y + 56);
+    doc.fillColor(textMuted).font('Helvetica').fontSize(7.4)
+       .text('Overall Average:', 288, r1, { lineBreak: false })
+       .text('Final Grade:', 288, r2, { lineBreak: false })
+       .text('Class Position:', 288, r3, { lineBreak: false })
+       .text('Attendance:', 288, r4, { lineBreak: false });
 
-    doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9)
-       .text(`${overallAverage}%`, 370, y + 10)
-       .fillColor(darkColor).fontSize(8.5)
-       .text(gpaRating, 370, y + 26)
-       .text(rankString, 370, y + 42)
-       .font('Helvetica').fontSize(8)
-       .text(attText, 370, y + 56);
+    doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.8)
+       .text(`${overallAverage}%`, 364, r1, { width: 142, height: 11, lineBreak: false })
+       .fillColor(darkColor).fontSize(8.2)
+       .text(gpaRating, 364, r2, { width: 142, height: 11, lineBreak: false, ellipsis: true })
+       .text(rankString, 364, r3, { width: 142, height: 11, lineBreak: false })
+       .font('Helvetica').fontSize(7.6)
+       .text(attText, 364, r4, { width: 142, height: 11, lineBreak: false });
   }
 
   return y + boxHeight;
+}
+
+function resolveTraitRatingMeta(rawVal) {
+  const norm = String(rawVal || 'AC').trim().toUpperCase();
+  if (norm === 'MS' || norm === '5' || norm === 'A' || norm === 'EXCELLENT' || norm === 'MASTERED') {
+    return { code: 'MS', score: 5, label: 'Excellent' };
+  }
+  if (norm === 'AC' || norm === '4' || norm === 'B' || norm === 'VERY GOOD' || norm === 'ACHIEVED') {
+    return { code: 'AC', score: 4, label: 'Very Good' };
+  }
+  if (norm === 'DV' || norm === '3' || norm === 'C' || norm === 'GOOD' || norm === 'DEVELOPING') {
+    return { code: 'DV', score: 3, label: 'Good' };
+  }
+  if (norm === 'EM' || norm === '2' || norm === 'D' || norm === 'FAIR' || norm === 'EMERGING') {
+    return { code: 'EM', score: 2, label: 'Fair' };
+  }
+  if (norm === 'NT' || norm === '1' || norm === 'E' || norm === 'F' || norm === 'NEEDS HELP') {
+    return { code: 'NT', score: 1, label: 'Needs Help' };
+  }
+  return { code: 'AC', score: 4, label: 'Very Good' };
+}
+
+function drawPsychomotorAndAffectiveGrid(doc, params, y, colors, options: any = {}) {
+  const { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg } = colors;
+  const psychomotor = params.psychomotor || params.assessment || {};
+  const affective = params.affective || params.assessment || {};
+  const gradingRanges = Array.isArray(params.gradingRanges) && params.gradingRanges.length > 0
+    ? params.gradingRanges
+    : [
+        { grade: 'A', minPercentage: 70, maxPercentage: 100, remark: 'Excellent' },
+        { grade: 'B', minPercentage: 60, maxPercentage: 69, remark: 'Very Good' },
+        { grade: 'C', minPercentage: 50, maxPercentage: 59, remark: 'Credit' },
+        { grade: 'D', minPercentage: 45, maxPercentage: 49, remark: 'Pass' },
+        { grade: 'E', minPercentage: 40, maxPercentage: 44, remark: 'Fair' },
+        { grade: 'F', minPercentage: 0, maxPercentage: 39, remark: 'Fail' },
+      ];
+
+  const leftX = 24;
+  const rightX = 301;
+  const tableW = 270;
+  const headerH = options.headerH || 15;
+  const rowH = options.rowH || 16;
+  const legendH = options.legendH || 15;
+
+  // Section 2 Header Title
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5).text(
+    '2. PSYCHOMOTOR & AFFECTIVE DOMAIN ASSESSMENT',
+    24,
+    y,
+    { width: 320, height: 11, lineBreak: false }
+  );
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7).text(
+    'Behavioral & Practical Skill Evaluation (Scale 1–5)',
+    330,
+    y + 1,
+    { width: 241, height: 10, align: 'right', lineBreak: false }
+  );
+  y += 12;
+
+  // Left Table Header: Psychomotor Assessment
+  doc.rect(leftX, y, tableW, headerH).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
+     .text('PSYCHOMOTOR SKILLS ASSESSMENT', leftX + 6, y + (headerH - 7) / 2, { width: 152, height: 9, lineBreak: false })
+     .text('SCALE (1-5) & RATING', leftX + 160, y + (headerH - 7) / 2, { width: 104, height: 9, align: 'right', lineBreak: false });
+
+  // Right Table Header: Affective & Behavioral Assessment
+  doc.rect(rightX, y, tableW, headerH).fill(secondaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
+     .text('AFFECTIVE & BEHAVIORAL TRAITS', rightX + 6, y + (headerH - 7) / 2, { width: 152, height: 9, lineBreak: false })
+     .text('SCALE (1-5) & RATING', rightX + 160, y + (headerH - 7) / 2, { width: 104, height: 9, align: 'right', lineBreak: false });
+
+  y += headerH;
+
+  const psychomotorTraits = [
+    { key: 'writingMastery', label: 'Handwriting & Neatness' },
+    { key: 'drawingCapability', label: 'Drawing & Artistic Skill' },
+    { key: 'physicalCoordination', label: 'Sports & Physical Coordination' },
+    { key: 'motorSkillProgression', label: 'Practical & Motor Dexterity' },
+  ];
+
+  const affectiveTraits = [
+    { key: 'generalPunctuality', label: 'Punctuality & Regularity' },
+    { key: 'peerRespect', label: 'Politeness & Peer Respect' },
+    { key: 'aestheticNeatness', label: 'Personal & Uniform Neatness' },
+    { key: 'activeGroupParticipation', label: 'Teamwork & Class Participation' },
+  ];
+
+  const drawTraitRow = (tableX, rowY, idx, label, rawRating, accentColor) => {
+    const bg = idx % 2 === 0 ? lightBg : '#ffffff';
+    doc.rect(tableX, rowY, tableW, rowH).fill(bg).stroke(lightBorder);
+    const textY = rowY + Math.max(2.5, (rowH - 7.2) / 2 - 0.5);
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.2)
+       .text(label, tableX + 6, textY, { width: 138, height: 9.5, lineBreak: false, ellipsis: true });
+
+    const meta = resolveTraitRatingMeta(rawRating);
+    // Draw 1..5 mini score boxes
+    const boxesStartX = tableX + 146;
+    const boxW = 11;
+    const boxH = Math.min(10.5, rowH - 3.5);
+    const boxY = rowY + (rowH - boxH) / 2;
+    for (let s = 1; s <= 5; s++) {
+      const bx = boxesStartX + (s - 1) * (boxW + 2);
+      const isFilled = s === meta.score;
+      doc.save();
+      if (isFilled) {
+        doc.roundedRect(bx, boxY, boxW, boxH, 1.5).fill(accentColor);
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(6.2)
+           .text(String(s), bx, boxY + (boxH - 6) / 2, { width: boxW, height: boxH, align: 'center', lineBreak: false });
+      } else {
+        doc.roundedRect(bx, boxY, boxW, boxH, 1.5).stroke('#cbd5e1');
+        doc.fillColor('#94a3b8').font('Helvetica').fontSize(6)
+           .text(String(s), bx, boxY + (boxH - 6) / 2, { width: boxW, height: boxH, align: 'center', lineBreak: false });
+      }
+      doc.restore();
+    }
+
+    doc.fillColor(accentColor).font('Helvetica-Bold').fontSize(6.8)
+       .text(meta.label, tableX + 212, textY, { width: 53, height: 9.5, align: 'right', lineBreak: false });
+  };
+
+  for (let i = 0; i < 4; i++) {
+    const pTrait = psychomotorTraits[i];
+    const aTrait = affectiveTraits[i];
+    const pVal = psychomotor[pTrait.key] || (params.assessment && params.assessment[pTrait.key]) || 'AC';
+    const aVal = affective[aTrait.key] || (params.assessment && params.assessment[aTrait.key]) || 'AC';
+
+    drawTraitRow(leftX, y, i, pTrait.label, pVal, primaryColor);
+    drawTraitRow(rightX, y, i, aTrait.label, aVal, secondaryColor);
+    y += rowH;
+  }
+
+  y += 4;
+
+  // Compact Grading & Behavioral Rubric Legend Strip (Strictly single-line)
+  doc.rect(24, y, 547, legendH).fill(lightBg).stroke(lightBorder);
+  const scaleSummary = gradingRanges
+    .slice(0, 6)
+    .map((r) => `${r.grade}:${r.minPercentage ?? r.minScore ?? 0}-${r.maxPercentage ?? r.maxScore ?? 100}%`)
+    .join(' | ');
+  const legendTextY = y + Math.max(3, (legendH - 6.5) / 2);
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(6.3)
+     .text(`GRADING KEY: ${scaleSummary}`, 30, legendTextY, {
+       width: 262,
+       height: 9,
+       lineBreak: false,
+       ellipsis: true,
+     });
+  doc.fillColor(textMuted).font('Helvetica-Bold').fontSize(6.2)
+     .text('TRAIT KEY: 5(MS)=Excellent | 4(AC)=Very Good | 3(DV)=Good | 2(EM)=Fair | 1=Needs Help', 295, legendTextY, {
+       width: 270,
+       height: 9,
+       align: 'right',
+       lineBreak: false,
+       ellipsis: true,
+     });
+
+  return y + legendH;
 }
 
 function drawBrandedRemarksAndSignatures(doc, params, y, colors) {
@@ -675,40 +967,48 @@ function drawBrandedRemarksAndSignatures(doc, params, y, colors) {
 
   const { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg } = colors;
 
-  // 1. Next Term Resumption & Payment Strip (Height: 24)
+  // Ensure the bottom endorsement + footer section covers the bottom of the A4 page cleanly
+  // Target footer Y is 812pt on the 841.89pt A4 page.
+  const targetFooterY = 812;
+  const startY = Math.min(y, 700);
+  const resumptionH = 20;
+  const gapAfterResumption = 6;
+  const boxStartY = startY + resumptionH + gapAfterResumption;
+  // Dynamically stretch the endorsement cards so the report card ends right at the bottom of A4 (max 102pt, min 76pt)
+  const boxHeight = Math.min(102, Math.max(76, targetFooterY - boxStartY - 6));
+
+  // 1. Next Term Resumption & Payment Strip
   const resumptionStr = formatResumptionDisplay(resumptionDate);
-  doc.rect(30, y, 535, 24).fill(lightBg).stroke(lightBorder);
-  doc.rect(30, y, 4, 24).fill(primaryColor);
+  doc.rect(24, startY, 547, resumptionH).fill(lightBg).stroke(lightBorder);
+  doc.rect(24, startY, 4, resumptionH).fill(primaryColor);
 
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
-     .text('NEXT TERM BEGINS:', 42, y + 8);
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
-     .text(resumptionStr, 128, y + 7.5, { width: 155, lineBreak: false, ellipsis: true });
+  doc.fillColor(textMuted).font('Helvetica-Bold').fontSize(7)
+     .text('NEXT TERM BEGINS:', 34, startY + 6, { height: 10, lineBreak: false });
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
+     .text(resumptionStr, 114, startY + 5.5, { width: 175, height: 11, lineBreak: false, ellipsis: true });
 
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
-     .text('NEXT TERM PAYMENT / FEES:', 295, y + 8);
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5)
-     .text(String(nextTermFees || '—'), 415, y + 7.5, { width: 145, lineBreak: false, ellipsis: true });
+  doc.fillColor(textMuted).font('Helvetica-Bold').fontSize(7)
+     .text('NEXT TERM SCHOOL FEES:', 298, startY + 6, { height: 10, lineBreak: false });
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
+     .text(String(nextTermFees || '—'), 398, startY + 5.5, { width: 165, height: 11, lineBreak: false, ellipsis: true });
 
-  y += 30;
+  // 2. Side-by-Side Combined Remarks & Signatures Boxes
+  const leftBoxX = 24;
+  const rightBoxX = 301;
+  const colW = 270;
 
-  // 2. Dual Remarks Boxes: Class Teacher's Comment (Left) & Principal's Comment (Right)
-  const boxHeight = 62;
-  const leftBoxX = 30;
-  const rightBoxX = 303;
-  const colW = 262;
-
-  doc.rect(leftBoxX, y, colW, boxHeight).fill('#ffffff').stroke(lightBorder);
-  doc.rect(rightBoxX, y, colW, boxHeight).fill('#ffffff').stroke(lightBorder);
+  doc.rect(leftBoxX, boxStartY, colW, boxHeight).fill('#ffffff').stroke(lightBorder);
+  doc.rect(rightBoxX, boxStartY, colW, boxHeight).fill('#ffffff').stroke(lightBorder);
 
   // Header bars inside comment boxes
-  doc.rect(leftBoxX, y, colW, 15).fill(primaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
-     .text("CLASS TEACHER'S REMARK", leftBoxX + 8, y + 4);
+  const boxHeaderH = 14.5;
+  doc.rect(leftBoxX, boxStartY, colW, boxHeaderH).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
+     .text("CLASS TEACHER'S REMARK & ENDORSEMENT", leftBoxX + 6, boxStartY + 3.8, { width: colW - 12, height: 9, lineBreak: false });
 
-  doc.rect(rightBoxX, y, colW, 15).fill(secondaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
-     .text("PRINCIPAL'S / HEAD TEACHER'S REMARK", rightBoxX + 8, y + 4);
+  doc.rect(rightBoxX, boxStartY, colW, boxHeaderH).fill(secondaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
+     .text("PRINCIPAL'S / HEAD TEACHER'S ENDORSEMENT", rightBoxX + 6, boxStartY + 3.8, { width: colW - 12, height: 9, lineBreak: false });
 
   const resolvedTeacherRemark =
     teacherComment ||
@@ -721,57 +1021,73 @@ function drawBrandedRemarksAndSignatures(doc, params, y, colors) {
     principalComment ||
     'A commendable terminal performance. Continue to work diligently in the coming term.';
 
-  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8)
-     .text(`"${resolvedTeacherRemark}"`, leftBoxX + 8, y + 20, { width: colW - 16, height: 38, ellipsis: true });
+  const sigRowH = 29;
+  const sigDivY = boxStartY + boxHeight - sigRowH;
+  const remarkAreaH = Math.max(24, sigDivY - (boxStartY + boxHeaderH) - 6);
 
-  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(8)
-     .text(`"${resolvedPrincipalRemark}"`, rightBoxX + 8, y + 20, { width: colW - 16, height: 38, ellipsis: true });
+  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(7.6)
+     .text(`"${resolvedTeacherRemark}"`, leftBoxX + 7, boxStartY + boxHeaderH + 4, {
+       width: colW - 14,
+       height: remarkAreaH,
+       ellipsis: true,
+     });
 
-  y += boxHeight + 10;
+  doc.fillColor(darkColor).font('Helvetica-Oblique').fontSize(7.6)
+     .text(`"${resolvedPrincipalRemark}"`, rightBoxX + 7, boxStartY + boxHeaderH + 4, {
+       width: colW - 14,
+       height: remarkAreaH,
+       ellipsis: true,
+     });
 
-  // 3. Dual Signatures Block (Teacher Signature & Principal Signature)
-  const sigBoxHeight = 52;
-  const sigLineY = Math.min(y + 34, 738);
+  // Horizontal divider inside each box separating remark from signature row
+  doc.moveTo(leftBoxX + 6, sigDivY).lineTo(leftBoxX + colW - 6, sigDivY).stroke('#e2e8f0');
+  doc.moveTo(rightBoxX + 6, sigDivY).lineTo(rightBoxX + colW - 6, sigDivY).stroke('#e2e8f0');
 
-  // Draw Teacher Signature Image if available
+  // Teacher Name & Signature on Left Box bottom row
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.2)
+     .text(String(formTeacherName || 'Class Teacher').toUpperCase(), leftBoxX + 7, sigDivY + 5, { width: 138, height: 10, lineBreak: false, ellipsis: true });
+  doc.fillColor(textMuted).font('Helvetica').fontSize(6.2)
+     .text('FORM TEACHER', leftBoxX + 7, sigDivY + 16, { width: 138, height: 9, lineBreak: false });
+
   if (teacherSignatureBuffer) {
-    safeDrawPdfImage(doc, teacherSignatureBuffer, 85, sigLineY - 28, {
-      fit: [110, 26],
+    safeDrawPdfImage(doc, teacherSignatureBuffer, leftBoxX + 160, sigDivY + 2, {
+      fit: [95, 19],
       align: 'center',
-      valign: 'bottom',
+      valign: 'center',
     });
+  } else {
+    doc.moveTo(leftBoxX + 155, sigDivY + 18).lineTo(leftBoxX + colW - 10, sigDivY + 18).stroke(lightBorder);
   }
+  doc.fillColor(textMuted).font('Helvetica').fontSize(5.8)
+     .text('SIGNATURE', leftBoxX + 155, sigDivY + 20, { width: 105, height: 8, align: 'center', lineBreak: false });
 
-  // Draw Principal Signature Image if available
+  // Principal Name, Official Stamp & Signature on Right Box bottom row
+  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.2)
+     .text(String(principalName || 'The Principal').toUpperCase(), rightBoxX + 7, sigDivY + 5, { width: 138, height: 10, lineBreak: false, ellipsis: true });
+  doc.fillColor(secondaryColor).font('Helvetica-Bold').fontSize(6.2)
+     .text('OFFICIAL STAMP & SEAL', rightBoxX + 7, sigDivY + 16, { width: 138, height: 9, lineBreak: false });
+
   if (principalSignatureBuffer) {
-    safeDrawPdfImage(doc, principalSignatureBuffer, 385, sigLineY - 28, {
-      fit: [110, 26],
+    safeDrawPdfImage(doc, principalSignatureBuffer, rightBoxX + 160, sigDivY + 2, {
+      fit: [95, 19],
       align: 'center',
-      valign: 'bottom',
+      valign: 'center',
     });
+  } else {
+    doc.moveTo(rightBoxX + 155, sigDivY + 18).lineTo(rightBoxX + colW - 10, sigDivY + 18).stroke(lightBorder);
   }
+  doc.fillColor(textMuted).font('Helvetica').fontSize(5.8)
+     .text('SIGNATURE & STAMP', rightBoxX + 155, sigDivY + 20, { width: 105, height: 8, align: 'center', lineBreak: false });
 
-  doc.moveTo(45, sigLineY).lineTo(235, sigLineY).stroke(lightBorder);
-  doc.moveTo(345, sigLineY).lineTo(535, sigLineY).stroke(lightBorder);
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-     .text(String(formTeacherName || 'Class Teacher').toUpperCase(), 45, sigLineY + 3, { width: 190, align: 'center' });
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7)
-     .text("CLASS TEACHER'S SIGNATURE", 45, sigLineY + 12, { width: 190, align: 'center' });
-
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-     .text(String(principalName || 'The Principal').toUpperCase(), 345, sigLineY + 3, { width: 190, align: 'center' });
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7)
-     .text("PRINCIPAL'S SIGNATURE & STAMP", 345, sigLineY + 12, { width: 190, align: 'center' });
-
-  // 4. Footer
-  doc.moveTo(30, 758).lineTo(565, 758).stroke('#e2e8f0');
-  doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+  // 3. Single-Page Anchored Footer at Bottom of A4 Sheet
+  const footerY = Math.min(Math.max(boxStartY + boxHeight + 6, targetFooterY), 815);
+  doc.moveTo(24, footerY).lineTo(571, footerY).stroke('#e2e8f0');
+  doc.fillColor(textMuted).font('Helvetica').fontSize(6.5)
      .text(
-       `Official Branded Academic Report Card • ${schoolName} • Generated & Verified on ${new Date().toLocaleDateString('en-GB')}`,
-       30,
-       764,
-       { align: 'center', width: 535 }
+       `Official A4 Academic Dossier • ${schoolName} • Generated & Verified on ${new Date().toLocaleDateString('en-GB')}`,
+       24,
+       footerY + 3,
+       { align: 'center', width: 547, height: 9, lineBreak: false }
      );
 }
 
@@ -795,8 +1111,8 @@ function drawStandardReportCard(doc, params) {
     gender = '',
     birthday = '',
     attendance = null,
-    reportCard = [],
-    overallAverage = 0,
+    reportCard: rawReportCard = [],
+    overallAverage: rawOverallAverage = 0,
     commentary = '',
     teacherComment = '',
     principalComment = '',
@@ -827,12 +1143,35 @@ function drawStandardReportCard(doc, params) {
     ? assessmentComponents
     : [];
 
+  // Deduplicate/consolidate subject rows so no subject appears twice on the report card
+  const reportCard = deduplicateReportCardSubjects(rawReportCard, resolvedComponents);
+
   const resolvedMaxTotal =
     typeof maxTotal === 'number' && maxTotal > 0
       ? maxTotal
       : resolvedComponents.length > 0
         ? resolvedComponents.reduce((sum, c) => sum + (Number(c.maxMarks) || 0), 0)
-        : (Number(reportCard?.[0]?.maxMarks) || 0);
+        : (Number(reportCard?.[0]?.maxMarks) || 100);
+
+  // Recompute accurate overall average when duplicate rows were consolidated
+  let overallAverage = rawOverallAverage;
+  if (reportCard.length > 0 && rawReportCard.length !== reportCard.length) {
+    let sumPct = 0;
+    let countValid = 0;
+    for (const r of reportCard) {
+      if (!r.absent) {
+        const sc = parseFloat(String(r.stageScore ?? r.mark ?? r.totalScore ?? ''));
+        if (!isNaN(sc)) {
+          const rMax = Number(r.maxMarks) || resolvedMaxTotal || 100;
+          sumPct += rMax > 0 ? (sc / rMax) * 100 : sc;
+          countValid++;
+        }
+      }
+    }
+    if (countValid > 0) {
+      overallAverage = Number((sumPct / countValid).toFixed(1));
+    }
+  }
 
   const stageLabel = isCombinedCa
     ? resolvedComponents.length === 1
@@ -870,7 +1209,7 @@ function drawStandardReportCard(doc, params) {
 
   // Compute GPA letter grade equivalent using active grading scale
   const gpaInfo = calculateGradeFromRanges(overallAverage, gradingRanges || undefined);
-  const gpaRating = `${gpaInfo.grade} (${gpaInfo.remark || 'Graded'})`;
+  const gpaRating = `${gpaInfo.grade} (${formatCompactRemark(gpaInfo.remark || 'Graded')})`;
 
   const reportSubtitle = isCombinedCa
     ? `CONTINUOUS ASSESSMENT REPORT (${resolvedComponents.map((c) => c.code || c.label).join(' + ') || 'CA'})`
@@ -878,7 +1217,7 @@ function drawStandardReportCard(doc, params) {
       ? 'CONTINUOUS ASSESSMENT PROGRESS REPORT'
       : 'OFFICIAL STUDENT TERMINAL REPORT CARD';
 
-  // 1. Branded Header with Logo & School Info
+  // 1. Branded Header with Logo & School Info (Y: 16 to 84)
   drawBrandedReportHeader(
     doc,
     {
@@ -897,7 +1236,7 @@ function drawStandardReportCard(doc, params) {
     colors
   );
 
-  // 2. Student Profile Info & Photo Block (Y: 100 to 172)
+  // 2. Student Profile Info & Photo Block (Y: 90 to 152, Height: 62pt)
   let y = drawStudentBioWithPhoto(
     doc,
     {
@@ -915,37 +1254,68 @@ function drawStandardReportCard(doc, params) {
       stage,
       stageLabel,
       studentPhotoBuffer,
+      boxHeight: 62,
     },
-    100,
+    90,
     colors
   );
 
-  y += 10;
+  // Dynamic Full-Page A4 Vertical Budgeting (Spans from Y=152 down to Y=812)
+  const maxRows = 20;
+  const itemsToRender = reportCard.slice(0, maxRows);
+  const minDisplayRows = 8;
+  const effectiveRowCount = Math.max(itemsToRender.length, minDisplayRows);
+
+  const sectionGap = effectiveRowCount <= 12 ? 9 : effectiveRowCount <= 15 ? 7 : 5;
+  const traitHeaderH = effectiveRowCount <= 14 ? 15.5 : 14;
+  const traitRowH = effectiveRowCount <= 12 ? 17.5 : effectiveRowCount <= 15 ? 15.5 : 14;
+  const traitLegendH = effectiveRowCount <= 14 ? 15.5 : 14;
+  const band4TotalH = 12 + traitHeaderH + 4 * traitRowH + 4 + traitLegendH;
+  const band5ReservedH = effectiveRowCount <= 12 ? 122 : effectiveRowCount <= 15 ? 112 : 104;
+
+  y += sectionGap;
 
   // 3. Academic Scoreboard Table
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text(
-    isProgressSlip ? 'CONTINUOUS ASSESSMENT PERFORMANCE' : 'COGNITIVE ACADEMIC PERFORMANCE',
-    30,
-    y
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5).text(
+    isProgressSlip ? '1. CONTINUOUS ASSESSMENT PERFORMANCE' : '1. COGNITIVE ACADEMIC PERFORMANCE',
+    24,
+    y,
+    { width: 280, height: 11, lineBreak: false }
   );
-  y += 13;
+  doc.fillColor(textMuted).font('Helvetica').fontSize(7.2).text(
+    `Subjects Evaluated: ${reportCard.length}  •  Max Score / Subject: ${resolvedMaxTotal || 100}`,
+    310,
+    y + 1,
+    { width: 261, height: 10, align: 'right', lineBreak: false }
+  );
+  y += 12;
 
-  // Table Header Row (Dynamic DB EvaluationMatrix Columns)
-  doc.rect(30, y, 535, 19).fill(primaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5);
+  // Table Header Row (Dynamic DB EvaluationMatrix Columns, X: 24, W: 547, H: 16.5)
+  const headerRowH = 16.5;
+  const sumRowH = 16;
+
+  // Calculate remaining vertical budget for subject rows so the entire A4 page is filled cleanly
+  const targetBand5StartY = 812 - band5ReservedH;
+  const targetBand3EndY = targetBand5StartY - sectionGap - band4TotalH - sectionGap;
+  const availableForSubjectRows = targetBand3EndY - (y + headerRowH + sumRowH);
+  const rowHeight = Math.min(24.5, Math.max(12.5, availableForSubjectRows / effectiveRowCount));
+  const rowFontSize = rowHeight < 13.5 ? 7 : rowHeight < 16 ? 7.5 : 8;
+
+  doc.rect(24, y, 547, headerRowH).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7);
 
   const numCompCols = resolvedComponents.length;
-  const codeX = 36;
-  const codeW = 46;
-  const totalW = 48;
+  const codeX = 28;
+  const codeW = 42;
+  const totalW = 46;
   const classAvgW = 44;
-  const gradeW = 36;
-  const remarkW = 48;
-  const fixedRightW = totalW + classAvgW + gradeW + remarkW; // 176
-  const totalUsableW = 524; // 36 to 560
-  const remainingForSubAndComps = totalUsableW - codeW - fixedRightW; // 302
+  const gradeW = 32;
+  const remarkW = 74;
+  const fixedRightW = totalW + classAvgW + gradeW + remarkW; // 196
+  const totalUsableW = 541; // 28 to 569
+  const remainingForSubAndComps = totalUsableW - codeW - fixedRightW; // 303
   const compW = numCompCols > 0
-    ? Math.min(48, Math.max(32, Math.floor(168 / numCompCols)))
+    ? Math.min(44, Math.max(28, Math.floor(156 / numCompCols)))
     : 0;
   const subjectX = codeX + codeW + 2;
   const subjectW = Math.max(110, remainingForSubAndComps - (compW * numCompCols) - 4);
@@ -955,27 +1325,29 @@ function drawStandardReportCard(doc, params) {
   const gradeX = classAvgX + classAvgW;
   const remarkX = gradeX + gradeW;
 
-  doc.text('CODE', codeX, y + 5, { width: codeW, lineBreak: false })
-     .text('SUBJECT', subjectX, y + 5, { width: subjectW, lineBreak: false });
+  const hTextY = y + (headerRowH - 7) / 2;
+  doc.text('CODE', codeX, hTextY, { width: codeW, height: 9, lineBreak: false })
+     .text('SUBJECT', subjectX, hTextY, { width: subjectW, height: 9, lineBreak: false });
 
   resolvedComponents.forEach((comp, cIdx) => {
     const rawHeader = String(comp.label || comp.name || comp.code || comp.key || '').trim();
     const shortHeader = rawHeader.length <= 10 ? rawHeader.toUpperCase() : String(comp.code || comp.key || rawHeader).toUpperCase();
-    const compHeader = comp.maxMarks ? `${shortHeader} (${comp.maxMarks})` : shortHeader;
-    doc.text(compHeader, firstCompX + cIdx * compW, y + 5, {
+    const compHeader = comp.maxMarks ? `${shortHeader}(${comp.maxMarks})` : shortHeader;
+    doc.text(compHeader, firstCompX + cIdx * compW, hTextY, {
       width: compW - 2,
+      height: 9,
       align: 'right',
       lineBreak: false,
     });
   });
 
-  const totalHeaderLabel = resolvedMaxTotal > 0 ? `TOTAL (${resolvedMaxTotal})` : 'TOTAL';
-  doc.text(totalHeaderLabel, totalX, y + 5, { width: totalW - 2, align: 'right', lineBreak: false })
-     .text('CLASS AVG', classAvgX, y + 5, { width: classAvgW - 2, align: 'right', lineBreak: false })
-     .text('GRADE', gradeX, y + 5, { width: gradeW, align: 'center', lineBreak: false })
-     .text('REMARK', remarkX, y + 5, { width: remarkW, align: 'center', lineBreak: false });
+  const totalHeaderLabel = resolvedMaxTotal > 0 ? `TOTAL(${resolvedMaxTotal})` : 'TOTAL';
+  doc.text(totalHeaderLabel, totalX, hTextY, { width: totalW - 2, height: 9, align: 'right', lineBreak: false })
+     .text('CLASS AVG', classAvgX, hTextY, { width: classAvgW - 2, height: 9, align: 'right', lineBreak: false })
+     .text('GRADE', gradeX, hTextY, { width: gradeW, height: 9, align: 'center', lineBreak: false })
+     .text('REMARK', remarkX, hTextY, { width: remarkW, height: 9, align: 'center', lineBreak: false });
 
-  y += 19;
+  y += headerRowH;
 
   // Helper to extract component score from row
   const getComponentDisplayScore = (row, comp, compIdx) => {
@@ -993,7 +1365,6 @@ function drawStandardReportCard(doc, params) {
         }
       }
     }
-    // Legacy fallback if componentScores was not populated
     const cat = String(comp.category || '').toUpperCase();
     if (cat === 'EXAM' && row.theoryMark !== undefined && row.theoryMark !== null) {
       return String(row.theoryMark);
@@ -1004,20 +1375,19 @@ function drawStandardReportCard(doc, params) {
     return '-';
   };
 
-  // Table Data Rows
-  const maxRows = 14;
-  const itemsToRender = reportCard.slice(0, maxRows);
-  const rowHeight = itemsToRender.length > 11 ? 17 : 19;
+  let cumulativeObtained = 0;
+  let cumulativeMax = 0;
 
   itemsToRender.forEach((row, idx) => {
     if (idx % 2 === 0) {
-      doc.rect(30, y, 535, rowHeight).fill(lightBg);
+      doc.rect(24, y, 547, rowHeight).fill(lightBg);
     } else {
-      doc.rect(30, y, 535, rowHeight).fill('#ffffff');
+      doc.rect(24, y, 547, rowHeight).fill('#ffffff');
     }
-    doc.rect(30, y, 535, rowHeight).stroke(lightBorder);
+    doc.rect(24, y, 547, rowHeight).stroke(lightBorder);
 
-    const textOffsetY = y + Math.max(4, Math.floor((rowHeight - 9) / 2));
+    const textOffsetY = y + Math.max(2.5, (rowHeight - rowFontSize) / 2 - 0.5);
+    const cellTextH = rowFontSize + 2.5;
 
     const totalScore =
       row.stageScore !== undefined && row.stageScore !== null
@@ -1028,51 +1398,79 @@ function drawStandardReportCard(doc, params) {
             ? String(row.totalScore)
             : '-';
 
-    const rowMax = Number(row.maxMarks) || resolvedMaxTotal;
+    const rowMax = Number(row.maxMarks) || resolvedMaxTotal || 100;
     let gradeLetter = row.grade || '-';
     let gradeRemark = row.remark || '-';
     if (!row.absent && totalScore !== '-' && !isNaN(parseFloat(totalScore))) {
       const tot = parseFloat(totalScore);
+      cumulativeObtained += tot;
+      cumulativeMax += rowMax;
       const pct = rowMax > 0 ? (tot / rowMax) * 100 : tot;
       const res = calculateGradeFromRanges(pct, gradingRanges || undefined);
       gradeLetter = res.grade;
       gradeRemark = res.remark || gradeLetter;
     }
+    const cleanRemark = formatCompactRemark(gradeRemark);
 
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-       .text(row.subjectCode || '-', codeX, textOffsetY, { width: codeW, lineBreak: false });
-    doc.font('Helvetica').fontSize(8)
-       .text(row.subjectName || '-', subjectX, textOffsetY, { width: subjectW, lineBreak: false, ellipsis: true });
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(rowFontSize - 0.3)
+       .text(row.subjectCode || '-', codeX, textOffsetY, { width: codeW, height: cellTextH, lineBreak: false, ellipsis: true });
+    doc.font('Helvetica-Bold').fontSize(rowFontSize)
+       .text(row.subjectName || '-', subjectX, textOffsetY, { width: subjectW, height: cellTextH, lineBreak: false, ellipsis: true });
 
     resolvedComponents.forEach((comp, cIdx) => {
       const valStr = getComponentDisplayScore(row, comp, cIdx);
-      doc.fillColor(darkColor).font('Helvetica').fontSize(8)
-         .text(valStr, firstCompX + cIdx * compW, textOffsetY, { width: compW - 2, align: 'right', lineBreak: false });
+      doc.fillColor(darkColor).font('Helvetica').fontSize(rowFontSize)
+         .text(valStr, firstCompX + cIdx * compW, textOffsetY, { width: compW - 2, height: cellTextH, align: 'right', lineBreak: false });
     });
 
-    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-       .text(row.absent ? '-' : totalScore, totalX, textOffsetY, { width: totalW - 2, align: 'right', lineBreak: false })
+    doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(rowFontSize)
+       .text(row.absent ? '-' : totalScore, totalX, textOffsetY, { width: totalW - 2, height: cellTextH, align: 'right', lineBreak: false })
        .font('Helvetica')
-       .text(row.absent ? '-' : `${row.classAverage ?? '-'}`, classAvgX, textOffsetY, { width: classAvgW - 2, align: 'right', lineBreak: false });
-    doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8)
-       .text(row.absent ? 'ABS' : gradeLetter, gradeX, textOffsetY, { width: gradeW, align: 'center', lineBreak: false });
-    doc.fillColor(textMuted).font('Helvetica').fontSize(7)
-       .text(row.absent ? 'Absent' : gradeRemark, remarkX, textOffsetY, { width: remarkW, align: 'center', lineBreak: false, ellipsis: true });
+       .text(row.absent ? '-' : `${row.classAverage ?? '-'}`, classAvgX, textOffsetY, { width: classAvgW - 2, height: cellTextH, align: 'right', lineBreak: false });
+    doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(rowFontSize)
+       .text(row.absent ? 'ABS' : gradeLetter, gradeX, textOffsetY, { width: gradeW, height: cellTextH, align: 'center', lineBreak: false });
+    doc.fillColor(textMuted).font('Helvetica').fontSize(rowFontSize - 0.5)
+       .text(row.absent ? 'Absent' : cleanRemark, remarkX, textOffsetY, { width: remarkW, height: cellTextH, align: 'center', lineBreak: false, ellipsis: true });
 
     y += rowHeight;
   });
 
-  if (itemsToRender.length < 5) {
-    const fillers = 5 - itemsToRender.length;
+  if (itemsToRender.length < minDisplayRows) {
+    const fillers = minDisplayRows - itemsToRender.length;
     for (let i = 0; i < fillers; i++) {
-      doc.rect(30, y, 535, rowHeight).stroke(lightBorder);
+      const idx = itemsToRender.length + i;
+      doc.rect(24, y, 547, rowHeight).fill(idx % 2 === 0 ? lightBg : '#ffffff').stroke(lightBorder);
       y += rowHeight;
     }
   }
 
-  y += 10;
+  // Summary / Aggregate Footer Row inside Subject Table
+  doc.rect(24, y, 547, sumRowH).fill('#eff6ff').stroke(lightBorder);
+  const sumTextY = y + (sumRowH - 7.5) / 2;
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(7.4)
+     .text('CUMULATIVE PERFORMANCE SUMMARY', codeX, sumTextY, { width: 220, height: 10, lineBreak: false })
+     .text(
+       cumulativeMax > 0 ? `${Math.round(cumulativeObtained * 10) / 10} / ${cumulativeMax}` : `${overallAverage}%`,
+       totalX - 30,
+       sumTextY,
+       { width: totalW + 28, height: 10, align: 'right', lineBreak: false }
+     )
+     .text(`AVG: ${overallAverage}%`, classAvgX - 6, sumTextY, { width: classAvgW + 4, height: 10, align: 'right', lineBreak: false })
+     .text(gpaInfo.grade, gradeX, sumTextY, { width: gradeW, height: 10, align: 'center', lineBreak: false })
+     .text(isProgressSlip ? 'In Progress' : rankString, remarkX, sumTextY, { width: remarkW, height: 10, align: 'center', lineBreak: false, ellipsis: true });
 
-  // 4. Next Term Resumption, Fees, Dual Comments & Signatures
+  y += sumRowH + sectionGap;
+
+  // 4. Psychomotor & Affective 2-Column Assessment Grid + Grading/Trait Legend
+  y = drawPsychomotorAndAffectiveGrid(doc, params, y, colors, {
+    headerH: traitHeaderH,
+    rowH: traitRowH,
+    legendH: traitLegendH,
+  });
+
+  y += sectionGap;
+
+  // 5. Next Term Resumption, Fees, Dual Comments & Signatures (Anchored to fill A4 bottom)
   drawBrandedRemarksAndSignatures(
     doc,
     {
@@ -1148,11 +1546,11 @@ function drawMontessoriReportCard(doc, params) {
       if (isActive) {
         doc.roundedRect(rx, y, pillWidth, pillHeight, 3).fill(primaryColor);
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
-           .text(code, rx, y + 3.5, { width: pillWidth, align: 'center' });
+           .text(code, rx, y + 3.5, { width: pillWidth, align: 'center', lineBreak: false });
       } else {
         doc.roundedRect(rx, y, pillWidth, pillHeight, 3).stroke(lightBorder);
         doc.fillColor('#94a3b8').font('Helvetica').fontSize(7)
-           .text(code, rx, y + 3.5, { width: pillWidth, align: 'center' });
+           .text(code, rx, y + 3.5, { width: pillWidth, align: 'center', lineBreak: false });
       }
       doc.restore();
     });
@@ -1191,31 +1589,34 @@ function drawMontessoriReportCard(doc, params) {
       rankString: 'Developmental',
       isProgressSlip: false,
       studentPhotoBuffer,
+      boxHeight: 62,
     },
-    100,
+    90,
     colors
   );
 
-  y += 8;
+  y += 6;
 
   // Rubric Legend
-  doc.rect(30, y, 535, 20).fill(lightBg).stroke(lightBorder);
+  doc.rect(24, y, 547, 18).fill(lightBg).stroke(lightBorder);
   doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-     .text('RATING KEY:  ', 40, y + 6, { continued: true })
-     .font('Helvetica').fillColor(textMuted)
-     .text('[EM] Emerging (1)     [DV] Developing (2)     [AC] Achieved (3)     [MS] Mastered (4)', { align: 'left' });
+     .text('RATING KEY:  [EM] Emerging (1)     [DV] Developing (2)     [AC] Achieved (3)     [MS] Mastered (4)', 34, y + 5, {
+       width: 520,
+       align: 'left',
+       lineBreak: false,
+     });
 
-  y += 28;
+  y += 24;
 
   // Domain 1: Psychomotor Skills
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text('1. PSYCHOMOTOR DEVELOPMENT', 30, y);
-  y += 13;
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(9.5).text('1. PSYCHOMOTOR DEVELOPMENT', 24, y, { lineBreak: false });
+  y += 12;
 
-  doc.rect(30, y, 535, 18).fill(primaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
-     .text('DEVELOPMENTAL TRAIT', 45, y + 5, { width: 280 })
-     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 5, { width: 210, align: 'center' });
-  y += 18;
+  doc.rect(24, y, 547, 17).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
+     .text('DEVELOPMENTAL TRAIT', 36, y + 4.5, { width: 280, lineBreak: false })
+     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 4.5, { width: 215, align: 'center', lineBreak: false });
+  y += 17;
 
   const psychomotorTraits = [
     { label: 'Writing Mastery & Pencil Grip', key: 'writingMastery' },
@@ -1225,29 +1626,29 @@ function drawMontessoriReportCard(doc, params) {
   ];
 
   psychomotorTraits.forEach((trait, idx) => {
-    if (idx % 2 === 0) doc.rect(30, y, 535, 21).fill(lightBg);
-    else doc.rect(30, y, 535, 21).fill('#ffffff');
-    doc.rect(30, y, 535, 21).stroke(lightBorder);
+    if (idx % 2 === 0) doc.rect(24, y, 547, 20).fill(lightBg);
+    else doc.rect(24, y, 547, 20).fill('#ffffff');
+    doc.rect(24, y, 547, 20).stroke(lightBorder);
 
     doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-       .text(trait.label, 45, y + 6, { width: 280 });
+       .text(trait.label, 36, y + 6, { width: 280, lineBreak: false });
 
     const val = assessment[trait.key] || 'AC';
-    drawRatingPills(doc, 345, y + 3.5, 205, val);
-    y += 21;
+    drawRatingPills(doc, 345, y + 3, 210, val);
+    y += 20;
   });
 
-  y += 10;
+  y += 8;
 
   // Domain 2: Affective & Behavioral Domain
-  doc.fillColor(secondaryColor).font('Helvetica-Bold').fontSize(10).text('2. AFFECTIVE & SOCIAL BEHAVIOR', 30, y);
-  y += 13;
+  doc.fillColor(secondaryColor).font('Helvetica-Bold').fontSize(9.5).text('2. AFFECTIVE & SOCIAL BEHAVIOR', 24, y, { lineBreak: false });
+  y += 12;
 
-  doc.rect(30, y, 535, 18).fill(secondaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
-     .text('BEHAVIORAL ATTRIBUTE', 45, y + 5, { width: 280 })
-     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 5, { width: 210, align: 'center' });
-  y += 18;
+  doc.rect(24, y, 547, 17).fill(secondaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
+     .text('BEHAVIORAL ATTRIBUTE', 36, y + 4.5, { width: 280, lineBreak: false })
+     .text('ASSESSMENT RATING [EM / DV / AC / MS]', 340, y + 4.5, { width: 215, align: 'center', lineBreak: false });
+  y += 17;
 
   const affectiveTraits = [
     { label: 'General Punctuality & Attendance', key: 'generalPunctuality' },
@@ -1257,19 +1658,19 @@ function drawMontessoriReportCard(doc, params) {
   ];
 
   affectiveTraits.forEach((trait, idx) => {
-    if (idx % 2 === 0) doc.rect(30, y, 535, 21).fill(lightBg);
-    else doc.rect(30, y, 535, 21).fill('#ffffff');
-    doc.rect(30, y, 535, 21).stroke(lightBorder);
+    if (idx % 2 === 0) doc.rect(24, y, 547, 20).fill(lightBg);
+    else doc.rect(24, y, 547, 20).fill('#ffffff');
+    doc.rect(24, y, 547, 20).stroke(lightBorder);
 
     doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8)
-       .text(trait.label, 45, y + 6, { width: 280 });
+       .text(trait.label, 36, y + 6, { width: 280, lineBreak: false });
 
     const val = assessment[trait.key] || 'AC';
-    drawRatingPills(doc, 345, y + 3.5, 205, val);
-    y += 21;
+    drawRatingPills(doc, 345, y + 3, 210, val);
+    y += 20;
   });
 
-  y += 12;
+  y += 10;
 
   drawBrandedRemarksAndSignatures(
     doc,
@@ -1365,66 +1766,64 @@ function drawCommentBasedReportCard(doc, params) {
       rankString: 'N/A',
       isProgressSlip: false,
       studentPhotoBuffer,
+      boxHeight: 62,
     },
-    100,
+    90,
     colors
   );
 
-  y += 8;
-
-  // Rubric Legend
-  doc.rect(30, y, 535, 20).fill(lightBg).stroke(lightBorder);
-  doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.5)
-     .text('RATING SCALE:  ', 40, y + 6, { continued: true })
-     .font('Helvetica').fillColor(textMuted)
-     .text('[1] Emerging     [2] Developing     [3] Satisfactory     [4] Proficient     [5] Advanced', { align: 'left' });
-
-  y += 26;
+  y += 5;
 
   // Learning Domains Table Header
-  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(10).text('LEARNING DOMAINS & QUALITATIVE OBSERVATIONS', 30, y);
-  y += 13;
+  doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.5).text('1. LEARNING DOMAINS & QUALITATIVE OBSERVATIONS', 24, y, { lineBreak: false });
+  y += 11;
 
-  doc.rect(30, y, 535, 19).fill(primaryColor);
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8)
-     .text('LEARNING DOMAIN / SUBJECT', 40, y + 5, { width: 140 })
-     .text('TEACHER QUALITATIVE OBSERVATION', 185, y + 5, { width: 260 })
-     .text('RATING (1-5)', 455, y + 5, { width: 100, align: 'center' });
-  y += 19;
+  doc.rect(24, y, 547, 16).fill(primaryColor);
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.2)
+     .text('LEARNING DOMAIN / SUBJECT', 32, y + 4.5, { width: 145, lineBreak: false })
+     .text('TEACHER QUALITATIVE OBSERVATION', 182, y + 4.5, { width: 270, lineBreak: false })
+     .text('RATING (1-5)', 460, y + 4.5, { width: 100, align: 'center', lineBreak: false });
+  y += 16;
 
   if (!subjectComments || subjectComments.length === 0) {
-    doc.rect(30, y, 535, 30).stroke(lightBorder);
-    doc.fillColor(textMuted).font('Helvetica-Oblique').fontSize(8.5)
-       .text('No qualitative subject assessments recorded for this period.', 40, y + 10, { width: 515, align: 'center' });
-    y += 30;
+    doc.rect(24, y, 547, 26).stroke(lightBorder);
+    doc.fillColor(textMuted).font('Helvetica-Oblique').fontSize(8)
+       .text('No qualitative subject assessments recorded for this period.', 32, y + 8, { width: 525, align: 'center', lineBreak: false });
+    y += 26;
   } else {
-    subjectComments.slice(0, 9).forEach((item, idx) => {
-      const rowHeight = 30;
-      if (idx % 2 === 0) doc.rect(30, y, 535, rowHeight).fill(lightBg);
-      else doc.rect(30, y, 535, rowHeight).fill('#ffffff');
-      doc.rect(30, y, 535, rowHeight).stroke(lightBorder);
+    const items = subjectComments.slice(0, 10);
+    const rowHeight = items.length > 8 ? 22 : 25;
+    items.forEach((item, idx) => {
+      if (idx % 2 === 0) doc.rect(24, y, 547, rowHeight).fill(lightBg);
+      else doc.rect(24, y, 547, rowHeight).fill('#ffffff');
+      doc.rect(24, y, 547, rowHeight).stroke(lightBorder);
 
-      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(8.5)
-         .text(item.subjectName || 'Learning Domain', 40, y + 7, { width: 140, lineBreak: false, ellipsis: true });
+      doc.fillColor(darkColor).font('Helvetica-Bold').fontSize(7.8)
+         .text(item.subjectName || 'Learning Domain', 32, y + 6, { width: 145, lineBreak: false, ellipsis: true });
 
       const obsText = item.comment || 'Pupil demonstrates active participation and positive curiosity.';
-      doc.fillColor(textMuted).font('Helvetica').fontSize(7.5)
-         .text(obsText, 185, y + 5, { width: 260, height: 22, ellipsis: true });
+      doc.fillColor(textMuted).font('Helvetica').fontSize(7)
+         .text(obsText, 182, y + 4, { width: 270, height: rowHeight - 6, ellipsis: true });
 
       const ratingVal = Number(item.rating) || 3;
       const ratingLabel = item.ratingLabel || `${ratingVal} / 5`;
-      const pillWidth = 90;
-      const pillX = 460;
-      const pillY = y + 6;
-      doc.roundedRect(pillX, pillY, pillWidth, 17, 4).fill(primaryColor);
-      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7.5)
-         .text(ratingLabel, pillX, pillY + 4, { width: pillWidth, align: 'center' });
+      const pillWidth = 86;
+      const pillX = 468;
+      const pillY = y + Math.floor((rowHeight - 14) / 2);
+      doc.roundedRect(pillX, pillY, pillWidth, 14, 3).fill(primaryColor);
+      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(7)
+         .text(ratingLabel, pillX, pillY + 3.5, { width: pillWidth, align: 'center', lineBreak: false });
 
       y += rowHeight;
     });
   }
 
-  y += 10;
+  y += 5;
+
+  // Psychomotor & Affective Grid
+  y = drawPsychomotorAndAffectiveGrid(doc, params, y, colors);
+
+  y += 4;
 
   drawBrandedRemarksAndSignatures(
     doc,
@@ -1483,7 +1882,7 @@ function generateCommentBasedReportCardPdf(params) {
       const hydrated = await preloadReportCardAssetBuffers(params);
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 22,
+        margins: { top: 14, bottom: 10, left: 20, right: 20 },
         info: {
           Title: `Developmental Report - ${hydrated.studentName || 'Pupil'}`,
           Author: 'Ugbekun Schools Platform',
@@ -1509,7 +1908,7 @@ function generateReportCardPdf(params) {
       const hydrated = await preloadReportCardAssetBuffers(params);
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 22,
+        margins: { top: 14, bottom: 10, left: 20, right: 20 },
         info: {
           Title: `Report Card - ${hydrated.studentName || 'Student'}`,
           Author: 'Ugbekun Schools Platform',
@@ -1541,7 +1940,7 @@ function generateMontessoriReportCardPdf(params) {
       const hydrated = await preloadReportCardAssetBuffers(params);
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 22,
+        margins: { top: 14, bottom: 10, left: 20, right: 20 },
         info: {
           Title: `Montessori Assessment - ${hydrated.studentName || 'Pupil'}`,
           Author: 'Ugbekun Schools Platform',
@@ -1576,7 +1975,7 @@ function generateBatchClassReportCardsPdf(params) {
 
       const doc = new PDFDocument({
         size: 'A4',
-        margin: 22,
+        margins: { top: 14, bottom: 10, left: 20, right: 20 },
         info: {
           Title: `Batch Report Cards - ${className} ${sectionName}`,
           Author: 'Ugbekun Schools Platform',
