@@ -3,35 +3,97 @@ import fs from 'fs';
 import path from 'path';
 import prisma from '../../lib/prisma';
 import gamificationService from '../../lib/gamificationService';
-import { canTeacherUseClassSubject, teacherScopedContentOr } from '../../lib/teacherAccess';
+import {
+  canTeacherUseClassSubject,
+  hasClassAccess,
+  getTeacherAuthorisedClassIds,
+  teacherScopedContentOr,
+  resolveActiveSessionForClass,
+  excludePromotedOutStudents,
+} from '../../lib/teacherAccess';
 import { mapQuestionBankWrite } from '../../lib/questionDraftService';
 import { snapshotFromBank } from '../admin/adminHomeworkController';
 import { uploadBase64File } from '../../lib/cloudinary';
 
 /**
  * GET /api/teacher/homeworks
+ * Strictly scoped to the teacher's currently assigned classes and subjects.
  */
 export async function getHomeworks(req: Request, res: Response): Promise<Response | void> {
   try {
+    const { classId, subjectId } = (req.query || {}) as any;
     const globalSetting = await prisma.globalSettings.findFirst();
     const sessionId = globalSetting?.sessionId || 5;
-    const scopedOr = await teacherScopedContentOr(prisma, req.teacherId);
 
-    const homeworks = await prisma.homework.findMany({
-      where: {
-        branchId: req.branchId,
-        sessionId,
-        OR: [
-          ...(req.teacherId ? [{ createdById: req.teacherId, createdByRole: 'TEACHER' }] : []),
-          ...scopedOr,
-        ],
-      },
+    const authorisedClassIds = await getTeacherAuthorisedClassIds(prisma, req.teacherId);
+    if (authorisedClassIds.length === 0) {
+      return res.json({ success: true, homeworks: [] });
+    }
+
+    if (classId) {
+      const targetClassId = Number(classId);
+      if (subjectId) {
+        const canUse = await canTeacherUseClassSubject(prisma, req.teacherId, targetClassId, Number(subjectId));
+        if (!canUse) {
+          return res.status(403).json({
+            success: false,
+            message: 'Access denied: You can only view assignments for your assigned class and subject.',
+          });
+        }
+      } else {
+        const canUseClass = await hasClassAccess(prisma, req.teacherId, targetClassId);
+        if (!canUseClass) {
+          return res.status(403).json({
+            success: false,
+            message: 'Access denied: You do not have access to assignments for other classes.',
+          });
+        }
+      }
+    }
+
+    const scopedOr = await teacherScopedContentOr(prisma, req.teacherId);
+    const andConditions: any[] = [
+      { branchId: req.branchId },
+      { sessionId },
+      { classId: { in: authorisedClassIds } },
+      { OR: scopedOr },
+    ];
+    if (classId) andConditions.push({ classId: Number(classId) });
+    if (subjectId) andConditions.push({ subjectId: Number(subjectId) });
+
+    const rawHomeworks = await prisma.homework.findMany({
+      where: { AND: andConditions },
       include: {
         class: { select: { id: true, name: true } },
         subject: { select: { id: true, name: true } },
+        submissions: { select: { id: true, score: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    const homeworks = rawHomeworks.map((hw) => {
+      const qMeta = (hw.questions && typeof hw.questions === 'object' && !Array.isArray(hw.questions))
+        ? (hw.questions as any)
+        : null;
+      const resolvedQuestions = qMeta?.questions || (Array.isArray(hw.questions) ? hw.questions : []);
+      const submissionsList = Array.isArray(hw.submissions) ? hw.submissions : [];
+      const submissionsCount = submissionsList.length;
+      const markedCount = submissionsList.filter((s) => s.score !== null && s.score !== undefined).length;
+
+      return {
+        ...hw,
+        className: hw.class?.name || 'Class',
+        subjectName: hw.subject?.name || 'Subject',
+        maxMarks: qMeta?.maxMarks || 20,
+        submissionMode: qMeta?.submissionMode || (resolvedQuestions.length > 0 ? 'ONLINE_QUESTIONS' : 'OFFLINE'),
+        attachmentUrl: qMeta?.attachmentUrl || null,
+        attachmentName: qMeta?.attachmentName || null,
+        questions: resolvedQuestions,
+        submissionsCount,
+        markedCount,
+      };
+    });
+
     return res.json({ success: true, homeworks });
   } catch (error) {
     console.error('[TEACHER] Get homeworks error:', error);
@@ -41,6 +103,8 @@ export async function getHomeworks(req: Request, res: Response): Promise<Respons
 
 /**
  * POST /api/teacher/homeworks
+ * Assigns homework strictly to the teacher's authorised class & subject.
+ * Any Question Bank items attached must strictly belong to the same classId and subjectId.
  */
 export async function createHomework(req: Request, res: Response): Promise<Response | void> {
   const {
@@ -62,7 +126,10 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
     return res.status(400).json({ success: false, message: 'Title, Class, Subject, and Due Date are required.' });
   }
 
-  const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, classId, subjectId);
+  const targetClassId = Number(classId);
+  const targetSubjectId = Number(subjectId);
+
+  const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, targetClassId, targetSubjectId);
   if (!allowed) {
     return res.status(403).json({
       success: false,
@@ -77,29 +144,31 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
     let snapshot: any = null;
 
     if (Array.isArray(questionBankIds) && questionBankIds.length > 0) {
-      ids = questionBankIds.map(Number).filter(Boolean);
+      ids = Array.from(new Set(questionBankIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)));
     }
 
-    if (!ids.length && Array.isArray(questions) && questions.length > 0) {
+    if (Array.isArray(questions) && questions.length > 0) {
       for (const q of questions) {
-        const existingId = Number(q.id);
+        const existingId = Number(q.questionBankId || q.id);
         if (Number.isInteger(existingId) && existingId > 0) {
-          ids.push(existingId);
+          if (!ids.includes(existingId)) ids.push(existingId);
           continue;
         }
+        if (!String(q.questionText || '').trim()) continue;
         const item = await prisma.questionBank.create({
           data: mapQuestionBankWrite(
             {
               questionText: q.questionText,
-              questionType: q.questionType || (q.type === 'MCQ' ? 'mcq' : 'theory'),
+              questionType: q.questionType || (q.type === 'MCQ' ? 'mcq' : q.type === 'TF' ? 'true_false' : 'theory'),
               options: q.options,
               correctOption: q.correctOption || q.correctAnswer,
               marks: q.marks || q.points || 1,
-              subjectId,
-              classId,
+              subjectId: targetSubjectId,
+              classId: targetClassId,
               termName,
               topic: q.topic,
-              sourceType: q.id ? 'BANK' : 'MANUAL',
+              sourceType: 'MANUAL',
+              status: 'APPROVED',
             },
             {
               branchId: req.branchId,
@@ -115,27 +184,52 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
 
     if (ids.length > 0) {
       const bankResult = await snapshotFromBank(ids, req.branchId);
+      if (bankResult.items.length !== ids.length) {
+        return res.status(400).json({
+          success: false,
+          message: 'One or more selected Question Bank items were not found or are not approved.',
+        });
+      }
+
+      // STRICT CLASS & SUBJECT VALIDATION: Teachers can NEVER pull questions from another class or subject
+      const foreignItem = bankResult.items.find(
+        (item) => Number(item.classId) !== targetClassId || Number(item.subjectId) !== targetSubjectId
+      );
+      if (foreignItem) {
+        return res.status(403).json({
+          success: false,
+          message:
+            'Strict Class Restriction: Every Question Bank item selected for an assignment must belong strictly to your assigned class and subject.',
+        });
+      }
+
       snapshot = bankResult.questions;
     }
 
     // Determine final question payload and metadata
     const parsedQuestions = snapshot || (Array.isArray(questions) && questions.length > 0 ? questions : []);
-    const resolvedSubmissionMode = submissionMode || (attachmentUrl ? 'FILE_UPLOAD' : (parsedQuestions.length > 0 ? 'ONLINE_QUESTIONS' : 'OFFLINE'));
+    const resolvedSubmissionMode =
+      submissionMode || (attachmentUrl ? 'FILE_UPLOAD' : parsedQuestions.length > 0 ? 'ONLINE_QUESTIONS' : 'OFFLINE');
+    const computedMaxMarks =
+      Number(maxMarks) ||
+      (parsedQuestions.length > 0
+        ? parsedQuestions.reduce((sum: number, q: any) => sum + (Number(q.points ?? q.marks) || 1), 0)
+        : 20);
 
     const questionsPayload = {
       questions: parsedQuestions,
       attachmentUrl: attachmentUrl || null,
       attachmentName: attachmentName || null,
       submissionMode: resolvedSubmissionMode,
-      maxMarks: Number(maxMarks) || 20,
+      maxMarks: computedMaxMarks,
     };
 
     const homework = await prisma.homework.create({
       data: {
-        title,
+        title: String(title).trim(),
         description: description || null,
-        classId: Number(classId),
-        subjectId: Number(subjectId),
+        classId: targetClassId,
+        subjectId: targetSubjectId,
         dueDate: new Date(dueDate),
         questions: questionsPayload,
         questionBankIds: ids.length > 0 ? ids : null,
@@ -162,7 +256,22 @@ export async function createHomework(req: Request, res: Response): Promise<Respo
       })
       .catch(() => null);
 
-    return res.json({ success: true, homework, message: 'Homework published successfully.' });
+    return res.json({
+      success: true,
+      homework: {
+        ...homework,
+        className: homework.class?.name || 'Class',
+        subjectName: homework.subject?.name || 'Subject',
+        maxMarks: computedMaxMarks,
+        submissionMode: resolvedSubmissionMode,
+        attachmentUrl: attachmentUrl || null,
+        attachmentName: attachmentName || null,
+        questions: parsedQuestions,
+        submissionsCount: 0,
+        markedCount: 0,
+      },
+      message: 'Homework published successfully.',
+    });
   } catch (error) {
     console.error('[TEACHER] Create homework error:', error);
     return res.status(500).json({ success: false, message: 'Failed to publish homework.' });
@@ -187,19 +296,21 @@ export async function getHomeworkSubmissions(req: Request, res: Response): Promi
     if (!homework) {
       return res.status(404).json({ success: false, message: 'Homework not found.' });
     }
-    const allowed =
-      (homework.createdById === req.teacherId && homework.createdByRole === 'TEACHER') ||
-      (await canTeacherUseClassSubject(prisma, req.teacherId, homework.classId, homework.subjectId));
+    const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, homework.classId, homework.subjectId);
     if (!allowed) {
       return res.status(403).json({ success: false, message: 'You can only view submissions for your authorised classes.' });
     }
 
-    // Fetch all enrolled students in the class
-    const enrolls = await prisma.enroll.findMany({
+    const activeSessionId = await resolveActiveSessionForClass(prisma, req.branchId, homework.classId);
+
+    // Fetch enrolled students in the class for the active session
+    const rawEnrolls = await prisma.enroll.findMany({
       where: {
         classId: homework.classId,
+        sessionId: activeSessionId,
         branchId: req.branchId,
         isAlumni: 0,
+        student: { active: true },
       },
       include: {
         student: {
@@ -214,6 +325,21 @@ export async function getHomeworkSubmissions(req: Request, res: Response): Promi
         section: { select: { id: true, name: true } },
       },
       orderBy: [{ roll: 'asc' }, { student: { lastName: 'asc' } }],
+    });
+
+    const filteredEnrolls = req.branchId
+      ? await excludePromotedOutStudents(
+          prisma,
+          { branchId: req.branchId, sessionId: activeSessionId, classId: homework.classId, sectionId: 0 },
+          rawEnrolls
+        )
+      : rawEnrolls;
+
+    const seenStudentIds = new Set<number>();
+    const enrolls = filteredEnrolls.filter((e) => {
+      if (seenStudentIds.has(e.studentId)) return false;
+      seenStudentIds.add(e.studentId);
+      return true;
     });
 
     // Fetch all submissions for this homework
@@ -357,6 +483,14 @@ export async function batchGradeHomework(req: Request, res: Response): Promise<R
     });
     if (!homework) {
       return res.status(404).json({ success: false, message: 'Homework not found.' });
+    }
+
+    const allowed = await canTeacherUseClassSubject(prisma, req.teacherId, homework.classId, homework.subjectId);
+    if (!allowed) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only grade assignments for your authorised class and subject.',
+      });
     }
 
     let updatedCount = 0;

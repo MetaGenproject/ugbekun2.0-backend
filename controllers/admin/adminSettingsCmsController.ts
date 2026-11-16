@@ -6,7 +6,7 @@ import prisma from '../../lib/prisma';
 import { cacheDel, cacheDelPattern } from '../../lib/cacheService';
 import { uploadToCloudinary } from '../../lib/cloudinaryService';
 import { saveLogoBase64, saveSignatureBase64 } from '../onboarding/onboardingController';
-import { parseTeacherSignatureConfig } from '../../lib/reportCardHelper';
+import { parseTeacherSignatureConfig, serializeTeacherSignatureConfig } from '../../lib/reportCardHelper';
 import {
   getMyEduRideConfig,
   saveMyEduRideConfig,
@@ -351,14 +351,7 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
         }
       }
 
-      if (Object.keys(sigConfig.byClass || {}).length > 0) {
-        processedTeacherSignatureUrl = JSON.stringify({
-          general: sigConfig.general || null,
-          byClass: sigConfig.byClass,
-        });
-      } else {
-        processedTeacherSignatureUrl = sigConfig.general || null;
-      }
+      processedTeacherSignatureUrl = serializeTeacherSignatureConfig(sigConfig);
     } else if (teacherSignatureBase64) {
       const uploaded = await saveSignatureBase64(teacherSignatureBase64, teacherSignatureFileName);
       if (uploaded) processedTeacherSignatureUrl = uploaded;
@@ -458,7 +451,7 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
             ...(processedLogoUrl !== undefined && { logo: processedLogoUrl, reportCardLogo: processedLogoUrl }),
           },
         })
-        .catch(() => {});
+        .catch(() => { });
     }
 
     // Invalidate Redis tenant cache for this branch
@@ -591,7 +584,7 @@ export async function uploadAdminPhoto(req: Request, res: Response): Promise<Res
         where: { id: userId },
         data: { photo: cloudinaryUrl },
       })
-      .catch(() => {});
+      .catch(() => { });
 
     return res.json({
       success: true,
@@ -1616,7 +1609,7 @@ export async function deleteBrandingAsset(req: Request, res: Response): Promise<
       await prisma.branch.update({
         where: { id: branchId },
         data: { logo: null },
-      }).catch(() => {});
+      }).catch(() => { });
     } else if (assetType === 'signature') {
       updateData = { principalSignatureUrl: null };
     } else if (assetType === 'teacher-signature') {
@@ -1626,11 +1619,7 @@ export async function deleteBrandingAsset(req: Request, res: Response): Promise<
       });
       const sigConfig = parseTeacherSignatureConfig(current?.defaultTeacherSignatureUrl);
       sigConfig.general = null;
-      if (Object.keys(sigConfig.byClass || {}).length > 0) {
-        updateData = { defaultTeacherSignatureUrl: JSON.stringify(sigConfig) };
-      } else {
-        updateData = { defaultTeacherSignatureUrl: null };
-      }
+      updateData = { defaultTeacherSignatureUrl: serializeTeacherSignatureConfig(sigConfig) };
     } else if (assetType === 'colors') {
       updateData = { primaryColor: '#0f172a', secondaryColor: '#0284c7', idCardTheme: 'EMERALD_MODERN' };
     } else {
@@ -1795,15 +1784,7 @@ export async function updateClassTeacherSignature(req: Request, res: Response): 
       return res.status(400).json({ success: false, message: 'Invalid action specified.' });
     }
 
-    let payload: string | null = null;
-    if (Object.keys(sigConfig.byClass || {}).length > 0) {
-      payload = JSON.stringify({
-        general: sigConfig.general || null,
-        byClass: sigConfig.byClass,
-      });
-    } else {
-      payload = sigConfig.general || null;
-    }
+    const payload = serializeTeacherSignatureConfig(sigConfig);
 
     await prisma.systemSetting.update({
       where: { branchId },

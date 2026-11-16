@@ -649,8 +649,15 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         aestheticNeatness: montAssessmentForJson?.aestheticNeatness || 'AC',
         activeGroupParticipation: montAssessmentForJson?.activeGroupParticipation || 'AC',
       },
-      // ZERO LEAKAGE: rank is null unless terminal exam is fully released
-      rank: isExamReleased && !isCaOnlyStage ? rank : null,
+      // ZERO LEAKAGE: rank is null unless terminal exam is fully released AND class position is enabled by Admin
+      rank:
+        isExamReleased &&
+        !isCaOnlyStage &&
+        schoolBranding.showPosition !== false &&
+        (schoolBranding.rankingType !== 'topn' || (rank !== null && rank <= (schoolBranding.rankingLimit || 3)))
+          ? rank
+          : null,
+      showPosition: schoolBranding.showPosition !== false,
       totalClassStudents,
       nextTermResumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
       nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
@@ -1158,10 +1165,11 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       commentary: commentaryRecord?.remark || '',
       teacherComment: commentaryRecord?.remark || '',
       principalComment: commentaryRecord?.reviewNotes || '',
-      rank,
+      rank: schoolBranding.showPosition === false ? null : rank,
       totalClassStudents,
-      rankingType,
-      rankingLimit: limit,
+      rankingType: schoolBranding.showPosition === false ? 'hidden' : (schoolBranding.rankingType || rankingType),
+      rankingLimit: Number(schoolBranding.rankingLimit || limit),
+      showPosition: schoolBranding.showPosition !== false,
       resumptionDate,
       nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
       formTeacherName: schoolBranding.classTeacherName || formTeacherName,

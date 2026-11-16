@@ -551,6 +551,32 @@ export async function teacherScopedContentOr(
   return or.length ? or : [{ id: -1 }];
 }
 
+export async function getTeacherAuthorisedClassIds(
+  prisma: any,
+  teacherId: number | string | undefined | null
+): Promise<number[]> {
+  if (!teacherId) return [];
+  const tId = Number(teacherId);
+
+  const [assigns, formRows] = await Promise.all([
+    prisma.subjectAssign.findMany({
+      where: { teacherId: tId },
+      select: { classId: true },
+    }),
+    prisma.teacherAllocation.findMany({
+      where: { teacherId: tId },
+      select: { classId: true },
+    }),
+  ]);
+
+  return Array.from(
+    new Set<number>([
+      ...assigns.map((a: { classId: number }) => Number(a.classId)),
+      ...formRows.map((f: { classId: number }) => Number(f.classId)),
+    ].filter((id) => Number.isInteger(id) && id > 0))
+  );
+}
+
 export async function assertTeacherQuestionAccess(
   prisma: any,
   teacherId: number | string | undefined | null,
@@ -559,17 +585,11 @@ export async function assertTeacherQuestionAccess(
 ): Promise<boolean> {
   if (!teacherId || !item) return false;
   if (branchId && item.branchId && item.branchId !== branchId) return false;
+  if (!item.classId) return false;
   if (item.classId && item.subjectId) {
     return canTeacherAccessSubject(prisma, teacherId, item.classId, null, item.subjectId);
   }
-  if (item.classId) {
-    const form = await prisma.teacherAllocation.findFirst({
-      where: { teacherId: Number(teacherId), classId: Number(item.classId) },
-      select: { id: true },
-    });
-    return !!form;
-  }
-  return item.createdById === Number(teacherId);
+  return hasClassAccess(prisma, teacherId, item.classId);
 }
 
 export default {
@@ -584,6 +604,7 @@ export default {
   excludePromotedOutStudents,
   getTeacherAcademicRoles,
   getTeacherClassSubjectScope,
+  getTeacherAuthorisedClassIds,
   teacherScopedContentOr,
   assertTeacherQuestionAccess,
 };

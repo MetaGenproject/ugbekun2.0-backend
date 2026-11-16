@@ -681,6 +681,8 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
     overallAverage = 0,
     gpaRating = '-',
     rankString = '-',
+    showPosition = true,
+    totalScoreString = '-',
     isProgressSlip = false,
     stage = 'FULL',
     stageLabel = '',
@@ -778,14 +780,14 @@ function drawStudentBioWithPhoto(doc, params, y, colors) {
     doc.fillColor(textMuted).font('Helvetica').fontSize(7.4)
        .text('Overall Average:', 288, r1, { lineBreak: false })
        .text('Final Grade:', 288, r2, { lineBreak: false })
-       .text('Class Position:', 288, r3, { lineBreak: false })
+       .text(showPosition ? 'Class Position:' : 'Total Score:', 288, r3, { lineBreak: false })
        .text('Attendance:', 288, r4, { lineBreak: false });
 
     doc.fillColor(primaryColor).font('Helvetica-Bold').fontSize(8.8)
        .text(`${overallAverage}%`, 364, r1, { width: 142, height: 11, lineBreak: false })
        .fillColor(darkColor).fontSize(8.2)
        .text(gpaRating, 364, r2, { width: 142, height: 11, lineBreak: false, ellipsis: true })
-       .text(rankString, 364, r3, { width: 142, height: 11, lineBreak: false })
+       .text(showPosition ? rankString : totalScoreString, 364, r3, { width: 142, height: 11, lineBreak: false })
        .font('Helvetica').fontSize(7.6)
        .text(attText, 364, r4, { width: 142, height: 11, lineBreak: false });
   }
@@ -1191,21 +1193,46 @@ function drawStandardReportCard(doc, params) {
 
   const colors = { primaryColor, secondaryColor, darkColor, textMuted, lightBorder, lightBg };
 
-  // Compute Ranking String (only for terminal reports)
+  const effectiveRankingType =
+    params.showPosition === false || branding.showPosition === false
+      ? 'hidden'
+      : rankingType || branding.rankingType || 'full';
+  const effectiveRankingLimit = Number(rankingLimit || branding.rankingLimit || 3);
+  const showPosition =
+    !isProgressSlip &&
+    params.showPosition !== false &&
+    branding.showPosition !== false &&
+    effectiveRankingType !== 'hidden';
+
+  // Compute Ranking String (only for terminal reports when position is enabled for the class)
   let rankString = '-';
-  if (!isProgressSlip) {
-    if (rankingType === 'full' && rank && totalClassStudents) {
+  if (showPosition) {
+    if (effectiveRankingType === 'full' && rank && totalClassStudents) {
       rankString = `${rank}${getOrdinalSuffix(rank)} of ${totalClassStudents}`;
-    } else if (rankingType === 'topn' && rank && rankingLimit) {
-      if (rank <= rankingLimit) {
-        rankString = `${rank}${getOrdinalSuffix(rank)} (Top ${rankingLimit})`;
+    } else if (effectiveRankingType === 'topn' && rank && effectiveRankingLimit) {
+      if (rank <= effectiveRankingLimit) {
+        rankString = `${rank}${getOrdinalSuffix(rank)} (Top ${effectiveRankingLimit})`;
       } else {
         rankString = 'Graded';
       }
-    } else if (rankingType === 'hidden') {
-      rankString = 'Hidden';
     }
   }
+
+  let precompObtained = 0;
+  let precompMax = 0;
+  for (const r of reportCard.slice(0, 20)) {
+    if (!r.absent) {
+      const sc = parseFloat(String(r.stageScore ?? r.mark ?? r.totalScore ?? ''));
+      if (!isNaN(sc)) {
+        precompObtained += sc;
+        precompMax += Number(r.maxMarks) || resolvedMaxTotal || 100;
+      }
+    }
+  }
+  const totalScoreString =
+    precompMax > 0
+      ? `${Math.round(precompObtained * 10) / 10} / ${precompMax}`
+      : `${reportCard.length} Subjects`;
 
   // Compute GPA letter grade equivalent using active grading scale
   const gpaInfo = calculateGradeFromRanges(overallAverage, gradingRanges || undefined);
@@ -1250,6 +1277,8 @@ function drawStandardReportCard(doc, params) {
       overallAverage,
       gpaRating,
       rankString,
+      showPosition,
+      totalScoreString,
       isProgressSlip,
       stage,
       stageLabel,
@@ -1457,7 +1486,16 @@ function drawStandardReportCard(doc, params) {
      )
      .text(`AVG: ${overallAverage}%`, classAvgX - 6, sumTextY, { width: classAvgW + 4, height: 10, align: 'right', lineBreak: false })
      .text(gpaInfo.grade, gradeX, sumTextY, { width: gradeW, height: 10, align: 'center', lineBreak: false })
-     .text(isProgressSlip ? 'In Progress' : rankString, remarkX, sumTextY, { width: remarkW, height: 10, align: 'center', lineBreak: false, ellipsis: true });
+     .text(
+       isProgressSlip
+         ? 'In Progress'
+         : showPosition
+           ? rankString
+           : formatCompactRemark(gpaInfo.remark || gpaInfo.grade),
+       remarkX,
+       sumTextY,
+       { width: remarkW, height: 10, align: 'center', lineBreak: false, ellipsis: true }
+     );
 
   y += sumRowH + sectionGap;
 

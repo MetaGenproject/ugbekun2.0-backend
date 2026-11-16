@@ -5,7 +5,13 @@ import {
 } from '../../lib/cbtCompanionExam';
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
-import { assertTeacherQuestionAccess, canTeacherUseClassSubject, teacherScopedContentOr } from '../../lib/teacherAccess';
+import {
+  assertTeacherQuestionAccess,
+  canTeacherUseClassSubject,
+  hasClassAccess,
+  getTeacherAuthorisedClassIds,
+  teacherScopedContentOr,
+} from '../../lib/teacherAccess';
 import { mapQuestionBankWrite } from '../../lib/questionDraftService';
 
 /**
@@ -79,12 +85,19 @@ export async function createOnlineExam(req: Request, res: Response): Promise<Res
     let snapshot = Array.isArray(questions) ? questions : [];
     if (bankIds.length) {
       const approved = await prisma.questionBank.findMany({
-        where: { id: { in: bankIds }, branchId: req.branchId, status: 'APPROVED' },
+        where: {
+          id: { in: bankIds },
+          branchId: req.branchId,
+          classId: Number(classId),
+          subjectId: Number(subjectId),
+          status: 'APPROVED',
+        },
       });
       if (approved.length !== bankIds.length) {
-        return res.status(400).json({
+        return res.status(403).json({
           success: false,
-          message: 'Only reviewed and approved Question Bank items can be assigned to a class.',
+          message:
+            'Strict Class Restriction: Every Question Bank item selected must belong strictly to your authorised class and subject.',
         });
       }
       snapshot = approved.map((q) => ({
@@ -166,23 +179,54 @@ export async function createOnlineExam(req: Request, res: Response): Promise<Res
 
 /**
  * GET /api/teacher/question-bank
+ * Strictly scoped to the teacher's authorised classes and subjects.
+ * Teachers cannot access Question Bank items from other classes.
  */
 export async function getQuestionBank(req: Request, res: Response): Promise<Response | void> {
   const { subjectId, classId, termName } = req.query;
   try {
-    const whereClause: any = {
-      branchId: req.branchId,
-      OR: await teacherScopedContentOr(prisma, req.teacherId),
-    };
-    if (subjectId) whereClause.subjectId = Number(subjectId);
-    if (classId) whereClause.classId = Number(classId);
-    if (termName) whereClause.termName = String(termName);
-    if (req.query.questionType) whereClause.questionType = String(req.query.questionType);
-    if (req.query.sourceType) whereClause.sourceType = String(req.query.sourceType);
-    if (req.query.status) whereClause.status = String(req.query.status);
+    const authorisedClassIds = await getTeacherAuthorisedClassIds(prisma, req.teacherId);
+    if (authorisedClassIds.length === 0) {
+      return res.json({ success: true, items: [] });
+    }
+
+    if (classId) {
+      const targetClassId = Number(classId);
+      if (subjectId) {
+        const canUsePair = await canTeacherUseClassSubject(prisma, req.teacherId, targetClassId, Number(subjectId));
+        if (!canUsePair) {
+          return res.status(403).json({
+            success: false,
+            message: 'Access denied: You can only access Question Bank items for your assigned class and subject.',
+          });
+        }
+      } else {
+        const canUseClass = await hasClassAccess(prisma, req.teacherId, targetClassId);
+        if (!canUseClass) {
+          return res.status(403).json({
+            success: false,
+            message: 'Access denied: You do not have access to Question Bank items for other classes.',
+          });
+        }
+      }
+    }
+
+    const scopedOr = await teacherScopedContentOr(prisma, req.teacherId);
+    const andConditions: any[] = [
+      { branchId: req.branchId },
+      { classId: { in: authorisedClassIds } },
+      { OR: scopedOr },
+    ];
+
+    if (subjectId) andConditions.push({ subjectId: Number(subjectId) });
+    if (classId) andConditions.push({ classId: Number(classId) });
+    if (termName) andConditions.push({ termName: String(termName) });
+    if (req.query.questionType) andConditions.push({ questionType: String(req.query.questionType) });
+    if (req.query.sourceType) andConditions.push({ sourceType: String(req.query.sourceType) });
+    if (req.query.status) andConditions.push({ status: String(req.query.status) });
 
     const items = await prisma.questionBank.findMany({
-      where: whereClause,
+      where: { AND: andConditions },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
         class: { select: { id: true, name: true } },
@@ -328,6 +372,16 @@ export async function distributeOnlineExam(req: Request, res: Response): Promise
 
     if (!finalTitle || !finalSubjectId) {
       return res.status(400).json({ success: false, message: 'Exam title and Subject are required.' });
+    }
+
+    for (const cid of classIds) {
+      const allowedForTarget = await canTeacherUseClassSubject(prisma, req.teacherId, Number(cid), finalSubjectId);
+      if (!allowedForTarget) {
+        return res.status(403).json({
+          success: false,
+          message: 'You can only distribute questions/assessments to classes assigned to you.',
+        });
+      }
     }
 
     const createdExams = [];

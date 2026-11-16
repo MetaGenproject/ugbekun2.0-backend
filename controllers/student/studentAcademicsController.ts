@@ -507,7 +507,12 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       },
       resumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
       nextTermFees: schoolBranding.nextTermFees || null,
-      rank,
+      rank:
+        schoolBranding.showPosition !== false &&
+        (schoolBranding.rankingType !== 'topn' || (rank !== null && rank <= (schoolBranding.rankingLimit || 3)))
+          ? rank
+          : null,
+      showPosition: schoolBranding.showPosition !== false,
       totalClassStudents,
     });
   } catch (error) {
@@ -894,10 +899,11 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       commentary: commentaryRecord?.remark || '',
       teacherComment: commentaryRecord?.remark || '',
       principalComment: commentaryRecord?.reviewNotes || '',
-      rank,
+      rank: schoolBranding.showPosition === false ? null : rank,
       totalClassStudents,
-      rankingType,
-      rankingLimit: limit,
+      rankingType: schoolBranding.showPosition === false ? 'hidden' : (schoolBranding.rankingType || rankingType),
+      rankingLimit: Number(schoolBranding.rankingLimit || limit),
+      showPosition: schoolBranding.showPosition !== false,
       resumptionDate,
       nextTermFees: schoolBranding.nextTermFees || null,
       formTeacherName: schoolBranding.classTeacherName || formTeacherName,

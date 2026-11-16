@@ -1,5 +1,11 @@
 import prismaDefault from './prisma';
 
+export interface ClassPositionPolicy {
+  showPosition: boolean;
+  rankingType: 'full' | 'topn' | 'hidden';
+  rankingLimit: number;
+}
+
 export interface SchoolReportBranding {
   schoolName: string;
   tagline: string;
@@ -22,6 +28,10 @@ export interface SchoolReportBranding {
   classTeacherSignatureUrl: string | null;
   autoPublishReportCards: boolean;
   branchCode: string;
+  showPosition: boolean;
+  rankingType: 'full' | 'topn' | 'hidden';
+  rankingLimit: number;
+  positionByClass: Record<string, ClassPositionPolicy>;
 }
 
 export interface ResolveBrandingOptions {
@@ -35,17 +45,19 @@ export interface ResolveBrandingOptions {
 export interface TeacherSignatureConfig {
   general?: string | null;
   byClass?: Record<string, string | null>;
+  defaultShowPosition?: boolean;
+  positionByClass?: Record<string, ClassPositionPolicy>;
 }
 
 /**
- * Parses the teacher signature configuration stored in SystemSetting.defaultTeacherSignatureUrl.
+ * Parses the teacher signature and class position configuration stored in SystemSetting.defaultTeacherSignatureUrl.
  * Supports:
- * 1. JSON: { general?: string | null, byClass?: Record<classId, string | 'DISABLED' | null> }
+ * 1. JSON: { general?: string | null, byClass?: Record<classId, string | 'DISABLED' | null>, defaultShowPosition?: boolean, positionByClass?: Record<classId, ClassPositionPolicy> }
  * 2. Legacy string: "https://.../teacher_sig.png" (treated as general)
  */
 export function parseTeacherSignatureConfig(raw?: string | null): TeacherSignatureConfig {
   if (!raw || typeof raw !== 'string') {
-    return { general: null, byClass: {} };
+    return { general: null, byClass: {}, defaultShowPosition: true, positionByClass: {} };
   }
   const trimmed = raw.trim();
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
@@ -55,13 +67,60 @@ export function parseTeacherSignatureConfig(raw?: string | null): TeacherSignatu
         return {
           general: parsed.general || null,
           byClass: parsed.byClass && typeof parsed.byClass === 'object' ? parsed.byClass : {},
+          defaultShowPosition:
+            typeof parsed.defaultShowPosition === 'boolean' ? parsed.defaultShowPosition : true,
+          positionByClass:
+            parsed.positionByClass && typeof parsed.positionByClass === 'object'
+              ? parsed.positionByClass
+              : {},
         };
       }
     } catch {
       // fallback
     }
   }
-  return { general: trimmed || null, byClass: {} };
+  return { general: trimmed || null, byClass: {}, defaultShowPosition: true, positionByClass: {} };
+}
+
+export function serializeTeacherSignatureConfig(config: TeacherSignatureConfig): string | null {
+  const hasByClass = Object.keys(config.byClass || {}).length > 0;
+  const hasPositionByClass = Object.keys(config.positionByClass || {}).length > 0;
+  const hasCustomDefaultPos = config.defaultShowPosition === false;
+
+  if (hasByClass || hasPositionByClass || hasCustomDefaultPos) {
+    return JSON.stringify({
+      general: config.general || null,
+      byClass: config.byClass || {},
+      defaultShowPosition: config.defaultShowPosition !== false,
+      positionByClass: config.positionByClass || {},
+    });
+  }
+  return config.general || null;
+}
+
+export function resolveClassPositionPolicy(
+  config: TeacherSignatureConfig,
+  classId?: number | null
+): ClassPositionPolicy {
+  const defaultShow = config.defaultShowPosition !== false;
+  if (classId) {
+    const entry = config.positionByClass?.[String(classId)];
+    if (entry && typeof entry === 'object') {
+      const showPosition = Boolean(entry.showPosition);
+      const rankingType: 'full' | 'topn' | 'hidden' = !showPosition
+        ? 'hidden'
+        : entry.rankingType === 'topn'
+          ? 'topn'
+          : 'full';
+      const rankingLimit = Number(entry.rankingLimit) > 0 ? Number(entry.rankingLimit) : 3;
+      return { showPosition, rankingType, rankingLimit };
+    }
+  }
+  return {
+    showPosition: defaultShow,
+    rankingType: defaultShow ? 'full' : 'hidden',
+    rankingLimit: 3,
+  };
 }
 
 /**
@@ -337,6 +396,8 @@ export async function resolveSchoolReportBranding(
       currencySymbol
     ));
 
+  const posPolicy = resolveClassPositionPolicy(teacherSigConfig, options.classId);
+
   return {
     schoolName: resolvedSchoolName,
     tagline: settings?.tagline || 'Excellence in Knowledge & Character',
@@ -359,6 +420,10 @@ export async function resolveSchoolReportBranding(
     classTeacherSignatureUrl: isClassTeacherUnavailable ? null : (classTeacherSignatureUrl || generalTeacherSignature || null),
     autoPublishReportCards: settings?.autoPublishReportCards ?? true,
     branchCode: branch?.code || settings?.regNoPrefix || 'SCH',
+    showPosition: posPolicy.showPosition,
+    rankingType: posPolicy.rankingType,
+    rankingLimit: posPolicy.rankingLimit,
+    positionByClass: teacherSigConfig.positionByClass || {},
   };
 }
 

@@ -25,6 +25,9 @@ import {
   resolveSchoolReportBranding,
   syncReportCardOnScoreSave,
   buildDefaultRemarksForAverage,
+  parseTeacherSignatureConfig,
+  serializeTeacherSignatureConfig,
+  resolveClassPositionPolicy,
 } from '../../lib/reportCardHelper';
 
 export function getRatingLabel(rating: number): string {
@@ -808,16 +811,25 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
       orderBy: { name: 'asc' },
     });
 
-    const classPubs = await prisma.classReportCardPublication.findMany({
-      where: {
-        sessionId,
-        isPublished: true,
-        ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
-        ...(req.query.termId ? { termId: Number(req.query.termId) } : {}),
-      },
-      select: { classId: true, sectionId: true },
-    });
+    const [classPubs, branchSettings] = await Promise.all([
+      prisma.classReportCardPublication.findMany({
+        where: {
+          sessionId,
+          isPublished: true,
+          ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+          ...(req.query.termId ? { termId: Number(req.query.termId) } : {}),
+        },
+        select: { classId: true, sectionId: true },
+      }),
+      branchId
+        ? prisma.systemSetting.findUnique({
+            where: { branchId },
+            select: { defaultTeacherSignatureUrl: true },
+          })
+        : Promise.resolve(null),
+    ]);
     const publishedClassIds = new Set(classPubs.map((p) => p.classId));
+    const sigConfig = parseTeacherSignatureConfig(branchSettings?.defaultTeacherSignatureUrl);
 
     const formatted = classes.map((c) => {
       const secMap: Record<number, any> = {};
@@ -837,6 +849,8 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
         }
       });
 
+      const posPolicy = resolveClassPositionPolicy(sigConfig, c.id);
+
       return {
         id: c.id,
         name: c.name,
@@ -844,6 +858,9 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
         usesScores: c.usesScores ?? true,
         isCommentBased: !(c.usesScores ?? true),
         isPublished: publishedClassIds.has(c.id),
+        showPosition: posPolicy.showPosition,
+        rankingType: posPolicy.rankingType,
+        rankingLimit: posPolicy.rankingLimit,
         totalEnrolled: c.enrolls.length,
         sections: Object.values(secMap),
       };
@@ -853,6 +870,7 @@ export async function getReportCardClasses(req: Request, res: Response): Promise
       success: true,
       sessionId,
       sessions: sessions.map((s) => ({ id: s.id, name: s.schoolYear })),
+      defaultShowPosition: sigConfig.defaultShowPosition !== false,
       classes: formatted,
     });
   } catch (error) {
@@ -1256,6 +1274,12 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       };
 
       const defaults = buildDefaultRemarksForAverage(normalizedAvg, st.firstName || 'Student');
+      const classShowPos = schoolBranding.showPosition !== false && schoolBranding.rankingType !== 'hidden';
+      const hideRankForStudent =
+        isCommentClass ||
+        isCombinedCaScope ||
+        !classShowPos ||
+        (schoolBranding.rankingType === 'topn' && rk !== null && rk > (schoolBranding.rankingLimit || 3));
 
       return {
         id: st.id,
@@ -1271,14 +1295,16 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         gender: st.gender || 'N/A',
         usesScores: !isCommentClass,
         isCommentBased: isCommentClass,
+        showPosition: classShowPos,
         totalMarks: isCommentClass ? null : agg.totalMarks,
         average: isCommentClass ? null : normalizedAvg,
         rawAverage: isCommentClass ? null : rawAvg,
         maxMarksPerSubject: activeMaxMarks,
         grade: isCommentClass ? null : grade,
-        // COMBINED_CA: rank and promotion are strictly hidden per spec
-        position: (isCommentClass || isCombinedCaScope) ? null : (rk ? `${getOrdinal(rk)} out of ${studentIds.length}` : 'N/A'),
-        rank: (isCommentClass || isCombinedCaScope) ? null : rk,
+        // COMBINED_CA or Admin-disabled Class Position: rank and position are strictly hidden
+        position: hideRankForStudent ? null : (rk ? `${getOrdinal(rk)} out of ${studentIds.length}` : 'N/A'),
+        rank: hideRankForStudent ? null : rk,
+        totalClassStudents: studentIds.length,
         attendanceDays: att.total > 0 ? `${att.present} / ${att.total} Days` : '0 Days Logged',
         presentCount: att.present,
         absentCount: att.absent,
@@ -1671,7 +1697,13 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       .sort((a, b) => b.avg - a.avg);
 
     const rankIdx = scoreRankList.findIndex((s) => s.id === parsedStudentId);
-    const rank = isCaOnlyStage ? null : (rankIdx !== -1 ? rankIdx + 1 : null);
+    const effectiveRankingType =
+      schoolBranding.showPosition === false
+        ? 'hidden'
+        : (req.query as any)?.rankingType || schoolBranding.rankingType || 'full';
+    const effectiveRankingLimit = Number((req.query as any)?.rankingLimit || schoolBranding.rankingLimit || 3);
+    const showPositionOnCard = effectiveRankingType !== 'hidden' && schoolBranding.showPosition !== false;
+    const rank = isCaOnlyStage || !showPositionOnCard ? null : (rankIdx !== -1 ? rankIdx + 1 : null);
 
     const [comm, montAssessment] = await Promise.all([
       prisma.studentCommentary.findFirst({
@@ -1688,7 +1720,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     const pdfBuffer = await generateReportCardPdf({
       schoolName: schoolBranding.schoolName,
       branchCode: schoolBranding.branchCode,
-      schoolBranding,
+      schoolBranding: { ...schoolBranding, showPosition: showPositionOnCard, rankingType: effectiveRankingType },
       studentName: `${student.lastName}, ${student.firstName}`,
       photo: student.photo,
       gender: student.gender,
@@ -1706,8 +1738,9 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       principalComment: comm?.reviewNotes || defaults.principalComment,
       rank,
       totalClassStudents: studentIds.length,
-      rankingType,
-      rankingLimit: Number(rankingLimit),
+      rankingType: effectiveRankingType,
+      rankingLimit: effectiveRankingLimit,
+      showPosition: showPositionOnCard,
       resumptionDate: schoolBranding.resumptionDate !== 'To Be Announced' ? schoolBranding.resumptionDate : (marks[0]?.exam?.resumptionDate || null),
       nextTermFees: schoolBranding.nextTermFees,
       formTeacherName,
@@ -1950,6 +1983,13 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       });
     }
 
+    const effectiveBatchRankingType =
+      schoolBranding.showPosition === false
+        ? 'hidden'
+        : (req.query as any)?.rankingType || schoolBranding.rankingType || 'full';
+    const effectiveBatchRankingLimit = Number((req.query as any)?.rankingLimit || schoolBranding.rankingLimit || 3);
+    const showPositionOnBatch = effectiveBatchRankingType !== 'hidden' && schoolBranding.showPosition !== false;
+
     const batchStudents = enrolls.map((e) => {
       const st = e.student;
       const agg = studentAggregates[st.id] || { sum: 0, count: 0 };
@@ -1958,7 +1998,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         agg.count > 0 && activeMaxMarks > 0
           ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
           : rawAvg;
-      const rk = isCaOnlyStage ? null : (rankMap[st.id] || null);
+      const rk = isCaOnlyStage || !showPositionOnBatch ? null : (rankMap[st.id] || null);
       const comm = commMap[st.id];
       const mont = montMap[st.id];
       const defaults = buildDefaultRemarksForAverage(normalizedAvg, st.firstName || 'Student');
@@ -1979,6 +2019,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         isEcd: cls?.isEcd || false,
         usesScores: !isCommentClass,
         isCommentBased: isCommentClass,
+        showPosition: showPositionOnBatch,
         reportCard: isCommentClass ? [] : (studentMarksMap[st.id] || []),
         subjectComments: subjectCommentsByStudent[st.id] || [],
         overallAverage: isCommentClass ? 0 : normalizedAvg,
@@ -1987,14 +2028,26 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         principalComment: comm?.reviewNotes || defaults.principalComment,
         rank: isCommentClass ? null : rk,
         totalClassStudents: studentIds.length,
-        rankingType,
-        rankingLimit: Number(rankingLimit),
+        rankingType: effectiveBatchRankingType,
+        rankingLimit: effectiveBatchRankingLimit,
         resumptionDate: schoolBranding.resumptionDate !== 'To Be Announced' ? schoolBranding.resumptionDate : (allMarks[0]?.exam?.resumptionDate || null),
         nextTermFees: schoolBranding.nextTermFees,
         formTeacherName,
         principalName: schoolBranding.principalName,
         examName: mont?.exam?.name || schoolBranding.currentTerm || 'Term Evaluation',
         assessment: mont || {},
+        psychomotor: {
+          writingMastery: mont?.writingMastery || 'AC',
+          drawingCapability: mont?.drawingCapability || 'AC',
+          physicalCoordination: mont?.physicalCoordination || 'AC',
+          motorSkillProgression: mont?.motorSkillProgression || 'AC',
+        },
+        affective: {
+          generalPunctuality: mont?.generalPunctuality || 'AC',
+          peerRespect: mont?.peerRespect || 'AC',
+          aestheticNeatness: mont?.aestheticNeatness || 'AC',
+          activeGroupParticipation: mont?.activeGroupParticipation || 'AC',
+        },
         gradingRanges: gradingScale.ranges,
         isMidTerm,
         stage: activeStage,
@@ -2006,7 +2059,11 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     const pdfBuffer = await generateBatchClassReportCardsPdf({
       schoolName: schoolBranding.schoolName,
       branchCode: schoolBranding.branchCode,
-      schoolBranding,
+      schoolBranding: {
+        ...schoolBranding,
+        showPosition: showPositionOnBatch,
+        rankingType: effectiveBatchRankingType,
+      },
       className,
       sectionName,
       sessionName,
@@ -2794,5 +2851,138 @@ export async function togglePublishReportCards(req: Request, res: Response): Pro
   } catch (err) {
     console.error('[ADMIN] Toggle class publish error:', err);
     return res.status(500).json({ success: false, message: 'Failed to update class publication status.' });
+  }
+}
+
+/**
+ * GET /api/admin/report-cards/position-settings
+ * Returns all classes in the school branch with their configured position/ranking visibility rules.
+ */
+export async function getReportCardPositionSettings(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  if (!branchId) {
+    return res.status(400).json({ success: false, message: 'branchId is required.' });
+  }
+
+  try {
+    const [settings, classes] = await Promise.all([
+      prisma.systemSetting.findUnique({
+        where: { branchId },
+        select: { defaultTeacherSignatureUrl: true },
+      }),
+      prisma.class.findMany({
+        where: { branchId },
+        select: { id: true, name: true, isEcd: true, usesScores: true },
+        orderBy: { id: 'asc' },
+      }),
+    ]);
+
+    const config = parseTeacherSignatureConfig(settings?.defaultTeacherSignatureUrl);
+    const classPolicies = classes.map((cls) => {
+      const policy = resolveClassPositionPolicy(config, cls.id);
+      return {
+        classId: cls.id,
+        className: cls.name,
+        isEcd: Boolean(cls.isEcd),
+        usesScores: cls.usesScores !== false,
+        showPosition: policy.showPosition,
+        rankingType: policy.rankingType,
+        rankingLimit: policy.rankingLimit,
+      };
+    });
+
+    return res.json({
+      success: true,
+      defaultShowPosition: config.defaultShowPosition !== false,
+      classes: classPolicies,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN REPORT CARDS] Get position settings error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load class position settings.' });
+  }
+}
+
+/**
+ * POST /api/admin/report-cards/position-settings
+ * Allows School Admin to toggle or configure report card position visibility per class or in bulk.
+ */
+export async function saveReportCardPositionSettings(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+  if (!branchId) {
+    return res.status(400).json({ success: false, message: 'branchId is required.' });
+  }
+
+  const { classId, showPosition, rankingType, rankingLimit, classes, defaultShowPosition } = req.body || {};
+
+  try {
+    const current = await prisma.systemSetting.findUnique({
+      where: { branchId },
+      select: { defaultTeacherSignatureUrl: true },
+    });
+
+    const config = parseTeacherSignatureConfig(current?.defaultTeacherSignatureUrl);
+    if (!config.positionByClass) config.positionByClass = {};
+
+    if (typeof defaultShowPosition === 'boolean') {
+      config.defaultShowPosition = defaultShowPosition;
+    }
+
+    if (Array.isArray(classes)) {
+      for (const item of classes) {
+        if (!item?.classId) continue;
+        const cKey = String(item.classId);
+        const showPos = Boolean(item.showPosition);
+        const rType: 'full' | 'topn' | 'hidden' = !showPos
+          ? 'hidden'
+          : item.rankingType === 'topn'
+            ? 'topn'
+            : 'full';
+        const rLimit = Number(item.rankingLimit) > 0 ? Number(item.rankingLimit) : 3;
+        config.positionByClass[cKey] = {
+          showPosition: showPos,
+          rankingType: rType,
+          rankingLimit: rLimit,
+        };
+      }
+    } else if (classId) {
+      const cKey = String(classId);
+      const showPos = showPosition !== undefined ? Boolean(showPosition) : rankingType !== 'hidden';
+      const rType: 'full' | 'topn' | 'hidden' = !showPos
+        ? 'hidden'
+        : rankingType === 'topn'
+          ? 'topn'
+          : 'full';
+      const rLimit = Number(rankingLimit) > 0 ? Number(rankingLimit) : 3;
+      config.positionByClass[cKey] = {
+        showPosition: showPos,
+        rankingType: rType,
+        rankingLimit: rLimit,
+      };
+    } else {
+      return res.status(400).json({ success: false, message: 'Provide classId or classes array.' });
+    }
+
+    const serialized = serializeTeacherSignatureConfig(config);
+    await prisma.systemSetting.upsert({
+      where: { branchId },
+      update: {
+        defaultTeacherSignatureUrl: serialized,
+        updatedAt: new Date(),
+      },
+      create: {
+        branchId,
+        defaultTeacherSignatureUrl: serialized,
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Class report card position settings saved successfully.',
+      defaultShowPosition: config.defaultShowPosition !== false,
+      positionByClass: config.positionByClass,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN REPORT CARDS] Save position settings error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save class position settings.' });
   }
 }
