@@ -79,19 +79,27 @@ export async function cascadeDeleteCbtExam(params: {
     if (dist && (!branchId || dist.branchId === branchId)) {
       distIds.add(dist.id)
       if (dist.groupId) groupIds.add(dist.groupId)
-      if (dist.onlineExamId) examIds.add(dist.onlineExamId)
-
-      // Find any companion OnlineExam records with identical title, classId, subjectId, branchId
-      const companions = await prisma.onlineExam.findMany({
-        where: {
-          title: dist.title,
-          classId: dist.classId,
-          subjectId: dist.subjectId,
-          branchId: dist.branchId,
-        },
-        select: { id: true },
-      })
-      companions.forEach((c) => examIds.add(c.id))
+      if (dist.onlineExamId) {
+        // Only delete the linked OnlineExam if no other distribution references it
+        const otherRefs = await prisma.cbtDistribution.count({
+          where: { onlineExamId: dist.onlineExamId, id: { not: dist.id } },
+        })
+        if (otherRefs === 0) {
+          examIds.add(dist.onlineExamId)
+        }
+      } else {
+        // Legacy fallback: only match companion OnlineExam records when onlineExamId is unset
+        const companions = await prisma.onlineExam.findMany({
+          where: {
+            title: dist.title,
+            classId: dist.classId,
+            subjectId: dist.subjectId,
+            branchId: dist.branchId,
+          },
+          select: { id: true },
+        })
+        companions.forEach((c) => examIds.add(c.id))
+      }
     } else {
       // Check if the provided ID was actually an OnlineExam ID
       const maybeExam = await prisma.onlineExam.findUnique({

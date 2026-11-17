@@ -96,22 +96,37 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
       orderBy: { createdAt: 'desc' },
     });
 
-    const companionExams = distributions.length
-      ? await prisma.onlineExam.findMany({
-          where: {
-            branchId: req.branchId,
-            OR: distributions.map((d) => ({
-              title: d.title,
-              classId: d.classId,
-              subjectId: d.subjectId,
-            })),
-          },
-        })
-      : [];
+    const linkedExamIds = distributions
+      .map((d) => d.onlineExamId)
+      .filter((id): id is number => Boolean(id));
+    const unlinkedDistConditions = distributions
+      .filter((d) => !d.onlineExamId)
+      .map((d) => ({
+        title: d.title,
+        classId: d.classId,
+        subjectId: d.subjectId,
+      }));
+
+    const companionExams =
+      linkedExamIds.length > 0 || unlinkedDistConditions.length > 0
+        ? await prisma.onlineExam.findMany({
+            where: {
+              branchId: req.branchId,
+              OR: [
+                ...(linkedExamIds.length > 0 ? [{ id: { in: linkedExamIds } }] : []),
+                ...unlinkedDistConditions,
+              ],
+            },
+          })
+        : [];
+    const companionById = new Map(companionExams.map((e) => [e.id, e]));
     const companionByKey = new Map(
       companionExams.map((e) => [companionExamKey(e.title, e.classId, e.subjectId), e])
     );
-    const coveredKeys = new Set(distributions.map((d) => companionExamKey(d.title, d.classId, d.subjectId)));
+    const coveredExamIds = new Set(linkedExamIds);
+    const coveredKeys = new Set(
+      distributions.filter((d) => !d.onlineExamId).map((d) => companionExamKey(d.title, d.classId, d.subjectId))
+    );
     const unpublishedDists = await prisma.cbtDistribution.findMany({
       where: {
         classId,
@@ -120,7 +135,9 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
       },
       select: { title: true, classId: true, subjectId: true, onlineExamId: true },
     });
-    const unpublishedKeys = new Set(unpublishedDists.map((d) => companionExamKey(d.title, d.classId, d.subjectId)));
+    const unpublishedKeys = new Set(
+      unpublishedDists.filter((d) => !d.onlineExamId).map((d) => companionExamKey(d.title, d.classId, d.subjectId))
+    );
     const unpublishedExamIds = new Set(unpublishedDists.map((d) => d.onlineExamId).filter(Boolean) as number[]);
     const uniqueExamIds = [...new Set([...onlineExams.map((e) => e.id), ...companionExams.map((e) => e.id)])];
     const submissions =
@@ -139,7 +156,9 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
 
     const formattedList = [
       ...distributions.map((dist) => {
-        const companion = companionByKey.get(companionExamKey(dist.title, dist.classId, dist.subjectId));
+        const companion = dist.onlineExamId
+          ? companionById.get(dist.onlineExamId)
+          : companionByKey.get(companionExamKey(dist.title, dist.classId, dist.subjectId));
         const sub = companion ? subMap[companion.id] : undefined;
         const qCount = Array.isArray(dist.group?.questionIds) ? (dist.group.questionIds as any[]).length : 10;
         const windowStatus = examWindowStatus(dist.startDate, dist.endDate);
@@ -177,7 +196,7 @@ export async function getActiveCbtExams(req: Request, res: Response): Promise<Re
       ...onlineExams
         .filter((ex) => {
           const key = companionExamKey(ex.title, ex.classId, ex.subjectId);
-          return !coveredKeys.has(key) && !unpublishedKeys.has(key) && !unpublishedExamIds.has(ex.id);
+          return !coveredExamIds.has(ex.id) && !coveredKeys.has(key) && !unpublishedKeys.has(key) && !unpublishedExamIds.has(ex.id);
         })
         .map((ex) => {
         const sub = subMap[ex.id];
@@ -325,13 +344,17 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
         });
       }
 
-      let onlineEx = await findCompanionOnlineExam({
-        title: dist.title,
-        classId: dist.classId,
-        subjectId: dist.subjectId,
-        branchId: req.branchId,
-        onlineExamId: dist.onlineExamId,
-      });
+      let onlineEx = dist.onlineExamId
+        ? await prisma.onlineExam.findFirst({
+            where: { id: dist.onlineExamId, branchId: req.branchId },
+          })
+        : await findCompanionOnlineExam({
+            title: dist.title,
+            classId: dist.classId,
+            subjectId: dist.subjectId,
+            branchId: req.branchId,
+            onlineExamId: dist.onlineExamId,
+          });
       if (!onlineEx) {
         onlineEx = await prisma.onlineExam.create({
           data: {
@@ -390,7 +413,7 @@ export async function takeCbtExam(req: Request, res: Response): Promise<Response
       where: { onlineExamId: targetOnlineExamId, studentId: req.studentId },
     });
 
-    if (submission && (submission.submittedAt || submission.totalMark !== null)) {
+    if (submission && submission.submittedAt) {
       return res.status(400).json({
         success: false,
         message: 'You have already completed and submitted this examination.',
@@ -477,16 +500,15 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
         });
       }
 
-      let onlineEx = await findCompanionOnlineExam({
-        title: dist.title,
-        classId: dist.classId,
-        subjectId: dist.subjectId,
-        branchId: dist.branchId || req.branchId || 0,
-        onlineExamId: dist.onlineExamId,
-      });
-      if (!onlineEx && dist.onlineExamId) {
-        onlineEx = await prisma.onlineExam.findUnique({ where: { id: dist.onlineExamId } });
-      }
+      let onlineEx = dist.onlineExamId
+        ? await prisma.onlineExam.findUnique({ where: { id: dist.onlineExamId } })
+        : await findCompanionOnlineExam({
+            title: dist.title,
+            classId: dist.classId,
+            subjectId: dist.subjectId,
+            branchId: dist.branchId || req.branchId || 0,
+            onlineExamId: dist.onlineExamId,
+          });
       if (onlineEx) {
         targetOnlineExamId = onlineEx.id;
         if (dist.onlineExamId !== onlineEx.id) {
@@ -517,7 +539,7 @@ export async function submitCbtExam(req: Request, res: Response): Promise<Respon
     if (dist?.onlineExamId) {
       candidateExamIds.add(dist.onlineExamId);
     }
-    if (dist) {
+    if (dist && !dist.onlineExamId) {
       const companions = await prisma.onlineExam.findMany({
         where: {
           branchId: dist.branchId || req.branchId || 0,

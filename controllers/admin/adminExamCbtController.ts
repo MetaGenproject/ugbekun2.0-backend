@@ -1550,22 +1550,23 @@ export async function createCbtDistribution(req: Request, res: Response): Promis
     const globalSetting = await prisma.globalSettings.findFirst();
     const activeSessionId = globalSetting?.sessionId || 5;
 
-    const companionIdentity = existingDist
-      ? {
+    let onlineExam: Awaited<ReturnType<typeof findCompanionOnlineExam>> = null;
+    if (existingDist) {
+      if (existingDist.onlineExamId) {
+        onlineExam = await prisma.onlineExam.findFirst({
+          where: { id: existingDist.onlineExamId, branchId },
+        });
+      }
+      if (!onlineExam) {
+        onlineExam = await findCompanionOnlineExam({
           title: existingDist.title,
           classId: existingDist.classId,
           subjectId: existingDist.subjectId,
           branchId,
           onlineExamId: existingDist.onlineExamId,
-        }
-      : {
-          title: title.trim(),
-          classId: Number(classId),
-          subjectId: Number(subjectId),
-          branchId,
-        };
-
-    let onlineExam = await findCompanionOnlineExam(companionIdentity);
+        });
+      }
+    }
 
     if (onlineExam) {
       await prisma.onlineExam.update({
