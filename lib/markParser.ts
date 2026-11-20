@@ -74,7 +74,9 @@ export function normalizeComponentToken(str: string | null | undefined): string 
 
 /**
  * Classifies a matrix column/component into 'CA', 'PRACTICAL', or 'EXAM'
- * using DB examCategory/category metadata first, then semantic token matching.
+ * using explicit structural category metadata first, then semantic token matching.
+ * Note: Delivery modes such as 'CBT' or 'MANUAL' on linked ExamMaster.examCategory
+ * do NOT override a column's structural identity (e.g. an EXAM column delivered via CBT).
  */
 export function classifyMatrixComponent(comp: {
   code?: string | null;
@@ -84,16 +86,29 @@ export function classifyMatrixComponent(comp: {
   category?: string | null;
   examCategory?: string | null;
 }): MatrixComponentCategory {
-  const explicitCat = String(comp.category || comp.examCategory || '')
+  const explicitCategory = String(comp.category || '')
     .trim()
     .toUpperCase();
-  if (explicitCat === 'EXAM' || explicitCat === 'EXAMINATION' || explicitCat === 'TERMINAL') {
+  if (explicitCategory === 'EXAM' || explicitCategory === 'EXAMINATION' || explicitCategory === 'TERMINAL') {
     return 'EXAM';
   }
-  if (explicitCat === 'PRACTICAL' || explicitCat === 'LAB' || explicitCat === 'PROJECT') {
+  if (explicitCategory === 'PRACTICAL' || explicitCategory === 'LAB' || explicitCategory === 'PROJECT') {
     return 'PRACTICAL';
   }
-  if (explicitCat === 'CA' || explicitCat === 'TEST' || explicitCat === 'CBT') {
+  if (explicitCategory === 'CA' || explicitCategory === 'TEST') {
+    return 'CA';
+  }
+
+  const examCat = String(comp.examCategory || '')
+    .trim()
+    .toUpperCase();
+  if (examCat === 'EXAM' || examCat === 'EXAMINATION' || examCat === 'TERMINAL') {
+    return 'EXAM';
+  }
+  if (examCat === 'PRACTICAL' || examCat === 'LAB' || examCat === 'PROJECT') {
+    return 'PRACTICAL';
+  }
+  if (examCat === 'CA' || examCat === 'TEST') {
     return 'CA';
   }
 
