@@ -375,8 +375,10 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
     let totalScoreSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.map((m) => {
+    const reportCard = studentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      const isAbsent = m.absent === '1' || m.absent === 'true';
+      if (!mapped.hasValidScore && !isAbsent) return [];
 
       if (mapped.hasValidScore) {
         totalScoreSum += mapped.stageTotal;
@@ -392,7 +394,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
           ? mapped.stageTotal
           : 0;
 
-      return {
+      return [{
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
@@ -403,9 +405,9 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
         componentScores: mapped.componentScores,
         maxMarks: activeMaxMarks,
-        absent: m.absent === '1' || m.absent === 'true',
+        absent: isAbsent,
         classAverage,
-      };
+      }];
     });
 
     const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
@@ -775,8 +777,10 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
     let totalScoreSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.map((m) => {
+    const reportCard = studentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      const isAbsent = m.absent === '1' || m.absent === 'true';
+      if (!mapped.hasValidScore && !isAbsent) return [];
 
       if (mapped.hasValidScore) {
         totalScoreSum += mapped.stageTotal;
@@ -792,7 +796,7 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
           ? mapped.stageTotal
           : 0;
 
-      return {
+      return [{
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
@@ -802,9 +806,9 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
         mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
         componentScores: mapped.componentScores,
         maxMarks: activeMaxMarks,
-        absent: m.absent === '1' || m.absent === 'true',
+        absent: isAbsent,
         classAverage,
-      };
+      }];
     });
 
     const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;

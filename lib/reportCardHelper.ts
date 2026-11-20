@@ -1,4 +1,6 @@
 import prismaDefault from './prisma';
+import { ResolvedClassMatrix, mapStudentMarkToMatrix } from './markParser';
+import { calculateGradeFromRanges } from './gradingService';
 
 export interface ClassPositionPolicy {
   showPosition: boolean;
@@ -702,4 +704,177 @@ export async function syncReportCardOnScoreSave(
   } catch (err) {
     console.error('[REPORT CARD SYNC] Error syncing report card on score save:', err);
   }
+}
+
+export interface AssignedSubjectInfo {
+  subjectId: number;
+  subjectName: string;
+  subjectCode: string;
+}
+
+/**
+ * Resolves the canonical deduplicated list of subjects assigned to a class/section
+ * under Academics (SubjectAssign) for the given session, falling back to the
+ * latest session's assignments if the target session has none.
+ */
+export async function resolveAssignedClassSubjects(
+  db: any,
+  params: {
+    classId: number;
+    sectionId?: number | null;
+    sessionId?: number | null;
+    branchId?: number | null;
+  }
+): Promise<AssignedSubjectInfo[]> {
+  const { classId, sectionId, sessionId, branchId } = params;
+  const baseWhere: any = {
+    classId,
+    ...(branchId ? { branchId } : {}),
+    ...(sectionId ? { sectionId } : {}),
+  };
+
+  let assigns = await db.subjectAssign.findMany({
+    where: {
+      ...baseWhere,
+      ...(sessionId ? { sessionId } : {}),
+    },
+    include: {
+      subject: { select: { id: true, name: true, subjectCode: true } },
+    },
+  });
+
+  if (assigns.length === 0 && sessionId) {
+    const latestAssign = await db.subjectAssign.findFirst({
+      where: baseWhere,
+      orderBy: { sessionId: 'desc' },
+      select: { sessionId: true },
+    });
+    if (latestAssign?.sessionId) {
+      assigns = await db.subjectAssign.findMany({
+        where: { ...baseWhere, sessionId: latestAssign.sessionId },
+        include: {
+          subject: { select: { id: true, name: true, subjectCode: true } },
+        },
+      });
+    }
+  }
+
+  const bySubjectId = new Map<number, AssignedSubjectInfo>();
+  for (const a of assigns) {
+    if (!a.subjectId || bySubjectId.has(a.subjectId)) continue;
+    bySubjectId.set(a.subjectId, {
+      subjectId: a.subjectId,
+      subjectName: a.subject?.name || 'Subject',
+      subjectCode: a.subject?.subjectCode || 'N/A',
+    });
+  }
+
+  return Array.from(bySubjectId.values()).sort((a, b) =>
+    a.subjectName.localeCompare(b.subjectName)
+  );
+}
+
+/**
+ * Builds canonical report card rows for a single student by left-joining
+ * consolidated marks onto the class's assigned subjects.
+ */
+export function buildReportCardRowsForStudent(params: {
+  assignedSubjects: AssignedSubjectInfo[];
+  studentMarks: any[];
+  dbMatrix: ResolvedClassMatrix;
+  activeStage: string;
+  activeMaxMarks: number;
+  isCombinedCaScope: boolean;
+  classSubjectTotals: Record<string, { sum: number; count: number }>;
+  gradingRanges?: any[];
+}): {
+  rows: any[];
+  sum: number;
+  count: number;
+  totalMarks: number;
+} {
+  const {
+    assignedSubjects,
+    studentMarks,
+    dbMatrix,
+    activeStage,
+    activeMaxMarks,
+    isCombinedCaScope,
+    classSubjectTotals,
+    gradingRanges,
+  } = params;
+
+  const markBySubjectId = new Map<number, any>();
+  for (const m of studentMarks) {
+    const subId = Number(m.subject?.id || m.subjectId);
+    if (subId && !markBySubjectId.has(subId)) {
+      markBySubjectId.set(subId, m);
+    }
+  }
+
+  const rows: any[] = [];
+  let sum = 0;
+  let count = 0;
+  let totalMarks = 0;
+
+  const subjectsToRender: Array<{ subjectId: number; subjectName: string; subjectCode: string; markRecord?: any }> =
+    assignedSubjects.length > 0
+      ? assignedSubjects.map((s) => ({
+          ...s,
+          markRecord: markBySubjectId.get(s.subjectId),
+        }))
+      : studentMarks.map((m) => ({
+          subjectId: Number(m.subject?.id || m.subjectId),
+          subjectName: m.subject?.name || 'Subject',
+          subjectCode: m.subject?.subjectCode || 'N/A',
+          markRecord: m,
+        }));
+
+  for (const item of subjectsToRender) {
+    const m = item.markRecord;
+    if (!m) continue;
+
+    const isAbsent = m.absent === '1' || m.absent === 'true';
+    const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+    if (!mapped.hasValidScore && !isAbsent) {
+      continue;
+    }
+
+    const cAvgObj = classSubjectTotals[String(item.subjectId)];
+    const scoreForStage = mapped.stageTotal;
+    const classAvg =
+      cAvgObj && cAvgObj.count > 0
+        ? Number((cAvgObj.sum / cAvgObj.count).toFixed(1))
+        : mapped.hasValidScore
+          ? scoreForStage
+          : 0;
+    const gradeRes = gradingRanges
+      ? calculateGradeFromRanges(mapped.normalizedPercentage, gradingRanges)
+      : { grade: '-', remark: '-' };
+
+    rows.push({
+      id: m.id,
+      examName: m.exam?.name || 'Evaluation',
+      subjectName: item.subjectName,
+      subjectCode: item.subjectCode,
+      cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
+      theoryMark: isCombinedCaScope ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+      mark: mapped.hasValidScore ? String(scoreForStage) : null,
+      stageScore: scoreForStage,
+      maxMarks: activeMaxMarks,
+      componentScores: mapped.componentScores,
+      grade: mapped.hasValidScore ? gradeRes.grade : '-',
+      remark: mapped.hasValidScore ? gradeRes.remark : '-',
+      classAverage: classAvg,
+      absent: isAbsent,
+    });
+
+    if (mapped.hasValidScore) {
+      sum += scoreForStage;
+      count += 1;
+      totalMarks += scoreForStage;
+    }
+  }
+
+  return { rows, sum, count, totalMarks };
 }

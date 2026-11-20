@@ -28,6 +28,8 @@ import {
   parseTeacherSignatureConfig,
   serializeTeacherSignatureConfig,
   resolveClassPositionPolicy,
+  resolveAssignedClassSubjects,
+  buildReportCardRowsForStudent,
 } from '../../lib/reportCardHelper';
 
 export function getRatingLabel(rating: number): string {
@@ -1092,11 +1094,22 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
     const dedupedEnrolls = Array.from(reportStudentMap.values());
     const studentIds = dedupedEnrolls.map((e) => e.studentId);
 
+    const assignedSubjects = await resolveAssignedClassSubjects(prisma, {
+      classId: parsedClassId,
+      sectionId: parsedSectionId,
+      sessionId,
+      branchId,
+    });
+    const assignedSubjectIds = assignedSubjects.map((s) => s.subjectId);
+
     const marks = await prisma.mark.findMany({
       where: {
         studentId: { in: studentIds },
+        classId: parsedClassId,
         sessionId,
         branchId,
+        ...(parsedTermId ? { exam: { termId: parsedTermId } } : {}),
+        ...(assignedSubjectIds.length > 0 ? { subjectId: { in: assignedSubjectIds } } : {}),
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
@@ -1202,41 +1215,30 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       }
     });
 
+    const marksByStudent = new Map<number, any[]>();
     consolidatedMarks.forEach((m) => {
-      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
-      if (studentMarksMap[m.studentId]) {
-        const scoreForStage = mapped.stageTotal;
-        const subKey = String(m.subject?.id || m.subjectId);
-        const cAvgObj = classSubjectTotals[subKey];
-        const classAvg =
-          cAvgObj && cAvgObj.count > 0
-            ? Number((cAvgObj.sum / cAvgObj.count).toFixed(1))
-            : scoreForStage;
+      const list = marksByStudent.get(m.studentId) || [];
+      list.push(m);
+      marksByStudent.set(m.studentId, list);
+    });
 
-        const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
-
-        studentMarksMap[m.studentId].push({
-          id: m.id,
-          examName: m.exam?.name || 'Evaluation',
-          subjectName: m.subject?.name || 'Subject',
-          subjectCode: m.subject?.subjectCode || 'N/A',
-          cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
-          theoryMark: isCombinedCaScope ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
-          mark: mapped.hasValidScore ? String(scoreForStage) : null,
-          stageScore: scoreForStage,
-          maxMarks: activeMaxMarks,
-          componentScores: mapped.componentScores,
-          grade: mapped.hasValidScore ? gradeRes.grade : '-',
-          remark: mapped.hasValidScore ? gradeRes.remark : '-',
-          classAverage: classAvg,
-          absent: m.absent === '1' || m.absent === 'true',
-        });
-        if (mapped.hasValidScore) {
-          studentAggregates[m.studentId].sum += scoreForStage;
-          studentAggregates[m.studentId].count += 1;
-          studentAggregates[m.studentId].totalMarks += scoreForStage;
-        }
-      }
+    studentIds.forEach((stId) => {
+      const built = buildReportCardRowsForStudent({
+        assignedSubjects,
+        studentMarks: marksByStudent.get(stId) || [],
+        dbMatrix,
+        activeStage,
+        activeMaxMarks,
+        isCombinedCaScope,
+        classSubjectTotals,
+        gradingRanges: gradingScale.ranges,
+      });
+      studentMarksMap[stId] = built.rows;
+      studentAggregates[stId] = {
+        sum: built.sum,
+        count: built.count,
+        totalMarks: built.totalMarks,
+      };
     });
 
     const scores = studentIds.map((id) => ({
@@ -1612,8 +1614,22 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
     const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
 
+    const assignedSubjects = await resolveAssignedClassSubjects(prisma, {
+      classId: parsedClassId,
+      sectionId: parsedSectionId,
+      sessionId,
+      branchId,
+    });
+    const assignedSubjectIds = assignedSubjects.map((s) => s.subjectId);
+
     const rawMarks = await prisma.mark.findMany({
-      where: { studentId: parsedStudentId, sessionId, branchId },
+      where: {
+        studentId: parsedStudentId,
+        classId: parsedClassId,
+        sessionId,
+        branchId,
+        ...(assignedSubjectIds.length > 0 ? { subjectId: { in: assignedSubjectIds } } : {}),
+      },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
         exam: { select: { name: true, resumptionDate: true } },
@@ -1622,11 +1638,17 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     const marks = consolidateMarksByStudentAndSubject(rawMarks, dbMatrix);
 
     const rawClassMarks = await prisma.mark.findMany({
-      where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId },
+      where: {
+        classId: parsedClassId,
+        sectionId: parsedSectionId,
+        sessionId,
+        branchId,
+        ...(assignedSubjectIds.length > 0 ? { subjectId: { in: assignedSubjectIds } } : {}),
+      },
       select: { id: true, examId: true, subjectId: true, mark: true, cbtMark: true, absent: true, studentId: true },
     });
     const allClassMarks = consolidateMarksByStudentAndSubject(rawClassMarks, dbMatrix);
-    const avgMap: Record<string, any> = {};
+    const avgMap: Record<string, { sum: number; count: number }> = {};
     allClassMarks.forEach((m) => {
       const k = String(m.subjectId);
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
@@ -1637,33 +1659,18 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       }
     });
 
-    let totalSum = 0;
-    let marksCount = 0;
-    const reportCard = marks.map((m) => {
-      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
-      if (mapped.hasValidScore) {
-        totalSum += mapped.stageTotal;
-        marksCount += 1;
-      }
-
-      const k = String(m.subjectId || m.subject?.id);
-      const cAvg =
-        avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : mapped.stageTotal;
-
-      return {
-        id: m.id,
-        examName: m.exam?.name || 'Term Evaluation',
-        subjectName: m.subject?.name || 'Subject',
-        subjectCode: m.subject?.subjectCode || 'N/A',
-        cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
-        theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
-        mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
-        componentScores: mapped.componentScores,
-        maxMarks: activeMaxMarks,
-        absent: m.absent === '1' || m.absent === 'true',
-        classAverage: cAvg,
-      };
+    const builtSingle = buildReportCardRowsForStudent({
+      assignedSubjects,
+      studentMarks: marks,
+      dbMatrix,
+      activeStage,
+      activeMaxMarks,
+      isCombinedCaScope: isCaOnlyStage,
+      classSubjectTotals: avgMap,
     });
+    const totalSum = builtSingle.sum;
+    const marksCount = builtSingle.count;
+    const reportCard = builtSingle.rows;
 
     const rawAverage = marksCount > 0 ? Number((totalSum / marksCount).toFixed(1)) : 0;
     const overallAverage =
@@ -1860,8 +1867,22 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       return res.status(404).json({ success: false, message: 'No enrolled students found in this class/section.' });
     }
 
+    const assignedSubjects = await resolveAssignedClassSubjects(prisma, {
+      classId: parsedClassId,
+      sectionId: parsedSectionId,
+      sessionId,
+      branchId,
+    });
+    const assignedSubjectIds = assignedSubjects.map((s) => s.subjectId);
+
     const rawAllMarks = await prisma.mark.findMany({
-      where: { studentId: { in: studentIds }, sessionId, branchId },
+      where: {
+        studentId: { in: studentIds },
+        classId: parsedClassId,
+        sessionId,
+        branchId,
+        ...(assignedSubjectIds.length > 0 ? { subjectId: { in: assignedSubjectIds } } : {}),
+      },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
         exam: { select: { name: true, resumptionDate: true } },
@@ -1869,7 +1890,7 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     });
     const allMarks = consolidateMarksByStudentAndSubject(rawAllMarks, dbMatrix);
 
-    const avgMap: Record<string, any> = {};
+    const avgMap: Record<string, { sum: number; count: number }> = {};
     allMarks.forEach((m) => {
       const k = String(m.subjectId || m.subject?.id);
       if (!avgMap[k]) avgMap[k] = { sum: 0, count: 0 };
@@ -1882,40 +1903,25 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
 
     const studentAggregates: Record<number, any> = {};
     const studentMarksMap: Record<number, any[]> = {};
-    studentIds.forEach((id) => {
-      studentAggregates[id] = { sum: 0, count: 0 };
-      studentMarksMap[id] = [];
+    const batchMarksByStudent = new Map<number, any[]>();
+    allMarks.forEach((m) => {
+      const list = batchMarksByStudent.get(m.studentId) || [];
+      list.push(m);
+      batchMarksByStudent.set(m.studentId, list);
     });
 
-    allMarks.forEach((m) => {
-      const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
-
-      if (studentMarksMap[m.studentId]) {
-        const scoreForStage = mapped.stageTotal;
-        const k = String(m.subjectId || m.subject?.id);
-        const cAvg =
-          avgMap[k] && avgMap[k].count > 0 ? Number((avgMap[k].sum / avgMap[k].count).toFixed(1)) : scoreForStage;
-
-        studentMarksMap[m.studentId].push({
-          id: m.id,
-          examName: m.exam?.name || 'Evaluation',
-          subjectName: m.subject?.name || 'Subject',
-          subjectCode: m.subject?.subjectCode || 'N/A',
-          cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
-          theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
-          mark: mapped.hasValidScore ? String(scoreForStage) : null,
-          stageScore: scoreForStage,
-          componentScores: mapped.componentScores,
-          maxMarks: activeMaxMarks,
-          absent: m.absent === '1' || m.absent === 'true',
-          classAverage: cAvg,
-        });
-
-        if (mapped.hasValidScore) {
-          studentAggregates[m.studentId].sum += scoreForStage;
-          studentAggregates[m.studentId].count += 1;
-        }
-      }
+    studentIds.forEach((id) => {
+      const built = buildReportCardRowsForStudent({
+        assignedSubjects,
+        studentMarks: batchMarksByStudent.get(id) || [],
+        dbMatrix,
+        activeStage,
+        activeMaxMarks,
+        isCombinedCaScope: isCaOnlyStage,
+        classSubjectTotals: avgMap,
+      });
+      studentAggregates[id] = { sum: built.sum, count: built.count };
+      studentMarksMap[id] = built.rows;
     });
 
     const rankList = studentIds

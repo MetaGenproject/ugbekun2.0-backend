@@ -1496,15 +1496,17 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     let totalPercentageSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.map((m) => {
+    const reportCard = studentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      const isAbsent = m.absent === '1' || m.absent === 'true';
+      if (!mapped.hasValidScore && !isAbsent) return [];
       if (mapped.hasValidScore) {
         totalPercentageSum += mapped.normalizedPercentage;
         marksCount++;
       }
       const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
 
-      return {
+      return [{
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
@@ -1517,9 +1519,9 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         maxMarks: activeMaxMarks,
         grade: gradeRes.grade,
         remark: gradeRes.remark,
-        absent: m.absent === '1' || m.absent === 'true',
+        absent: isAbsent,
         classAverage: mapped.stageTotal,
-      };
+      }];
     });
 
     const overallAverage = marksCount > 0 ? Number((totalPercentageSum / marksCount).toFixed(1)) : 0;

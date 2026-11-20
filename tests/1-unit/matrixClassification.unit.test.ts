@@ -6,6 +6,7 @@ import {
   parseMarkScore,
   resolveActiveMatrixColumnsForStage,
 } from '../../lib/markParser';
+import { buildReportCardRowsForStudent } from '../../lib/reportCardHelper';
 
 export async function testMatrixClassificationUnit() {
   console.log('\n--- [UNIT TEST] Matrix Component Classification & COMBINED_CA Max Marks ---');
@@ -87,6 +88,30 @@ export async function testMatrixClassificationUnit() {
   const parsedEmptyWithCbt = parseMarkScore('{"CA1":"","CA2":"","EXAM":""}', '18');
   assert.equal(parsedEmptyWithCbt.hasValidScore, false);
   assert.equal(parsedEmptyWithCbt.total, 0);
+
+  // 5. Report card rows must include ONLY assigned subjects that have teacher/admin-filled scores
+  const built = buildReportCardRowsForStudent({
+    assignedSubjects: [
+      { subjectId: 1, subjectName: 'Literacy', subjectCode: 'LIT' },
+      { subjectId: 2, subjectName: 'Numeracy', subjectCode: 'NUM' },
+      { subjectId: 3, subjectName: 'Basic Science', subjectCode: 'BSC' },
+    ],
+    studentMarks: [
+      { id: 101, subjectId: 1, mark: '{"CA1":"18","CA2":"","EXAM":""}', cbtMark: '18', absent: '0' },
+      { id: 102, subjectId: 2, mark: '{"CA1":"","CA2":"","EXAM":""}', cbtMark: '15', absent: '0' }, // unentered CBT-only
+      { id: 103, subjectId: 99, mark: '{"CA1":"19","CA2":"","EXAM":""}', cbtMark: null, absent: '0' }, // unassigned subject
+    ],
+    dbMatrix: resolved,
+    activeStage: 'COMBINED_CA',
+    activeMaxMarks: 40,
+    isCombinedCaScope: true,
+    classSubjectTotals: { '1': { sum: 18, count: 1 } },
+  });
+  assert.equal(built.rows.length, 1);
+  assert.equal(built.rows[0].subjectName, 'Literacy');
+  assert.equal(built.rows[0].mark, '18');
+  assert.equal(built.count, 1);
+  assert.equal(built.sum, 18);
 
   console.log('✔ Matrix classification & COMBINED_CA unit validations passed.');
 }

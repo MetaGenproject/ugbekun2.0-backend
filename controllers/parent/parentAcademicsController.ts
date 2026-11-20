@@ -487,8 +487,10 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     let totalScoreSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.map((m) => {
+    const reportCard = studentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      const isAbsent = m.absent === '1' || m.absent === 'true';
+      if (!mapped.hasValidScore && !isAbsent) return [];
 
       if (mapped.hasValidScore) {
         totalScoreSum += mapped.stageTotal;
@@ -507,7 +509,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       // ZERO DATA LEAKAGE: When exam/full is not released, sanitize theoryMark, mark (total) and classAverage!
       const caScore = mapped.caTotal > 0 ? String(mapped.caTotal) : (mapped.stageTotal > 0 && !isExamReleased ? String(mapped.stageTotal) : null);
 
-      return {
+      return [{
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
@@ -521,10 +523,10 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         mark: (isExamReleased || isCombinedCaOnly || isCaOnlyStage) ? (mapped.hasValidScore ? String(mapped.stageTotal) : null) : null,
         componentScores: mapped.componentScores,
         maxMarks: activeMaxMarks,
-        absent: m.absent === '1' || m.absent === 'true',
+        absent: isAbsent,
         classAverage: isExamReleased ? classAverage : null,
-        statusRemark: m.absent === '1' || m.absent === 'true' ? 'Absent' : (caScore ? 'Progress recorded' : 'Pending'),
-      };
+        statusRemark: isAbsent ? 'Absent' : (caScore ? 'Progress recorded' : 'Pending'),
+      }];
     });
 
     // Zero Leakage: Withhold overall average if terminal exam is unreleased
@@ -1026,8 +1028,10 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
     let totalScoreSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.map((m) => {
+    const reportCard = studentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+      const isAbsent = m.absent === '1' || m.absent === 'true';
+      if (!mapped.hasValidScore && !isAbsent) return [];
 
       if (mapped.hasValidScore) {
         totalScoreSum += mapped.stageTotal;
@@ -1044,7 +1048,7 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
           : 0;
 
       // ZERO DATA LEAKAGE IN PDF:
-      return {
+      return [{
         id: m.id,
         examName: m.exam.name,
         subjectName: m.subject.name,
@@ -1056,9 +1060,9 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         mark: (isExamReleased || isCaOnlyStage) ? (mapped.hasValidScore ? String(mapped.stageTotal) : null) : null,
         componentScores: mapped.componentScores,
         maxMarks: activeMaxMarks,
-        absent: m.absent === '1' || m.absent === 'true',
+        absent: isAbsent,
         classAverage: isExamReleased ? classAverage : null,
-      };
+      }];
     });
 
     const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
