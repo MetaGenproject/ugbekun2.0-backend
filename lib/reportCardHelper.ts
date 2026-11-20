@@ -651,8 +651,7 @@ export async function syncReportCardOnScoreSave(
             manualSum = parseFloat(String(m.mark)) || 0;
           }
         }
-        const cbtScore = parseFloat(String(m.cbtMark || '0')) || 0;
-        const total = Math.min(100, manualSum + cbtScore);
+        const total = Math.min(100, manualSum);
         if (total > 0) {
           const list = scoresByStudent.get(m.studentId) || [];
           list.push(total);

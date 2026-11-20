@@ -220,16 +220,9 @@ export function parseMarkScore(
     }
   }
 
-  // Only add standalone cbtMark when rawMark did not already contain JSON component marks
-  // (Prevents double-counting when CBT Auto-Fill writes into both componentMarks JSON and cbtMark)
-  if (!parsedFromJsonComponents && cbtMark !== null && cbtMark !== undefined && String(cbtMark).trim() !== '') {
-    const cbt = parseFloat(String(cbtMark).trim());
-    if (!isNaN(cbt) && cbt > 0) {
-      testScore += cbt;
-      total += cbt;
-      hasValidScore = true;
-    }
-  }
+  // Report cards must strictly reflect scores saved into the evaluation matrix (rawMark)
+  // by teachers or admins; standalone cbtMark is only for Marks Entry staging/auto-fill.
+  void cbtMark;
 
   return {
     total: Math.round(total * 100) / 100,
@@ -781,22 +774,8 @@ export function mapStudentMarkToMatrix(
     }
   }
 
-  // Fallback for standalone cbtMark when no CA column was populated from JSON
-  const cbtRaw = markRecord?.cbtMark;
-  if (cbtRaw !== null && cbtRaw !== undefined && String(cbtRaw).trim() !== '') {
-    const cbtVal = parseFloat(String(cbtRaw).trim());
-    if (!isNaN(cbtVal) && cbtVal > 0) {
-      const anyCaPopulated = dbMatrix.caColumns.some((c) => componentScores[c.code] !== null);
-      if (!anyCaPopulated && dbMatrix.caColumns.length > 0) {
-        const firstCa = dbMatrix.caColumns[0];
-        componentScores[firstCa.code] = cbtVal;
-        componentScores[firstCa.key] = cbtVal;
-        numericComponents[firstCa.code] = cbtVal;
-        numericComponents[firstCa.key] = cbtVal;
-        hasValidScore = true;
-      }
-    }
-  }
+  // Standalone markRecord.cbtMark is intentionally NOT injected into CA columns here:
+  // report cards must only display scores explicitly entered/saved into Mark.mark by teachers or admins.
 
   let fullTotal = 0;
   let caTotal = 0;

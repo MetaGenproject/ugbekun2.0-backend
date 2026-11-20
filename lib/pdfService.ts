@@ -1398,9 +1398,6 @@ function drawStandardReportCard(doc, params) {
     if (cat === 'EXAM' && row.theoryMark !== undefined && row.theoryMark !== null) {
       return String(row.theoryMark);
     }
-    if (cat === 'CA' && compIdx === 0 && row.cbtMark !== undefined && row.cbtMark !== null) {
-      return String(row.cbtMark);
-    }
     return '-';
   };
 

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import {
   buildResolvedMatrixFromDbRecord,
   classifyMatrixComponent,
+  mapStudentMarkToMatrix,
+  parseMarkScore,
   resolveActiveMatrixColumnsForStage,
 } from '../../lib/markParser';
 
@@ -70,6 +72,21 @@ export async function testMatrixClassificationUnit() {
   assert.equal(combinedCa.activeStage, 'COMBINED_CA');
   assert.equal(combinedCa.activeMaxMarks, 40);
   assert.equal(combinedCa.activeColumns.length, 2);
+
+  // 4. Unentered matrix scores must NEVER fall back to standalone cbtMark on report cards
+  const emptyMatrixWithCbt = mapStudentMarkToMatrix(
+    { mark: '{"CA1":"","CA2":"","EXAM":""}', cbtMark: '18', absent: '0' },
+    resolved,
+    'FULL'
+  );
+  assert.equal(emptyMatrixWithCbt.hasValidScore, false);
+  assert.equal(emptyMatrixWithCbt.caTotal, 0);
+  assert.equal(emptyMatrixWithCbt.fullTotal, 0);
+  assert.equal(emptyMatrixWithCbt.componentScores.CA1, null);
+
+  const parsedEmptyWithCbt = parseMarkScore('{"CA1":"","CA2":"","EXAM":""}', '18');
+  assert.equal(parsedEmptyWithCbt.hasValidScore, false);
+  assert.equal(parsedEmptyWithCbt.total, 0);
 
   console.log('✔ Matrix classification & COMBINED_CA unit validations passed.');
 }
