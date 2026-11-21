@@ -75,21 +75,140 @@ export function computeSimilarity(s1: string, s2: string): number {
   return 1.0 - distance / maxLength;
 }
 
+async function resolveActiveBranchTermId(branchId?: number | null): Promise<number> {
+  if (!branchId) return 1;
+  const sys = await prisma.systemSetting.findFirst({
+    where: { branchId },
+    select: { currentTerm: true },
+  });
+  const txt = String(sys?.currentTerm || '').toLowerCase();
+  if (txt.includes('second') || txt.includes('2nd')) return 2;
+  if (txt.includes('third') || txt.includes('3rd')) return 3;
+  return 1;
+}
+
+async function resolveSessionScopedExamId(params: {
+  branchId?: number | null;
+  sessionId: number;
+  requestedExamId?: number | null;
+  preferredTermId?: number | null;
+}): Promise<number> {
+  const { branchId, sessionId, requestedExamId, preferredTermId } = params;
+  const activeTermId = preferredTermId || (await resolveActiveBranchTermId(branchId));
+
+  if (requestedExamId && requestedExamId > 0) {
+    const reqExam = await prisma.exam.findUnique({ where: { id: requestedExamId } });
+    if (
+      reqExam &&
+      reqExam.sessionId === sessionId &&
+      (!branchId || reqExam.branchId === branchId)
+    ) {
+      return reqExam.id;
+    }
+  }
+
+  // Fallback within the SAME sessionId + matching termId first, then any exam in the same sessionId
+  const sameTermExam = await prisma.exam.findFirst({
+    where: {
+      ...(branchId ? { branchId } : {}),
+      sessionId,
+      termId: activeTermId,
+    },
+    orderBy: { id: 'desc' },
+    select: { id: true },
+  });
+  if (sameTermExam) return sameTermExam.id;
+
+  const sameSessionExam = await prisma.exam.findFirst({
+    where: {
+      ...(branchId ? { branchId } : {}),
+      sessionId,
+    },
+    orderBy: { id: 'desc' },
+    select: { id: true },
+  });
+  if (sameSessionExam) return sameSessionExam.id;
+
+  // Create a clean term exam for this session so we never cross-link prior sessions
+  if (branchId) {
+    const termLabel = activeTermId === 2 ? '2nd Term' : activeTermId === 3 ? '3rd Term' : '1st Term';
+    const created = await prisma.exam.create({
+      data: {
+        name: `${termLabel} Evaluation`,
+        branchId,
+        sessionId,
+        termId: activeTermId,
+        typeId: 1,
+        remark: 'Academic Evaluation',
+        markDistribution: JSON.stringify([{ id: 1, mark: 100 }]),
+        status: 1,
+        publishResult: 1,
+      },
+      select: { id: true },
+    });
+    return created.id;
+  }
+
+  return requestedExamId && requestedExamId > 0 ? requestedExamId : 1;
+}
+
 /**
  * GET /api/teacher/exams
+ * Strictly scoped to the requested or active academic session (and active term first)
+ * so prior-session exams never leak into current-session marks entry dropdowns.
  */
 export async function getExams(req: Request, res: Response): Promise<Response | void> {
   try {
-    const exams = await prisma.exam.findMany({
-      where: req.branchId ? { branchId: req.branchId } : {},
+    const querySessionId = req.query.sessionId ? Number(req.query.sessionId) : 0;
+    const queryTermId = req.query.termId ? Number(req.query.termId) : 0;
+    const globalSetting = !querySessionId ? await prisma.globalSettings.findFirst() : null;
+    const targetSessionId = querySessionId || globalSetting?.sessionId || 0;
+    const activeTermId = queryTermId || (await resolveActiveBranchTermId(req.branchId));
+
+    const whereClause: any = {
+      ...(req.branchId ? { branchId: req.branchId } : {}),
+      ...(targetSessionId ? { sessionId: targetSessionId } : {}),
+      ...(queryTermId ? { termId: queryTermId } : {}),
+    };
+
+    let exams = await prisma.exam.findMany({
+      where: whereClause,
       select: {
         id: true,
         name: true,
         termId: true,
+        sessionId: true,
       },
       orderBy: { id: 'desc' },
     });
-    return res.json({ success: true, exams });
+
+    if (exams.length === 0 && req.branchId && targetSessionId) {
+      await resolveSessionScopedExamId({
+        branchId: req.branchId,
+        sessionId: targetSessionId,
+        preferredTermId: activeTermId,
+      });
+      exams = await prisma.exam.findMany({
+        where: whereClause,
+        select: {
+          id: true,
+          name: true,
+          termId: true,
+          sessionId: true,
+        },
+        orderBy: { id: 'desc' },
+      });
+    }
+
+    // Prioritize current active term exams at the top so UI auto-selects the right term
+    exams.sort((a, b) => {
+      const aMatch = a.termId === activeTermId ? 0 : 1;
+      const bMatch = b.termId === activeTermId ? 0 : 1;
+      if (aMatch !== bMatch) return aMatch - bMatch;
+      return b.id - a.id;
+    });
+
+    return res.json({ success: true, exams, sessionId: targetSessionId || null, termId: activeTermId });
   } catch (error) {
     console.error('[TEACHER] Fetch exams error:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch exams.' });
@@ -3822,10 +3941,15 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
 
   try {
     const globalSetting = await prisma.globalSettings.findFirst();
-    const examRecord = exId ? await prisma.exam.findUnique({ where: { id: exId } }) : null;
     const activeSession = sessionId
       ? Number(sessionId)
-      : (examRecord?.sessionId || globalSetting?.sessionId || 1);
+      : (globalSetting?.sessionId || 1);
+    const resolvedExId = await resolveSessionScopedExamId({
+      branchId,
+      sessionId: activeSession,
+      requestedExamId: examId ? Number(examId) : null,
+      preferredTermId: req.body?.termId ? Number(req.body.termId) : null,
+    });
 
     let savedCount = 0;
     for (const item of rawMarks) {
@@ -3840,7 +3964,8 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
           classId: cId,
           subjectId: subId,
           studentId: sId,
-          ...(examId ? { examId: exId } : { sessionId: activeSession }),
+          examId: resolvedExId,
+          sessionId: activeSession,
         },
       });
 
@@ -3851,7 +3976,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
             mark: markValue,
             absent: isAbsentStr,
             sessionId: activeSession,
-            ...(examId ? { examId: exId } : {}),
+            examId: resolvedExId,
           },
         });
       } else {
@@ -3862,7 +3987,7 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
             sectionId: secId,
             subjectId: subId,
             studentId: sId,
-            examId: exId,
+            examId: resolvedExId,
             sessionId: activeSession,
             mark: markValue,
             absent: isAbsentStr,
