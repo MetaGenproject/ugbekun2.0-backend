@@ -27,6 +27,8 @@ import { getRatingLabel } from '../admin/adminMarksReportController';
 import {
   resolveSchoolReportBranding,
   syncReportCardOnScoreSave,
+  bulkSaveMarksBatch,
+  bulkSaveSubjectCommentsBatch,
   buildDefaultRemarksForAverage,
   computeStudentAttendanceMap,
 } from '../../lib/reportCardHelper';
@@ -1324,54 +1326,36 @@ export async function batchSaveGradebook(req: Request, res: Response): Promise<R
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
+    const globalSetting = await prisma.globalSettings.findFirst({ select: { sessionId: true } });
     const sessionId = globalSetting?.sessionId || 5;
 
-    let count = 0;
-    await prisma.$transaction(async (tx) => {
-      for (const item of scores) {
-        if (!item.studentId) continue;
-
+    const items = scores
+      .filter((item: any) => Boolean(item?.studentId))
+      .map((item: any) => {
         const rawMark = item.theoryMark !== undefined ? item.theoryMark : item.mark;
         const markVal = rawMark !== undefined ? (rawMark !== null && rawMark !== '' ? String(rawMark) : null) : null;
         const absentVal = item.absent ? '1' : null;
+        return {
+          studentId: Number(item.studentId),
+          mark: markVal,
+          absent: absentVal,
+        };
+      });
 
-        const existing = await tx.mark.findFirst({
-          where: {
-            studentId: Number(item.studentId),
-            subjectId: Number(subjectId),
-            examId: Number(examId),
-            classId: Number(classId),
-            sectionId: Number(sectionId),
-          },
-        });
-
-        if (existing) {
-          await tx.mark.update({
-            where: { id: existing.id },
-            data: {
-              mark: markVal,
-              absent: absentVal,
-            },
-          });
-        } else {
-          await tx.mark.create({
-            data: {
-              studentId: Number(item.studentId),
-              subjectId: Number(subjectId),
-              examId: Number(examId),
-              classId: Number(classId),
-              sectionId: Number(sectionId),
-              mark: markVal,
-              cbtMark: existing?.cbtMark ?? null,
-              absent: absentVal,
-              sessionId,
-              branchId: req.branchId || null,
-            },
-          });
-        }
-        count++;
-      }
+    const count = await bulkSaveMarksBatch(prisma, {
+      findWhere: {
+        subjectId: Number(subjectId),
+        examId: Number(examId),
+        classId: Number(classId),
+        sectionId: Number(sectionId),
+      },
+      branchId: req.branchId || null,
+      classId: Number(classId),
+      sectionId: Number(sectionId),
+      subjectId: Number(subjectId),
+      examId: Number(examId),
+      sessionId,
+      items,
     });
 
     await syncReportCardOnScoreSave(prisma, {
@@ -1379,7 +1363,7 @@ export async function batchSaveGradebook(req: Request, res: Response): Promise<R
       classId: Number(classId),
       sectionId: Number(sectionId),
       sessionId,
-      studentIds: scores.map((s: any) => Number(s.studentId)).filter(Boolean),
+      studentIds: items.map((i) => i.studentId),
       publishedBy: req.userId,
     });
 
@@ -3736,9 +3720,13 @@ export async function saveTeacherSubjectCommentsBatch(req: Request, res: Respons
   }
 
   try {
-    const classData = await prisma.class.findFirst({
-      where: { id: cId, ...(branchId ? { branchId } : {}) },
-    });
+    const [classData, globalSetting] = await Promise.all([
+      prisma.class.findFirst({
+        where: { id: cId, ...(branchId ? { branchId } : {}) },
+        select: { id: true, branchId: true },
+      }),
+      sessionId ? Promise.resolve(null) : prisma.globalSettings.findFirst({ select: { sessionId: true } }),
+    ]);
     if (!classData) {
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
@@ -3748,48 +3736,28 @@ export async function saveTeacherSubjectCommentsBatch(req: Request, res: Respons
       return res.status(400).json({ success: false, message: 'Branch ID could not be resolved for class.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
 
-    const savedRecords = await prisma.$transaction(async (tx) => {
-      const results: any[] = [];
-
-      for (const item of assessments) {
-        if (!item.studentId) continue;
-        const studentId = Number(item.studentId);
-        const comment = typeof item.comment === 'string' ? item.comment.trim() : '';
+    const items = assessments
+      .filter((item: any) => Boolean(item?.studentId))
+      .map((item: any) => {
         let rating = Number(item.rating) || 3;
         if (rating < 1) rating = 1;
         if (rating > 5) rating = 5;
+        return {
+          studentId: Number(item.studentId),
+          comment: typeof item.comment === 'string' ? item.comment.trim() : '',
+          rating,
+        };
+      });
 
-        const record = await tx.subjectCommentAssessment.upsert({
-          where: {
-            studentId_subjectId_termId_sessionId: {
-              studentId,
-              subjectId: subId,
-              termId: parsedTermId,
-              sessionId: activeSession,
-            },
-          },
-          create: {
-            studentId,
-            subjectId: subId,
-            classId: cId,
-            termId: parsedTermId,
-            sessionId: activeSession,
-            branchId: effectiveBranchId,
-            comment,
-            rating,
-          },
-          update: {
-            comment,
-            rating,
-            classId: cId,
-          },
-        });
-        results.push(record);
-      }
-      return results;
+    const savedStudentIds = await bulkSaveSubjectCommentsBatch(prisma, {
+      branchId: effectiveBranchId,
+      classId: cId,
+      subjectId: subId,
+      termId: parsedTermId,
+      sessionId: activeSession,
+      items,
     });
 
     await syncReportCardOnScoreSave(prisma, {
@@ -3797,15 +3765,15 @@ export async function saveTeacherSubjectCommentsBatch(req: Request, res: Respons
       classId: cId,
       sectionId: secId,
       sessionId: activeSession,
-      studentIds: savedRecords.map((r: any) => Number(r.studentId)),
+      studentIds: savedStudentIds,
       publishedBy: req.userId,
     });
 
     return res.json({
       success: true,
       reportCardUpdatedImmediately: true,
-      message: `Successfully saved ${savedRecords.length} developmental comment assessments. Report cards updated immediately.`,
-      savedCount: savedRecords.length,
+      message: `Successfully saved ${savedStudentIds.length} developmental comment assessments. Report cards updated immediately.`,
+      savedCount: savedStudentIds.length,
     });
   } catch (error: any) {
     console.error('[TEACHER] Batch save subject comments error:', error);
@@ -3931,7 +3899,10 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
   const exId = examId ? Number(examId) : 1;
 
   // Strict Permission Enforcement: Class Teacher or assigned Subject Teacher
-  const canAccess = await canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, sessionId, req);
+  const [canAccess, globalSetting] = await Promise.all([
+    canTeacherAccessSubject(prisma, req.teacherId, cId, secId, subId, sessionId, req),
+    sessionId ? Promise.resolve(null) : prisma.globalSettings.findFirst({ select: { sessionId: true } }),
+  ]);
   if (!canAccess) {
     return res.status(403).json({
       success: false,
@@ -3940,7 +3911,6 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
   }
 
   try {
-    const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = sessionId
       ? Number(sessionId)
       : (globalSetting?.sessionId || 1);
@@ -3951,58 +3921,44 @@ export async function saveTeacherMarksEntryBatch(req: Request, res: Response): P
       preferredTermId: req.body?.termId ? Number(req.body.termId) : null,
     });
 
-    let savedCount = 0;
-    for (const item of rawMarks) {
-      const sId = Number(item.studentId || item.id);
-      if (!sId) continue;
-      const isAbsentStr = (item.absent || item.isAbsent) ? '1' : '0';
-      const compData = item.components || item.componentMarks;
-      const markValue = compData ? JSON.stringify(compData) : String(item.mark || '0');
-
-      const existing = await prisma.mark.findFirst({
-        where: {
-          classId: cId,
-          subjectId: subId,
+    const items = rawMarks
+      .map((item: any) => {
+        const sId = Number(item.studentId || item.id);
+        if (!sId) return null;
+        const isAbsentStr = (item.absent || item.isAbsent) ? '1' : '0';
+        const compData = item.components || item.componentMarks;
+        const markValue = compData ? JSON.stringify(compData) : String(item.mark || '0');
+        return {
           studentId: sId,
-          examId: resolvedExId,
-          sessionId: activeSession,
-        },
-      });
+          mark: markValue,
+          absent: isAbsentStr,
+        };
+      })
+      .filter((x): x is { studentId: number; mark: string; absent: string } => x !== null);
 
-      if (existing) {
-        await prisma.mark.update({
-          where: { id: existing.id },
-          data: {
-            mark: markValue,
-            absent: isAbsentStr,
-            sessionId: activeSession,
-            examId: resolvedExId,
-          },
-        });
-      } else {
-        await prisma.mark.create({
-          data: {
-            branchId: branchId || 1,
-            classId: cId,
-            sectionId: secId,
-            subjectId: subId,
-            studentId: sId,
-            examId: resolvedExId,
-            sessionId: activeSession,
-            mark: markValue,
-            absent: isAbsentStr,
-          },
-        });
-      }
-      savedCount++;
-    }
+    const savedCount = await bulkSaveMarksBatch(prisma, {
+      findWhere: {
+        classId: cId,
+        subjectId: subId,
+        examId: resolvedExId,
+        sessionId: activeSession,
+      },
+      branchId: branchId || 1,
+      classId: cId,
+      sectionId: secId,
+      subjectId: subId,
+      examId: resolvedExId,
+      sessionId: activeSession,
+      items,
+      updateExamAndSession: true,
+    });
 
     await syncReportCardOnScoreSave(prisma, {
       branchId: branchId || 1,
       classId: cId,
       sectionId: secId,
       sessionId: activeSession,
-      studentIds: rawMarks.map((item: any) => Number(item.studentId || item.id)).filter(Boolean),
+      studentIds: items.map((i) => i.studentId),
       publishedBy: req.userId,
     });
 

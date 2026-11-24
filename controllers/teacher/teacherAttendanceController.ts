@@ -192,7 +192,7 @@ export async function saveAttendance(req: Request, res: Response): Promise<Respo
     });
 
     if (req.teacherId) {
-      await prisma.teacherActivity
+      prisma.teacherActivity
         .create({
           data: {
             branchId: req.branchId,
@@ -423,7 +423,7 @@ export async function submitAttendanceRegister(req: Request, res: Response): Pro
     const isUpdate = Boolean(register.submittedAt);
 
     if (req.teacherId) {
-      await prisma.teacherActivity
+      prisma.teacherActivity
         .create({
           data: {
             branchId: req.branchId,

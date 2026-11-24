@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import prismaDefault from './prisma';
 import { ResolvedClassMatrix, mapStudentMarkToMatrix } from './markParser';
 import { calculateGradeFromRanges } from './gradingService';
@@ -523,6 +524,217 @@ export function buildDefaultRemarksForAverage(avgScore: number, studentName: str
   };
 }
 
+export interface BulkMarkSaveItem {
+  studentId: number;
+  mark: string | null;
+  absent: string | null;
+}
+
+/**
+ * Bulk-upserts student marks for a subject using 1 read + batched createMany/UNNEST update,
+ * eliminating N+1 per-student findFirst + update/create round trips.
+ */
+export async function bulkSaveMarksBatch(
+  db: typeof prismaDefault,
+  params: {
+    findWhere: Prisma.MarkWhereInput;
+    branchId: number | null;
+    classId: number;
+    sectionId: number;
+    subjectId: number;
+    examId: number;
+    sessionId: number;
+    items: BulkMarkSaveItem[];
+    updateExamAndSession?: boolean;
+  }
+): Promise<number> {
+  const deduped = new Map<number, BulkMarkSaveItem>();
+  for (const item of params.items) {
+    if (!item.studentId || !Number.isFinite(item.studentId)) continue;
+    deduped.set(item.studentId, item);
+  }
+  const uniqueItems = Array.from(deduped.values());
+  if (uniqueItems.length === 0) return 0;
+
+  const studentIds = uniqueItems.map((i) => i.studentId);
+  const existingRows = await db.mark.findMany({
+    where: {
+      ...params.findWhere,
+      studentId: { in: studentIds },
+    },
+    select: { id: true, studentId: true },
+    orderBy: { id: 'asc' },
+  });
+
+  const existingIdByStudent = new Map<number, number>();
+  for (const row of existingRows) {
+    if (!existingIdByStudent.has(row.studentId)) {
+      existingIdByStudent.set(row.studentId, row.id);
+    }
+  }
+
+  const toCreate: Prisma.MarkCreateManyInput[] = [];
+  const updateIds: number[] = [];
+  const updateMarks: (string | null)[] = [];
+  const updateAbsents: (string | null)[] = [];
+
+  for (const item of uniqueItems) {
+    const existingId = existingIdByStudent.get(item.studentId);
+    if (existingId) {
+      updateIds.push(existingId);
+      updateMarks.push(item.mark);
+      updateAbsents.push(item.absent);
+    } else {
+      toCreate.push({
+        branchId: params.branchId,
+        classId: params.classId,
+        sectionId: params.sectionId,
+        subjectId: params.subjectId,
+        studentId: item.studentId,
+        examId: params.examId,
+        sessionId: params.sessionId,
+        mark: item.mark,
+        absent: item.absent,
+      });
+    }
+  }
+
+  const tasks: Promise<unknown>[] = [];
+  if (toCreate.length > 0) {
+    tasks.push(db.mark.createMany({ data: toCreate }));
+  }
+  if (updateIds.length > 0) {
+    if (params.updateExamAndSession) {
+      tasks.push(
+        db.$executeRaw`
+          UPDATE mark AS m
+          SET
+            mark = v.mark,
+            absent = v.absent,
+            session_id = ${params.sessionId},
+            exam_id = ${params.examId}
+          FROM UNNEST(${updateIds}::int4[], ${updateMarks}::text[], ${updateAbsents}::text[]) AS v(id, mark, absent)
+          WHERE m.id = v.id
+        `
+      );
+    } else {
+      tasks.push(
+        db.$executeRaw`
+          UPDATE mark AS m
+          SET
+            mark = v.mark,
+            absent = v.absent
+          FROM UNNEST(${updateIds}::int4[], ${updateMarks}::text[], ${updateAbsents}::text[]) AS v(id, mark, absent)
+          WHERE m.id = v.id
+        `
+      );
+    }
+  }
+
+  await Promise.all(tasks);
+  return uniqueItems.length;
+}
+
+export interface BulkSubjectCommentItem {
+  studentId: number;
+  comment: string;
+  rating: number;
+}
+
+/**
+ * Bulk-upserts subject developmental comment assessments using 1 lookup + createMany/UNNEST update.
+ */
+export async function bulkSaveSubjectCommentsBatch(
+  db: typeof prismaDefault,
+  params: {
+    branchId: number;
+    classId: number;
+    subjectId: number;
+    termId: number;
+    sessionId: number;
+    items: BulkSubjectCommentItem[];
+    validateStudentBranch?: boolean;
+  }
+): Promise<number[]> {
+  const deduped = new Map<number, BulkSubjectCommentItem>();
+  for (const item of params.items) {
+    if (!item.studentId || !Number.isFinite(item.studentId)) continue;
+    deduped.set(item.studentId, item);
+  }
+  const candidateIds = Array.from(deduped.keys());
+  if (candidateIds.length === 0) return [];
+
+  let validIds = candidateIds;
+  if (params.validateStudentBranch) {
+    const validStudents = await db.student.findMany({
+      where: { id: { in: candidateIds }, branchId: params.branchId },
+      select: { id: true },
+    });
+    const validSet = new Set(validStudents.map((s) => s.id));
+    validIds = candidateIds.filter((id) => validSet.has(id));
+    if (validIds.length === 0) return [];
+  }
+
+  const existingRows = await db.subjectCommentAssessment.findMany({
+    where: {
+      subjectId: params.subjectId,
+      termId: params.termId,
+      sessionId: params.sessionId,
+      studentId: { in: validIds },
+    },
+    select: { id: true, studentId: true },
+  });
+  const existingByStudent = new Map(existingRows.map((r) => [r.studentId, r.id]));
+
+  const toCreate: Prisma.SubjectCommentAssessmentCreateManyInput[] = [];
+  const updateIds: number[] = [];
+  const updateComments: string[] = [];
+  const updateRatings: number[] = [];
+
+  for (const studentId of validIds) {
+    const item = deduped.get(studentId)!;
+    const existingId = existingByStudent.get(studentId);
+    if (existingId) {
+      updateIds.push(existingId);
+      updateComments.push(item.comment);
+      updateRatings.push(item.rating);
+    } else {
+      toCreate.push({
+        studentId,
+        subjectId: params.subjectId,
+        classId: params.classId,
+        termId: params.termId,
+        sessionId: params.sessionId,
+        branchId: params.branchId,
+        comment: item.comment,
+        rating: item.rating,
+      });
+    }
+  }
+
+  const tasks: Promise<unknown>[] = [];
+  if (toCreate.length > 0) {
+    tasks.push(db.subjectCommentAssessment.createMany({ data: toCreate, skipDuplicates: true }));
+  }
+  if (updateIds.length > 0) {
+    tasks.push(
+      db.$executeRaw`
+        UPDATE subject_comment_assessments AS s
+        SET
+          comment = v.comment,
+          rating = v.rating,
+          class_id = ${params.classId},
+          updated_at = NOW()
+        FROM UNNEST(${updateIds}::int4[], ${updateComments}::text[], ${updateRatings}::int4[]) AS v(id, comment, rating)
+        WHERE s.id = v.id
+      `
+    );
+  }
+
+  await Promise.all(tasks);
+  return validIds;
+}
+
 /**
  * Immediate Report Card Compilation Hook:
  * Invoked immediately after teachers or admins save scores so report cards
@@ -543,24 +755,48 @@ export async function syncReportCardOnScoreSave(
   if (!branchId || !classId || !sessionId) return;
 
   try {
-    const settings = await prisma.systemSetting.findUnique({
-      where: { branchId },
-      select: { autoPublishReportCards: true },
-    });
-
-    const shouldAutoPublish = settings?.autoPublishReportCards ?? true;
-
-    if (shouldAutoPublish) {
-      const existingPub = await prisma.classReportCardPublication.findFirst({
+    const [settings, existingPub] = await Promise.all([
+      prisma.systemSetting.findUnique({
+        where: { branchId },
+        select: { autoPublishReportCards: true },
+      }),
+      prisma.classReportCardPublication.findFirst({
         where: {
           classId,
           sessionId,
           OR: [{ branchId }, { branchId: null }],
         },
-      });
+        select: {
+          id: true,
+          branchId: true,
+          isPublished: true,
+          releaseCa1: true,
+          releaseCa2: true,
+          releaseCombinedCa: true,
+          releaseExam: true,
+          releaseFull: true,
+        },
+      }),
+    ]);
+
+    const shouldAutoPublish = settings?.autoPublishReportCards ?? true;
+
+    const pubWritePromise: Promise<unknown> = (() => {
+      if (!shouldAutoPublish) return Promise.resolve();
+      const alreadyFullyPublished =
+        existingPub &&
+        existingPub.branchId === branchId &&
+        existingPub.isPublished &&
+        existingPub.releaseCa1 &&
+        existingPub.releaseCa2 &&
+        existingPub.releaseCombinedCa &&
+        existingPub.releaseExam &&
+        existingPub.releaseFull;
+
+      if (alreadyFullyPublished) return Promise.resolve();
 
       if (existingPub) {
-        await prisma.classReportCardPublication.update({
+        return prisma.classReportCardPublication.update({
           where: { id: existingPub.id },
           data: {
             branchId,
@@ -574,31 +810,34 @@ export async function syncReportCardOnScoreSave(
             ...(publishedBy ? { publishedBy } : {}),
           },
         });
-      } else {
-        await prisma.classReportCardPublication.create({
-          data: {
-            branchId,
-            classId,
-            sessionId,
-            isPublished: true,
-            releaseCa1: true,
-            releaseCa2: true,
-            releaseCombinedCa: true,
-            releaseExam: true,
-            releaseFull: true,
-            publishedAt: new Date(),
-            publishedBy: publishedBy || null,
-          },
-        });
       }
-    }
+      return prisma.classReportCardPublication.create({
+        data: {
+          branchId,
+          classId,
+          sessionId,
+          isPublished: true,
+          releaseCa1: true,
+          releaseCa2: true,
+          releaseCombinedCa: true,
+          releaseExam: true,
+          releaseFull: true,
+          publishedAt: new Date(),
+          publishedBy: publishedBy || null,
+        },
+      });
+    })();
 
     // Ensure impacted students have initial commentary records synthesized if none exist yet
     if (studentIds && studentIds.length > 0) {
       const uniqueStudentIds = Array.from(new Set(studentIds.filter((id) => Number.isFinite(id) && id > 0)));
-      if (uniqueStudentIds.length === 0) return;
+      if (uniqueStudentIds.length === 0) {
+        await pubWritePromise;
+        return;
+      }
 
-      const [students, marks, existingCommentaries] = await Promise.all([
+      const [, students, marks, existingCommentaries] = await Promise.all([
+        pubWritePromise,
         prisma.student.findMany({
           where: { id: { in: uniqueStudentIds } },
           select: { id: true, firstName: true, lastName: true },
@@ -622,6 +861,7 @@ export async function syncReportCardOnScoreSave(
             sessionId,
           },
           select: {
+            id: true,
             studentId: true,
             remark: true,
             reviewNotes: true,
@@ -661,10 +901,18 @@ export async function syncReportCardOnScoreSave(
         }
       }
 
+      const toCreate: Prisma.StudentCommentaryCreateManyInput[] = [];
+      const updateIds: number[] = [];
+      const updateRemarks: string[] = [];
+      const updateReviewNotes: string[] = [];
+
       for (const stId of uniqueStudentIds) {
         const existing = commentaryMap.get(stId);
         // If human-edited commentary already exists with both teacher & principal comments, preserve it
         if (existing?.isEditedByHuman && existing.remark && existing.reviewNotes) {
+          continue;
+        }
+        if (existing && existing.remark && existing.reviewNotes) {
           continue;
         }
 
@@ -675,18 +923,8 @@ export async function syncReportCardOnScoreSave(
             : 0;
         const defaults = buildDefaultRemarksForAverage(avg, studentMap.get(stId) || 'Student');
 
-        await prisma.studentCommentary.upsert({
-          where: {
-            studentId_sessionId: {
-              studentId: stId,
-              sessionId,
-            },
-          },
-          update: {
-            ...(!existing?.remark ? { remark: defaults.teacherComment } : {}),
-            ...(!existing?.reviewNotes ? { reviewNotes: defaults.principalComment } : {}),
-          },
-          create: {
+        if (!existing) {
+          toCreate.push({
             studentId: stId,
             classId,
             sectionId: sectionId || 1,
@@ -697,9 +935,40 @@ export async function syncReportCardOnScoreSave(
             status: 'APPROVED',
             isAiGenerated: false,
             isEditedByHuman: false,
-          },
-        }).catch(() => {});
+          });
+        } else {
+          updateIds.push(existing.id);
+          updateRemarks.push(existing.remark || defaults.teacherComment);
+          updateReviewNotes.push(existing.reviewNotes || defaults.principalComment);
+        }
       }
+
+      const writeTasks: Promise<unknown>[] = [];
+      if (toCreate.length > 0) {
+        writeTasks.push(
+          prisma.studentCommentary
+            .createMany({ data: toCreate, skipDuplicates: true })
+            .catch(() => {})
+        );
+      }
+      if (updateIds.length > 0) {
+        writeTasks.push(
+          prisma.$executeRaw`
+            UPDATE student_commentary AS sc
+            SET
+              remark = v.remark,
+              review_notes = v.review_notes,
+              updated_at = NOW()
+            FROM UNNEST(${updateIds}::int4[], ${updateRemarks}::text[], ${updateReviewNotes}::text[]) AS v(id, remark, review_notes)
+            WHERE sc.id = v.id
+          `.catch(() => {})
+        );
+      }
+      if (writeTasks.length > 0) {
+        await Promise.all(writeTasks);
+      }
+    } else {
+      await pubWritePromise;
     }
   } catch (err) {
     console.error('[REPORT CARD SYNC] Error syncing report card on score save:', err);

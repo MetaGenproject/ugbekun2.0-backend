@@ -598,80 +598,6 @@ export async function openOrGetRegister(
   }
 }
 
-async function upsertAttendanceRow(
-  db: DbClient,
-  row: {
-    registerId: number;
-    studentId: number;
-    classId: number;
-    sectionId: number;
-    sessionId: number;
-    branchId: number;
-    attendanceDate: Date;
-    status: string;
-    remark: string | null;
-    markedByTeacherId: number | null;
-  }
-) {
-  const existing = await db.attendance.findFirst({
-    where: {
-      OR: [
-        { registerId: row.registerId, studentId: row.studentId },
-        {
-          studentId: row.studentId,
-          sessionId: row.sessionId,
-          branchId: row.branchId,
-          attendanceDate: row.attendanceDate,
-        },
-      ],
-    },
-    select: { id: true, status: true },
-  });
-
-  const data = {
-    classId: row.classId,
-    sectionId: row.sectionId,
-    attendanceDate: row.attendanceDate,
-    status: row.status,
-    remark: row.remark,
-    sessionId: row.sessionId,
-    branchId: row.branchId,
-    registerId: row.registerId,
-    markedByTeacherId: row.markedByTeacherId,
-  };
-
-  if (existing) {
-    return db.attendance.update({ where: { id: existing.id }, data });
-  }
-
-  try {
-    return await db.attendance.create({
-      data: {
-        studentId: row.studentId,
-        ...data,
-      },
-    });
-  } catch (error: any) {
-    if (error?.code !== 'P2002') throw error;
-    const again = await db.attendance.findFirst({
-      where: {
-        OR: [
-          { registerId: row.registerId, studentId: row.studentId },
-          {
-            studentId: row.studentId,
-            sessionId: row.sessionId,
-            branchId: row.branchId,
-            attendanceDate: row.attendanceDate,
-          },
-        ],
-      },
-      select: { id: true },
-    });
-    if (!again) throw error;
-    return db.attendance.update({ where: { id: again.id }, data });
-  }
-}
-
 type WriteMode = 'patch' | 'submit' | 'legacy-save' | 'admin-save';
 
 function assertWritable(register: { status: string }, mode: WriteMode) {
@@ -735,60 +661,154 @@ export async function upsertEntries(
   const enrolledSet = new Set(enrolledIds);
   const auditEdits = Boolean(register.submittedAt);
 
+  type ExistingAttendanceStub = {
+    id: number;
+    studentId: number;
+    registerId: number | null;
+    status: string;
+  };
+
+  async function loadExistingByStudent(studentIds: number[]): Promise<Map<number, ExistingAttendanceStub>> {
+    if (studentIds.length === 0) return new Map();
+    const rows = await db.attendance.findMany({
+      where: {
+        OR: [
+          { registerId: register.id, studentId: { in: studentIds } },
+          {
+            studentId: { in: studentIds },
+            sessionId: register.sessionId,
+            branchId: register.branchId,
+            attendanceDate,
+          },
+        ],
+      },
+      select: { id: true, studentId: true, registerId: true, status: true },
+    });
+    const map = new Map<number, ExistingAttendanceStub>();
+    for (const row of rows) {
+      const prev = map.get(row.studentId);
+      if (!prev || row.registerId === register.id) {
+        map.set(row.studentId, row);
+      }
+    }
+    return map;
+  }
+
+  async function applyBulkAttendanceUpdates(
+    rows: Array<{ id: number; status: string; remark: string | null }>
+  ) {
+    if (rows.length === 0) return;
+    const ids = rows.map((r) => r.id);
+    const statuses = rows.map((r) => r.status);
+    const remarks = rows.map((r) => r.remark);
+    const teacherId = args.teacherId ?? null;
+    await db.$executeRaw`
+      UPDATE attendance AS a
+      SET
+        class_id = ${register.classId},
+        section_id = ${register.sectionId},
+        attendance_date = ${attendanceDate},
+        status = v.status,
+        remark = v.remark,
+        session_id = ${register.sessionId},
+        branch_id = ${register.branchId},
+        register_id = ${register.id},
+        marked_by_teacher_id = ${teacherId},
+        updated_at = NOW()
+      FROM UNNEST(${ids}::int4[], ${statuses}::text[], ${remarks}::text[]) AS v(id, status, remark)
+      WHERE a.id = v.id
+    `;
+  }
+
   if (mode === 'patch') {
+    const dedupedPatch = new Map<
+      number,
+      { studentId: number; status: AttendanceStatusValue | null; remark: string | null }
+    >();
     for (const item of args.entries) {
       const studentId = Number(item.studentId);
       if (!studentId || !enrolledSet.has(studentId)) continue;
       const status = normalizeAttendanceStatus(item.status);
       const remarkRaw = item.remark != null ? String(item.remark).trim() : '';
-      if (!status) {
-        const existing = await db.attendance.findFirst({
-          where: { registerId: register.id, studentId },
-          select: { id: true, status: true },
-        });
-        await db.attendance.deleteMany({ where: { registerId: register.id, studentId } });
-        if (auditEdits && existing) {
-          await writeAudit(db, {
+      dedupedPatch.set(studentId, {
+        studentId,
+        status,
+        remark: remarkRaw || null,
+      });
+    }
+
+    const patchIds = Array.from(dedupedPatch.keys());
+    const existingByStudent = await loadExistingByStudent(patchIds);
+
+    const deleteStudentIds: number[] = [];
+    const toCreate: Prisma.AttendanceCreateManyInput[] = [];
+    const toUpdate: Array<{ id: number; status: string; remark: string | null }> = [];
+    const auditRows: Prisma.AttendanceAuditCreateManyInput[] = [];
+
+    for (const entry of dedupedPatch.values()) {
+      const existing = existingByStudent.get(entry.studentId);
+      if (!entry.status) {
+        deleteStudentIds.push(entry.studentId);
+        if (auditEdits && existing && existing.registerId === register.id) {
+          auditRows.push({
             registerId: register.id,
             branchId: register.branchId,
             action: 'EDIT',
             attendanceId: existing.id,
-            studentId,
+            studentId: entry.studentId,
             fromCode: existing.status,
             toCode: null,
-            actorUserId: args.actorUserId,
+            actorUserId: args.actorUserId ?? null,
           });
         }
         continue;
       }
-      const before = await db.attendance.findFirst({
-        where: { registerId: register.id, studentId },
-        select: { id: true, status: true },
-      });
-      await upsertAttendanceRow(db, {
-        registerId: register.id,
-        studentId,
-        classId: register.classId,
-        sectionId: register.sectionId,
-        sessionId: register.sessionId,
-        branchId: register.branchId,
-        attendanceDate,
-        status,
-        remark: remarkRaw || null,
-        markedByTeacherId: args.teacherId ?? null,
-      });
-      if (auditEdits && (before?.status || null) !== status) {
-        await writeAudit(db, {
+
+      if (existing) {
+        toUpdate.push({ id: existing.id, status: entry.status, remark: entry.remark });
+      } else {
+        toCreate.push({
+          studentId: entry.studentId,
+          classId: register.classId,
+          sectionId: register.sectionId,
+          attendanceDate,
+          status: entry.status,
+          remark: entry.remark,
+          sessionId: register.sessionId,
+          branchId: register.branchId,
+          registerId: register.id,
+          markedByTeacherId: args.teacherId ?? null,
+        });
+      }
+
+      const prevStatus = existing && existing.registerId === register.id ? existing.status : null;
+      if (auditEdits && prevStatus !== entry.status) {
+        auditRows.push({
           registerId: register.id,
           branchId: register.branchId,
           action: 'EDIT',
-          attendanceId: before?.id ?? null,
-          studentId,
-          fromCode: before?.status ?? null,
-          toCode: status,
-          actorUserId: args.actorUserId,
+          attendanceId: existing && existing.registerId === register.id ? existing.id : null,
+          studentId: entry.studentId,
+          fromCode: prevStatus,
+          toCode: entry.status,
+          actorUserId: args.actorUserId ?? null,
         });
       }
+    }
+
+    if (deleteStudentIds.length > 0) {
+      await db.attendance.deleteMany({
+        where: { registerId: register.id, studentId: { in: deleteStudentIds } },
+      });
+    }
+    if (toCreate.length > 0) {
+      await db.attendance.createMany({ data: toCreate, skipDuplicates: true });
+    }
+    if (toUpdate.length > 0) {
+      await applyBulkAttendanceUpdates(toUpdate);
+    }
+    if (auditRows.length > 0) {
+      await db.attendanceAudit.createMany({ data: auditRows });
     }
 
     const updated = await db.attendanceRegister.update({
@@ -810,39 +830,51 @@ export async function upsertEntries(
     requireComplete: args.requireComplete,
   });
 
+  const plannedIds = planned.rows.map((r) => r.studentId);
+  const existingByStudent = await loadExistingByStudent(plannedIds);
+
+  const toCreate: Prisma.AttendanceCreateManyInput[] = [];
+  const toUpdate: Array<{ id: number; status: string; remark: string | null }> = [];
+  const auditRows: Prisma.AttendanceAuditCreateManyInput[] = [];
+
   for (const row of planned.rows) {
-    const before = auditEdits
-      ? await db.attendance.findFirst({
-          where: { registerId: register.id, studentId: row.studentId },
-          select: { id: true, status: true },
-        })
-      : null;
+    const existing = existingByStudent.get(row.studentId);
+    if (existing) {
+      toUpdate.push({ id: existing.id, status: row.status, remark: row.remark });
+    } else {
+      toCreate.push({
+        studentId: row.studentId,
+        classId: register.classId,
+        sectionId: register.sectionId,
+        attendanceDate,
+        status: row.status,
+        remark: row.remark,
+        sessionId: register.sessionId,
+        branchId: register.branchId,
+        registerId: register.id,
+        markedByTeacherId: args.teacherId ?? null,
+      });
+    }
 
-    await upsertAttendanceRow(db, {
-      registerId: register.id,
-      studentId: row.studentId,
-      classId: register.classId,
-      sectionId: register.sectionId,
-      sessionId: register.sessionId,
-      branchId: register.branchId,
-      attendanceDate,
-      status: row.status,
-      remark: row.remark,
-      markedByTeacherId: args.teacherId ?? null,
-    });
-
-    if (auditEdits && before && before.status !== row.status) {
-      await writeAudit(db, {
+    if (auditEdits && existing && existing.registerId === register.id && existing.status !== row.status) {
+      auditRows.push({
         registerId: register.id,
         branchId: register.branchId,
         action: 'EDIT',
-        attendanceId: before.id,
+        attendanceId: existing.id,
         studentId: row.studentId,
-        fromCode: before.status,
+        fromCode: existing.status,
         toCode: row.status,
-        actorUserId: args.actorUserId,
+        actorUserId: args.actorUserId ?? null,
       });
     }
+  }
+
+  if (toCreate.length > 0) {
+    await db.attendance.createMany({ data: toCreate, skipDuplicates: true });
+  }
+  if (toUpdate.length > 0) {
+    await applyBulkAttendanceUpdates(toUpdate);
   }
 
   const bumpVersion = mode === 'submit' || mode === 'legacy-save' || mode === 'admin-save';
@@ -866,12 +898,16 @@ export async function upsertEntries(
   });
 
   if (nextStatus === REGISTER_STATUS.SUBMITTED) {
-    await writeAudit(db, {
+    auditRows.push({
       registerId: register.id,
       branchId: register.branchId,
       action: register.submittedAt ? 'EDIT' : 'SUBMIT',
-      actorUserId: args.actorUserId,
+      actorUserId: args.actorUserId ?? null,
     });
+  }
+
+  if (auditRows.length > 0) {
+    await db.attendanceAudit.createMany({ data: auditRows });
   }
 
   return { register: updated, planned };
@@ -1001,25 +1037,113 @@ export async function getWeekMatrix(
   args: { branchId: number; sessionId: number; classId: number; sectionId: number; dateKey: string }
 ) {
   const dateKeys = schoolWeekDateKeys(requireSchoolDateKey(args.dateKey));
-  const days = [];
-  for (const dateKey of dateKeys) {
-    const snapshot = await getRegisterWithEntries(db, { ...args, dateKey });
-    days.push({
-      dateKey,
-      weekday: snapshot.calendar.weekday,
-      weekdayShort: snapshot.calendar.weekdayShort,
-      isToday: snapshot.calendar.isToday,
-      isFuture: snapshot.calendar.isFuture,
-      isWeekend: snapshot.calendar.isWeekend,
-      isHoliday: snapshot.calendar.isHoliday,
-      isSpecialSchoolDay: snapshot.calendar.isSpecialSchoolDay,
-      isSchoolDay: snapshot.calendar.isSchoolDay,
-      holidayTitle: snapshot.calendar.holidayTitle,
-      canEdit: snapshot.canEdit,
-      register: snapshot.register,
-      summary: snapshot.summary,
-    });
+  const describedByDate = dateKeys.map((dateKey) => describeSchoolDate(dateKey));
+  const weekDates = dateKeys.map((dateKey) => schoolDateUtcMidnight(dateKey));
+  const firstKey = dateKeys[0];
+  const lastKey = dateKeys[dateKeys.length - 1];
+
+  const [enrolledIds, classifications, registers] = await Promise.all([
+    loadEnrolledStudentIds(db, args),
+    classifySchoolDates(
+      db,
+      args.branchId,
+      dateKeys,
+      describedByDate.map((d) => d.isWeekend)
+    ),
+    db.attendanceRegister.findMany({
+      where: {
+        branchId: args.branchId,
+        sessionId: args.sessionId,
+        classId: args.classId,
+        sectionId: args.sectionId,
+        registerDate: { in: weekDates },
+      },
+      include: {
+        takenByTeacher: { select: { id: true, name: true } },
+      },
+    }),
+  ]);
+
+  const registerByDateKey = new Map<string, (typeof registers)[number]>();
+  for (const reg of registers) {
+    const key = parseSchoolDateKey(reg.registerDate) || storedAttendanceDateKey(reg.registerDate);
+    registerByDateKey.set(key, reg);
   }
+
+  const enrolledSet = new Set(enrolledIds);
+  const registerIds = registers.map((r) => r.id);
+  const missingDateKeys = dateKeys.filter((k) => !registerByDateKey.has(k));
+
+  const [regEntries, legacyEntries] = await Promise.all([
+    registerIds.length > 0
+      ? db.attendance.findMany({
+          where: { registerId: { in: registerIds }, branchId: args.branchId },
+          select: { registerId: true, studentId: true, status: true },
+        })
+      : Promise.resolve([]),
+    missingDateKeys.length > 0 && firstKey && lastKey
+      ? db.attendance.findMany({
+          where: {
+            branchId: args.branchId,
+            sessionId: args.sessionId,
+            classId: args.classId,
+            sectionId: args.sectionId,
+            attendanceDate: {
+              gte: schoolDateStoredRange(firstKey).gte,
+              lt: schoolDateStoredRange(lastKey).lt,
+            },
+          },
+          select: { studentId: true, status: true, attendanceDate: true },
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const entriesByRegisterId = new Map<number, Array<{ studentId: number; status: string }>>();
+  for (const row of regEntries) {
+    if (!row.registerId || !enrolledSet.has(row.studentId)) continue;
+    const list = entriesByRegisterId.get(row.registerId) || [];
+    list.push({ studentId: row.studentId, status: normalizeAttendanceStatus(row.status) || row.status });
+    entriesByRegisterId.set(row.registerId, list);
+  }
+
+  const legacyEntriesByDateKey = new Map<string, Array<{ studentId: number; status: string }>>();
+  for (const row of legacyEntries) {
+    if (!enrolledSet.has(row.studentId)) continue;
+    const key = storedAttendanceDateKey(row.attendanceDate);
+    const list = legacyEntriesByDateKey.get(key) || [];
+    list.push({ studentId: row.studentId, status: normalizeAttendanceStatus(row.status) || row.status });
+    legacyEntriesByDateKey.set(key, list);
+  }
+
+  const days = dateKeys.map((dateKey, idx) => {
+    const described = describedByDate[idx];
+    const classified = classifications[idx];
+    const register = registerByDateKey.get(dateKey) ?? null;
+    const dayEntries = register
+      ? entriesByRegisterId.get(register.id) || []
+      : legacyEntriesByDateKey.get(dateKey) || [];
+    const canEdit =
+      !described.isFuture &&
+      classified.isSchoolDay &&
+      (!register || register.status !== REGISTER_STATUS.LOCKED);
+
+    return {
+      dateKey,
+      weekday: described.weekday,
+      weekdayShort: described.weekdayShort,
+      isToday: described.isToday,
+      isFuture: described.isFuture,
+      isWeekend: described.isWeekend,
+      isHoliday: classified.isHoliday,
+      isSpecialSchoolDay: classified.isSpecialSchoolDay,
+      isSchoolDay: classified.isSchoolDay,
+      holidayTitle: classified.holidayTitle,
+      canEdit,
+      register: register ? serializeRegister(register) : null,
+      summary: summarizeEntries(enrolledIds, dayEntries),
+    };
+  });
+
   return { dateKeys, days };
 }
 

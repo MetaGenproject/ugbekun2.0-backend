@@ -24,6 +24,8 @@ import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/grading
 import {
   resolveSchoolReportBranding,
   syncReportCardOnScoreSave,
+  bulkSaveMarksBatch,
+  bulkSaveSubjectCommentsBatch,
   buildDefaultRemarksForAverage,
   parseTeacherSignatureConfig,
   serializeTeacherSignatureConfig,
@@ -444,75 +446,52 @@ export async function saveSubjectCommentsBatch(req: Request, res: Response): Pro
   const parsedTermId = termId ? Number(termId) : 1;
 
   try {
-    const classData = await prisma.class.findFirst({
-      where: { id: cId, branchId },
-    });
+    const [classData, globalSetting] = await Promise.all([
+      prisma.class.findFirst({ where: { id: cId, branchId }, select: { id: true } }),
+      sessionId ? Promise.resolve(null) : prisma.globalSettings.findFirst({ select: { sessionId: true } }),
+    ]);
 
     if (!classData) {
       return res.status(404).json({ success: false, message: 'Class not found.' });
     }
 
-    const globalSetting = await prisma.globalSettings.findFirst();
     const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 6;
 
-    const savedRecords = await prisma.$transaction(async (tx) => {
-      const results: any[] = [];
-
-      for (const item of assessments) {
-        if (!item.studentId) continue;
-        const studentId = Number(item.studentId);
-        const comment = typeof item.comment === 'string' ? item.comment.trim() : '';
+    const items = assessments
+      .filter((item: any) => Boolean(item?.studentId))
+      .map((item: any) => {
         let rating = Number(item.rating) || 3;
         if (rating < 1) rating = 1;
         if (rating > 5) rating = 5;
+        return {
+          studentId: Number(item.studentId),
+          comment: typeof item.comment === 'string' ? item.comment.trim() : '',
+          rating,
+        };
+      });
 
-        const student = await tx.student.findFirst({
-          where: { id: studentId, branchId },
-        });
-        if (!student) continue;
-
-        const record = await tx.subjectCommentAssessment.upsert({
-          where: {
-            studentId_subjectId_termId_sessionId: {
-              studentId,
-              subjectId: subId,
-              termId: parsedTermId,
-              sessionId: activeSession,
-            },
-          },
-          create: {
-            studentId,
-            subjectId: subId,
-            classId: cId,
-            termId: parsedTermId,
-            sessionId: activeSession,
-            branchId,
-            comment,
-            rating,
-          },
-          update: {
-            comment,
-            rating,
-            classId: cId,
-          },
-        });
-        results.push(record);
-      }
-      return results;
+    const savedStudentIds = await bulkSaveSubjectCommentsBatch(prisma, {
+      branchId: branchId!,
+      classId: cId,
+      subjectId: subId,
+      termId: parsedTermId,
+      sessionId: activeSession,
+      items,
+      validateStudentBranch: true,
     });
 
     await syncReportCardOnScoreSave(prisma, {
       branchId: branchId!,
       classId: cId,
       sessionId: activeSession,
-      studentIds: savedRecords.map((r: any) => Number(r.studentId)),
+      studentIds: savedStudentIds,
       publishedBy: req.userId,
     });
 
     return res.json({
       success: true,
-      message: `Successfully saved ${savedRecords.length} developmental comment assessments. Report cards updated immediately.`,
-      savedCount: savedRecords.length,
+      message: `Successfully saved ${savedStudentIds.length} developmental comment assessments. Report cards updated immediately.`,
+      savedCount: savedStudentIds.length,
     });
   } catch (error: any) {
     console.error('[ADMIN] Batch save subject comments error:', error);
@@ -537,60 +516,39 @@ export async function saveMarksEntryBatch(req: Request, res: Response): Promise<
     const subId = Number(subjectId);
     const secId = sectionId ? Number(sectionId) : 1;
     const exId = examId ? Number(examId) : 1;
-    const globalSetting = await prisma.globalSettings.findFirst();
+    const globalSetting = sessionId ? null : await prisma.globalSettings.findFirst({ select: { sessionId: true } });
     const activeSession = sessionId ? Number(sessionId) : globalSetting?.sessionId || 1;
 
-    let savedCount = 0;
+    const items = marks
+      .filter((item: any) => Boolean(item?.studentId))
+      .map((item: any) => ({
+        studentId: Number(item.studentId),
+        mark: item.components ? JSON.stringify(item.components) : String(item.mark || '0'),
+        absent: item.absent ? '1' : '0',
+      }));
 
-    for (const item of marks) {
-      if (!item.studentId) continue;
-
-      const sId = Number(item.studentId);
-      const isAbsentStr = item.absent ? '1' : '0';
-      const markValue = item.components ? JSON.stringify(item.components) : String(item.mark || '0');
-
-      const existing = await prisma.mark.findFirst({
-        where: {
-          branchId,
-          classId: cId,
-          subjectId: subId,
-          studentId: sId,
-          sessionId: activeSession,
-        },
-      });
-
-      if (existing) {
-        await prisma.mark.update({
-          where: { id: existing.id },
-          data: {
-            mark: markValue,
-            absent: isAbsentStr,
-          },
-        });
-      } else {
-        await prisma.mark.create({
-          data: {
-            branchId,
-            classId: cId,
-            sectionId: secId,
-            subjectId: subId,
-            studentId: sId,
-            examId: exId,
-            sessionId: activeSession,
-            mark: markValue,
-            absent: isAbsentStr,
-          },
-        });
-      }
-      savedCount++;
-    }
+    const savedCount = await bulkSaveMarksBatch(prisma, {
+      findWhere: {
+        branchId,
+        classId: cId,
+        subjectId: subId,
+        sessionId: activeSession,
+      },
+      branchId: branchId ?? null,
+      classId: cId,
+      sectionId: secId,
+      subjectId: subId,
+      examId: exId,
+      sessionId: activeSession,
+      items,
+    });
 
     await syncReportCardOnScoreSave(prisma, {
       branchId: branchId!,
       classId: cId,
       sectionId: secId,
       sessionId: activeSession,
-      studentIds: marks.map((m: any) => Number(m.studentId)).filter(Boolean),
+      studentIds: items.map((i) => i.studentId),
       publishedBy: req.userId,
     });
 
