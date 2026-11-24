@@ -189,6 +189,38 @@ export async function uploadLandingPageMedia(req: Request, res: Response): Promi
   }
 }
 
+function normalizeCustomDomainInput(raw: any): string | null {
+  if (raw === undefined || raw === null) return null;
+  const trimmed = String(raw).trim().toLowerCase();
+  if (!trimmed) return null;
+  const noProto = trimmed.replace(/^https?:\/\//i, '');
+  const hostOnly = noProto.split('/')[0].split(':')[0].trim();
+  const nonWww = hostOnly.startsWith('www.') ? hostOnly.slice(4) : hostOnly;
+  return nonWww || null;
+}
+
+function formatSuperadminDomainRecord(b: any) {
+  const effectiveSub = b.subdomain || b.code?.toLowerCase() || `branch-${b.id}`;
+  return {
+    branchId: b.id,
+    name: b.name,
+    code: b.code,
+    schoolName: b.systemSetting?.schoolName || b.name,
+    subdomain: b.subdomain || null,
+    suggestedSubdomain: effectiveSub,
+    subdomainUrl: `https://${effectiveSub}.ugbekun.edu.ng`,
+    customDomain: b.customDomain || null,
+    customDomainUrl: b.customDomain ? `https://${b.customDomain}` : null,
+    domainStatus: b.domainStatus || 'PENDING_VERIFICATION',
+    verificationToken: b.domainVerificationToken || `ugbekun-verify-${b.id}`,
+    dnsTarget: b.domainDnsTarget || DEFAULT_DNS_TARGET,
+    sslStatus: b.sslStatus || 'PENDING',
+    domainVerifiedAt: b.domainVerifiedAt,
+    hasLandingPage: Boolean(b.landingPage?.isEnabled),
+    landingPageUpdatedAt: b.landingPage?.updatedAt,
+  };
+}
+
 /**
  * GET /api/superadmin/domains
  */
@@ -217,23 +249,7 @@ export async function getDomains(req: Request, res: Response): Promise<Response 
       orderBy: { name: 'asc' },
     });
 
-    const domainList = branches.map((b) => ({
-      branchId: b.id,
-      name: b.name,
-      code: b.code,
-      schoolName: b.systemSetting?.schoolName || b.name,
-      subdomain: b.subdomain || b.code?.toLowerCase() || `branch-${b.id}`,
-      subdomainUrl: `https://${b.subdomain || b.code?.toLowerCase() || `branch-${b.id}`}.ugbekun.edu.ng`,
-      customDomain: b.customDomain || null,
-      customDomainUrl: b.customDomain ? `https://${b.customDomain}` : null,
-      domainStatus: b.domainStatus || 'PENDING_VERIFICATION',
-      verificationToken: b.domainVerificationToken || `ugbekun-verify-${b.id}`,
-      dnsTarget: b.domainDnsTarget || DEFAULT_DNS_TARGET,
-      sslStatus: b.sslStatus || 'PENDING',
-      domainVerifiedAt: b.domainVerifiedAt,
-      hasLandingPage: Boolean(b.landingPage?.isEnabled),
-      landingPageUpdatedAt: b.landingPage?.updatedAt,
-    }));
+    const domainList = branches.map(formatSuperadminDomainRecord);
 
     return res.json({
       success: true,
@@ -247,6 +263,103 @@ export async function getDomains(req: Request, res: Response): Promise<Response 
 }
 
 /**
+ * PUT /api/superadmin/domains/:branchId
+ * Save or update subdomain & custom domain for a branch (SuperAdmin).
+ */
+export async function updateBranchDomain(req: Request, res: Response): Promise<Response | void> {
+  const branchId = parseInt(req.params.branchId as string, 10);
+  if (isNaN(branchId)) {
+    return res.status(400).json({ success: false, message: 'Invalid branch ID.' });
+  }
+
+  try {
+    const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+    if (!branch) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' });
+    }
+
+    const { customDomain, subdomain } = req.body;
+    const updateData: Record<string, any> = {};
+
+    if (subdomain !== undefined) {
+      const cleanSub = formatDomainSlug(subdomain);
+      if (cleanSub) {
+        const dupSub = await prisma.branch.findFirst({
+          where: { subdomain: cleanSub, NOT: { id: branchId } },
+          select: { id: true, name: true },
+        });
+        if (dupSub) {
+          return res.status(409).json({
+            success: false,
+            message: `Subdomain "${cleanSub}" is already assigned to ${dupSub.name}.`,
+          });
+        }
+        updateData.subdomain = cleanSub;
+      } else {
+        updateData.subdomain = null;
+      }
+    }
+
+    if (customDomain !== undefined) {
+      const cleanDom = normalizeCustomDomainInput(customDomain);
+      if (cleanDom) {
+        const dupDom = await prisma.branch.findFirst({
+          where: {
+            OR: [{ customDomain: cleanDom }, { customDomain: `www.${cleanDom}` }],
+            NOT: { id: branchId },
+          },
+          select: { id: true, name: true },
+        });
+        if (dupDom) {
+          return res.status(409).json({
+            success: false,
+            message: `Custom domain "${cleanDom}" is already linked to ${dupDom.name}.`,
+          });
+        }
+        updateData.customDomain = cleanDom;
+        if (cleanDom !== branch.customDomain) {
+          updateData.domainStatus = 'PENDING_VERIFICATION';
+          updateData.sslStatus = 'PENDING';
+          updateData.domainVerifiedAt = null;
+        }
+      } else {
+        updateData.customDomain = null;
+        updateData.domainStatus = 'PENDING_VERIFICATION';
+        updateData.sslStatus = 'PENDING';
+        updateData.domainVerifiedAt = null;
+      }
+    }
+
+    if (!branch.domainVerificationToken) {
+      updateData.domainVerificationToken = generateDomainVerificationToken(branch.id);
+    }
+    if (!branch.domainDnsTarget) {
+      updateData.domainDnsTarget = DEFAULT_DNS_TARGET;
+    }
+
+    const updated = await prisma.branch.update({
+      where: { id: branchId },
+      data: updateData,
+      include: {
+        systemSetting: { select: { schoolName: true, website: true, logoUrl: true } },
+        landingPage: { select: { isEnabled: true, updatedAt: true } },
+      },
+    });
+
+    await cacheDelPattern('tenant:resolve:*');
+
+    return res.json({
+      success: true,
+      message: `Domain settings saved for ${updated.name}.`,
+      data: formatSuperadminDomainRecord(updated),
+    });
+  } catch (error: any) {
+    console.error('[SUPERADMIN] Update domain error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update domain settings.' });
+  }
+}
+
+/**
  * POST /api/superadmin/domains/:branchId/force-activate
  */
 export async function forceActivateDomain(req: Request, res: Response): Promise<Response | void> {
@@ -256,29 +369,67 @@ export async function forceActivateDomain(req: Request, res: Response): Promise<
   }
 
   try {
+    const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+    if (!branch) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' });
+    }
+
     const { customDomain, subdomain } = req.body;
+    const cleanDom = customDomain !== undefined ? normalizeCustomDomainInput(customDomain) : branch.customDomain;
+    const cleanSub = subdomain !== undefined ? (formatDomainSlug(subdomain) || null) : branch.subdomain;
+
+    if (cleanDom) {
+      const dupDom = await prisma.branch.findFirst({
+        where: {
+          OR: [{ customDomain: cleanDom }, { customDomain: `www.${cleanDom}` }],
+          NOT: { id: branchId },
+        },
+        select: { id: true, name: true },
+      });
+      if (dupDom) {
+        return res.status(409).json({
+          success: false,
+          message: `Custom domain "${cleanDom}" is already linked to ${dupDom.name}.`,
+        });
+      }
+    }
+
+    if (cleanSub) {
+      const dupSub = await prisma.branch.findFirst({
+        where: { subdomain: cleanSub, NOT: { id: branchId } },
+        select: { id: true, name: true },
+      });
+      if (dupSub) {
+        return res.status(409).json({
+          success: false,
+          message: `Subdomain "${cleanSub}" is already assigned to ${dupSub.name}.`,
+        });
+      }
+    }
 
     const updated = await prisma.branch.update({
       where: { id: branchId },
       data: {
-        ...(customDomain !== undefined && { customDomain: customDomain ? String(customDomain).trim().toLowerCase() : null }),
-        ...(subdomain !== undefined && { subdomain: formatDomainSlug(subdomain) }),
+        ...(customDomain !== undefined && { customDomain: cleanDom }),
+        ...(subdomain !== undefined && { subdomain: cleanSub }),
+        domainVerificationToken: branch.domainVerificationToken || generateDomainVerificationToken(branch.id),
+        domainDnsTarget: branch.domainDnsTarget || DEFAULT_DNS_TARGET,
         domainStatus: 'ACTIVE',
         sslStatus: 'ACTIVE',
         domainVerifiedAt: new Date(),
       },
+      include: {
+        systemSetting: { select: { schoolName: true, website: true, logoUrl: true } },
+        landingPage: { select: { isEnabled: true, updatedAt: true } },
+      },
     });
+
+    await cacheDelPattern('tenant:resolve:*');
 
     return res.json({
       success: true,
-      message: `Domain for ${updated.name} forcefully activated.`,
-      data: {
-        branchId: updated.id,
-        subdomain: updated.subdomain,
-        customDomain: updated.customDomain,
-        domainStatus: updated.domainStatus,
-        sslStatus: updated.sslStatus,
-      },
+      message: `Domain for ${updated.name} activated.`,
+      data: formatSuperadminDomainRecord(updated),
     });
   } catch (error: any) {
     console.error('[SUPERADMIN] Force activate domain error:', error);
@@ -296,9 +447,39 @@ export async function verifyBranchDomainDns(req: Request, res: Response): Promis
   }
 
   try {
-    const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+    let branch = await prisma.branch.findUnique({ where: { id: branchId } });
     if (!branch) {
       return res.status(404).json({ success: false, message: 'Branch not found.' });
+    }
+
+    const bodyCustomDomain = req.body?.customDomain !== undefined ? normalizeCustomDomainInput(req.body.customDomain) : undefined;
+    const bodySubdomain = req.body?.subdomain !== undefined ? (formatDomainSlug(req.body.subdomain) || null) : undefined;
+
+    if (bodyCustomDomain !== undefined || bodySubdomain !== undefined) {
+      if (bodyCustomDomain) {
+        const dupDom = await prisma.branch.findFirst({
+          where: {
+            OR: [{ customDomain: bodyCustomDomain }, { customDomain: `www.${bodyCustomDomain}` }],
+            NOT: { id: branchId },
+          },
+          select: { id: true, name: true },
+        });
+        if (dupDom) {
+          return res.status(409).json({
+            success: false,
+            message: `Custom domain "${bodyCustomDomain}" is already linked to ${dupDom.name}.`,
+          });
+        }
+      }
+      branch = await prisma.branch.update({
+        where: { id: branchId },
+        data: {
+          ...(bodyCustomDomain !== undefined && { customDomain: bodyCustomDomain }),
+          ...(bodySubdomain !== undefined && { subdomain: bodySubdomain }),
+          domainVerificationToken: branch.domainVerificationToken || generateDomainVerificationToken(branch.id),
+          domainDnsTarget: branch.domainDnsTarget || DEFAULT_DNS_TARGET,
+        },
+      });
     }
 
     if (!branch.customDomain) {
@@ -309,27 +490,33 @@ export async function verifyBranchDomainDns(req: Request, res: Response): Promis
     const target = branch.domainDnsTarget || DEFAULT_DNS_TARGET;
     const probe = await verifyDomainDns(branch.customDomain, token, target);
 
-    if (probe.verified) {
-      await prisma.branch.update({
-        where: { id: branchId },
-        data: {
-          domainStatus: 'ACTIVE',
-          sslStatus: 'ACTIVE',
-          domainVerifiedAt: new Date(),
-        },
-      });
-    } else {
-      await prisma.branch.update({
-        where: { id: branchId },
-        data: { domainStatus: 'MISCONFIGURED' },
-      });
-    }
+    const updated = await prisma.branch.update({
+      where: { id: branchId },
+      data: probe.verified
+        ? {
+            domainStatus: 'ACTIVE',
+            sslStatus: 'ACTIVE',
+            domainVerifiedAt: new Date(),
+            domainVerificationToken: token,
+            domainDnsTarget: target,
+          }
+        : {
+            domainStatus: 'MISCONFIGURED',
+            domainVerificationToken: token,
+            domainDnsTarget: target,
+          },
+      include: {
+        systemSetting: { select: { schoolName: true, website: true, logoUrl: true } },
+        landingPage: { select: { isEnabled: true, updatedAt: true } },
+      },
+    });
+
+    await cacheDelPattern('tenant:resolve:*');
 
     return res.json({
       success: true,
       data: {
-        branchId: branch.id,
-        customDomain: branch.customDomain,
+        ...formatSuperadminDomainRecord(updated),
         ...probe,
       },
     });

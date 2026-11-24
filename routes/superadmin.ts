@@ -42,6 +42,7 @@ router.post('/branches/:branchId/landing-page/upload-media', superadminControlle
 
 // Domain Management
 router.get('/domains', superadminController.getDomains);
+router.put('/domains/:branchId', superadminController.updateBranchDomain);
 router.post('/domains/:branchId/force-activate', superadminController.forceActivateDomain);
 router.post('/domains/:branchId/verify-dns', superadminController.verifyBranchDomainDns);
 
