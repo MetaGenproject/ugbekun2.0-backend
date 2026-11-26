@@ -21,6 +21,27 @@ import {
 } from '../../lib/idCardService';
 import { uploadBase64Image } from '../../lib/cloudinary';
 import { getAiModel, requireDeepseekClient } from '../../lib/aiClient';
+import { parseSchoolDateKey, schoolDateUtcMidnight, storedAttendanceDateKey } from '../../lib/schoolDate';
+
+function parseAdmissionDateInput(raw: unknown): Date | null {
+  if (raw == null || raw === '') return null;
+  if (raw instanceof Date) {
+    return Number.isNaN(raw.getTime()) ? null : raw;
+  }
+  const str = String(raw).trim();
+  if (!str) return null;
+  const dateKey = parseSchoolDateKey(str);
+  if (dateKey) {
+    return schoolDateUtcMidnight(dateKey);
+  }
+  const parsed = new Date(str);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatDateKeyOrNull(value?: Date | null): string | null {
+  if (!value || Number.isNaN(value.getTime())) return null;
+  return parseSchoolDateKey(value) || storedAttendanceDateKey(value);
+}
 
 const openai = { chat: { completions: { create: (args: any) => requireDeepseekClient().chat.completions.create({ ...args, model: args.model || getAiModel() }) } } };
 
@@ -88,6 +109,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           email: true,
           photo: true,
           parentId: true,
+          admissionDate: true,
           active: true,
           user: { select: { id: true, username: true } },
           parent: { select: { name: true, photo: true, mobileno: true, email: true } },
@@ -225,6 +247,7 @@ export async function getStudentsParents(req: Request, res: Response): Promise<R
           mobileno: student.mobileno,
           email: student.email,
           photo: sanitizePhotoUrl(student.photo),
+          admissionDate: formatDateKeyOrNull(student.admissionDate),
           active: student.active,
           parentId: student.parentId || null,
           parentName: student.parent?.name || null,
@@ -355,7 +378,7 @@ export async function onboardStudent(req: Request, res: Response): Promise<Respo
     const lastName = (student.lastName || body.lastName || '').trim();
     const gender = student.gender || body.gender || 'Male';
     const birthday = student.birthday || student.dob || body.birthday || body.dob;
-    const admissionDate = student.admissionDate || body.admissionDate || new Date();
+    const admissionDate = parseAdmissionDateInput(student.admissionDate || body.admissionDate) || new Date();
     const bloodGroup = student.bloodGroup || body.bloodGroup || null;
     const religion = student.religion || body.religion || null;
     const motherTongue = student.motherTongue || body.motherTongue || null;
@@ -980,6 +1003,7 @@ export async function importBulkStudents(req: Request, res: Response): Promise<R
           data: {
             id: nextStudentId++,
             registerNo,
+            admissionDate: parseAdmissionDateInput(row.admissionDate) || new Date(),
             firstName: row.firstName,
             lastName: row.lastName,
             gender: row.gender || 'Male',
@@ -1432,6 +1456,7 @@ export async function getStudentById(req: Request, res: Response): Promise<Respo
         lastName: student.lastName || '',
         gender: student.gender || '',
         birthday: student.birthday ? student.birthday.toISOString().split('T')[0] : '',
+        admissionDate: formatDateKeyOrNull(student.admissionDate) || '',
         religion: student.religion || '',
         caste: student.caste || '',
         bloodGroup: student.bloodGroup || '',
@@ -1587,6 +1612,7 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
       lastName,
       gender,
       birthday,
+      admissionDate,
       registerNo,
       religion,
       caste,
@@ -1628,6 +1654,17 @@ export async function updateStudent(req: Request, res: Response): Promise<Respon
       if (lastName !== undefined) updateData.lastName = lastName;
       if (gender !== undefined) updateData.gender = gender;
       if (birthday !== undefined) updateData.birthday = birthday ? new Date(birthday) : null;
+      if (admissionDate !== undefined) {
+        if (admissionDate === null || admissionDate === '') {
+          updateData.admissionDate = null;
+        } else {
+          const parsedAdm = parseAdmissionDateInput(admissionDate);
+          if (!parsedAdm) {
+            throw new Error('Invalid admission date format. Use YYYY-MM-DD.');
+          }
+          updateData.admissionDate = parsedAdm;
+        }
+      }
       if (registerNo !== undefined) updateData.registerNo = registerNo;
       if (religion !== undefined) updateData.religion = religion;
       if (caste !== undefined) updateData.caste = caste;
@@ -2014,6 +2051,7 @@ export async function approveSiblingRequest(req: Request, res: Response): Promis
         data: {
           id: nextStudentId,
           registerNo,
+          admissionDate: parseAdmissionDateInput(req.body?.admissionDate) || new Date(),
           firstName,
           lastName,
           gender: gender || 'Male',
@@ -2242,6 +2280,7 @@ export async function getClassroomStudents(req: Request, res: Response): Promise
           gender: e.student.gender,
           mobileno: e.student.mobileno,
           email: e.student.email,
+          admissionDate: formatDateKeyOrNull(e.student.admissionDate),
           active: e.student.active,
           parentName: e.student.parent?.name || null,
           parentRelation: e.student.parent?.relation || null,
@@ -2351,11 +2390,11 @@ export async function updateOnlineAdmissionStatus(req: Request, res: Response): 
       return res.status(400).json({ success: false, message: 'Invalid Admission ID.' });
     }
 
-    const { status, classId, sectionId } = req.body;
+    const { status, classId, sectionId, admissionDate: requestedAdmissionDate } = req.body;
     const targetStatus = parseInt(status, 10);
 
-    if (isNaN(targetStatus) || ![1, 2, 3, 4].includes(targetStatus)) {
-      return res.status(400).json({ success: false, message: 'Invalid admission status (1=Pending, 2=Screening, 3=Approved, 4=Rejected).' });
+    if (isNaN(targetStatus) || ![0, 1, 2, 3, 4].includes(targetStatus)) {
+      return res.status(400).json({ success: false, message: 'Invalid admission status (1=Pending, 2=Screening, 3=Approved, 4/0=Rejected).' });
     }
 
     const admission = await prisma.onlineAdmission.findFirst({
@@ -2373,6 +2412,9 @@ export async function updateOnlineAdmissionStatus(req: Request, res: Response): 
       if (!targetClassId || !targetSectionId) {
         return res.status(400).json({ success: false, message: 'Class and section allocation required for approving admission.' });
       }
+
+      const resolvedAdmissionDate =
+        parseAdmissionDateInput(requestedAdmissionDate) || admission.admissionDate || new Date();
 
       const globalSetting = await prisma.globalSettings.findFirst();
       const sessionId = globalSetting?.sessionId || 5;
@@ -2446,7 +2488,7 @@ export async function updateOnlineAdmissionStatus(req: Request, res: Response): 
           data: {
             id: nextStudentId,
             registerNo,
-            admissionDate: new Date(),
+            admissionDate: resolvedAdmissionDate,
             firstName: admission.firstName,
             lastName: admission.lastName || '',
             gender: admission.gender || 'Unknown',
@@ -2488,7 +2530,12 @@ export async function updateOnlineAdmissionStatus(req: Request, res: Response): 
 
         await tx.onlineAdmission.update({
           where: { id: admissionId },
-          data: { status: 3 },
+          data: {
+            status: 3,
+            admissionDate: resolvedAdmissionDate,
+            classId: targetClassId,
+            sectionId: String(targetSectionId),
+          },
         });
       });
 
@@ -2548,13 +2595,98 @@ export async function updateOnlineAdmissionStatus(req: Request, res: Response): 
 
     const updated = await prisma.onlineAdmission.update({
       where: { id: admissionId },
-      data: { status: targetStatus },
+      data: {
+        status: targetStatus,
+        ...(requestedAdmissionDate !== undefined
+          ? { admissionDate: parseAdmissionDateInput(requestedAdmissionDate) }
+          : {}),
+        ...(req.body?.reviewNotes !== undefined ? { reviewNotes: req.body.reviewNotes } : {}),
+        ...(req.body?.rejectionReason !== undefined ? { rejectionReason: req.body.rejectionReason } : {}),
+      },
     });
 
     return res.json({ success: true, message: 'Admission status updated.', admission: updated });
   } catch (error: any) {
     console.error('[ADMIN] Update admission status error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Failed to update admission status.' });
+  }
+}
+
+/**
+ * PATCH /api/admin/online-admissions/:id
+ * Allows editing an admission candidate's admissionDate (and class/section allocation).
+ * If already approved (status=3), also syncs the linked student record's admissionDate.
+ */
+export async function updateOnlineAdmission(req: Request, res: Response): Promise<Response | void> {
+  const branchId = req.branchId;
+
+  try {
+    const admissionId = parseInt(req.params.id as string, 10);
+    if (isNaN(admissionId)) {
+      return res.status(400).json({ success: false, message: 'Invalid Admission ID.' });
+    }
+
+    const admission = await prisma.onlineAdmission.findFirst({
+      where: { id: admissionId, branchId },
+    });
+    if (!admission) {
+      return res.status(404).json({ success: false, message: 'Online admission record not found.' });
+    }
+
+    const { admissionDate, classId, sectionId } = req.body || {};
+    const updateData: any = {};
+
+    if (admissionDate !== undefined) {
+      if (admissionDate === null || admissionDate === '') {
+        updateData.admissionDate = null;
+      } else {
+        const parsed = parseAdmissionDateInput(admissionDate);
+        if (!parsed) {
+          return res.status(400).json({ success: false, message: 'Invalid admissionDate. Use YYYY-MM-DD.' });
+        }
+        updateData.admissionDate = parsed;
+      }
+    }
+    if (classId !== undefined && classId !== '') {
+      updateData.classId = Number(classId);
+    }
+    if (sectionId !== undefined) {
+      updateData.sectionId = sectionId ? String(sectionId) : null;
+    }
+
+    const updated = await prisma.onlineAdmission.update({
+      where: { id: admissionId },
+      data: updateData,
+    });
+
+    // If candidate was already onboarded, best-effort sync Student.admissionDate for teacher attendance
+    if (admission.status === 3 && updateData.admissionDate !== undefined) {
+      const matchedStudent = await prisma.student.findFirst({
+        where: {
+          branchId,
+          firstName: admission.firstName,
+          lastName: admission.lastName || '',
+          ...(admission.birthday ? { birthday: admission.birthday } : {}),
+        },
+        orderBy: { id: 'desc' },
+        select: { id: true },
+      });
+      if (matchedStudent) {
+        await prisma.student.update({
+          where: { id: matchedStudent.id },
+          data: { admissionDate: updateData.admissionDate, updatedAt: new Date() },
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: 'Admission record updated.',
+      admission: updated,
+    });
+  } catch (error: any) {
+    console.error('[ADMIN] Update online admission error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update admission.' });
   }
 }
 

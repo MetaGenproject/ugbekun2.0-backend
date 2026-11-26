@@ -51,6 +51,7 @@ import {
   getClassroomStudents,
   getOnlineAdmissions,
   reviewOnlineAdmission,
+  updateOnlineAdmission,
   parseStudentDocument,
   getIdCards,
   getIdCardsStats,
@@ -428,7 +429,9 @@ router.get('/classroom-students', getClassroomStudents);
 router.get('/classrooms/:id/students', getClassroomStudents);
 router.post('/classrooms/remove-student-enrollment', removeStudentEnrollment);
 router.get('/online-admissions', getOnlineAdmissions);
+router.patch('/online-admissions/:id', updateOnlineAdmission);
 router.post('/online-admissions/:id/review', reviewOnlineAdmission);
+router.post('/online-admissions/:id/status', reviewOnlineAdmission);
 router.post('/students/parse-document', upload.single('file'), parseStudentDocument);
 
 router.get('/id-cards', getIdCards);

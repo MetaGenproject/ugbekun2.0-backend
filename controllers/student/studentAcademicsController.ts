@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { generateReportCardPdf, generateMontessoriReportCardPdf } from '../../lib/pdfService';
-import { listSubmittedAttendance } from '../../lib/attendanceRegisterService';
+import { buildStudentAttendanceReport } from '../../lib/attendanceRegisterService';
 import {
   parseMarkScore,
   resolveClassEvaluationMatrix,
@@ -16,7 +16,11 @@ import { resolveSchoolReportBranding } from '../../lib/reportCardHelper';
  */
 export async function getAttendance(req: Request, res: Response): Promise<Response | void> {
   try {
-    const { logs, summary } = await listSubmittedAttendance(prisma, {
+    if (!req.studentId || !req.branchId) {
+      return res.status(400).json({ success: false, message: 'Student context unavailable.' });
+    }
+
+    const report = await buildStudentAttendanceReport(prisma, {
       studentId: req.studentId,
       sessionId: req.sessionId,
       branchId: req.branchId,
@@ -24,17 +28,28 @@ export async function getAttendance(req: Request, res: Response): Promise<Respon
 
     return res.json({
       success: true,
-      percentage: summary.percentage,
-      totalDays: summary.totalDays,
-      presentCount: summary.presentCount,
-      absentCount: summary.absentCount,
-      lateCount: summary.lateCount,
-      logs: logs.map((l) => ({
+      percentage: report.summary.percentage,
+      totalDays: report.summary.totalDays,
+      presentCount: report.summary.presentCount,
+      absentCount: report.summary.absentCount,
+      lateCount: report.summary.lateCount,
+      excusedCount: report.summary.excusedCount,
+      sickCount: report.summary.sickCount,
+      inAttendance: report.summary.inAttendance,
+      currentTerm: report.currentTerm,
+      sessionName: report.sessionName,
+      logs: report.logs.map((l) => ({
         id: l.id,
         attendanceDate: l.attendanceDate,
         status: l.status,
         remark: l.remark,
       })),
+      reports: {
+        daily: report.daily,
+        weekly: report.weekly,
+        monthly: report.monthly,
+        termly: report.termly,
+      },
     });
   } catch (error) {
     console.error('[STUDENT] Attendance error:', error);

@@ -9,6 +9,7 @@ import {
   requireSchoolDateKey,
   schoolDateStoredRange,
   schoolDateUtcMidnight,
+  schoolMonthLabel,
   schoolWeekDateKeys,
   storedAttendanceDateKey,
   todaySchoolDateKey,
@@ -476,6 +477,7 @@ async function loadRoster(
           lastName: true,
           registerNo: true,
           gender: true,
+          admissionDate: true,
         },
       },
     },
@@ -490,6 +492,9 @@ async function loadRoster(
     firstName: row.student.firstName,
     lastName: row.student.lastName,
     gender: row.student.gender,
+    admissionDate: row.student.admissionDate
+      ? parseSchoolDateKey(row.student.admissionDate) || storedAttendanceDateKey(row.student.admissionDate)
+      : null,
   }));
 }
 
@@ -1277,4 +1282,177 @@ export function toLegacyAttendancePayload(
     status: row.status,
     remark: row.remark,
   }));
+}
+
+const ACADEMIC_TERMS_META = [
+  { termId: 1, termLabel: 'First Term', monthsRange: 'Sep – Dec', months: [8, 9, 10, 11] },
+  { termId: 2, termLabel: 'Second Term', monthsRange: 'Jan – Apr', months: [0, 1, 2, 3] },
+  { termId: 3, termLabel: 'Third Term', monthsRange: 'May – Aug', months: [4, 5, 6, 7] },
+] as const;
+
+function resolveTermIdFromLabel(raw?: string | null): number {
+  const compact = String(raw || '').trim().toLowerCase().replace(/\s+/g, '');
+  if (compact.includes('second') || compact.includes('2nd')) return 2;
+  if (compact.includes('third') || compact.includes('3rd')) return 3;
+  return 1;
+}
+
+function termMetaForDateKey(dateKey: string) {
+  const monthZeroIdx = Number(dateKey.slice(5, 7)) - 1;
+  return (
+    ACADEMIC_TERMS_META.find((t) => (t.months as readonly number[]).includes(monthZeroIdx)) ||
+    ACADEMIC_TERMS_META[0]
+  );
+}
+
+function evaluateAttendanceRate(daysMarked: number, percentage: number): string {
+  if (daysMarked === 0) return 'No Records';
+  if (percentage >= 95) return 'Excellent';
+  if (percentage >= 85) return 'Good';
+  if (percentage >= 75) return 'Average';
+  return 'Needs Attention';
+}
+
+/**
+ * Builds organized daily, weekly, monthly, and termly attendance reports
+ * for a single student from submitted attendance registers.
+ */
+export async function buildStudentAttendanceReport(
+  db: DbClient,
+  args: {
+    studentId: number;
+    sessionId?: number;
+    branchId: number;
+  }
+) {
+  const [{ logs, summary }, schoolYearRow, branchSetting] = await Promise.all([
+    listSubmittedAttendance(db, {
+      studentId: args.studentId,
+      sessionId: args.sessionId,
+      branchId: args.branchId,
+      order: 'desc',
+    }),
+    args.sessionId
+      ? db.schoolYear.findUnique({ where: { id: args.sessionId }, select: { schoolYear: true } })
+      : Promise.resolve(null),
+    args.branchId
+      ? db.systemSetting.findUnique({ where: { branchId: args.branchId }, select: { currentTerm: true } })
+      : Promise.resolve(null),
+  ]);
+
+  const currentTerm = branchSetting?.currentTerm || 'First Term';
+  const currentTermId = resolveTermIdFromLabel(currentTerm);
+
+  const daily = logs.map((log) => {
+    const dateKey =
+      parseSchoolDateKey(log.attendanceDate) || storedAttendanceDateKey(log.attendanceDate);
+    const term = termMetaForDateKey(dateKey);
+    const normalizedStatus = normalizeAttendanceStatus(log.status) || log.status;
+    return {
+      id: log.id,
+      dateKey,
+      attendanceDate: log.attendanceDate,
+      status: normalizedStatus,
+      remark: log.remark,
+      monthKey: dateKey.slice(0, 7),
+      termId: term.termId,
+      termLabel: term.termLabel,
+    };
+  });
+
+  const weeklyMap = new Map<string, typeof daily>();
+  const monthlyMap = new Map<string, typeof daily>();
+  const termlyMap = new Map<number, typeof daily>([
+    [1, []],
+    [2, []],
+    [3, []],
+  ]);
+
+  for (const row of daily) {
+    const weekDates = schoolWeekDateKeys(row.dateKey);
+    const weekStart = weekDates[0];
+    const weekRows = weeklyMap.get(weekStart) || [];
+    weekRows.push(row);
+    weeklyMap.set(weekStart, weekRows);
+
+    const monthRows = monthlyMap.get(row.monthKey) || [];
+    monthRows.push(row);
+    monthlyMap.set(row.monthKey, monthRows);
+
+    const termRows = termlyMap.get(row.termId) || [];
+    termRows.push(row);
+    termlyMap.set(row.termId, termRows);
+  }
+
+  const weekly = Array.from(weeklyMap.entries())
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([weekStart, rows]) => {
+      const weekDates = schoolWeekDateKeys(weekStart);
+      const stats = summarizeSubmittedLogs(rows);
+      return {
+        weekStart,
+        weekEnd: weekDates[weekDates.length - 1],
+        daysMarked: stats.totalDays,
+        present: stats.presentCount,
+        absent: stats.absentCount,
+        late: stats.lateCount,
+        excused: stats.excusedCount,
+        sick: stats.sickCount,
+        inAttendance: stats.inAttendance,
+        percentage: stats.totalDays > 0 ? stats.percentage : 0,
+      };
+    });
+
+  const monthly = Array.from(monthlyMap.entries())
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([monthKey, rows]) => {
+      const stats = summarizeSubmittedLogs(rows);
+      const term = termMetaForDateKey(`${monthKey}-01`);
+      return {
+        monthKey,
+        monthLabel: schoolMonthLabel(monthKey),
+        termId: term.termId,
+        termLabel: term.termLabel,
+        daysMarked: stats.totalDays,
+        present: stats.presentCount,
+        absent: stats.absentCount,
+        late: stats.lateCount,
+        excused: stats.excusedCount,
+        sick: stats.sickCount,
+        inAttendance: stats.inAttendance,
+        percentage: stats.totalDays > 0 ? stats.percentage : 0,
+      };
+    });
+
+  const termly = ACADEMIC_TERMS_META.map((term) => {
+    const rows = termlyMap.get(term.termId) || [];
+    const stats = summarizeSubmittedLogs(rows);
+    const pct = stats.totalDays > 0 ? stats.percentage : 0;
+    return {
+      termId: term.termId,
+      termLabel: term.termLabel,
+      monthsRange: term.monthsRange,
+      isCurrentTerm: term.termId === currentTermId,
+      daysMarked: stats.totalDays,
+      present: stats.presentCount,
+      absent: stats.absentCount,
+      late: stats.lateCount,
+      excused: stats.excusedCount,
+      sick: stats.sickCount,
+      inAttendance: stats.inAttendance,
+      percentage: pct,
+      evaluation: evaluateAttendanceRate(stats.totalDays, pct),
+    };
+  });
+
+  return {
+    summary,
+    currentTerm,
+    sessionName: schoolYearRow?.schoolYear ?? null,
+    logs,
+    daily,
+    weekly,
+    monthly,
+    termly,
+  };
 }

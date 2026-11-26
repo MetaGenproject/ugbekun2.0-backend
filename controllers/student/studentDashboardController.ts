@@ -317,7 +317,15 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
 
     // Attendance KPI processing
     const attendanceLogs = attendanceRes.logs || [];
-    const attendanceSummary = attendanceRes.summary || { percentage: 0, totalDays: 0, presentCount: 0, absentCount: 0, lateCount: 0 };
+    const attendanceSummary = attendanceRes.summary || {
+      percentage: 0,
+      totalDays: 0,
+      presentCount: 0,
+      absentCount: 0,
+      lateCount: 0,
+      excusedCount: 0,
+      sickCount: 0,
+    };
     const attendancePct = attendanceSummary.percentage;
     const attendance = {
       percentage: attendancePct,
@@ -325,6 +333,8 @@ export async function getDashboardOverview(req: Request, res: Response): Promise
       presentCount: attendanceSummary.presentCount,
       absentCount: attendanceSummary.absentCount,
       lateCount: attendanceSummary.lateCount,
+      excusedCount: attendanceSummary.excusedCount,
+      sickCount: attendanceSummary.sickCount,
       logs: attendanceLogs.slice(0, 30).map((l) => ({
         id: l.id,
         attendanceDate: l.attendanceDate,
