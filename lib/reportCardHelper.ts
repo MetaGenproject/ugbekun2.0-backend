@@ -1,6 +1,6 @@
 import { Prisma } from '@prisma/client';
 import prismaDefault from './prisma';
-import { ResolvedClassMatrix, mapStudentMarkToMatrix } from './markParser';
+import { ResolvedClassMatrix, mapStudentMarkToMatrix, normalizeComponentToken, resolveClassEvaluationMatrix } from './markParser';
 import { calculateGradeFromRanges } from './gradingService';
 
 export interface ClassPositionPolicy {
@@ -1186,6 +1186,33 @@ export function examMatchesTerm(
   return targetTermId === 1;
 }
 
+export interface StudentStageOption {
+  value: string;
+  label: string;
+  shortLabel: string;
+  maxMarks: number;
+  category: 'FULL' | 'CA' | 'EXAM';
+  isCaOnly: boolean;
+}
+
+export interface ScopeStageAvailability {
+  sessionId: number;
+  classId: number;
+  termId: number;
+  isPublished: boolean;
+  defaultStage: string;
+  publishedStages: string[];
+}
+
+export interface ClassPublicationFlags {
+  isPublished: boolean;
+  releaseCa1: boolean;
+  releaseCa2: boolean;
+  releaseCombinedCa: boolean;
+  releaseExam: boolean;
+  releaseFull: boolean;
+}
+
 export interface StudentReportClassOption {
   sessionId: number;
   classId: number;
@@ -1203,10 +1230,373 @@ export interface StudentReportOptionsPayload {
   currentClassId: number | null;
   currentTermId: number;
   currentTermLabel: string;
+  stageCatalogByClassId: Record<string, StudentStageOption[]>;
+  stageAvailability: Record<string, ScopeStageAvailability>;
 }
 
 /**
- * Fetches enrolled and mark-recorded sessions, classes, and terms for a student
+ * Builds the canonical list of user-selectable report stages for a class evaluation matrix
+ * matching the Admin & Teacher portal stage selector.
+ */
+export function buildStageCatalogForClass(
+  dbMatrix: ResolvedClassMatrix | null,
+  options?: { isEcd?: boolean }
+): StudentStageOption[] {
+  if (options?.isEcd || !dbMatrix) {
+    return [
+      {
+        value: 'FULL',
+        label: 'Full Terminal Report',
+        shortLabel: 'Full Report',
+        maxMarks: 100,
+        category: 'FULL',
+        isCaOnly: false,
+      },
+    ];
+  }
+
+  const catalog: StudentStageOption[] = [
+    {
+      value: 'FULL',
+      label:
+        dbMatrix.fullMaxMarks > 0
+          ? `Full Terminal Report (${dbMatrix.fullMaxMarks} marks)`
+          : 'Full Terminal Report',
+      shortLabel: 'Full Report',
+      maxMarks: dbMatrix.fullMaxMarks,
+      category: 'FULL',
+      isCaOnly: false,
+    },
+  ];
+
+  if (dbMatrix.caColumns.length > 0) {
+    const singleCa = dbMatrix.caColumns.length === 1;
+    const caLabel = singleCa
+      ? `${dbMatrix.caColumns[0].label || dbMatrix.caColumns[0].name} Only (${dbMatrix.caMaxMarks} marks)`
+      : `Only CA / Combined CA (${dbMatrix.caMaxMarks} marks)`;
+    catalog.push({
+      value: 'COMBINED_CA',
+      label: caLabel,
+      shortLabel: 'Only CA',
+      maxMarks: dbMatrix.caMaxMarks,
+      category: 'CA',
+      isCaOnly: true,
+    });
+
+    if (dbMatrix.caColumns.length > 1) {
+      for (const col of dbMatrix.caColumns) {
+        const code = String(col.code || col.key || col.label || '').trim().toUpperCase();
+        if (!code) continue;
+        catalog.push({
+          value: code,
+          label: `${col.label || col.name} Only (${col.maxMarks} marks)`,
+          shortLabel: `${col.code || col.label} Only`,
+          maxMarks: col.maxMarks,
+          category: 'CA',
+          isCaOnly: true,
+        });
+      }
+    }
+  }
+
+  if (dbMatrix.examColumns.length > 0) {
+    catalog.push({
+      value: 'EXAM',
+      label: `Exam Only (${dbMatrix.examMaxMarks} marks)`,
+      shortLabel: 'Exam Only',
+      maxMarks: dbMatrix.examMaxMarks,
+      category: 'EXAM',
+      isCaOnly: false,
+    });
+  }
+
+  return catalog;
+}
+
+function getCaColumnIndex(dbMatrix: ResolvedClassMatrix | null, stageValue: string): number {
+  if (!dbMatrix || dbMatrix.caColumns.length === 0) return -1;
+  const targetToken = normalizeComponentToken(stageValue);
+  const directIdx = dbMatrix.caColumns.findIndex(
+    (c) =>
+      normalizeComponentToken(c.code) === targetToken ||
+      normalizeComponentToken(c.key) === targetToken ||
+      normalizeComponentToken(c.name) === targetToken ||
+      normalizeComponentToken(c.label) === targetToken
+  );
+  if (directIdx >= 0) return directIdx;
+  if (targetToken === 'CA1') return 0;
+  if (targetToken === 'CA2' && dbMatrix.caColumns.length >= 2) return 1;
+  return -1;
+}
+
+export function normalizeRequestedStageCode(
+  dbMatrix: ResolvedClassMatrix | null,
+  rawStage: unknown
+): string {
+  const upper = String(rawStage || '').trim().toUpperCase();
+  if (!upper || upper === 'AUTO') return 'AUTO';
+  if (upper === 'FULL' || upper === 'ALL' || upper === 'TERMINAL') return 'FULL';
+  if (upper === 'COMBINED_CA' || upper === 'CA_ONLY' || upper === 'CA' || upper === 'MID_TERM') {
+    return 'COMBINED_CA';
+  }
+  if (upper === 'EXAM' || upper === 'EXAM_ONLY') return 'EXAM';
+
+  if (dbMatrix) {
+    const token = normalizeComponentToken(upper);
+    const matched = dbMatrix.columns.find(
+      (c) =>
+        normalizeComponentToken(c.code) === token ||
+        normalizeComponentToken(c.key) === token ||
+        normalizeComponentToken(c.name) === token ||
+        normalizeComponentToken(c.label) === token
+    );
+    if (matched) {
+      if (matched.category === 'EXAM' && dbMatrix.examColumns.length === 1) return 'EXAM';
+      return String(matched.code || matched.key || upper).trim().toUpperCase();
+    }
+    if (token === 'CA1' && dbMatrix.caColumns.length >= 1) {
+      return dbMatrix.caColumns.length === 1
+        ? 'COMBINED_CA'
+        : String(dbMatrix.caColumns[0].code || 'CA1').trim().toUpperCase();
+    }
+    if (token === 'CA2' && dbMatrix.caColumns.length >= 2) {
+      return String(dbMatrix.caColumns[1].code || 'CA2').trim().toUpperCase();
+    }
+  }
+
+  return upper;
+}
+
+export function isStagePublishedForPolicy(
+  stageValue: string,
+  dbMatrix: ResolvedClassMatrix | null,
+  pubState: ClassPublicationFlags
+): boolean {
+  if (!pubState.isPublished) return false;
+  const canonical = normalizeRequestedStageCode(dbMatrix, stageValue);
+
+  if (canonical === 'FULL') {
+    return Boolean(pubState.releaseFull);
+  }
+  if (canonical === 'EXAM') {
+    return Boolean(pubState.releaseExam || pubState.releaseFull);
+  }
+  if (canonical === 'COMBINED_CA') {
+    if (!dbMatrix || dbMatrix.caColumns.length <= 1) {
+      return Boolean(pubState.releaseCombinedCa || pubState.releaseCa1 || pubState.releaseFull);
+    }
+    return Boolean(
+      pubState.releaseCombinedCa ||
+        (pubState.releaseCa1 && pubState.releaseCa2) ||
+        pubState.releaseFull
+    );
+  }
+
+  const caIdx = getCaColumnIndex(dbMatrix, canonical);
+  if (caIdx === 0) {
+    return Boolean(pubState.releaseCa1 || pubState.releaseCombinedCa || pubState.releaseFull);
+  }
+  if (caIdx === 1) {
+    return Boolean(pubState.releaseCa2 || pubState.releaseCombinedCa || pubState.releaseFull);
+  }
+  if (caIdx >= 2) {
+    return Boolean(pubState.releaseCombinedCa || pubState.releaseFull);
+  }
+
+  // Fallback for non-CA columns matched directly in dbMatrix
+  const token = normalizeComponentToken(canonical);
+  const col = dbMatrix?.columns.find(
+    (c) =>
+      normalizeComponentToken(c.code) === token ||
+      normalizeComponentToken(c.key) === token
+  );
+  if (col) {
+    return Boolean(pubState.releaseFull || (col.category === 'CA' && pubState.releaseCombinedCa));
+  }
+  return false;
+}
+
+export function resolvePublishedStagesForClass(
+  dbMatrix: ResolvedClassMatrix | null,
+  pubState: ClassPublicationFlags,
+  options?: { isEcd?: boolean }
+): {
+  catalog: StudentStageOption[];
+  publishedStages: string[];
+  defaultPublishedStage: string;
+} {
+  const catalog = buildStageCatalogForClass(dbMatrix, options);
+  const publishedStages = catalog
+    .filter((item) => isStagePublishedForPolicy(item.value, dbMatrix, pubState))
+    .map((item) => item.value);
+
+  const defaultPublishedStage =
+    publishedStages[0] || catalog[0]?.value || 'FULL';
+
+  return {
+    catalog,
+    publishedStages,
+    defaultPublishedStage,
+  };
+}
+
+export function resolveStudentStageAccess(params: {
+  dbMatrix: ResolvedClassMatrix | null;
+  pubState: ClassPublicationFlags;
+  requestedStageRaw?: unknown;
+  isEcd?: boolean;
+  className?: string | null;
+  termLabel?: string | null;
+}): {
+  allowed: boolean;
+  explicitlyRequested: boolean;
+  requestedStage: string;
+  resolvedStage: string;
+  defaultPublishedStage: string;
+  publishedStages: string[];
+  denialMessage: string | null;
+} {
+  const { dbMatrix, pubState, requestedStageRaw, isEcd, className, termLabel } = params;
+  const { catalog, publishedStages, defaultPublishedStage } = resolvePublishedStagesForClass(
+    dbMatrix,
+    pubState,
+    { isEcd }
+  );
+
+  const normalizedRequest = normalizeRequestedStageCode(dbMatrix, requestedStageRaw);
+  const explicitlyRequested = normalizedRequest !== 'AUTO';
+  const targetStage = explicitlyRequested ? normalizedRequest : defaultPublishedStage;
+
+  const targetClassLabel = className || 'this class';
+  const targetTerm = termLabel || 'this term';
+
+  if (!pubState.isPublished || publishedStages.length === 0) {
+    return {
+      allowed: false,
+      explicitlyRequested,
+      requestedStage: targetStage,
+      resolvedStage: defaultPublishedStage,
+      defaultPublishedStage,
+      publishedStages: [],
+      denialMessage: `Official report cards for ${targetClassLabel} (${targetTerm}) have not been released yet by the school administration.`,
+    };
+  }
+
+  const allowed = isStagePublishedForPolicy(targetStage, dbMatrix, pubState);
+  if (!allowed) {
+    const requestedLabel =
+      catalog.find((c) => c.value === targetStage)?.label || targetStage;
+    const publishedLabels = catalog
+      .filter((c) => publishedStages.includes(c.value))
+      .map((c) => c.shortLabel);
+    const availableSuffix =
+      publishedLabels.length > 0
+        ? ` Currently published: ${publishedLabels.join(', ')}.`
+        : '';
+
+    return {
+      allowed: false,
+      explicitlyRequested,
+      requestedStage: targetStage,
+      resolvedStage: defaultPublishedStage,
+      defaultPublishedStage,
+      publishedStages,
+      denialMessage: `${requestedLabel} for ${targetClassLabel} (${targetTerm}) has not been published yet by the school administration.${availableSuffix}`,
+    };
+  }
+
+  return {
+    allowed: true,
+    explicitlyRequested,
+    requestedStage: targetStage,
+    resolvedStage: targetStage,
+    defaultPublishedStage,
+    publishedStages,
+    denialMessage: null,
+  };
+}
+
+function isPublicationRowActivelyPublished(
+  pub: {
+    isPublished?: boolean | null;
+    releaseCa1?: boolean | null;
+    releaseCa2?: boolean | null;
+    releaseCombinedCa?: boolean | null;
+    releaseExam?: boolean | null;
+    releaseFull?: boolean | null;
+  } | null | undefined
+): boolean {
+  return Boolean(
+    pub &&
+      pub.isPublished &&
+      (pub.releaseCa1 || pub.releaseCa2 || pub.releaseCombinedCa || pub.releaseExam || pub.releaseFull)
+  );
+}
+
+function evaluatePublicationRowsForScope<
+  T extends {
+    classId: number;
+    sessionId: number;
+    sectionId: number | null;
+    termId: number | null;
+    branchId: number | null;
+    isPublished: boolean;
+    releaseCa1: boolean;
+    releaseCa2: boolean;
+    releaseCombinedCa: boolean;
+    releaseExam: boolean;
+    releaseFull: boolean;
+  },
+>(
+  rows: T[],
+  params: {
+    classId: number;
+    sectionId?: number | null;
+    sessionId: number;
+    termId: number;
+    branchId?: number | null;
+    autoPublishReportCards: boolean;
+  }
+): ClassPublicationFlags & { classPub: T | null; hasExplicitPub: boolean } {
+  const { classId, sectionId, sessionId, termId, branchId, autoPublishReportCards } = params;
+  const scopedRows = rows.filter(
+    (r) =>
+      r.classId === classId &&
+      r.sessionId === sessionId &&
+      (!sectionId || r.sectionId === sectionId || r.sectionId === null) &&
+      (!branchId || r.branchId === branchId || r.branchId === null)
+  );
+
+  const termRows = termId ? scopedRows.filter((r) => r.termId === termId) : scopedRows;
+  let selectedPub: T | null =
+    (sectionId ? termRows.find((r) => r.sectionId === sectionId && isPublicationRowActivelyPublished(r)) : undefined) ||
+    termRows.find((r) => isPublicationRowActivelyPublished(r)) ||
+    null;
+
+  if (!selectedPub && termRows.length > 0) {
+    selectedPub = termRows[0];
+  }
+
+  // If explicit publications exist for this class/session in other terms, do NOT auto-publish unrelated terms
+  const hasExplicitPub = Boolean(selectedPub) || scopedRows.length > 0;
+  const isPublished = hasExplicitPub
+    ? isPublicationRowActivelyPublished(selectedPub)
+    : Boolean(autoPublishReportCards);
+
+  return {
+    classPub: selectedPub,
+    hasExplicitPub,
+    isPublished,
+    releaseCa1: hasExplicitPub ? Boolean(selectedPub?.releaseCa1) : isPublished,
+    releaseCa2: hasExplicitPub ? Boolean(selectedPub?.releaseCa2) : isPublished,
+    releaseCombinedCa: hasExplicitPub ? Boolean(selectedPub?.releaseCombinedCa) : isPublished,
+    releaseExam: hasExplicitPub ? Boolean(selectedPub?.releaseExam) : isPublished,
+    releaseFull: hasExplicitPub ? Boolean(selectedPub?.releaseFull) : isPublished,
+  };
+}
+
+/**
+ * Fetches enrolled and mark-recorded sessions, classes, terms, and stage publication policies
  * so both Student and Parent portals share identical filter options and scoping.
  */
 export async function fetchStudentReportOptions(
@@ -1223,7 +1613,7 @@ export async function fetchStudentReportOptions(
         sessionId: true,
         classId: true,
         sectionId: true,
-        class: { select: { id: true, name: true, isEcd: true } },
+        class: { select: { id: true, name: true, isEcd: true, usesScores: true } },
         section: { select: { id: true, name: true } },
       },
     }),
@@ -1234,12 +1624,15 @@ export async function fetchStudentReportOptions(
         sessionId: true,
         classId: true,
         sectionId: true,
-        class: { select: { id: true, name: true, isEcd: true } },
+        class: { select: { id: true, name: true, isEcd: true, usesScores: true } },
         section: { select: { id: true, name: true } },
       },
     }),
     branchId
-      ? prisma.systemSetting.findUnique({ where: { branchId }, select: { currentTerm: true } })
+      ? prisma.systemSetting.findUnique({
+          where: { branchId },
+          select: { currentTerm: true, autoPublishReportCards: true },
+        })
       : Promise.resolve(null),
   ]);
 
@@ -1264,17 +1657,87 @@ export async function fetchStudentReportOptions(
   }));
 
   const classScopeMap = new Map<string, StudentReportClassOption>();
+  const classNonScoreMap = new Map<number, boolean>();
   for (const row of [...enrolls, ...markScopeRows]) {
     const key = `${row.sessionId}:${row.classId}`;
-    if (!classScopeMap.has(key) && row.class) {
-      classScopeMap.set(key, {
-        sessionId: row.sessionId,
-        classId: row.classId,
-        sectionId: row.sectionId ?? null,
-        className: row.class.name,
-        sectionName: row.section?.name || '',
-        isEcd: Boolean(row.class.isEcd),
+    if (row.class) {
+      if (row.class.isEcd || row.class.usesScores === false) {
+        classNonScoreMap.set(row.classId, true);
+      }
+      if (!classScopeMap.has(key)) {
+        classScopeMap.set(key, {
+          sessionId: row.sessionId,
+          classId: row.classId,
+          sectionId: row.sectionId ?? null,
+          className: row.class.name,
+          sectionName: row.section?.name || '',
+          isEcd: Boolean(row.class.isEcd),
+        });
+      }
+    }
+  }
+
+  const classes = Array.from(classScopeMap.values());
+  const uniqueClassIds = Array.from(new Set(classes.map((c) => c.classId)));
+  const sessionIdsArr = Array.from(sessionIdsSet);
+
+  const [matrixPairs, publicationRows] = await Promise.all([
+    Promise.all(
+      uniqueClassIds.map(async (cid) => {
+        const isNonScore = classNonScoreMap.get(cid) === true;
+        const matrix = isNonScore ? null : await resolveClassEvaluationMatrix(prisma, branchId, cid);
+        return [cid, matrix] as const;
+      })
+    ),
+    uniqueClassIds.length > 0 && sessionIdsArr.length > 0
+      ? prisma.classReportCardPublication.findMany({
+          where: {
+            classId: { in: uniqueClassIds },
+            sessionId: { in: sessionIdsArr },
+            ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+          },
+          orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const matrixByClassId = new Map<number, ResolvedClassMatrix | null>(matrixPairs);
+  const autoPublishReportCards = branchSetting?.autoPublishReportCards !== false;
+
+  const stageCatalogByClassId: Record<string, StudentStageOption[]> = {};
+  for (const cid of uniqueClassIds) {
+    const matrix = matrixByClassId.get(cid) ?? null;
+    const isNonScore = classNonScoreMap.get(cid) === true;
+    stageCatalogByClassId[String(cid)] = buildStageCatalogForClass(matrix, { isEcd: isNonScore });
+  }
+
+  const stageAvailability: Record<string, ScopeStageAvailability> = {};
+  for (const clsOpt of classes) {
+    const matrix = matrixByClassId.get(clsOpt.classId) ?? null;
+    const isNonScore = classNonScoreMap.get(clsOpt.classId) === true;
+    for (const term of ACADEMIC_TERMS_CATALOG) {
+      const pubState = evaluatePublicationRowsForScope(publicationRows, {
+        classId: clsOpt.classId,
+        sectionId: clsOpt.sectionId,
+        sessionId: clsOpt.sessionId,
+        termId: term.id,
+        branchId,
+        autoPublishReportCards,
       });
+      const { publishedStages, defaultPublishedStage } = resolvePublishedStagesForClass(
+        matrix,
+        pubState,
+        { isEcd: isNonScore }
+      );
+      const scopeKey = `${clsOpt.sessionId}:${clsOpt.classId}:${term.id}`;
+      stageAvailability[scopeKey] = {
+        sessionId: clsOpt.sessionId,
+        classId: clsOpt.classId,
+        termId: term.id,
+        isPublished: pubState.isPublished && publishedStages.length > 0,
+        defaultStage: defaultPublishedStage,
+        publishedStages,
+      };
     }
   }
 
@@ -1283,12 +1746,14 @@ export async function fetchStudentReportOptions(
 
   return {
     sessions,
-    classes: Array.from(classScopeMap.values()),
+    classes,
     terms: ACADEMIC_TERMS_CATALOG.map((t) => ({ id: t.id, label: t.label })),
     currentSessionId: currentSessionId || sessions[0]?.id || null,
     currentClassId: enrolls[0]?.classId || null,
     currentTermId,
     currentTermLabel,
+    stageCatalogByClassId,
+    stageAvailability,
   };
 }
 
@@ -1405,73 +1870,22 @@ export async function resolveClassPublicationForStudent(
     ? { OR: [{ branchId }, { branchId: null }] }
     : {};
 
-  const isRowActivelyPublished = (pub: {
-    isPublished?: boolean | null;
-    releaseCa1?: boolean | null;
-    releaseCa2?: boolean | null;
-    releaseCombinedCa?: boolean | null;
-    releaseExam?: boolean | null;
-    releaseFull?: boolean | null;
-  } | null | undefined) =>
-    Boolean(
-      pub &&
-        pub.isPublished &&
-        (pub.releaseCa1 || pub.releaseCa2 || pub.releaseCombinedCa || pub.releaseExam || pub.releaseFull)
-    );
-
-  // 1. Check publications matching this term, newest first
-  const termRows = await prisma.classReportCardPublication.findMany({
+  const rows = await prisma.classReportCardPublication.findMany({
     where: {
       classId,
       sessionId,
-      ...(termId ? { termId } : {}),
       ...sectionFilter,
       ...branchFilter,
     },
     orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
   });
 
-  let selectedPub =
-    (sectionId ? termRows.find((r) => r.sectionId === sectionId && isRowActivelyPublished(r)) : undefined) ||
-    termRows.find((r) => isRowActivelyPublished(r)) ||
-    null;
-
-  // 2. Fallback to any published record for this class & session (e.g., published under a sibling termId or legacy row)
-  if (!selectedPub) {
-    const sessionPublishedRows = await prisma.classReportCardPublication.findMany({
-      where: {
-        classId,
-        sessionId,
-        ...sectionFilter,
-        ...branchFilter,
-        isPublished: true,
-      },
-      orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
-    });
-    selectedPub =
-      (sectionId
-        ? sessionPublishedRows.find((r) => r.sectionId === sectionId && isRowActivelyPublished(r))
-        : undefined) ||
-      sessionPublishedRows.find((r) => isRowActivelyPublished(r)) ||
-      null;
-  }
-
-  // 3. Respect explicit unpublished gating if no published record matched
-  if (!selectedPub && termRows.length > 0) {
-    selectedPub = termRows[0];
-  }
-
-  const hasExplicitPub = Boolean(selectedPub);
-  const isPublished = hasExplicitPub ? isRowActivelyPublished(selectedPub) : Boolean(autoPublishReportCards);
-
-  return {
-    classPub: selectedPub,
-    hasExplicitPub,
-    isPublished,
-    releaseCa1: hasExplicitPub ? Boolean(selectedPub?.releaseCa1) : isPublished,
-    releaseCa2: hasExplicitPub ? Boolean(selectedPub?.releaseCa2) : isPublished,
-    releaseCombinedCa: hasExplicitPub ? Boolean(selectedPub?.releaseCombinedCa) : isPublished,
-    releaseExam: hasExplicitPub ? Boolean(selectedPub?.releaseExam) : isPublished,
-    releaseFull: hasExplicitPub ? Boolean(selectedPub?.releaseFull) : isPublished,
-  };
+  return evaluatePublicationRowsForScope(rows, {
+    classId,
+    sectionId,
+    sessionId,
+    termId: termId || 0,
+    branchId,
+    autoPublishReportCards: Boolean(autoPublishReportCards),
+  });
 }

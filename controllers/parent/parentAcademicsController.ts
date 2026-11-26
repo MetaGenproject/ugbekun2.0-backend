@@ -21,6 +21,7 @@ import {
   fetchStudentReportOptions,
   resolveStudentReportFilterScope,
   resolveClassPublicationForStudent,
+  resolveStudentStageAccess,
 } from '../../lib/reportCardHelper';
 
 /**
@@ -342,6 +343,41 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       currentTerm: targetTermLabel,
     };
 
+    const [pubState, dbMatrix] = await Promise.all([
+      resolveClassPublicationForStudent(prisma, {
+        classId: targetClassId,
+        sectionId: targetSectionId,
+        sessionId: activeSessionId,
+        termId: targetTermId,
+        branchId: req.studentBranchId,
+        autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+      }),
+      isEcdClass || isCommentClass
+        ? Promise.resolve(null)
+        : resolveClassEvaluationMatrix(prisma, req.studentBranchId, targetClassId),
+    ]);
+
+    const {
+      releaseCa1,
+      releaseCa2,
+      releaseCombinedCa,
+      releaseExam,
+      releaseFull,
+    } = pubState;
+
+    const stageAccess = resolveStudentStageAccess({
+      dbMatrix,
+      pubState,
+      requestedStageRaw: (req.query as any)?.stage,
+      isEcd: isEcdClass || isCommentClass,
+      className: clsInfo?.name,
+      termLabel: targetTermLabel,
+    });
+
+    const visibleStages = stageAccess.publishedStages;
+    const isExamReleased = Boolean(releaseExam || releaseFull);
+    const isCombinedCaOnly = !isExamReleased && Boolean(releaseCombinedCa);
+
     const selectionMeta = {
       sessionId: activeSessionId || null,
       sessionName: sessionRow?.schoolYear || schoolBranding.academicSession || null,
@@ -351,34 +387,20 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       sectionName: sectionRow?.name || null,
       termId: targetTermId,
       termLabel: targetTermLabel,
+      requestedStage: stageAccess.requestedStage,
+      visibleStages,
       options,
     };
 
-    const {
-      isPublished,
-      releaseCa1,
-      releaseCa2,
-      releaseCombinedCa,
-      releaseExam,
-      releaseFull,
-    } = await resolveClassPublicationForStudent(prisma, {
-      classId: targetClassId,
-      sectionId: targetSectionId,
-      sessionId: activeSessionId,
-      termId: targetTermId,
-      branchId: req.studentBranchId,
-      autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
-    });
-
-    if (!isPublished) {
+    if (!stageAccess.allowed) {
       return res.json({
         success: true,
         isPublished: false,
         ...selectionMeta,
+        stage: stageAccess.requestedStage,
         schoolBranding,
         studentBio: studentRecord,
         attendanceSummary: attendanceRes.summary,
-        visibleStages: [],
         releaseCa1: false,
         releaseCa2: false,
         releaseCombinedCa: false,
@@ -389,21 +411,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         commentary: null,
         rank: null,
         totalClassStudents: 0,
-        message: `Official report cards for ${clsInfo?.name || "your child's class"} (${targetTermLabel}) have not been released yet by the school administration.`,
+        message: stageAccess.denialMessage,
       });
     }
 
-    const visibleStages: string[] = [];
-    if (releaseCa1) visibleStages.push('CA1');
-    if (releaseCa2) visibleStages.push('CA2');
-    if (releaseCombinedCa) visibleStages.push('COMBINED_CA');
-    if (releaseExam) visibleStages.push('EXAM');
-    if (releaseFull) visibleStages.push('FULL');
-
-    // ZERO LEAKAGE RULE: exam scores and ranking MUST NOT be sent when only CA/Combined CA is released
-    const isExamReleased = Boolean(releaseExam || releaseFull);
-    const isCombinedCaOnly = releaseCombinedCa && !isExamReleased;
-
+    // Stage & release flags already validated cleanly via stageAccess above
     if (isCommentClass) {
       const [subjectComments, commentary, mont, nextTermFeesStr] = await Promise.all([
         prisma.subjectCommentAssessment.findMany({
@@ -566,28 +578,8 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       });
     }
 
-    const [dbMatrix, gradingScale] = await Promise.all([
-      resolveClassEvaluationMatrix(prisma, req.studentBranchId, targetClassId),
-      resolveGradingScale(prisma, req.studentBranchId, targetClassId),
-    ]);
-
-    let defaultStage = 'FULL';
-    if (!isExamReleased) {
-      if (releaseCombinedCa || (releaseCa1 && releaseCa2)) defaultStage = 'COMBINED_CA';
-      else if (releaseCa1) defaultStage = 'CA1';
-      else if (releaseCa2) defaultStage = 'CA2';
-      else defaultStage = 'COMBINED_CA';
-    }
-    const requestedStageRaw = String((req.query as any)?.stage || defaultStage).toUpperCase();
-    const requestedStage =
-      !isExamReleased &&
-      (requestedStageRaw === 'FULL' ||
-        requestedStageRaw === 'ALL' ||
-        requestedStageRaw === 'TERMINAL' ||
-        requestedStageRaw === 'EXAM' ||
-        requestedStageRaw === 'EXAM_ONLY')
-        ? defaultStage
-        : requestedStageRaw;
+    const gradingScale = await resolveGradingScale(prisma, req.studentBranchId, targetClassId);
+    const requestedStage = stageAccess.resolvedStage;
 
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
     const examIds = Array.from(new Set(studentMarks.map((m) => m.examId)));
@@ -788,7 +780,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       schoolBranding,
       studentBio: studentRecord,
       attendanceSummary: attendanceRes.summary,
-      stage: isExamReleased && !isCaOnlyStage ? 'FULL' : (isCombinedCaOnly || isCaOnlyStage ? 'COMBINED_CA' : 'MID_TERM'),
+      stage: activeStage,
       isCaOnlyStage,
       maxTotal: activeMaxMarks,
       caMaxMarks: dbMatrix.caMaxMarks,
@@ -803,9 +795,8 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       releaseExam,
       releaseFull,
       reportCard,
-      // ZERO LEAKAGE: omit overallAverage when exam not released; send combinedCaAverage for combined CA
-      overallAverage: isExamReleased && !isCaOnlyStage ? overallAverage : null,
-      rawAverage: isExamReleased && !isCaOnlyStage ? rawAverage : null,
+      overallAverage: (isExamReleased || isCombinedCaOnly || isCaOnlyStage) && marksCount > 0 ? normalizedAverage : null,
+      rawAverage: (isExamReleased || isCombinedCaOnly || isCaOnlyStage) && marksCount > 0 ? rawAverage : null,
       combinedCaAverage: isCombinedCaOnly || isCaOnlyStage ? combinedCaAverage : null,
       commentary: commentary?.remark || null,
       teacherComment: commentary?.remark || null,
@@ -896,37 +887,6 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       currentTerm: targetTermLabel,
     };
 
-    const {
-      isPublished,
-      releaseCa1,
-      releaseCa2,
-      releaseCombinedCa,
-      releaseExam,
-      releaseFull,
-    } = await resolveClassPublicationForStudent(prisma, {
-      classId: targetClassId,
-      sectionId: targetSectionId,
-      sessionId: activeSessionId,
-      termId: targetTermId,
-      branchId: req.studentBranchId,
-      autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
-    });
-
-    if (!isPublished) {
-      return res.status(403).json({
-        success: false,
-        message: `Official report cards for your child's class (${targetTermLabel}) have not been published yet by the school administration.`,
-      });
-    }
-
-    const visibleStages: string[] = [];
-    if (releaseCa1) visibleStages.push('CA1');
-    if (releaseCa2) visibleStages.push('CA2');
-    if (releaseExam) visibleStages.push('EXAM');
-    if (releaseFull) visibleStages.push('FULL');
-
-    const isExamReleased = Boolean(releaseExam || releaseFull);
-
     let isEcdClass = false;
     let isCommentClass = false;
     let clsInfo = null;
@@ -938,6 +898,47 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       isEcdClass = !!clsInfo?.isEcd;
       isCommentClass = clsInfo?.usesScores === false;
     }
+
+    const [pubState, dbMatrix] = await Promise.all([
+      resolveClassPublicationForStudent(prisma, {
+        classId: targetClassId,
+        sectionId: targetSectionId,
+        sessionId: activeSessionId,
+        termId: targetTermId,
+        branchId: req.studentBranchId,
+        autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+      }),
+      isEcdClass || isCommentClass
+        ? Promise.resolve(null)
+        : resolveClassEvaluationMatrix(prisma, req.studentBranchId, targetClassId),
+    ]);
+
+    const {
+      releaseCa1,
+      releaseCa2,
+      releaseCombinedCa,
+      releaseExam,
+      releaseFull,
+    } = pubState;
+
+    const stageAccess = resolveStudentStageAccess({
+      dbMatrix,
+      pubState,
+      requestedStageRaw: (req.query as any)?.stage,
+      isEcd: isEcdClass || isCommentClass,
+      className: clsInfo?.name,
+      termLabel: targetTermLabel,
+    });
+
+    if (!stageAccess.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: stageAccess.denialMessage,
+      });
+    }
+
+    const visibleStages = stageAccess.publishedStages;
+    const isExamReleased = Boolean(releaseExam || releaseFull);
 
     if (isCommentClass && clsInfo) {
       const student = await prisma.student.findUnique({
@@ -1179,32 +1180,8 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       });
     }
 
-    const [dbMatrix, gradingScale] = await Promise.all([
-      resolveClassEvaluationMatrix(prisma, req.studentBranchId, targetClassId),
-      resolveGradingScale(prisma, req.studentBranchId, targetClassId),
-    ]);
-
-    if (releaseCombinedCa && !visibleStages.includes('COMBINED_CA')) {
-      visibleStages.push('COMBINED_CA');
-    }
-
-    let defaultStage = 'FULL';
-    if (!isExamReleased) {
-      if (releaseCombinedCa || (releaseCa1 && releaseCa2)) defaultStage = 'COMBINED_CA';
-      else if (releaseCa1) defaultStage = 'CA1';
-      else if (releaseCa2) defaultStage = 'CA2';
-      else defaultStage = 'COMBINED_CA';
-    }
-    const requestedStageRaw = String((req.query as any)?.stage || defaultStage).toUpperCase();
-    const requestedStage =
-      !isExamReleased &&
-      (requestedStageRaw === 'FULL' ||
-        requestedStageRaw === 'ALL' ||
-        requestedStageRaw === 'TERMINAL' ||
-        requestedStageRaw === 'EXAM' ||
-        requestedStageRaw === 'EXAM_ONLY')
-        ? defaultStage
-        : requestedStageRaw;
+    const gradingScale = await resolveGradingScale(prisma, req.studentBranchId, targetClassId);
+    const requestedStage = stageAccess.resolvedStage;
 
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
     const examIds = Array.from(new Set(studentMarks.map((m) => m.examId)));

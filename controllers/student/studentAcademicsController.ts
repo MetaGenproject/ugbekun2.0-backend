@@ -18,6 +18,7 @@ import {
   examMatchesTerm,
   fetchStudentReportOptions,
   resolveClassPublicationForStudent,
+  resolveStudentStageAccess,
 } from '../../lib/reportCardHelper';
 
 /**
@@ -276,20 +277,27 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       currentTerm: targetTermLabel,
     };
 
-    const {
-      isPublished: isClassPublished,
-      releaseCa1,
-      releaseCa2,
-      releaseCombinedCa,
-      releaseExam,
-      releaseFull,
-    } = await resolveClassPublicationForStudent(prisma, {
-      classId: targetClassId,
-      sectionId: targetSectionId,
-      sessionId: activeSessionId,
-      termId: targetTermId,
-      branchId: req.branchId,
-      autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+    const [pubState, dbMatrix] = await Promise.all([
+      resolveClassPublicationForStudent(prisma, {
+        classId: targetClassId,
+        sectionId: targetSectionId,
+        sessionId: activeSessionId,
+        termId: targetTermId,
+        branchId: req.branchId,
+        autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+      }),
+      isEcdClass
+        ? Promise.resolve(null)
+        : resolveClassEvaluationMatrix(prisma, req.branchId, targetClassId),
+    ]);
+
+    const stageAccess = resolveStudentStageAccess({
+      dbMatrix,
+      pubState,
+      requestedStageRaw: (req.query as any)?.stage,
+      isEcd: isEcdClass,
+      className: clsInfo?.name,
+      termLabel: targetTermLabel,
     });
 
     const selectionMeta = {
@@ -301,14 +309,17 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       sectionName: sectionRow?.name || null,
       termId: targetTermId,
       termLabel: targetTermLabel,
+      requestedStage: stageAccess.requestedStage,
+      visibleStages: stageAccess.publishedStages,
       options,
     };
 
-    if (!isClassPublished) {
+    if (!stageAccess.allowed) {
       return res.json({
         success: true,
         isPublished: false,
         ...selectionMeta,
+        stage: stageAccess.requestedStage,
         schoolBranding,
         studentBio: studentRecord,
         reportCard: [],
@@ -316,7 +327,7 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
         commentary: null,
         rank: null,
         totalClassStudents: 0,
-        message: `Official report cards for ${clsInfo?.name || 'this class'} (${targetTermLabel}) have not been released yet by the school administration.`,
+        message: stageAccess.denialMessage,
       });
     }
 
@@ -394,30 +405,8 @@ export async function getGrades(req: Request, res: Response): Promise<Response |
       });
     }
 
-    const [dbMatrix, gradingScale] = await Promise.all([
-      resolveClassEvaluationMatrix(prisma, req.branchId, targetClassId),
-      resolveGradingScale(prisma, req.branchId, targetClassId),
-    ]);
-
-    const isExamReleased = Boolean(releaseExam || releaseFull);
-
-    let defaultStage = 'FULL';
-    if (!isExamReleased) {
-      if (releaseCombinedCa || (releaseCa1 && releaseCa2)) defaultStage = 'COMBINED_CA';
-      else if (releaseCa1) defaultStage = 'CA1';
-      else if (releaseCa2) defaultStage = 'CA2';
-      else defaultStage = 'COMBINED_CA';
-    }
-    const requestedStageRaw = String((req.query as any)?.stage || defaultStage).toUpperCase();
-    const requestedStage =
-      !isExamReleased &&
-      (requestedStageRaw === 'FULL' ||
-        requestedStageRaw === 'ALL' ||
-        requestedStageRaw === 'TERMINAL' ||
-        requestedStageRaw === 'EXAM' ||
-        requestedStageRaw === 'EXAM_ONLY')
-        ? defaultStage
-        : requestedStageRaw;
+    const gradingScale = await resolveGradingScale(prisma, req.branchId, targetClassId);
+    const requestedStage = stageAccess.resolvedStage;
 
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
     const examIds = Array.from(new Set(studentMarks.map((m) => m.examId)));
@@ -685,29 +674,6 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       currentTerm: targetTermLabel,
     };
 
-    const {
-      isPublished: isClassPublished,
-      releaseCa1,
-      releaseCa2,
-      releaseCombinedCa,
-      releaseExam,
-      releaseFull,
-    } = await resolveClassPublicationForStudent(prisma, {
-      classId: targetClassId,
-      sectionId: targetSectionId,
-      sessionId: activeSessionId,
-      termId: targetTermId,
-      branchId: req.branchId,
-      autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
-    });
-
-    if (!isClassPublished) {
-      return res.status(403).json({
-        success: false,
-        message: 'Official report cards for the selected class have not been published yet by the school administration.',
-      });
-    }
-
     let isEcdClass = false;
     let clsInfo = null;
     if (targetClassId) {
@@ -716,6 +682,44 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
         select: { name: true, isEcd: true },
       });
       isEcdClass = !!clsInfo?.isEcd;
+    }
+
+    const [pubState, dbMatrix] = await Promise.all([
+      resolveClassPublicationForStudent(prisma, {
+        classId: targetClassId,
+        sectionId: targetSectionId,
+        sessionId: activeSessionId,
+        termId: targetTermId,
+        branchId: req.branchId,
+        autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+      }),
+      isEcdClass
+        ? Promise.resolve(null)
+        : resolveClassEvaluationMatrix(prisma, req.branchId, targetClassId),
+    ]);
+
+    const {
+      releaseCa1,
+      releaseCa2,
+      releaseCombinedCa,
+      releaseExam,
+      releaseFull,
+    } = pubState;
+
+    const stageAccess = resolveStudentStageAccess({
+      dbMatrix,
+      pubState,
+      requestedStageRaw: (req.query as any)?.stage,
+      isEcd: isEcdClass,
+      className: clsInfo?.name,
+      termLabel: targetTermLabel,
+    });
+
+    if (!stageAccess.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: stageAccess.denialMessage,
+      });
     }
 
     if (isEcdClass && clsInfo) {
@@ -870,30 +874,8 @@ export async function exportGradesPdf(req: Request, res: Response): Promise<Resp
       });
     }
 
-    const [dbMatrix, gradingScale] = await Promise.all([
-      resolveClassEvaluationMatrix(prisma, req.branchId, targetClassId),
-      resolveGradingScale(prisma, req.branchId, targetClassId),
-    ]);
-
-    const isExamReleased = Boolean(releaseExam || releaseFull);
-
-    let defaultStage = 'FULL';
-    if (!isExamReleased) {
-      if (releaseCombinedCa || (releaseCa1 && releaseCa2)) defaultStage = 'COMBINED_CA';
-      else if (releaseCa1) defaultStage = 'CA1';
-      else if (releaseCa2) defaultStage = 'CA2';
-      else defaultStage = 'COMBINED_CA';
-    }
-    const requestedStageRaw = String((req.query as any)?.stage || defaultStage).toUpperCase();
-    const requestedStage =
-      !isExamReleased &&
-      (requestedStageRaw === 'FULL' ||
-        requestedStageRaw === 'ALL' ||
-        requestedStageRaw === 'TERMINAL' ||
-        requestedStageRaw === 'EXAM' ||
-        requestedStageRaw === 'EXAM_ONLY')
-        ? defaultStage
-        : requestedStageRaw;
+    const gradingScale = await resolveGradingScale(prisma, req.branchId, targetClassId);
+    const requestedStage = stageAccess.resolvedStage;
 
     const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
     const examIds = Array.from(new Set(studentMarks.map((m) => m.examId)));
