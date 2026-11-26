@@ -443,10 +443,14 @@ function safeDrawPdfImage(doc, buffer, x, y, options) {
 }
 
 function formatCompactRemark(rawRemark) {
-  const str = String(rawRemark || '-').trim();
+  const str = String(rawRemark || '').trim();
   if (!str) return '-';
-  if (/needs\s*improvement\s*\/\s*fail/i.test(str)) return 'Needs Improvement';
-  if (/very\s*good/i.test(str) && str.length > 14) return 'Very Good';
+  if (/excellent|distinction/i.test(str)) return 'Excellent';
+  if (/very\s*good/i.test(str)) return 'Very Good';
+  if (/good|credit/i.test(str)) return 'Good';
+  if (/pass/i.test(str)) return 'Pass';
+  if (/fair/i.test(str)) return 'Fair';
+  if (/fail|needs\s*improvement|poor/i.test(str)) return 'Fail';
   return str;
 }
 
@@ -1218,6 +1222,55 @@ function drawStandardReportCard(doc, params) {
     }
   }
 
+  // Helper to extract component score from row
+  const getComponentDisplayScore = (row, comp) => {
+    if (row.absent) return '-';
+    const scoresMap = row.componentScores || {};
+    const candidates = [comp.code, comp.key, comp.label, comp.name].filter(Boolean);
+    for (const cand of candidates) {
+      if (scoresMap[cand] !== undefined && scoresMap[cand] !== null) {
+        return String(scoresMap[cand]);
+      }
+      const upper = String(cand).toUpperCase();
+      for (const [k, v] of Object.entries(scoresMap)) {
+        if (k.toUpperCase() === upper && v !== undefined && v !== null) {
+          return String(v);
+        }
+      }
+    }
+    const cat = String(comp.category || '').toUpperCase();
+    if (cat === 'EXAM' && row.theoryMark !== undefined && row.theoryMark !== null) {
+      return String(row.theoryMark);
+    }
+    if (cat === 'CA' && (row.cbtMark !== undefined && row.cbtMark !== null)) {
+      return String(row.cbtMark);
+    }
+    return '-';
+  };
+
+  const resolveEffectiveRowMax = (row) => {
+    const explicitMax = Number(row.maxMarks) || 0;
+    const baseMax = explicitMax > 0 ? explicitMax : resolvedMaxTotal || 100;
+    if (explicitMax > 0 && resolvedMaxTotal > 0 && explicitMax < resolvedMaxTotal) {
+      return explicitMax;
+    }
+    if (resolvedComponents.length > 0) {
+      let recMax = 0;
+      let hasAnyComp = false;
+      for (const comp of resolvedComponents) {
+        const valStr = getComponentDisplayScore(row, comp);
+        if (valStr !== '-' && valStr !== '' && !isNaN(Number(valStr))) {
+          recMax += Number(comp.maxMarks) || 0;
+          hasAnyComp = true;
+        }
+      }
+      if (hasAnyComp && recMax > 0) {
+        return recMax;
+      }
+    }
+    return baseMax;
+  };
+
   let precompObtained = 0;
   let precompMax = 0;
   for (const r of reportCard.slice(0, 20)) {
@@ -1225,9 +1278,14 @@ function drawStandardReportCard(doc, params) {
       const sc = parseFloat(String(r.stageScore ?? r.mark ?? r.totalScore ?? ''));
       if (!isNaN(sc)) {
         precompObtained += sc;
-        precompMax += Number(r.maxMarks) || resolvedMaxTotal || 100;
+        precompMax += resolveEffectiveRowMax(r);
       }
     }
+  }
+  const hasPartialRecordedMax =
+    precompMax > 0 && resolvedMaxTotal > 0 && precompMax < reportCard.filter((r) => !r.absent).length * resolvedMaxTotal;
+  if (hasPartialRecordedMax && precompMax > 0) {
+    overallAverage = Number(((precompObtained / precompMax) * 100).toFixed(1));
   }
   const totalScoreString =
     precompMax > 0
@@ -1378,29 +1436,6 @@ function drawStandardReportCard(doc, params) {
 
   y += headerRowH;
 
-  // Helper to extract component score from row
-  const getComponentDisplayScore = (row, comp, compIdx) => {
-    if (row.absent) return '-';
-    const scoresMap = row.componentScores || {};
-    const candidates = [comp.code, comp.key, comp.label, comp.name].filter(Boolean);
-    for (const cand of candidates) {
-      if (scoresMap[cand] !== undefined && scoresMap[cand] !== null) {
-        return String(scoresMap[cand]);
-      }
-      const upper = String(cand).toUpperCase();
-      for (const [k, v] of Object.entries(scoresMap)) {
-        if (k.toUpperCase() === upper && v !== undefined && v !== null) {
-          return String(v);
-        }
-      }
-    }
-    const cat = String(comp.category || '').toUpperCase();
-    if (cat === 'EXAM' && row.theoryMark !== undefined && row.theoryMark !== null) {
-      return String(row.theoryMark);
-    }
-    return '-';
-  };
-
   let cumulativeObtained = 0;
   let cumulativeMax = 0;
 
@@ -1424,7 +1459,7 @@ function drawStandardReportCard(doc, params) {
             ? String(row.totalScore)
             : '-';
 
-    const rowMax = Number(row.maxMarks) || resolvedMaxTotal || 100;
+    const rowMax = resolveEffectiveRowMax(row);
     let gradeLetter = row.grade || '-';
     let gradeRemark = row.remark || '-';
     if (!row.absent && totalScore !== '-' && !isNaN(parseFloat(totalScore))) {
@@ -1444,7 +1479,7 @@ function drawStandardReportCard(doc, params) {
        .text(row.subjectName || '-', subjectX, textOffsetY, { width: subjectW, height: cellTextH, lineBreak: false, ellipsis: true });
 
     resolvedComponents.forEach((comp, cIdx) => {
-      const valStr = getComponentDisplayScore(row, comp, cIdx);
+      const valStr = getComponentDisplayScore(row, comp);
       doc.fillColor(darkColor).font('Helvetica').fontSize(rowFontSize)
          .text(valStr, firstCompX + cIdx * compW, textOffsetY, { width: compW - 2, height: cellTextH, align: 'right', lineBreak: false });
     });

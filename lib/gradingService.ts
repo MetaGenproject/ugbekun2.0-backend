@@ -20,12 +20,28 @@ export interface GradingScaleData {
 }
 
 export const FALLBACK_PRIMARY_RANGES: GradeRange[] = [
-  { grade: 'A', minScore: 70, maxScore: 100, gradePoint: 5.0, remark: 'Distinction / Excellent', color: 'emerald' },
+  { grade: 'A', minScore: 70, maxScore: 100, gradePoint: 5.0, remark: 'Excellent', color: 'emerald' },
   { grade: 'B', minScore: 60, maxScore: 69, gradePoint: 4.0, remark: 'Very Good', color: 'blue' },
-  { grade: 'C', minScore: 50, maxScore: 59, gradePoint: 3.0, remark: 'Credit / Good', color: 'amber' },
-  { grade: 'D', minScore: 40, maxScore: 49, gradePoint: 2.0, remark: 'Fair / Pass', color: 'orange' },
-  { grade: 'F', minScore: 0, maxScore: 39, gradePoint: 0.0, remark: 'Needs Improvement / Fail', color: 'rose' },
+  { grade: 'C', minScore: 50, maxScore: 59, gradePoint: 3.0, remark: 'Good', color: 'amber' },
+  { grade: 'D', minScore: 40, maxScore: 49, gradePoint: 2.0, remark: 'Pass', color: 'orange' },
+  { grade: 'F', minScore: 0, maxScore: 39, gradePoint: 0.0, remark: 'Fail', color: 'rose' },
 ];
+
+/**
+ * Normalizes compound or verbose grading scale remarks (e.g. "Distinction / Excellent",
+ * "Credit / Good", "Fair / Pass", "Needs Improvement / Fail") to single concise report card labels.
+ */
+export function normalizeReportCardRemark(rawRemark?: string | null): string {
+  const str = String(rawRemark || '').trim();
+  if (!str) return '-';
+  if (/excellent|distinction/i.test(str)) return 'Excellent';
+  if (/very\s*good/i.test(str)) return 'Very Good';
+  if (/good|credit/i.test(str)) return 'Good';
+  if (/pass/i.test(str)) return 'Pass';
+  if (/fair/i.test(str)) return 'Fair';
+  if (/fail|needs\s*improvement|poor/i.test(str)) return 'Fail';
+  return str;
+}
 
 /**
  * Validates grade ranges for continuity and non-overlapping coverage
@@ -87,7 +103,7 @@ export function calculateGradeFromRanges(
   if (match) {
     return {
       grade: match.grade,
-      remark: match.remark || 'Graded',
+      remark: normalizeReportCardRemark(match.remark || 'Graded'),
       gradePoint: Number(match.gradePoint) || 0,
       color: match.color || 'slate',
     };
@@ -98,7 +114,7 @@ export function calculateGradeFromRanges(
     const highest = [...activeRanges].sort((a, b) => b.maxScore - a.maxScore)[0];
     return {
       grade: highest.grade,
-      remark: highest.remark,
+      remark: normalizeReportCardRemark(highest.remark),
       gradePoint: Number(highest.gradePoint) || 0,
       color: highest.color || 'emerald',
     };

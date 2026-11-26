@@ -1,16 +1,49 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
 import { generateReportCardPdf, generateMontessoriReportCardPdf, generateCommentBasedReportCardPdf } from '../../lib/pdfService';
-import { buildStudentAttendanceReport } from '../../lib/attendanceRegisterService';
+import { buildStudentAttendanceReport, listSubmittedAttendance } from '../../lib/attendanceRegisterService';
 import {
   parseMarkScore,
   resolveClassEvaluationMatrix,
   resolveActiveMatrixColumnsForStage,
+  resolveEffectiveMatrixStageForMarks,
   mapStudentMarkToMatrix,
+  consolidateMarksByStudentAndSubject,
 } from '../../lib/markParser';
 import { resolveGradingScale } from '../../lib/gradingService';
 import { getRatingLabel } from '../admin/adminMarksReportController';
-import { resolveSchoolReportBranding, computeStudentAttendanceMap, resolveNextTermPaymentLabel } from '../../lib/reportCardHelper';
+import {
+  resolveSchoolReportBranding,
+  computeStudentAttendanceMap,
+  resolveNextTermPaymentLabel,
+  termLabelForId,
+  examMatchesTerm,
+  fetchStudentReportOptions,
+  resolveStudentReportFilterScope,
+  resolveClassPublicationForStudent,
+} from '../../lib/reportCardHelper';
+
+/**
+ * GET /api/parent/child/:studentId/report-card/options
+ * Returns enrolled and mark-recorded sessions, classes, and terms for a linked child.
+ */
+export async function getChildReportCardOptions(req: Request, res: Response): Promise<Response | void> {
+  try {
+    if (!req.studentId) {
+      return res.status(400).json({ success: false, message: 'Student context unavailable.' });
+    }
+    const options = await fetchStudentReportOptions(
+      prisma,
+      req.studentId,
+      req.studentBranchId,
+      req.childSessionId
+    );
+    return res.json({ success: true, ...options });
+  } catch (error) {
+    console.error('[PARENT] Child report card options error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load report card options.' });
+  }
+}
 
 /**
  * GET /api/parent/child/:studentId/attendance
@@ -219,69 +252,132 @@ async function resolveNextTermFees(branchId?: number | null, classId?: number | 
  */
 export async function getChildGrades(req: Request, res: Response): Promise<Response | void> {
   try {
+    if (!req.studentId) {
+      return res.status(400).json({ success: false, message: 'Student context unavailable.' });
+    }
+
+    const scope = await resolveStudentReportFilterScope(prisma, {
+      studentId: req.studentId,
+      branchId: req.studentBranchId,
+      fallbackSessionId: req.childSessionId,
+      fallbackClassId: req.childClassId,
+      fallbackSectionId: req.childSectionId,
+      query: req.query as Record<string, any>,
+    });
+
+    if (!scope.isAuthorizedSession) {
+      return res.status(403).json({
+        success: false,
+        message: 'Selected academic session is not available for this child.',
+      });
+    }
+    if (!scope.isAuthorizedClass) {
+      return res.status(403).json({
+        success: false,
+        message: 'Selected class is not associated with this child.',
+      });
+    }
+
+    const {
+      options,
+      activeSessionId,
+      targetClassId,
+      targetSectionId,
+      targetTermId,
+      targetTermLabel,
+    } = scope;
+
     let isEcdClass = false;
     let isCommentClass = false;
     let clsInfo = null;
-    if (req.childClassId) {
+    if (targetClassId) {
       clsInfo = await prisma.class.findUnique({
-        where: { id: req.childClassId },
-        select: { name: true, isEcd: true, usesScores: true },
+        where: { id: targetClassId },
+        select: { id: true, name: true, isEcd: true, usesScores: true },
       });
       isEcdClass = !!clsInfo?.isEcd;
       isCommentClass = clsInfo?.usesScores === false;
     }
 
-    // Per-Class Publication Gating + Real-Time Auto-Publish Support
-    const [classPub, schoolBranding, studentRecord] = await Promise.all([
-      req.childClassId && req.childSessionId
-        ? prisma.classReportCardPublication.findFirst({
-            where: {
-              classId: req.childClassId,
-              sessionId: req.childSessionId,
-              ...(req.studentBranchId ? { OR: [{ branchId: req.studentBranchId }, { branchId: null }] } : {}),
-            },
-          })
-        : Promise.resolve(null),
+    // Per-Class & Per-Term Publication Gating + Real-Time Auto-Publish Support
+    const [baseBranding, studentRecord, sessionRow, sectionRow, attendanceRes] = await Promise.all([
       resolveSchoolReportBranding(prisma, req.studentBranchId, {
-        classId: req.childClassId || undefined,
-        sectionId: req.childSectionId || undefined,
-        sessionId: req.childSessionId || undefined,
+        classId: targetClassId,
+        sectionId: targetSectionId,
+        sessionId: activeSessionId,
       }),
-      req.studentId
-        ? prisma.student.findUnique({
-            where: { id: req.studentId },
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              registerNo: true,
-              photo: true,
-              gender: true,
-              birthday: true,
-            },
-          })
+      prisma.student.findUnique({
+        where: { id: req.studentId },
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          registerNo: true,
+          photo: true,
+          gender: true,
+          birthday: true,
+        },
+      }),
+      activeSessionId
+        ? prisma.schoolYear.findUnique({ where: { id: activeSessionId }, select: { id: true, schoolYear: true } })
         : Promise.resolve(null),
+      targetSectionId
+        ? prisma.section.findUnique({ where: { id: targetSectionId }, select: { id: true, name: true } })
+        : Promise.resolve(null),
+      req.studentBranchId
+        ? listSubmittedAttendance(prisma, {
+            studentId: req.studentId,
+            sessionId: activeSessionId,
+            branchId: req.studentBranchId,
+          })
+        : Promise.resolve({
+            logs: [],
+            summary: { percentage: 100, totalDays: 0, presentCount: 0, absentCount: 0, lateCount: 0 },
+          }),
     ]);
 
-    const hasExplicitPub = Boolean(classPub);
-    const isPublished = hasExplicitPub
-      ? Boolean(
-          classPub &&
-            classPub.isPublished &&
-            (classPub.releaseCa1 ||
-              classPub.releaseCa2 ||
-              classPub.releaseCombinedCa ||
-              classPub.releaseExam ||
-              classPub.releaseFull)
-        )
-      : Boolean(schoolBranding.autoPublishReportCards !== false);
+    const schoolBranding = {
+      ...baseBranding,
+      ...(sessionRow?.schoolYear ? { academicSession: sessionRow.schoolYear } : {}),
+      currentTerm: targetTermLabel,
+    };
+
+    const selectionMeta = {
+      sessionId: activeSessionId || null,
+      sessionName: sessionRow?.schoolYear || schoolBranding.academicSession || null,
+      classId: targetClassId || null,
+      className: clsInfo?.name || null,
+      sectionId: targetSectionId || null,
+      sectionName: sectionRow?.name || null,
+      termId: targetTermId,
+      termLabel: targetTermLabel,
+      options,
+    };
+
+    const {
+      isPublished,
+      releaseCa1,
+      releaseCa2,
+      releaseCombinedCa,
+      releaseExam,
+      releaseFull,
+    } = await resolveClassPublicationForStudent(prisma, {
+      classId: targetClassId,
+      sectionId: targetSectionId,
+      sessionId: activeSessionId,
+      termId: targetTermId,
+      branchId: req.studentBranchId,
+      autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+    });
 
     if (!isPublished) {
       return res.json({
         success: true,
         isPublished: false,
+        ...selectionMeta,
         schoolBranding,
         studentBio: studentRecord,
+        attendanceSummary: attendanceRes.summary,
         visibleStages: [],
         releaseCa1: false,
         releaseCa2: false,
@@ -293,15 +389,9 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         commentary: null,
         rank: null,
         totalClassStudents: 0,
-        message: 'Official report cards for your child\'s class have not been released yet by the school administration.',
+        message: `Official report cards for ${clsInfo?.name || "your child's class"} (${targetTermLabel}) have not been released yet by the school administration.`,
       });
     }
-
-    const releaseCa1 = hasExplicitPub ? Boolean(classPub?.releaseCa1) : true;
-    const releaseCa2 = hasExplicitPub ? Boolean(classPub?.releaseCa2) : true;
-    const releaseCombinedCa = hasExplicitPub ? Boolean(classPub?.releaseCombinedCa) : true;
-    const releaseExam = hasExplicitPub ? Boolean(classPub?.releaseExam) : true;
-    const releaseFull = hasExplicitPub ? Boolean(classPub?.releaseFull) : true;
 
     const visibleStages: string[] = [];
     if (releaseCa1) visibleStages.push('CA1');
@@ -315,38 +405,41 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     const isCombinedCaOnly = releaseCombinedCa && !isExamReleased;
 
     if (isCommentClass) {
-      const subjectComments = await prisma.subjectCommentAssessment.findMany({
-        where: {
-          studentId: req.studentId,
-          classId: req.childClassId,
-          sessionId: req.childSessionId,
-          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
-        },
-        include: {
-          subject: { select: { id: true, name: true, subjectCode: true } },
-        },
-        orderBy: { subject: { name: 'asc' } },
-      });
-
-      const commentary = await prisma.studentCommentary.findFirst({
-        where: {
-          studentId: req.studentId,
-          sessionId: req.childSessionId,
-          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
-        },
-      });
-
-      const mont = await prisma.montessoriAssessment.findFirst({
-        where: {
-          studentId: req.studentId,
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
-        },
-      });
-
-      const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
+      const [subjectComments, commentary, mont, nextTermFeesStr] = await Promise.all([
+        prisma.subjectCommentAssessment.findMany({
+          where: {
+            studentId: req.studentId,
+            ...(targetClassId ? { classId: targetClassId } : {}),
+            ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+            termId: targetTermId,
+            ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+          },
+          include: {
+            subject: { select: { id: true, name: true, subjectCode: true } },
+          },
+          orderBy: { subject: { name: 'asc' } },
+        }),
+        activeSessionId
+          ? prisma.studentCommentary.findFirst({
+              where: {
+                studentId: req.studentId,
+                sessionId: activeSessionId,
+                ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+              },
+            })
+          : Promise.resolve(null),
+        prisma.montessoriAssessment.findFirst({
+          where: {
+            studentId: req.studentId,
+            ...(targetClassId ? { classId: targetClassId } : {}),
+            ...(targetSectionId ? { sectionId: targetSectionId } : {}),
+            ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+            ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+          },
+          orderBy: { id: 'desc' },
+        }),
+        resolveNextTermFees(req.studentBranchId, targetClassId),
+      ]);
 
       return res.json({
         success: true,
@@ -354,6 +447,10 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         isCommentBased: true,
         isEcd: true,
         isPublished: true,
+        ...selectionMeta,
+        schoolBranding,
+        studentBio: studentRecord,
+        attendanceSummary: attendanceRes.summary,
         visibleStages,
         releaseCa1,
         releaseCa2,
@@ -370,7 +467,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
           ratingLabel: getRatingLabel(sc.rating),
         })),
         commentary: commentary?.remark || mont?.narrativeComment || null,
-        nextTermFees: nextTermFeesStr,
+        teacherComment: commentary?.remark || mont?.narrativeComment || null,
+        principalComment: commentary?.reviewNotes || null,
+        nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
+        resumptionDate: schoolBranding.resumptionDate || null,
+        nextTermResumptionDate: schoolBranding.resumptionDate || null,
         reportCard: [],
         overallAverage: null,
         rank: null,
@@ -379,58 +480,72 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     }
 
     if (isEcdClass) {
-      const assessment = await prisma.montessoriAssessment.findFirst({
+      const assessments = await prisma.montessoriAssessment.findMany({
         where: {
           studentId: req.studentId,
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          branchId: req.studentBranchId,
+          ...(targetClassId ? { classId: targetClassId } : {}),
+          ...(targetSectionId ? { sectionId: targetSectionId } : {}),
+          ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
         },
         include: {
-          exam: { select: { name: true, publishResult: true } },
+          exam: { select: { name: true, termId: true, publishResult: true } },
         },
+        orderBy: { id: 'desc' },
       });
+      const matchedEcd = assessments.find((a) => examMatchesTerm(a.exam, targetTermId)) || null;
       return res.json({
         success: true,
         isEcd: true,
         isPublished: true,
+        ...selectionMeta,
+        schoolBranding,
+        studentBio: studentRecord,
+        attendanceSummary: attendanceRes.summary,
         visibleStages,
         releaseCa1,
         releaseCa2,
         releaseExam,
         releaseFull,
-        assessment: assessment || null,
+        assessment: matchedEcd,
       });
     }
 
-    const studentMarks = await prisma.mark.findMany({
+    const sessionMarks = await prisma.mark.findMany({
       where: {
         studentId: req.studentId,
-        sessionId: req.childSessionId,
-        branchId: req.studentBranchId,
+        ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+        ...(targetClassId ? { classId: targetClassId } : {}),
+        ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
       },
       include: {
         subject: { select: { id: true, name: true, subjectCode: true } },
-        exam: { select: { id: true, name: true, resumptionDate: true, publishResult: true } },
+        exam: { select: { id: true, name: true, termId: true, resumptionDate: true, publishResult: true } },
       },
     });
 
-    const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
+    const studentMarks = sessionMarks.filter((m) => examMatchesTerm(m.exam, targetTermId));
+    const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, targetClassId);
 
     if (studentMarks.length === 0) {
-      const commentary = await prisma.studentCommentary.findFirst({
-        where: {
-          studentId: req.studentId,
-          sessionId: req.childSessionId,
-          status: 'PRINCIPAL_SIGNED_OFF',
-        },
-        select: { remark: true },
-      });
+      const commentary = activeSessionId
+        ? await prisma.studentCommentary.findFirst({
+            where: {
+              studentId: req.studentId,
+              sessionId: activeSessionId,
+              status: 'PRINCIPAL_SIGNED_OFF',
+            },
+            select: { remark: true, reviewNotes: true },
+          })
+        : null;
 
       return res.json({
         success: true,
         isPublished: true,
+        ...selectionMeta,
+        schoolBranding,
+        studentBio: studentRecord,
+        attendanceSummary: attendanceRes.summary,
         stage: isExamReleased ? 'FULL' : 'MID_TERM',
         visibleStages,
         releaseCa1,
@@ -440,17 +555,20 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         reportCard: [],
         overallAverage: null,
         commentary: commentary?.remark || null,
+        teacherComment: commentary?.remark || null,
+        principalComment: commentary?.reviewNotes || null,
         rank: null,
         totalClassStudents: 0,
+        resumptionDate: schoolBranding.resumptionDate || null,
         nextTermResumptionDate: null,
-        nextTermFees: nextTermFeesStr,
-        message: 'Report cards are published. No subject scores recorded yet for this session.',
+        nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
+        message: `No subject scores recorded for ${selectionMeta.className || 'this class'} · ${targetTermLabel} (${selectionMeta.sessionName || 'Session'}).`,
       });
     }
 
     const [dbMatrix, gradingScale] = await Promise.all([
-      resolveClassEvaluationMatrix(prisma, req.studentBranchId, req.childClassId),
-      resolveGradingScale(prisma, req.studentBranchId, req.childClassId),
+      resolveClassEvaluationMatrix(prisma, req.studentBranchId, targetClassId),
+      resolveGradingScale(prisma, req.studentBranchId, targetClassId),
     ]);
 
     let defaultStage = 'FULL';
@@ -460,27 +578,52 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       else if (releaseCa2) defaultStage = 'CA2';
       else defaultStage = 'COMBINED_CA';
     }
-    const requestedStage = String((req.query as any)?.stage || defaultStage).toUpperCase();
+    const requestedStageRaw = String((req.query as any)?.stage || defaultStage).toUpperCase();
+    const requestedStage =
+      !isExamReleased &&
+      (requestedStageRaw === 'FULL' ||
+        requestedStageRaw === 'ALL' ||
+        requestedStageRaw === 'TERMINAL' ||
+        requestedStageRaw === 'EXAM' ||
+        requestedStageRaw === 'EXAM_ONLY')
+        ? defaultStage
+        : requestedStageRaw;
+
+    const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
+    const examIds = Array.from(new Set(studentMarks.map((m) => m.examId)));
+    const rawClassMarks = await prisma.mark.findMany({
+      where: {
+        ...(targetClassId ? { classId: targetClassId } : {}),
+        ...(targetSectionId ? { sectionId: targetSectionId } : {}),
+        ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+        subjectId: { in: subjectIds },
+      },
+      include: {
+        exam: { select: { name: true, termId: true } },
+      },
+    });
+
+    const termClassMarks = rawClassMarks.filter((m) => examMatchesTerm(m.exam, targetTermId));
+    const consolidatedClassMarks = consolidateMarksByStudentAndSubject(
+      termClassMarks.length > 0 ? termClassMarks : rawClassMarks,
+      dbMatrix
+    );
+    const consolidatedStudentMarks = consolidateMarksByStudentAndSubject(studentMarks, dbMatrix);
+
     const {
       activeStage,
       activeColumns,
       activeMaxMarks,
       isCaOnlyStage,
-    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
-
-    const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
-    const classMarks = await prisma.mark.findMany({
-      where: {
-        classId: req.childClassId,
-        sectionId: req.childSectionId,
-        sessionId: req.childSessionId,
-        subjectId: { in: subjectIds },
-      },
-    });
+    } = resolveEffectiveMatrixStageForMarks(
+      dbMatrix,
+      requestedStage,
+      consolidatedClassMarks.length > 0 ? consolidatedClassMarks : consolidatedStudentMarks
+    );
 
     const classAverageMap: Record<string, { sum: number; count: number }> = {};
-    classMarks.forEach((m) => {
-      const key = `${m.examId}-${m.subjectId}`;
+    consolidatedClassMarks.forEach((m) => {
+      const key = String(m.subjectId);
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 };
       }
@@ -491,29 +634,33 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       }
     });
 
-    const commentary = await prisma.studentCommentary.findFirst({
-      where: {
-        studentId: req.studentId,
-        sessionId: req.childSessionId,
-      },
-      select: { remark: true, reviewNotes: true },
-    });
+    const commentary = activeSessionId
+      ? await prisma.studentCommentary.findFirst({
+          where: {
+            studentId: req.studentId,
+            sessionId: activeSessionId,
+          },
+          select: { remark: true, reviewNotes: true },
+        })
+      : null;
 
     let totalScoreSum = 0;
+    let totalMaxSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.flatMap((m) => {
+    const reportCard = consolidatedStudentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       const isAbsent = m.absent === '1' || m.absent === 'true';
       if (!mapped.hasValidScore && !isAbsent) return [];
 
+      const rowMaxMarks = mapped.effectiveMaxMarks || activeMaxMarks;
       if (mapped.hasValidScore) {
         totalScoreSum += mapped.stageTotal;
+        totalMaxSum += rowMaxMarks;
         marksCount++;
       }
 
-      const avgKey = `${m.examId}-${m.subjectId}`;
-      const avgData = classAverageMap[avgKey];
+      const avgData = classAverageMap[String(m.subjectId)];
       const classAverage =
         avgData && avgData.count > 0
           ? Number((avgData.sum / avgData.count).toFixed(1))
@@ -521,7 +668,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
           ? mapped.stageTotal
           : 0;
 
-      // ZERO DATA LEAKAGE: When exam/full is not released, sanitize theoryMark, mark (total) and classAverage!
+      // ZERO DATA LEAKAGE: When exam/full is not released, sanitize theoryMark and keep only released stage metrics!
       const caScore = mapped.caTotal > 0 ? String(mapped.caTotal) : (mapped.stageTotal > 0 && !isExamReleased ? String(mapped.stageTotal) : null);
 
       return [{
@@ -537,9 +684,9 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         theoryMark: isExamReleased && !isCaOnlyStage ? (mapped.examTotal > 0 ? String(mapped.examTotal) : null) : null,
         mark: (isExamReleased || isCombinedCaOnly || isCaOnlyStage) ? (mapped.hasValidScore ? String(mapped.stageTotal) : null) : null,
         componentScores: mapped.componentScores,
-        maxMarks: activeMaxMarks,
+        maxMarks: rowMaxMarks,
         absent: isAbsent,
-        classAverage: isExamReleased ? classAverage : null,
+        classAverage: isExamReleased || isCaOnlyStage || isCombinedCaOnly ? classAverage : null,
         statusRemark: isAbsent ? 'Absent' : (caScore ? 'Progress recorded' : 'Pending'),
       }];
     });
@@ -548,9 +695,11 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
     // For COMBINED_CA only: show CA average, capped at CA total from DB matrix
     const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
     const normalizedAverage =
-      marksCount > 0 && activeMaxMarks > 0
-        ? Number((((totalScoreSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
-        : rawAverage;
+      marksCount > 0 && totalMaxSum > 0
+        ? Number(((totalScoreSum / totalMaxSum) * 100).toFixed(1))
+        : marksCount > 0 && activeMaxMarks > 0
+          ? Number((((totalScoreSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
+          : rawAverage;
     const overallAverage = isExamReleased && marksCount > 0 ? normalizedAverage : null;
     const combinedCaAverage = (isCombinedCaOnly || isCaOnlyStage) && marksCount > 0 ? rawAverage : null;
 
@@ -559,13 +708,13 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
 
     // ZERO LEAKAGE: Rank MUST NOT be computed or sent for CA-only or Combined CA releases
     // Rank is ONLY computed and sent on full Terminal Exam report cards
-    if (isExamReleased && !isCaOnlyStage && req.childClassId && req.childSectionId) {
+    if (isExamReleased && !isCaOnlyStage && targetClassId && targetSectionId && activeSessionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          branchId: req.studentBranchId,
+          classId: targetClassId,
+          sectionId: targetSectionId,
+          sessionId: activeSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
         },
         select: { studentId: true },
       });
@@ -576,8 +725,10 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
         const allMarks = await prisma.mark.findMany({
           where: {
             studentId: { in: studentIds },
-            sessionId: req.childSessionId,
-            branchId: req.studentBranchId,
+            sessionId: activeSessionId,
+            classId: targetClassId,
+            examId: { in: examIds },
+            ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
           },
           select: { studentId: true, mark: true, cbtMark: true },
         });
@@ -608,31 +759,35 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
           rank = myIndex + 1;
         }
       }
-    } else if (req.childClassId && req.childSectionId) {
+    } else if (targetClassId && targetSectionId && activeSessionId) {
       const count = await prisma.enroll.count({
         where: {
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          branchId: req.studentBranchId,
+          classId: targetClassId,
+          sectionId: targetSectionId,
+          sessionId: activeSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
         },
       });
       totalClassStudents = count;
     }
 
-    const montAssessmentForJson = await prisma.montessoriAssessment.findFirst({
-      where: {
-        studentId: req.studentId,
-        sessionId: req.childSessionId,
-      },
-      orderBy: { id: 'desc' },
-    });
+    const montAssessmentForJson = activeSessionId
+      ? await prisma.montessoriAssessment.findFirst({
+          where: {
+            studentId: req.studentId,
+            sessionId: activeSessionId,
+          },
+          orderBy: { id: 'desc' },
+        })
+      : null;
 
     return res.json({
       success: true,
       isPublished: true,
+      ...selectionMeta,
       schoolBranding,
       studentBio: studentRecord,
+      attendanceSummary: attendanceRes.summary,
       stage: isExamReleased && !isCaOnlyStage ? 'FULL' : (isCombinedCaOnly || isCaOnlyStage ? 'COMBINED_CA' : 'MID_TERM'),
       isCaOnlyStage,
       maxTotal: activeMaxMarks,
@@ -650,6 +805,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
       reportCard,
       // ZERO LEAKAGE: omit overallAverage when exam not released; send combinedCaAverage for combined CA
       overallAverage: isExamReleased && !isCaOnlyStage ? overallAverage : null,
+      rawAverage: isExamReleased && !isCaOnlyStage ? rawAverage : null,
       combinedCaAverage: isCombinedCaOnly || isCaOnlyStage ? combinedCaAverage : null,
       commentary: commentary?.remark || null,
       teacherComment: commentary?.remark || null,
@@ -676,6 +832,7 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
           : null,
       showPosition: schoolBranding.showPosition !== false,
       totalClassStudents,
+      resumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
       nextTermResumptionDate: studentMarks[0]?.exam?.resumptionDate || schoolBranding.resumptionDate || null,
       nextTermFees: schoolBranding.nextTermFees || nextTermFeesStr,
     });
@@ -690,51 +847,77 @@ export async function getChildGrades(req: Request, res: Response): Promise<Respo
  */
 export async function exportChildReportPdf(req: Request, res: Response): Promise<Response | void> {
   try {
+    if (!req.studentId) {
+      return res.status(400).json({ success: false, message: 'Student context unavailable.' });
+    }
+
     const { rankingType = 'full', rankingLimit = 3 } = req.query as any;
     const limit = parseInt(rankingLimit as string, 10) || 3;
 
-    // Per-Class Publication Gating + Auto-Publish Support
-    const [classPub, schoolBranding] = await Promise.all([
-      req.childClassId && req.childSessionId
-        ? prisma.classReportCardPublication.findFirst({
-            where: {
-              classId: req.childClassId,
-              sessionId: req.childSessionId,
-              ...(req.studentBranchId ? { OR: [{ branchId: req.studentBranchId }, { branchId: null }] } : {}),
-            },
-          })
-        : Promise.resolve(null),
+    const scope = await resolveStudentReportFilterScope(prisma, {
+      studentId: req.studentId,
+      branchId: req.studentBranchId,
+      fallbackSessionId: req.childSessionId,
+      fallbackClassId: req.childClassId,
+      fallbackSectionId: req.childSectionId,
+      query: req.query as Record<string, any>,
+    });
+
+    if (!scope.isAuthorizedSession) {
+      return res.status(403).json({
+        success: false,
+        message: 'Selected academic session is not available for this child.',
+      });
+    }
+    if (!scope.isAuthorizedClass) {
+      return res.status(403).json({
+        success: false,
+        message: 'Selected class is not associated with this child.',
+      });
+    }
+
+    const { activeSessionId, targetClassId, targetSectionId, targetTermId, targetTermLabel } = scope;
+
+    // Per-Class & Per-Term Publication Gating + Auto-Publish Support
+    const [baseBranding, sessionRow] = await Promise.all([
       resolveSchoolReportBranding(prisma, req.studentBranchId, {
-        classId: req.childClassId || undefined,
-        sectionId: req.childSectionId || undefined,
-        sessionId: req.childSessionId || undefined,
+        classId: targetClassId,
+        sectionId: targetSectionId,
+        sessionId: activeSessionId,
       }),
+      activeSessionId
+        ? prisma.schoolYear.findUnique({ where: { id: activeSessionId }, select: { schoolYear: true } })
+        : Promise.resolve(null),
     ]);
 
-    const hasExplicitPub = Boolean(classPub);
-    const isPublished = hasExplicitPub
-      ? Boolean(
-          classPub &&
-            classPub.isPublished &&
-            (classPub.releaseCa1 ||
-              classPub.releaseCa2 ||
-              classPub.releaseCombinedCa ||
-              classPub.releaseExam ||
-              classPub.releaseFull)
-        )
-      : Boolean(schoolBranding.autoPublishReportCards !== false);
+    const schoolBranding = {
+      ...baseBranding,
+      ...(sessionRow?.schoolYear ? { academicSession: sessionRow.schoolYear } : {}),
+      currentTerm: targetTermLabel,
+    };
+
+    const {
+      isPublished,
+      releaseCa1,
+      releaseCa2,
+      releaseCombinedCa,
+      releaseExam,
+      releaseFull,
+    } = await resolveClassPublicationForStudent(prisma, {
+      classId: targetClassId,
+      sectionId: targetSectionId,
+      sessionId: activeSessionId,
+      termId: targetTermId,
+      branchId: req.studentBranchId,
+      autoPublishReportCards: schoolBranding.autoPublishReportCards !== false,
+    });
 
     if (!isPublished) {
       return res.status(403).json({
         success: false,
-        message: 'Official report cards for your child\'s class have not been published yet by the school administration.',
+        message: `Official report cards for your child's class (${targetTermLabel}) have not been published yet by the school administration.`,
       });
     }
-
-    const releaseCa1 = hasExplicitPub ? Boolean(classPub?.releaseCa1) : true;
-    const releaseCa2 = hasExplicitPub ? Boolean(classPub?.releaseCa2) : true;
-    const releaseExam = hasExplicitPub ? Boolean(classPub?.releaseExam) : true;
-    const releaseFull = hasExplicitPub ? Boolean(classPub?.releaseFull) : true;
 
     const visibleStages: string[] = [];
     if (releaseCa1) visibleStages.push('CA1');
@@ -747,9 +930,9 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
     let isEcdClass = false;
     let isCommentClass = false;
     let clsInfo = null;
-    if (req.childClassId) {
+    if (targetClassId) {
       clsInfo = await prisma.class.findUnique({
-        where: { id: req.childClassId },
+        where: { id: targetClassId },
         select: { name: true, isEcd: true, usesScores: true },
       });
       isEcdClass = !!clsInfo?.isEcd;
@@ -768,20 +951,19 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       }
 
       let sectionName = 'N/A';
-      let sessionName = 'N/A';
+      const sessionName = sessionRow?.schoolYear || 'N/A';
       let formTeacherName = 'Class Teacher';
 
-      if (req.childSectionId) {
-        const sec = await prisma.section.findUnique({ where: { id: req.childSectionId }, select: { name: true } });
+      if (targetSectionId) {
+        const sec = await prisma.section.findUnique({ where: { id: targetSectionId }, select: { name: true } });
         sectionName = sec?.name || 'N/A';
-        const sess = await prisma.schoolYear.findUnique({ where: { id: req.childSessionId }, select: { schoolYear: true } });
-        sessionName = sess?.schoolYear || 'N/A';
-
+      }
+      if (targetClassId && targetSectionId && activeSessionId) {
         const formAllocation = await prisma.teacherAllocation.findFirst({
           where: {
-            classId: req.childClassId,
-            sectionId: req.childSectionId,
-            sessionId: req.childSessionId,
+            classId: targetClassId,
+            sectionId: targetSectionId,
+            sessionId: activeSessionId,
             ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
           },
           include: {
@@ -793,28 +975,31 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         }
       }
 
-      const subjectComments = await prisma.subjectCommentAssessment.findMany({
-        where: {
-          studentId: req.studentId,
-          classId: req.childClassId,
-          sessionId: req.childSessionId,
-          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
-        },
-        include: {
-          subject: { select: { name: true, subjectCode: true } },
-        },
-        orderBy: { subject: { name: 'asc' } },
-      });
-
-      const commentary = await prisma.studentCommentary.findFirst({
-        where: {
-          studentId: req.studentId,
-          sessionId: req.childSessionId,
-          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
-        },
-      });
-
-      const nextTermFees = await resolveNextTermFees(req.studentBranchId, req.childClassId);
+      const [subjectComments, commentary, nextTermFees] = await Promise.all([
+        prisma.subjectCommentAssessment.findMany({
+          where: {
+            studentId: req.studentId,
+            ...(targetClassId ? { classId: targetClassId } : {}),
+            ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+            termId: targetTermId,
+            ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+          },
+          include: {
+            subject: { select: { name: true, subjectCode: true } },
+          },
+          orderBy: { subject: { name: 'asc' } },
+        }),
+        activeSessionId
+          ? prisma.studentCommentary.findFirst({
+              where: {
+                studentId: req.studentId,
+                sessionId: activeSessionId,
+                ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
+              },
+            })
+          : Promise.resolve(null),
+        resolveNextTermFees(req.studentBranchId, targetClassId),
+      ]);
 
       const pdfBuffer = await generateCommentBasedReportCardPdf({
         schoolName: student.branch?.name || 'Ugbekun Schools',
@@ -824,7 +1009,7 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         className: clsInfo.name,
         sectionName,
         sessionName,
-        examName: 'Developmental Evaluation',
+        examName: targetTermLabel,
         subjectComments: subjectComments.map((sc) => ({
           subjectName: sc.subject?.name || 'Subject',
           comment: sc.comment,
@@ -860,20 +1045,19 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       }
 
       let sectionName = 'N/A';
-      let sessionName = 'N/A';
+      const sessionName = sessionRow?.schoolYear || 'N/A';
       let formTeacherName = 'Class Teacher';
 
-      if (req.childSectionId) {
-        const sec = await prisma.section.findUnique({ where: { id: req.childSectionId }, select: { name: true } });
+      if (targetSectionId) {
+        const sec = await prisma.section.findUnique({ where: { id: targetSectionId }, select: { name: true } });
         sectionName = sec?.name || 'N/A';
-        const sess = await prisma.schoolYear.findUnique({ where: { id: req.childSessionId }, select: { schoolYear: true } });
-        sessionName = sess?.schoolYear || 'N/A';
-
+      }
+      if (targetClassId && targetSectionId && activeSessionId) {
         const formAllocation = await prisma.teacherAllocation.findFirst({
           where: {
-            classId: req.childClassId,
-            sectionId: req.childSectionId,
-            sessionId: req.childSessionId,
+            classId: targetClassId,
+            sectionId: targetSectionId,
+            sessionId: activeSessionId,
             branchId: req.studentBranchId,
           },
           include: {
@@ -887,28 +1071,31 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
 
       const examIdVal = req.query.examId ? Number(req.query.examId) : undefined;
 
-      const assessment = await prisma.montessoriAssessment.findFirst({
+      const assessments = await prisma.montessoriAssessment.findMany({
         where: {
           studentId: req.studentId,
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          branchId: req.studentBranchId,
+          ...(targetClassId ? { classId: targetClassId } : {}),
+          ...(targetSectionId ? { sectionId: targetSectionId } : {}),
+          ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
           ...(examIdVal ? { examId: examIdVal } : {}),
         },
         include: {
-          exam: { select: { name: true, resumptionDate: true, publishResult: true } },
+          exam: { select: { name: true, termId: true, resumptionDate: true, publishResult: true } },
         },
+        orderBy: { id: 'desc' },
       });
+
+      const assessment = assessments.find((a) => examMatchesTerm(a.exam, targetTermId)) || null;
 
       if (!assessment) {
         return res.status(404).json({
           success: false,
-          message: 'No Montessori assessment recorded yet for this student.',
+          message: `No Montessori assessment recorded yet for ${clsInfo.name} (${targetTermLabel}).`,
         });
       }
 
-      const examName = assessment?.exam?.name || 'Term Evaluation';
+      const examName = assessment?.exam?.name || targetTermLabel;
       const resumptionDate = assessment?.exam?.resumptionDate || null;
 
       const pdfBuffer = await generateMontessoriReportCardPdf({
@@ -944,24 +1131,21 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       return res.status(404).json({ success: false, message: 'Student not found.' });
     }
 
-    let className = 'N/A';
+    const className = clsInfo?.name || 'N/A';
     let sectionName = 'N/A';
-    let sessionName = 'N/A';
+    const sessionName = sessionRow?.schoolYear || 'N/A';
     let formTeacherName = 'Class Teacher';
 
-    if (req.childClassId && req.childSectionId) {
-      const cls = await prisma.class.findUnique({ where: { id: req.childClassId }, select: { name: true } });
-      className = cls?.name || 'N/A';
-      const sec = await prisma.section.findUnique({ where: { id: req.childSectionId }, select: { name: true } });
+    if (targetSectionId) {
+      const sec = await prisma.section.findUnique({ where: { id: targetSectionId }, select: { name: true } });
       sectionName = sec?.name || 'N/A';
-      const sess = await prisma.schoolYear.findUnique({ where: { id: req.childSessionId }, select: { schoolYear: true } });
-      sessionName = sess?.schoolYear || 'N/A';
-
+    }
+    if (targetClassId && targetSectionId && activeSessionId) {
       const formAllocation = await prisma.teacherAllocation.findFirst({
         where: {
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
+          classId: targetClassId,
+          sectionId: targetSectionId,
+          sessionId: activeSessionId,
           branchId: req.studentBranchId,
         },
         include: {
@@ -973,31 +1157,33 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       }
     }
 
-    const studentMarks = await prisma.mark.findMany({
+    const sessionMarks = await prisma.mark.findMany({
       where: {
         studentId: req.studentId,
-        sessionId: req.childSessionId,
-        branchId: req.studentBranchId,
+        ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+        ...(targetClassId ? { classId: targetClassId } : {}),
+        ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
       },
       include: {
         subject: { select: { name: true, subjectCode: true } },
-        exam: { select: { name: true, resumptionDate: true, publishResult: true } },
+        exam: { select: { name: true, termId: true, resumptionDate: true, publishResult: true } },
       },
     });
+
+    const studentMarks = sessionMarks.filter((m) => examMatchesTerm(m.exam, targetTermId));
 
     if (studentMarks.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'No subject marks recorded yet for this child in the published session.',
+        message: `No subject marks recorded yet for ${className} · ${targetTermLabel} (${sessionName}).`,
       });
     }
 
     const [dbMatrix, gradingScale] = await Promise.all([
-      resolveClassEvaluationMatrix(prisma, req.studentBranchId, req.childClassId),
-      resolveGradingScale(prisma, req.studentBranchId, req.childClassId),
+      resolveClassEvaluationMatrix(prisma, req.studentBranchId, targetClassId),
+      resolveGradingScale(prisma, req.studentBranchId, targetClassId),
     ]);
 
-    const releaseCombinedCa = hasExplicitPub ? Boolean(classPub?.releaseCombinedCa) : true;
     if (releaseCombinedCa && !visibleStages.includes('COMBINED_CA')) {
       visibleStages.push('COMBINED_CA');
     }
@@ -1009,27 +1195,52 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       else if (releaseCa2) defaultStage = 'CA2';
       else defaultStage = 'COMBINED_CA';
     }
-    const requestedStage = String((req.query as any)?.stage || defaultStage).toUpperCase();
+    const requestedStageRaw = String((req.query as any)?.stage || defaultStage).toUpperCase();
+    const requestedStage =
+      !isExamReleased &&
+      (requestedStageRaw === 'FULL' ||
+        requestedStageRaw === 'ALL' ||
+        requestedStageRaw === 'TERMINAL' ||
+        requestedStageRaw === 'EXAM' ||
+        requestedStageRaw === 'EXAM_ONLY')
+        ? defaultStage
+        : requestedStageRaw;
+
+    const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
+    const examIds = Array.from(new Set(studentMarks.map((m) => m.examId)));
+    const rawClassMarks = await prisma.mark.findMany({
+      where: {
+        ...(targetClassId ? { classId: targetClassId } : {}),
+        ...(targetSectionId ? { sectionId: targetSectionId } : {}),
+        ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+        subjectId: { in: subjectIds },
+      },
+      include: {
+        exam: { select: { name: true, termId: true } },
+      },
+    });
+
+    const termClassMarks = rawClassMarks.filter((m) => examMatchesTerm(m.exam, targetTermId));
+    const consolidatedClassMarks = consolidateMarksByStudentAndSubject(
+      termClassMarks.length > 0 ? termClassMarks : rawClassMarks,
+      dbMatrix
+    );
+    const consolidatedStudentMarks = consolidateMarksByStudentAndSubject(studentMarks, dbMatrix);
+
     const {
       activeStage,
       activeColumns,
       activeMaxMarks,
       isCaOnlyStage,
-    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
-
-    const subjectIds = Array.from(new Set(studentMarks.map((m) => m.subjectId)));
-    const classMarks = await prisma.mark.findMany({
-      where: {
-        classId: req.childClassId,
-        sectionId: req.childSectionId,
-        sessionId: req.childSessionId,
-        subjectId: { in: subjectIds },
-      },
-    });
+    } = resolveEffectiveMatrixStageForMarks(
+      dbMatrix,
+      requestedStage,
+      consolidatedClassMarks.length > 0 ? consolidatedClassMarks : consolidatedStudentMarks
+    );
 
     const classAverageMap: Record<string, { sum: number; count: number }> = {};
-    classMarks.forEach((m) => {
-      const key = `${m.examId}-${m.subjectId}`;
+    consolidatedClassMarks.forEach((m) => {
+      const key = String(m.subjectId);
       if (!classAverageMap[key]) {
         classAverageMap[key] = { sum: 0, count: 0 };
       }
@@ -1041,20 +1252,22 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
     });
 
     let totalScoreSum = 0;
+    let totalMaxSum = 0;
     let marksCount = 0;
 
-    const reportCard = studentMarks.flatMap((m) => {
+    const reportCard = consolidatedStudentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       const isAbsent = m.absent === '1' || m.absent === 'true';
       if (!mapped.hasValidScore && !isAbsent) return [];
 
+      const rowMaxMarks = mapped.effectiveMaxMarks || activeMaxMarks;
       if (mapped.hasValidScore) {
         totalScoreSum += mapped.stageTotal;
+        totalMaxSum += rowMaxMarks;
         marksCount++;
       }
 
-      const avgKey = `${m.examId}-${m.subjectId}`;
-      const avgData = classAverageMap[avgKey];
+      const avgData = classAverageMap[String(m.subjectId)];
       const classAverage =
         avgData && avgData.count > 0
           ? Number((avgData.sum / avgData.count).toFixed(1))
@@ -1074,30 +1287,32 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         theoryMark: isExamReleased && !isCaOnlyStage ? (mapped.examTotal > 0 ? String(mapped.examTotal) : null) : null,
         mark: (isExamReleased || isCaOnlyStage) ? (mapped.hasValidScore ? String(mapped.stageTotal) : null) : null,
         componentScores: mapped.componentScores,
-        maxMarks: activeMaxMarks,
+        maxMarks: rowMaxMarks,
         absent: isAbsent,
-        classAverage: isExamReleased ? classAverage : null,
+        classAverage: isExamReleased || isCaOnlyStage ? classAverage : null,
       }];
     });
 
     const rawAverage = marksCount > 0 ? Number((totalScoreSum / marksCount).toFixed(1)) : 0;
     const normalizedAverage =
-      marksCount > 0 && activeMaxMarks > 0
-        ? Number((((totalScoreSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
-        : rawAverage;
+      marksCount > 0 && totalMaxSum > 0
+        ? Number(((totalScoreSum / totalMaxSum) * 100).toFixed(1))
+        : marksCount > 0 && activeMaxMarks > 0
+          ? Number((((totalScoreSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
+          : rawAverage;
     const overallAverage = (isExamReleased || isCaOnlyStage) && marksCount > 0 ? normalizedAverage : 0;
-    const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, req.childClassId);
+    const nextTermFeesStr = await resolveNextTermFees(req.studentBranchId, targetClassId);
 
     let rank = null;
     let totalClassStudents = 0;
 
-    if (isExamReleased && !isCaOnlyStage && req.childClassId && req.childSectionId) {
+    if (isExamReleased && !isCaOnlyStage && targetClassId && targetSectionId && activeSessionId) {
       const enrolls = await prisma.enroll.findMany({
         where: {
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          branchId: req.studentBranchId,
+          classId: targetClassId,
+          sectionId: targetSectionId,
+          sessionId: activeSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
         },
         select: { studentId: true },
       });
@@ -1108,8 +1323,10 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         const allMarks = await prisma.mark.findMany({
           where: {
             studentId: { in: studentIds },
-            sessionId: req.childSessionId,
-            branchId: req.studentBranchId,
+            sessionId: activeSessionId,
+            classId: targetClassId,
+            examId: { in: examIds },
+            ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
           },
           select: { studentId: true, mark: true, cbtMark: true },
         });
@@ -1140,33 +1357,37 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
           rank = myIndex + 1;
         }
       }
-    } else if (req.childClassId && req.childSectionId) {
+    } else if (targetClassId && targetSectionId && activeSessionId) {
       const count = await prisma.enroll.count({
         where: {
-          classId: req.childClassId,
-          sectionId: req.childSectionId,
-          sessionId: req.childSessionId,
-          branchId: req.studentBranchId,
+          classId: targetClassId,
+          sectionId: targetSectionId,
+          sessionId: activeSessionId,
+          ...(req.studentBranchId ? { branchId: req.studentBranchId } : {}),
         },
       });
       totalClassStudents = count;
     }
 
     const [commentaryRecord, montAssessment] = await Promise.all([
-      prisma.studentCommentary.findFirst({
-        where: {
-          studentId: req.studentId,
-          sessionId: req.childSessionId,
-        },
-        select: { remark: true, reviewNotes: true },
-      }),
-      prisma.montessoriAssessment.findFirst({
-        where: {
-          studentId: req.studentId,
-          sessionId: req.childSessionId,
-        },
-        orderBy: { id: 'desc' },
-      }),
+      activeSessionId
+        ? prisma.studentCommentary.findFirst({
+            where: {
+              studentId: req.studentId,
+              sessionId: activeSessionId,
+            },
+            select: { remark: true, reviewNotes: true },
+          })
+        : Promise.resolve(null),
+      activeSessionId
+        ? prisma.montessoriAssessment.findFirst({
+            where: {
+              studentId: req.studentId,
+              sessionId: activeSessionId,
+            },
+            orderBy: { id: 'desc' },
+          })
+        : Promise.resolve(null),
     ]);
 
     const resumptionDate = studentMarks[0]?.exam.resumptionDate || schoolBranding.resumptionDate || null;
@@ -1198,7 +1419,11 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       photo: student.photo || null,
       gender: student.gender || null,
       birthday: student.birthday || null,
-      schoolBranding,
+      schoolBranding: {
+        ...schoolBranding,
+        academicSession: sessionName !== 'N/A' ? sessionName : schoolBranding.academicSession,
+        currentTerm: targetTermLabel,
+      },
       gradingRanges: gradingScale.ranges,
       assessmentComponents: activeColumns,
       maxTotal: activeMaxMarks,

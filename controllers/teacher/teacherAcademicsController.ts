@@ -19,6 +19,7 @@ import {
   parseMarkScore,
   resolveClassEvaluationMatrix,
   resolveActiveMatrixColumnsForStage,
+  resolveEffectiveMatrixStageForMarks,
   mapStudentMarkToMatrix,
   buildResolvedMatrixFromDbRecord,
 } from '../../lib/markParser';
@@ -1580,9 +1581,10 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       }
     }
 
-    const { activeStage, activeColumns, activeMaxMarks, isCaOnlyStage } = resolveActiveMatrixColumnsForStage(
+    const { activeStage, activeColumns, activeMaxMarks, isCaOnlyStage } = resolveEffectiveMatrixStageForMarks(
       dbMatrix,
-      effectiveStage
+      effectiveStage,
+      studentMarks
     );
 
     const [commentaryRecord, montAssessment] = await Promise.all([
@@ -1597,14 +1599,19 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
     ]);
 
     let totalPercentageSum = 0;
+    let totalScoreSum = 0;
+    let totalMaxSum = 0;
     let marksCount = 0;
 
     const reportCard = studentMarks.flatMap((m) => {
       const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
       const isAbsent = m.absent === '1' || m.absent === 'true';
       if (!mapped.hasValidScore && !isAbsent) return [];
+      const rowMaxMarks = mapped.effectiveMaxMarks || activeMaxMarks;
       if (mapped.hasValidScore) {
         totalPercentageSum += mapped.normalizedPercentage;
+        totalScoreSum += mapped.stageTotal;
+        totalMaxSum += rowMaxMarks;
         marksCount++;
       }
       const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
@@ -1619,7 +1626,7 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
         theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
         mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
         stageScore: mapped.stageTotal,
-        maxMarks: activeMaxMarks,
+        maxMarks: rowMaxMarks,
         grade: gradeRes.grade,
         remark: gradeRes.remark,
         absent: isAbsent,
@@ -1627,7 +1634,12 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       }];
     });
 
-    const overallAverage = marksCount > 0 ? Number((totalPercentageSum / marksCount).toFixed(1)) : 0;
+    const overallAverage =
+      marksCount > 0 && totalMaxSum > 0
+        ? Number(((totalScoreSum / totalMaxSum) * 100).toFixed(1))
+        : marksCount > 0
+          ? Number((totalPercentageSum / marksCount).toFixed(1))
+          : 0;
 
     const pdfBuffer = await generateReportCardPdf({
       schoolName: schoolBranding.schoolName || student.branch?.name || 'Ugbekun Schools',
@@ -1758,11 +1770,6 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     const montMap = new Map<number, any>();
     montessoriRows.forEach((m) => montMap.set(m.studentId, m));
 
-    const { activeStage, activeColumns, activeMaxMarks, isCaOnlyStage } = resolveActiveMatrixColumnsForStage(
-      dbMatrix,
-      reqStage ? String(reqStage) : 'FULL'
-    );
-
     const studentCards = [];
     for (const e of enrolls) {
       const marks = await prisma.mark.findMany({
@@ -1778,12 +1785,27 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         },
       });
 
+      const studentStageScope = resolveEffectiveMatrixStageForMarks(
+        dbMatrix,
+        reqStage ? String(reqStage) : 'FULL',
+        marks
+      );
+      const effStage = studentStageScope.activeStage;
+      const effColumns = studentStageScope.activeColumns;
+      const effMaxMarks = studentStageScope.activeMaxMarks;
+      const effIsCaOnly = studentStageScope.isCaOnlyStage;
+
       let pctSum = 0;
+      let totalScoreSum = 0;
+      let totalMaxSum = 0;
       let validCount = 0;
       const rc = marks.map((m) => {
-        const mapped = mapStudentMarkToMatrix(m, dbMatrix, activeStage);
+        const mapped = mapStudentMarkToMatrix(m, dbMatrix, effStage);
+        const rowMaxMarks = mapped.effectiveMaxMarks || effMaxMarks;
         if (mapped.hasValidScore) {
           pctSum += mapped.normalizedPercentage;
+          totalScoreSum += mapped.stageTotal;
+          totalMaxSum += rowMaxMarks;
           validCount++;
         }
         const gradeRes = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScale.ranges);
@@ -1794,10 +1816,10 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
           subjectCode: m.subject.subjectCode,
           componentScores: mapped.componentScores,
           cbtMark: mapped.caTotal > 0 ? String(mapped.caTotal) : null,
-          theoryMark: isCaOnlyStage ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
+          theoryMark: effIsCaOnly ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
           mark: mapped.hasValidScore ? String(mapped.stageTotal) : null,
           stageScore: mapped.stageTotal,
-          maxMarks: activeMaxMarks,
+          maxMarks: rowMaxMarks,
           grade: gradeRes.grade,
           remark: gradeRes.remark,
           absent: m.absent === '1' || m.absent === 'true',
@@ -1805,7 +1827,12 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         };
       });
 
-      const avg = validCount > 0 ? Number((pctSum / validCount).toFixed(1)) : 0;
+      const avg =
+        validCount > 0 && totalMaxSum > 0
+          ? Number(((totalScoreSum / totalMaxSum) * 100).toFixed(1))
+          : validCount > 0
+            ? Number((pctSum / validCount).toFixed(1))
+            : 0;
       const att = attendanceMap.get(e.student.id) || { present: 0, absent: 0, late: 0, totalDays: 0 };
       const mont = montMap.get(e.student.id);
 
@@ -1816,15 +1843,15 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         sectionName: e.section?.name || 'N/A',
         sessionName: schoolYear?.schoolYear || schoolBranding.academicSession || 'N/A',
         reportCard: rc,
-        assessmentComponents: activeColumns,
-        maxTotal: activeMaxMarks,
-        stage: activeStage,
-        isMidTerm: isCaOnlyStage && activeStage !== 'COMBINED_CA',
+        assessmentComponents: effColumns,
+        maxTotal: effMaxMarks,
+        stage: effStage,
+        isMidTerm: effIsCaOnly && effStage !== 'COMBINED_CA',
         overallAverage: avg,
         commentary: e.student.commentaries[0]?.remark || '',
         teacherComment: e.student.commentaries[0]?.remark || '',
         principalComment: e.student.commentaries[0]?.reviewNotes || '',
-        rank: isCaOnlyStage || schoolBranding.showPosition === false ? null : 1,
+        rank: effIsCaOnly || schoolBranding.showPosition === false ? null : 1,
         totalClassStudents: enrolls.length,
         rankingType: schoolBranding.showPosition === false ? 'hidden' : (schoolBranding.rankingType || 'full'),
         rankingLimit: Number(schoolBranding.rankingLimit || 3),
@@ -4499,6 +4526,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
       const subjectBreakdowns: Record<number, any> = {};
       const subjectGrades: Record<number, any> = {};
       let totalScore = 0;
+      let totalMaxMarksForValid = 0;
       let studentTotalCA = 0;
       let studentTotalExam = 0;
       let subjectCount = 0;
@@ -4522,7 +4550,7 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
           practicalScore: mapped.practicalTotal,
           totalScore: mapped.stageTotal,
           fullTotal: mapped.fullTotal,
-          maxMarks: subjectMaxMarks,
+          maxMarks: mapped.effectiveMaxMarks || subjectMaxMarks,
         };
 
         studentTotalCA += mapped.caTotal;
@@ -4532,15 +4560,24 @@ export async function getTeacherClassReports(req: Request, res: Response): Promi
         subjectBreakdowns[sub.id] = componentsMap;
         subjectGrades[sub.id] = calculateGradeFromRanges(mapped.normalizedPercentage, gradingScaleData.ranges);
         totalScore += score;
-        if (mapped.hasValidScore && score > 0) subjectCount++;
+        if (mapped.hasValidScore) {
+          subjectCount++;
+          totalMaxMarksForValid += mapped.effectiveMaxMarks || subjectMaxMarks;
+        }
       });
 
       const rawAverageScore =
-        offeredSubjects.length > 0 ? Math.round((totalScore / offeredSubjects.length) * 10) / 10 : 0;
+        subjectCount > 0
+          ? Math.round((totalScore / subjectCount) * 10) / 10
+          : offeredSubjects.length > 0
+            ? Math.round((totalScore / offeredSubjects.length) * 10) / 10
+            : 0;
       const averageScore =
-        offeredSubjects.length > 0 && subjectMaxMarks > 0
-          ? Math.round(((rawAverageScore / subjectMaxMarks) * 100) * 10) / 10
-          : rawAverageScore;
+        subjectCount > 0 && totalMaxMarksForValid > 0
+          ? Math.round(((totalScore / totalMaxMarksForValid) * 100) * 10) / 10
+          : offeredSubjects.length > 0 && subjectMaxMarks > 0
+            ? Math.round(((rawAverageScore / subjectMaxMarks) * 100) * 10) / 10
+            : rawAverageScore;
       const overallGrade = calculateGradeFromRanges(averageScore, gradingScaleData.ranges);
 
       const s = e.student;

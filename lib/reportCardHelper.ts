@@ -1061,6 +1061,7 @@ export function buildReportCardRowsForStudent(params: {
   sum: number;
   count: number;
   totalMarks: number;
+  maxMarksSum: number;
 } {
   const {
     assignedSubjects,
@@ -1085,6 +1086,7 @@ export function buildReportCardRowsForStudent(params: {
   let sum = 0;
   let count = 0;
   let totalMarks = 0;
+  let maxMarksSum = 0;
 
   const subjectsToRender: Array<{ subjectId: number; subjectName: string; subjectCode: string; markRecord?: any }> =
     assignedSubjects.length > 0
@@ -1109,6 +1111,7 @@ export function buildReportCardRowsForStudent(params: {
       continue;
     }
 
+    const rowMaxMarks = mapped.effectiveMaxMarks || activeMaxMarks;
     const cAvgObj = classSubjectTotals[String(item.subjectId)];
     const scoreForStage = mapped.stageTotal;
     const classAvg =
@@ -1130,7 +1133,7 @@ export function buildReportCardRowsForStudent(params: {
       theoryMark: isCombinedCaScope ? null : (mapped.examTotal > 0 ? String(mapped.examTotal) : null),
       mark: mapped.hasValidScore ? String(scoreForStage) : null,
       stageScore: scoreForStage,
-      maxMarks: activeMaxMarks,
+      maxMarks: rowMaxMarks,
       componentScores: mapped.componentScores,
       grade: mapped.hasValidScore ? gradeRes.grade : '-',
       remark: mapped.hasValidScore ? gradeRes.remark : '-',
@@ -1142,8 +1145,333 @@ export function buildReportCardRowsForStudent(params: {
       sum += scoreForStage;
       count += 1;
       totalMarks += scoreForStage;
+      maxMarksSum += rowMaxMarks;
     }
   }
 
-  return { rows, sum, count, totalMarks };
+  return { rows, sum, count, totalMarks, maxMarksSum };
+}
+
+export const ACADEMIC_TERMS_CATALOG = [
+  { id: 1, label: 'First Term' },
+  { id: 2, label: 'Second Term' },
+  { id: 3, label: 'Third Term' },
+] as const;
+
+export function resolveTermIdFromInput(rawTermId: unknown, fallbackLabel?: string | null): number {
+  const num = Number(rawTermId);
+  if (num === 1 || num === 2 || num === 3) return num;
+  const compact = String(fallbackLabel || '').trim().toLowerCase().replace(/\s+/g, '');
+  if (compact.includes('second') || compact.includes('2nd')) return 2;
+  if (compact.includes('third') || compact.includes('3rd')) return 3;
+  return 1;
+}
+
+export function termLabelForId(termId: number): string {
+  return ACADEMIC_TERMS_CATALOG.find((t) => t.id === termId)?.label || 'First Term';
+}
+
+export function examMatchesTerm(
+  exam: { termId?: number | null; name?: string | null } | null | undefined,
+  targetTermId: number
+): boolean {
+  if (!exam) return false;
+  if (exam.termId === 1 || exam.termId === 2 || exam.termId === 3) {
+    return exam.termId === targetTermId;
+  }
+  const name = String(exam.name || '').toLowerCase();
+  if (/\b(2nd|second)\b/i.test(name)) return targetTermId === 2;
+  if (/\b(3rd|third)\b/i.test(name)) return targetTermId === 3;
+  if (/\b(1st|first)\b/i.test(name)) return targetTermId === 1;
+  return targetTermId === 1;
+}
+
+export interface StudentReportClassOption {
+  sessionId: number;
+  classId: number;
+  sectionId: number | null;
+  className: string;
+  sectionName: string;
+  isEcd: boolean;
+}
+
+export interface StudentReportOptionsPayload {
+  sessions: Array<{ id: number; label: string; isCurrent: boolean }>;
+  classes: StudentReportClassOption[];
+  terms: Array<{ id: number; label: string }>;
+  currentSessionId: number | null;
+  currentClassId: number | null;
+  currentTermId: number;
+  currentTermLabel: string;
+}
+
+/**
+ * Fetches enrolled and mark-recorded sessions, classes, and terms for a student
+ * so both Student and Parent portals share identical filter options and scoping.
+ */
+export async function fetchStudentReportOptions(
+  prisma: typeof prismaDefault,
+  studentId: number,
+  branchId?: number | null,
+  currentSessionId?: number | null
+): Promise<StudentReportOptionsPayload> {
+  const [enrolls, markScopeRows, branchSetting] = await Promise.all([
+    prisma.enroll.findMany({
+      where: { studentId, ...(branchId ? { branchId } : {}) },
+      orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+      select: {
+        sessionId: true,
+        classId: true,
+        sectionId: true,
+        class: { select: { id: true, name: true, isEcd: true } },
+        section: { select: { id: true, name: true } },
+      },
+    }),
+    prisma.mark.findMany({
+      where: { studentId, ...(branchId ? { branchId } : {}) },
+      distinct: ['sessionId', 'classId', 'sectionId'],
+      select: {
+        sessionId: true,
+        classId: true,
+        sectionId: true,
+        class: { select: { id: true, name: true, isEcd: true } },
+        section: { select: { id: true, name: true } },
+      },
+    }),
+    branchId
+      ? prisma.systemSetting.findUnique({ where: { branchId }, select: { currentTerm: true } })
+      : Promise.resolve(null),
+  ]);
+
+  const sessionIdsSet = new Set<number>();
+  if (currentSessionId) sessionIdsSet.add(currentSessionId);
+  enrolls.forEach((e) => sessionIdsSet.add(e.sessionId));
+  markScopeRows.forEach((m) => sessionIdsSet.add(m.sessionId));
+
+  const schoolYears =
+    sessionIdsSet.size > 0
+      ? await prisma.schoolYear.findMany({
+          where: { id: { in: Array.from(sessionIdsSet) } },
+          orderBy: { id: 'desc' },
+          select: { id: true, schoolYear: true },
+        })
+      : [];
+
+  const sessions = schoolYears.map((sy) => ({
+    id: sy.id,
+    label: sy.schoolYear,
+    isCurrent: sy.id === currentSessionId,
+  }));
+
+  const classScopeMap = new Map<string, StudentReportClassOption>();
+  for (const row of [...enrolls, ...markScopeRows]) {
+    const key = `${row.sessionId}:${row.classId}`;
+    if (!classScopeMap.has(key) && row.class) {
+      classScopeMap.set(key, {
+        sessionId: row.sessionId,
+        classId: row.classId,
+        sectionId: row.sectionId ?? null,
+        className: row.class.name,
+        sectionName: row.section?.name || '',
+        isEcd: Boolean(row.class.isEcd),
+      });
+    }
+  }
+
+  const currentTermLabel = branchSetting?.currentTerm || 'First Term';
+  const currentTermId = resolveTermIdFromInput(undefined, currentTermLabel);
+
+  return {
+    sessions,
+    classes: Array.from(classScopeMap.values()),
+    terms: ACADEMIC_TERMS_CATALOG.map((t) => ({ id: t.id, label: t.label })),
+    currentSessionId: currentSessionId || sessions[0]?.id || null,
+    currentClassId: enrolls[0]?.classId || null,
+    currentTermId,
+    currentTermLabel,
+  };
+}
+
+export interface ResolvedReportFilterScope {
+  options: StudentReportOptionsPayload;
+  activeSessionId: number | undefined;
+  targetClassId: number | undefined;
+  targetSectionId: number | undefined;
+  targetTermId: number;
+  targetTermLabel: string;
+  isAuthorizedSession: boolean;
+  isAuthorizedClass: boolean;
+}
+
+/**
+ * Resolves and validates optional sessionId, classId, and termId query parameters
+ * strictly against the target student's enrolled/mark-recorded options (IDOR safe).
+ */
+export async function resolveStudentReportFilterScope(
+  prisma: typeof prismaDefault,
+  params: {
+    studentId: number;
+    branchId?: number | null;
+    fallbackSessionId?: number | null;
+    fallbackClassId?: number | null;
+    fallbackSectionId?: number | null;
+    query?: Record<string, any>;
+  }
+): Promise<ResolvedReportFilterScope> {
+  const { studentId, branchId, fallbackSessionId, fallbackClassId, fallbackSectionId, query } = params;
+  const reqSessionId = query?.sessionId ? Number(query.sessionId) : null;
+  const reqClassId = query?.classId ? Number(query.classId) : null;
+  const reqTermId = query?.termId ? Number(query.termId) : null;
+
+  const options = await fetchStudentReportOptions(prisma, studentId, branchId, fallbackSessionId);
+
+  const isAuthorizedSession =
+    !reqSessionId ||
+    options.sessions.length === 0 ||
+    options.sessions.some((s) => s.id === reqSessionId);
+
+  const activeSessionId = reqSessionId || fallbackSessionId || options.currentSessionId || undefined;
+
+  const matchedClassOption =
+    options.classes.find(
+      (c) =>
+        (reqClassId ? c.classId === reqClassId : true) &&
+        (activeSessionId ? c.sessionId === activeSessionId : true)
+    ) ||
+    (reqClassId ? options.classes.find((c) => c.classId === reqClassId) : undefined);
+
+  const isAuthorizedClass = !reqClassId || Boolean(matchedClassOption);
+  const targetClassId = reqClassId || matchedClassOption?.classId || fallbackClassId || undefined;
+  const targetSectionId = matchedClassOption?.sectionId || fallbackSectionId || undefined;
+  const targetTermId = resolveTermIdFromInput(reqTermId, options.currentTermLabel);
+  const targetTermLabel = termLabelForId(targetTermId);
+
+  return {
+    options,
+    activeSessionId,
+    targetClassId,
+    targetSectionId,
+    targetTermId,
+    targetTermLabel,
+    isAuthorizedSession,
+    isAuthorizedClass,
+  };
+}
+
+/**
+ * Resolves the canonical ClassReportCardPublication gating state for a student/child
+ * identically across Student and Parent portals, handling section-specific vs school-wide
+ * publications and most-recently-published rows cleanly.
+ */
+export async function resolveClassPublicationForStudent(
+  prisma: typeof prismaDefault,
+  params: {
+    classId?: number;
+    sectionId?: number;
+    sessionId?: number;
+    termId?: number;
+    branchId?: number | null;
+    autoPublishReportCards?: boolean;
+  }
+): Promise<{
+  classPub: any | null;
+  hasExplicitPub: boolean;
+  isPublished: boolean;
+  releaseCa1: boolean;
+  releaseCa2: boolean;
+  releaseCombinedCa: boolean;
+  releaseExam: boolean;
+  releaseFull: boolean;
+}> {
+  const { classId, sectionId, sessionId, termId, branchId, autoPublishReportCards = true } = params;
+  if (!classId || !sessionId) {
+    const autoPub = Boolean(autoPublishReportCards);
+    return {
+      classPub: null,
+      hasExplicitPub: false,
+      isPublished: autoPub,
+      releaseCa1: autoPub,
+      releaseCa2: autoPub,
+      releaseCombinedCa: autoPub,
+      releaseExam: autoPub,
+      releaseFull: autoPub,
+    };
+  }
+
+  const sectionFilter = sectionId
+    ? { OR: [{ sectionId }, { sectionId: null }] }
+    : {};
+  const branchFilter = branchId
+    ? { OR: [{ branchId }, { branchId: null }] }
+    : {};
+
+  const isRowActivelyPublished = (pub: {
+    isPublished?: boolean | null;
+    releaseCa1?: boolean | null;
+    releaseCa2?: boolean | null;
+    releaseCombinedCa?: boolean | null;
+    releaseExam?: boolean | null;
+    releaseFull?: boolean | null;
+  } | null | undefined) =>
+    Boolean(
+      pub &&
+        pub.isPublished &&
+        (pub.releaseCa1 || pub.releaseCa2 || pub.releaseCombinedCa || pub.releaseExam || pub.releaseFull)
+    );
+
+  // 1. Check publications matching this term, newest first
+  const termRows = await prisma.classReportCardPublication.findMany({
+    where: {
+      classId,
+      sessionId,
+      ...(termId ? { termId } : {}),
+      ...sectionFilter,
+      ...branchFilter,
+    },
+    orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+  });
+
+  let selectedPub =
+    (sectionId ? termRows.find((r) => r.sectionId === sectionId && isRowActivelyPublished(r)) : undefined) ||
+    termRows.find((r) => isRowActivelyPublished(r)) ||
+    null;
+
+  // 2. Fallback to any published record for this class & session (e.g., published under a sibling termId or legacy row)
+  if (!selectedPub) {
+    const sessionPublishedRows = await prisma.classReportCardPublication.findMany({
+      where: {
+        classId,
+        sessionId,
+        ...sectionFilter,
+        ...branchFilter,
+        isPublished: true,
+      },
+      orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+    });
+    selectedPub =
+      (sectionId
+        ? sessionPublishedRows.find((r) => r.sectionId === sectionId && isRowActivelyPublished(r))
+        : undefined) ||
+      sessionPublishedRows.find((r) => isRowActivelyPublished(r)) ||
+      null;
+  }
+
+  // 3. Respect explicit unpublished gating if no published record matched
+  if (!selectedPub && termRows.length > 0) {
+    selectedPub = termRows[0];
+  }
+
+  const hasExplicitPub = Boolean(selectedPub);
+  const isPublished = hasExplicitPub ? isRowActivelyPublished(selectedPub) : Boolean(autoPublishReportCards);
+
+  return {
+    classPub: selectedPub,
+    hasExplicitPub,
+    isPublished,
+    releaseCa1: hasExplicitPub ? Boolean(selectedPub?.releaseCa1) : isPublished,
+    releaseCa2: hasExplicitPub ? Boolean(selectedPub?.releaseCa2) : isPublished,
+    releaseCombinedCa: hasExplicitPub ? Boolean(selectedPub?.releaseCombinedCa) : isPublished,
+    releaseExam: hasExplicitPub ? Boolean(selectedPub?.releaseExam) : isPublished,
+    releaseFull: hasExplicitPub ? Boolean(selectedPub?.releaseFull) : isPublished,
+  };
 }

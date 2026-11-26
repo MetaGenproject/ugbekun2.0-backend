@@ -54,6 +54,8 @@ export interface MatrixMappedScore {
   examTotal: number;
   practicalTotal: number;
   activeMaxMarks: number;
+  recordedMaxMarks: number;
+  effectiveMaxMarks: number;
   fullMaxMarks: number;
   caMaxMarks: number;
   normalizedPercentage: number;
@@ -799,10 +801,12 @@ export function mapStudentMarkToMatrix(
   });
 
   let stageTotal = 0;
+  let recordedMaxMarks = 0;
   activeColumns.forEach((col) => {
     const val = componentScores[col.code];
     if (val !== null && val !== undefined && !isNaN(Number(val))) {
       stageTotal += Number(val);
+      recordedMaxMarks += Number(col.maxMarks) || 0;
     }
   });
 
@@ -812,8 +816,13 @@ export function mapStudentMarkToMatrix(
   practicalTotal = Math.round(practicalTotal * 100) / 100;
   stageTotal = Math.round(stageTotal * 100) / 100;
 
+  const effectiveMaxMarks =
+    recordedMaxMarks > 0 && hasValidScore ? recordedMaxMarks : activeMaxMarks;
+
   const normalizedPercentage =
-    activeMaxMarks > 0 && hasValidScore ? Math.round(((stageTotal / activeMaxMarks) * 100) * 100) / 100 : 0;
+    effectiveMaxMarks > 0 && hasValidScore
+      ? Math.round(((stageTotal / effectiveMaxMarks) * 100) * 100) / 100
+      : 0;
 
   return {
     componentScores,
@@ -825,10 +834,79 @@ export function mapStudentMarkToMatrix(
     examTotal,
     practicalTotal,
     activeMaxMarks,
+    recordedMaxMarks,
+    effectiveMaxMarks,
     fullMaxMarks: dbMatrix.fullMaxMarks,
     caMaxMarks: dbMatrix.caMaxMarks,
     normalizedPercentage,
     hasValidScore,
+  };
+}
+
+/**
+ * Auto-scopes FULL stage to the actually recorded CA columns when no EXAM scores
+ * exist anywhere in the supplied marks slice (e.g., mid-term / CA-only reporting
+ * before Exams are entered), preventing unrecorded exam weights from grading CA scores as Fail.
+ */
+export function resolveEffectiveMatrixStageForMarks(
+  dbMatrix: ResolvedClassMatrix,
+  requestedStage: string | null | undefined,
+  marks: Array<{ mark?: string | null; cbtMark?: string | null; absent?: string | boolean | null }>
+): {
+  activeStage: string;
+  activeColumns: ResolvedMatrixColumn[];
+  activeMaxMarks: number;
+  isCaOnlyStage: boolean;
+  wasAutoScopedFromFull: boolean;
+} {
+  const base = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
+  if (
+    base.activeStage !== 'FULL' ||
+    dbMatrix.caColumns.length === 0 ||
+    dbMatrix.examColumns.length === 0 ||
+    !Array.isArray(marks) ||
+    marks.length === 0
+  ) {
+    return { ...base, wasAutoScopedFromFull: false };
+  }
+
+  const recordedCodes = new Set<string>();
+  for (const m of marks) {
+    const mapped = mapStudentMarkToMatrix(m, dbMatrix, 'FULL');
+    if (!mapped.hasValidScore) continue;
+    for (const col of dbMatrix.columns) {
+      const val = mapped.componentScores[col.code];
+      if (val !== null && val !== undefined && !isNaN(Number(val))) {
+        recordedCodes.add(col.code);
+      }
+    }
+  }
+
+  const hasAnyExamScore = dbMatrix.examColumns.some((c) => recordedCodes.has(c.code));
+  const recordedCaCols = dbMatrix.caColumns.filter((c) => recordedCodes.has(c.code));
+
+  if (hasAnyExamScore || recordedCaCols.length === 0) {
+    return { ...base, wasAutoScopedFromFull: false };
+  }
+
+  if (recordedCaCols.length === 1 && dbMatrix.caColumns.length > 1) {
+    const single = recordedCaCols[0];
+    return {
+      activeStage: single.code,
+      activeColumns: [single],
+      activeMaxMarks: Number(single.maxMarks) || 0,
+      isCaOnlyStage: true,
+      wasAutoScopedFromFull: true,
+    };
+  }
+
+  const caMax = recordedCaCols.reduce((sum, c) => sum + (Number(c.maxMarks) || 0), 0);
+  return {
+    activeStage: 'COMBINED_CA',
+    activeColumns: recordedCaCols,
+    activeMaxMarks: caMax > 0 ? caMax : dbMatrix.caMaxMarks,
+    isCaOnlyStage: true,
+    wasAutoScopedFromFull: true,
   };
 }
 

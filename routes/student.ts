@@ -16,6 +16,7 @@ router.get('/attendance', studentController.getAttendance);
 router.get('/tasks', studentController.getTasks);
 router.get('/grades', studentController.getGrades);
 router.get('/grades/export-pdf', studentController.exportGradesPdf);
+router.get('/report-card/options', studentController.getReportCardOptions);
 
 // Homework Submission
 router.get('/homeworks/:id', studentController.getHomeworkDetail);

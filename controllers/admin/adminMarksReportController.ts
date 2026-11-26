@@ -17,6 +17,7 @@ import {
   parseMarkScore,
   resolveClassEvaluationMatrix,
   resolveActiveMatrixColumnsForStage,
+  resolveEffectiveMatrixStageForMarks,
   mapStudentMarkToMatrix,
   consolidateMarksByStudentAndSubject,
 } from '../../lib/markParser';
@@ -906,14 +907,6 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
       resolveGradingScale(prisma, branchId, parsedClassId),
     ]);
 
-    const {
-      activeStage,
-      activeColumns,
-      activeMaxMarks,
-      isCaOnlyStage,
-    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
-    const isCombinedCaScope = isCaOnlyStage;
-
     let enrolls = await prisma.enroll.findMany({
       where: {
         classId: parsedClassId,
@@ -1160,6 +1153,13 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
     });
 
     const consolidatedMarks = consolidateMarksByStudentAndSubject(marks, dbMatrix);
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveEffectiveMatrixStageForMarks(dbMatrix, requestedStage, consolidatedMarks);
+    const isCombinedCaScope = isCaOnlyStage;
 
     // Compute class averages per subject for the active stage
     const classSubjectTotals: Record<string, { sum: number; count: number }> = {};
@@ -1196,12 +1196,18 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
         sum: built.sum,
         count: built.count,
         totalMarks: built.totalMarks,
+        maxMarksSum: built.maxMarksSum,
       };
     });
 
     const scores = studentIds.map((id) => ({
       id,
-      avg: studentAggregates[id].count > 0 ? studentAggregates[id].sum / studentAggregates[id].count : 0,
+      avg:
+        studentAggregates[id].maxMarksSum > 0
+          ? (studentAggregates[id].sum / studentAggregates[id].maxMarksSum) * 100
+          : studentAggregates[id].count > 0
+            ? studentAggregates[id].sum / studentAggregates[id].count
+            : 0,
     }));
     scores.sort((a, b) => b.avg - a.avg);
 
@@ -1212,12 +1218,14 @@ export async function getReportCardStudents(req: Request, res: Response): Promis
 
     const studentList = dedupedEnrolls.map((e) => {
       const st = e.student;
-      const agg = studentAggregates[st.id] || { sum: 0, count: 0, totalMarks: 0 };
+      const agg = studentAggregates[st.id] || { sum: 0, count: 0, totalMarks: 0, maxMarksSum: 0 };
       const rawAvg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
       const normalizedAvg =
-        agg.count > 0 && activeMaxMarks > 0
-          ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
-          : rawAvg;
+        agg.count > 0 && agg.maxMarksSum > 0
+          ? Number(((agg.sum / agg.maxMarksSum) * 100).toFixed(1))
+          : agg.count > 0 && activeMaxMarks > 0
+            ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
+            : rawAvg;
       const rk = rankMap[st.id] || null;
       const comm = commMap[st.id];
       const mont = montMap[st.id];
@@ -1564,13 +1572,6 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       resolveGradingScale(prisma, branchId, parsedClassId),
     ]);
     const requestedStage = String((req.query as any)?.stage || 'FULL').toUpperCase();
-    const {
-      activeStage,
-      activeColumns,
-      activeMaxMarks,
-      isCaOnlyStage,
-    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
-    const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
 
     const assignedSubjects = await resolveAssignedClassSubjects(prisma, {
       classId: parsedClassId,
@@ -1606,6 +1607,19 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
       select: { id: true, examId: true, subjectId: true, mark: true, cbtMark: true, absent: true, studentId: true },
     });
     const allClassMarks = consolidateMarksByStudentAndSubject(rawClassMarks, dbMatrix);
+
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveEffectiveMatrixStageForMarks(
+      dbMatrix,
+      requestedStage,
+      allClassMarks.length > 0 ? allClassMarks : marks
+    );
+    const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
+
     const avgMap: Record<string, { sum: number; count: number }> = {};
     allClassMarks.forEach((m) => {
       const k = String(m.subjectId);
@@ -1632,9 +1646,11 @@ export async function exportReportCardPdf(req: Request, res: Response): Promise<
 
     const rawAverage = marksCount > 0 ? Number((totalSum / marksCount).toFixed(1)) : 0;
     const overallAverage =
-      marksCount > 0 && activeMaxMarks > 0
-        ? Number((((totalSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
-        : rawAverage;
+      marksCount > 0 && builtSingle.maxMarksSum > 0
+        ? Number(((totalSum / builtSingle.maxMarksSum) * 100).toFixed(1))
+        : marksCount > 0 && activeMaxMarks > 0
+          ? Number((((totalSum / marksCount) / activeMaxMarks) * 100).toFixed(1))
+          : rawAverage;
 
     const enrolls = await prisma.enroll.findMany({
       where: { classId: parsedClassId, sectionId: parsedSectionId, sessionId, branchId },
@@ -1780,14 +1796,6 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
       resolveClassEvaluationMatrix(prisma, branchId, parsedClassId),
     ]);
 
-    const {
-      activeStage,
-      activeColumns,
-      activeMaxMarks,
-      isCaOnlyStage,
-    } = resolveActiveMatrixColumnsForStage(dbMatrix, requestedStage);
-    const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
-
     const className = cls?.name || 'Classroom';
     const sectionName = sec?.name || 'Main';
     const sessionName = sess?.schoolYear || schoolBranding.academicSession || 'Active Session';
@@ -1848,6 +1856,14 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
     });
     const allMarks = consolidateMarksByStudentAndSubject(rawAllMarks, dbMatrix);
 
+    const {
+      activeStage,
+      activeColumns,
+      activeMaxMarks,
+      isCaOnlyStage,
+    } = resolveEffectiveMatrixStageForMarks(dbMatrix, requestedStage, allMarks);
+    const isMidTerm = isCaOnlyStage && activeStage !== 'COMBINED_CA' && activeStage !== 'CA_ONLY';
+
     const avgMap: Record<string, { sum: number; count: number }> = {};
     allMarks.forEach((m) => {
       const k = String(m.subjectId || m.subject?.id);
@@ -1878,14 +1894,19 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
         isCombinedCaScope: isCaOnlyStage,
         classSubjectTotals: avgMap,
       });
-      studentAggregates[id] = { sum: built.sum, count: built.count };
+      studentAggregates[id] = { sum: built.sum, count: built.count, maxMarksSum: built.maxMarksSum };
       studentMarksMap[id] = built.rows;
     });
 
     const rankList = studentIds
       .map((id) => ({
         id,
-        avg: studentAggregates[id].count > 0 ? studentAggregates[id].sum / studentAggregates[id].count : 0,
+        avg:
+          studentAggregates[id].maxMarksSum > 0
+            ? (studentAggregates[id].sum / studentAggregates[id].maxMarksSum) * 100
+            : studentAggregates[id].count > 0
+              ? studentAggregates[id].sum / studentAggregates[id].count
+              : 0,
       }))
       .sort((a, b) => b.avg - a.avg);
 
@@ -1956,12 +1977,14 @@ export async function exportBatchReportCardsPdf(req: Request, res: Response): Pr
 
     const batchStudents = enrolls.map((e) => {
       const st = e.student;
-      const agg = studentAggregates[st.id] || { sum: 0, count: 0 };
+      const agg = studentAggregates[st.id] || { sum: 0, count: 0, maxMarksSum: 0 };
       const rawAvg = agg.count > 0 ? Number((agg.sum / agg.count).toFixed(1)) : 0;
       const normalizedAvg =
-        agg.count > 0 && activeMaxMarks > 0
-          ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
-          : rawAvg;
+        agg.count > 0 && agg.maxMarksSum > 0
+          ? Number(((agg.sum / agg.maxMarksSum) * 100).toFixed(1))
+          : agg.count > 0 && activeMaxMarks > 0
+            ? Number((((agg.sum / agg.count) / activeMaxMarks) * 100).toFixed(1))
+            : rawAvg;
       const rk = isCaOnlyStage || !showPositionOnBatch ? null : (rankMap[st.id] || null);
       const comm = commMap[st.id];
       const mont = montMap[st.id];
