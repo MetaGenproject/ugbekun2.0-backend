@@ -1100,8 +1100,8 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
       const resumptionDate = assessment?.exam?.resumptionDate || null;
 
       const pdfBuffer = await generateMontessoriReportCardPdf({
-        schoolName: student.branch?.name || 'Ugbekun Schools',
-        branchCode: student.branch?.code || 'GEN',
+        schoolName: schoolBranding.schoolName || student.branch?.name || 'Ugbekun Schools',
+        branchCode: schoolBranding.branchCode || student.branch?.code || 'GEN',
         studentName: `${student.lastName}, ${student.firstName}`,
         registerNo: student.registerNo,
         className: clsInfo.name,
@@ -1110,7 +1110,8 @@ export async function exportChildReportPdf(req: Request, res: Response): Promise
         examName,
         assessment: assessment || {},
         resumptionDate,
-        formTeacherName,
+        formTeacherName: schoolBranding.classTeacherName || formTeacherName,
+        schoolBranding,
       });
 
       const safeLastName = (student.lastName || 'Student').replace(/\s+/g, '_');

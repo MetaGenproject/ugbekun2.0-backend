@@ -263,6 +263,53 @@ export async function resolveNextTermPaymentLabel(
   return '';
 }
 
+export interface AllocationTeacherCandidate {
+  id?: number;
+  classId: number;
+  sectionId: number | null;
+  sessionId?: number | null;
+  teacher?: {
+    id: number;
+    name: string;
+    signatureUrl?: string | null;
+  } | null;
+}
+
+/**
+ * Deterministically picks the best matching class teacher allocation for a class,
+ * preferring active session, matching section, and a teacher profile that has
+ * an uploaded signature URL when multiple allocations share the class.
+ */
+export function selectBestTeacherAllocation<T extends AllocationTeacherCandidate>(
+  allocations: T[],
+  options: { classId?: number | null; sectionId?: number | null; sessionId?: number | null }
+): T | null {
+  const candidates = allocations.filter(
+    (a) => a.teacher && (!options.classId || a.classId === options.classId)
+  );
+  if (candidates.length === 0) return null;
+
+  const scoreCandidate = (a: T): number => {
+    let score = 0;
+    if (options.sessionId && a.sessionId === options.sessionId) score += 1000;
+    if (options.sectionId && a.sectionId === options.sectionId) score += 200;
+    else if (!options.sectionId && a.sectionId === null) score += 50;
+    if (a.teacher?.signatureUrl && a.teacher.signatureUrl.trim().length > 0) score += 20;
+    return score;
+  };
+
+  let best = candidates[0];
+  let bestScore = scoreCandidate(best);
+  for (let i = 1; i < candidates.length; i++) {
+    const sc = scoreCandidate(candidates[i]);
+    if (sc > bestScore) {
+      best = candidates[i];
+      bestScore = sc;
+    }
+  }
+  return best;
+}
+
 /**
  * Resolves the complete school branding, contact info, colors, resumption date,
  * next term payment, and teacher/principal signatures for report cards.
@@ -312,47 +359,42 @@ export async function resolveSchoolReportBranding(
     const classKey = String(options.classId);
     const classOverride = teacherSigConfig.byClass?.[classKey];
 
-    if (classOverride === 'DISABLED' || classOverride === 'UNAVAILABLE' || classOverride === 'NONE' || classOverride === null) {
-      // Admin explicitly marked that teacher signature is removed / unavailable for this class
-      isClassTeacherUnavailable = true;
-      classTeacherSignatureUrl = null;
-    } else if (typeof classOverride === 'string' && classOverride.trim().length > 0) {
-      // Admin uploaded a custom signature for this specific class
-      classTeacherSignatureUrl = classOverride.trim();
-    } else {
-      // No custom class override; check allocated teacher profile, then fallback to general
-      const allocation = await prisma.teacherAllocation.findFirst({
+    const allocations = await prisma.teacherAllocation
+      .findMany({
         where: {
           branchId,
           classId: options.classId,
-          ...(options.sectionId ? { sectionId: options.sectionId } : {}),
         },
         include: {
           teacher: {
             select: { id: true, name: true, signatureUrl: true },
           },
         },
-        orderBy: { id: 'desc' },
-      }).catch(() => null);
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
+      })
+      .catch(() => []);
 
-      if (allocation?.teacher) {
-        classTeacherName = allocation.teacher.name || 'Class Teacher';
-        classTeacherSignatureUrl = allocation.teacher.signatureUrl || generalTeacherSignature;
-      } else {
-        // Fallback: check any teacher allocated to this class in this branch
-        const anyAllocation = await prisma.teacherAllocation.findFirst({
-          where: { branchId, classId: options.classId },
-          include: {
-            teacher: { select: { id: true, name: true, signatureUrl: true } },
-          },
-        }).catch(() => null);
-        if (anyAllocation?.teacher) {
-          classTeacherName = anyAllocation.teacher.name || 'Class Teacher';
-          classTeacherSignatureUrl = anyAllocation.teacher.signatureUrl || generalTeacherSignature;
-        } else {
-          classTeacherSignatureUrl = generalTeacherSignature;
-        }
-      }
+    const bestAllocation = selectBestTeacherAllocation(allocations, {
+      classId: options.classId,
+      sectionId: options.sectionId,
+      sessionId,
+    });
+
+    if (bestAllocation?.teacher?.name) {
+      classTeacherName = bestAllocation.teacher.name;
+    }
+
+    if (classOverride === 'DISABLED' || classOverride === 'UNAVAILABLE' || classOverride === 'NONE') {
+      // Admin explicitly marked that teacher signature is removed / unavailable for this class
+      isClassTeacherUnavailable = true;
+      classTeacherSignatureUrl = null;
+    } else if (typeof classOverride === 'string' && classOverride.trim().length > 0) {
+      // Admin or teacher saved a custom signature for this specific class
+      classTeacherSignatureUrl = classOverride.trim();
+    } else if (bestAllocation?.teacher?.signatureUrl && bestAllocation.teacher.signatureUrl.trim().length > 0) {
+      classTeacherSignatureUrl = bestAllocation.teacher.signatureUrl.trim();
+    } else {
+      classTeacherSignatureUrl = generalTeacherSignature;
     }
   } else {
     classTeacherSignatureUrl = generalTeacherSignature;

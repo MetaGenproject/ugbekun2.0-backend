@@ -32,7 +32,10 @@ import {
   bulkSaveSubjectCommentsBatch,
   buildDefaultRemarksForAverage,
   computeStudentAttendanceMap,
+  parseTeacherSignatureConfig,
+  serializeTeacherSignatureConfig,
 } from '../../lib/reportCardHelper';
+import { saveSignatureBase64 } from '../onboarding/onboardingController';
 
 let Tesseract: any;
 try {
@@ -474,11 +477,42 @@ export async function saveCommentary(req: Request, res: Response): Promise<Respo
       });
     }
 
-    if (teacherSignatureUrl && req.teacherId) {
-      await prisma.teacher.update({
-        where: { id: Number(req.teacherId) },
-        data: { signatureUrl: String(teacherSignatureUrl) },
-      }).catch(() => {});
+    let resolvedTeacherSigUrl: string | null = null;
+    if (teacherSignatureUrl && typeof teacherSignatureUrl === 'string' && teacherSignatureUrl.trim().length > 0 && req.teacherId) {
+      const trimmedSig = teacherSignatureUrl.trim();
+      const isNewUpload = trimmedSig.startsWith('data:image/');
+      resolvedTeacherSigUrl = isNewUpload
+        ? (await saveSignatureBase64(trimmedSig, `teacher_${req.teacherId}_signature.png`)) || trimmedSig
+        : trimmedSig;
+
+      await prisma.teacher
+        .update({
+          where: { id: Number(req.teacherId) },
+          data: { signatureUrl: resolvedTeacherSigUrl },
+        })
+        .catch((err) => console.error('[TEACHER] Signature save error:', err?.message || err));
+
+      // Ensure any class-level signature config in SystemSetting does not hide or override a newly uploaded teacher signature
+      if (isNewUpload && req.branchId && resolvedClassId) {
+        const setting = await prisma.systemSetting.findUnique({
+          where: { branchId: req.branchId },
+          select: { defaultTeacherSignatureUrl: true },
+        });
+        if (setting) {
+          const sigConfig = parseTeacherSignatureConfig(setting.defaultTeacherSignatureUrl);
+          if (!sigConfig.byClass) sigConfig.byClass = {};
+          sigConfig.byClass[String(resolvedClassId)] = resolvedTeacherSigUrl;
+          await prisma.systemSetting
+            .update({
+              where: { branchId: req.branchId },
+              data: {
+                defaultTeacherSignatureUrl: serializeTeacherSignatureConfig(sigConfig),
+                updatedAt: new Date(),
+              },
+            })
+            .catch(() => {});
+        }
+      }
     }
 
     const effectivePrincipalNote = principalRemark !== undefined ? principalRemark : reviewNotes;
@@ -565,7 +599,12 @@ export async function saveCommentary(req: Request, res: Response): Promise<Respo
       }).catch(() => {});
     }
 
-    return res.json({ success: true, message: 'Commentary saved to report card immediately.', commentary: saved });
+    return res.json({
+      success: true,
+      message: 'Commentary saved to report card immediately.',
+      commentary: saved,
+      ...(resolvedTeacherSigUrl ? { teacherSignatureUrl: resolvedTeacherSigUrl } : {}),
+    });
   } catch (error) {
     console.error('[TEACHER] Save commentary error:', error);
     return res.status(500).json({ success: false, message: 'Failed to save commentary.' });

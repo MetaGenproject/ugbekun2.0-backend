@@ -6,7 +6,11 @@ import prisma from '../../lib/prisma';
 import { cacheDel, cacheDelPattern } from '../../lib/cacheService';
 import { uploadToCloudinary } from '../../lib/cloudinaryService';
 import { saveLogoBase64, saveSignatureBase64 } from '../onboarding/onboardingController';
-import { parseTeacherSignatureConfig, serializeTeacherSignatureConfig } from '../../lib/reportCardHelper';
+import {
+  parseTeacherSignatureConfig,
+  serializeTeacherSignatureConfig,
+  selectBestTeacherAllocation,
+} from '../../lib/reportCardHelper';
 import {
   getMyEduRideConfig,
   saveMyEduRideConfig,
@@ -306,25 +310,40 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       if (uploaded) processedSignatureUrl = uploaded;
     }
 
-    let processedTeacherSignatureUrl = defaultTeacherSignatureUrl;
-    if (
-      teacherSignatureBase64 ||
-      classTeacherSignatures ||
-      (defaultTeacherSignatureUrl && typeof defaultTeacherSignatureUrl === 'string' && defaultTeacherSignatureUrl.startsWith('{'))
-    ) {
+    let processedTeacherSignatureUrl: string | null | undefined = undefined;
+    const hasTeacherSigUpdate =
+      Boolean(teacherSignatureBase64) ||
+      Boolean(classTeacherSignatures) ||
+      defaultTeacherSignatureUrl !== undefined;
+
+    if (hasTeacherSigUpdate) {
       const currentSetting = await prisma.systemSetting.findUnique({
         where: { branchId },
         select: { defaultTeacherSignatureUrl: true },
       });
-      const sigConfig = parseTeacherSignatureConfig(
-        defaultTeacherSignatureUrl || currentSetting?.defaultTeacherSignatureUrl
-      );
+      const existingConfig = parseTeacherSignatureConfig(currentSetting?.defaultTeacherSignatureUrl);
+      const isIncomingJson =
+        typeof defaultTeacherSignatureUrl === 'string' &&
+        defaultTeacherSignatureUrl.trim().startsWith('{');
+
+      const sigConfig = isIncomingJson
+        ? parseTeacherSignatureConfig(defaultTeacherSignatureUrl)
+        : existingConfig;
+
+      // Always preserve existing byClass & positionByClass when non-JSON general string or empty string arrives
+      if (!isIncomingJson) {
+        sigConfig.byClass = existingConfig.byClass || {};
+        sigConfig.positionByClass = existingConfig.positionByClass || {};
+        sigConfig.defaultShowPosition = existingConfig.defaultShowPosition;
+      }
 
       if (teacherSignatureBase64) {
         const uploaded = await saveSignatureBase64(teacherSignatureBase64, teacherSignatureFileName);
         if (uploaded) sigConfig.general = uploaded;
-      } else if (defaultTeacherSignatureUrl !== undefined && !defaultTeacherSignatureUrl?.startsWith('{')) {
-        sigConfig.general = defaultTeacherSignatureUrl || null;
+      } else if (!isIncomingJson && typeof defaultTeacherSignatureUrl === 'string' && defaultTeacherSignatureUrl.trim().length > 0) {
+        sigConfig.general = defaultTeacherSignatureUrl.trim();
+      } else if (defaultTeacherSignatureUrl === null) {
+        sigConfig.general = null;
       }
 
       if (classTeacherSignatures && typeof classTeacherSignatures === 'object') {
@@ -352,9 +371,6 @@ export async function updateSettings(req: Request, res: Response): Promise<Respo
       }
 
       processedTeacherSignatureUrl = serializeTeacherSignatureConfig(sigConfig);
-    } else if (teacherSignatureBase64) {
-      const uploaded = await saveSignatureBase64(teacherSignatureBase64, teacherSignatureFileName);
-      if (uploaded) processedTeacherSignatureUrl = uploaded;
     }
 
     const updated = await prisma.systemSetting.upsert({
@@ -1657,7 +1673,7 @@ export async function getClassTeacherSignatures(req: Request, res: Response): Pr
   }
 
   try {
-    const [settings, classes, allocations] = await Promise.all([
+    const [settings, classes, allocations, globalSettings] = await Promise.all([
       prisma.systemSetting.findUnique({
         where: { branchId },
         select: { defaultTeacherSignatureUrl: true },
@@ -1674,31 +1690,36 @@ export async function getClassTeacherSignatures(req: Request, res: Response): Pr
             select: { id: true, name: true, signatureUrl: true },
           },
         },
-        orderBy: { id: 'desc' },
+        orderBy: [{ sessionId: 'desc' }, { id: 'desc' }],
       }),
+      prisma.globalSettings.findFirst({ select: { sessionId: true } }).catch(() => null),
     ]);
 
     const sigConfig = parseTeacherSignatureConfig(settings?.defaultTeacherSignatureUrl);
     const generalSignatureUrl = sigConfig.general || null;
+    const activeSessionId = globalSettings?.sessionId || null;
 
     const result = classes.map((cls) => {
       const classKey = String(cls.id);
       const override = sigConfig.byClass?.[classKey];
-      const alloc = allocations.find((a) => a.classId === cls.id && a.teacher);
+      const alloc = selectBestTeacherAllocation(allocations, {
+        classId: cls.id,
+        sessionId: activeSessionId,
+      });
 
       let effectiveSignatureUrl: string | null = null;
       let source: 'CLASS_CUSTOM' | 'GENERAL' | 'TEACHER_PROFILE' | 'UNAVAILABLE' | 'NONE' = 'NONE';
       let isUnavailable = false;
 
-      if (override === 'DISABLED' || override === 'UNAVAILABLE' || override === 'NONE' || override === null) {
+      if (override === 'DISABLED' || override === 'UNAVAILABLE' || override === 'NONE') {
         isUnavailable = true;
         effectiveSignatureUrl = null;
         source = 'UNAVAILABLE';
       } else if (typeof override === 'string' && override.trim().length > 0) {
         effectiveSignatureUrl = override.trim();
         source = 'CLASS_CUSTOM';
-      } else if (alloc?.teacher?.signatureUrl) {
-        effectiveSignatureUrl = alloc.teacher.signatureUrl;
+      } else if (alloc?.teacher?.signatureUrl && alloc.teacher.signatureUrl.trim().length > 0) {
+        effectiveSignatureUrl = alloc.teacher.signatureUrl.trim();
         source = 'TEACHER_PROFILE';
       } else if (generalSignatureUrl) {
         effectiveSignatureUrl = generalSignatureUrl;

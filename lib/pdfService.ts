@@ -2107,55 +2107,112 @@ function generateBatchClassReportCardsPdf(params) {
   });
 }
 
-function fetchImage(photoPath) {
+function fetchHttpBuffer(
+  targetUrl: string,
+  options: { timeoutMs?: number; family?: 4 | 6 } = {},
+  redirectsLeft = 3
+): Promise<{ buffer: Buffer | null; contentType: string }> {
   return new Promise((resolve) => {
-    if (!photoPath || typeof photoPath !== 'string') return resolve(null);
-    const trimmed = photoPath.trim();
-    if (!trimmed) return resolve(null);
-
-    // Support Base64 Data URIs (e.g., data:image/png;base64,...)
-    if (trimmed.startsWith('data:image/')) {
-      const commaIdx = trimmed.indexOf(',');
-      if (commaIdx !== -1) {
-        try {
-          const base64Data = trimmed.slice(commaIdx + 1);
-          return resolve(Buffer.from(base64Data, 'base64'));
-        } catch {
-          return resolve(null);
-        }
-      }
-      return resolve(null);
+    let client: any;
+    try {
+      client = targetUrl.startsWith('https://') ? https : require('http');
+    } catch {
+      return resolve({ buffer: null, contentType: '' });
     }
 
-    if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/')) {
-      const cleanPath = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
-      const fullPath = path.join(__dirname, '..', cleanPath);
+    const reqOptions: any = {
+      timeout: options.timeoutMs || 15000,
+      ...(options.family ? { family: options.family } : {}),
+    };
+
+    const req = client.get(targetUrl, reqOptions, (res: any) => {
+      if (
+        res.statusCode &&
+        res.statusCode >= 300 &&
+        res.statusCode < 400 &&
+        res.headers.location &&
+        redirectsLeft > 0
+      ) {
+        const nextUrl = new URL(res.headers.location, targetUrl).toString();
+        res.resume();
+        fetchHttpBuffer(nextUrl, options, redirectsLeft - 1).then(resolve);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        resolve({ buffer: null, contentType: '' });
+        return;
+      }
+      const contentType = String(res.headers['content-type'] || '').toLowerCase();
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType }));
+      res.on('error', () => resolve({ buffer: null, contentType: '' }));
+    });
+    req.on('error', () => resolve({ buffer: null, contentType: '' }));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ buffer: null, contentType: '' });
+    });
+  });
+}
+
+function toPdfFriendlyCloudinaryUrl(url: string): string {
+  if (!url || !url.includes('res.cloudinary.com') || !url.includes('/image/upload/')) {
+    return url;
+  }
+  const normalized = url.replace(/\.(webp|svg|gif|avif)(\?.*)?$/i, '.png$2');
+  if (normalized.includes('/image/upload/f_')) return normalized;
+  return normalized.replace('/image/upload/', '/image/upload/f_png/');
+}
+
+async function fetchImage(photoPath: any): Promise<Buffer | null> {
+  if (!photoPath || typeof photoPath !== 'string') return null;
+  const trimmed = photoPath.trim();
+  if (!trimmed) return null;
+
+  // Support Base64 Data URIs (e.g., data:image/png;base64,...)
+  if (trimmed.startsWith('data:image/')) {
+    const commaIdx = trimmed.indexOf(',');
+    if (commaIdx !== -1) {
+      try {
+        const base64Data = trimmed.slice(commaIdx + 1);
+        return Buffer.from(base64Data, 'base64');
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/')) {
+    const cleanPath = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
+    const distRelative = path.join(__dirname, '..', cleanPath);
+    const rootRelative = path.join(process.cwd(), cleanPath);
+    const fullPath = fs.existsSync(distRelative) ? distRelative : rootRelative;
+    return await new Promise((resolve) => {
       fs.readFile(fullPath, (err, data) => {
         if (err) resolve(null);
         else resolve(data);
       });
-      return;
+    });
+  }
+
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    const pdfSafeUrl = toPdfFriendlyCloudinaryUrl(trimmed);
+    // Prefer IPv4 first to avoid Node Happy Eyeballs IPv6 ENETUNREACH / premature connect ETIMEDOUT
+    let result = await fetchHttpBuffer(pdfSafeUrl, { family: 4, timeoutMs: 15000 });
+    if (!result.buffer && pdfSafeUrl !== trimmed) {
+      result = await fetchHttpBuffer(trimmed, { family: 4, timeoutMs: 15000 });
     }
-    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-      const client = trimmed.startsWith('https://') ? https : require('http');
-      const req = client.get(trimmed, { timeout: 6000 }, (res) => {
-        if (res.statusCode !== 200) {
-          resolve(null);
-          return;
-        }
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-        res.on('error', () => resolve(null));
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => {
-        req.destroy();
-        resolve(null);
-      });
-      return;
+    if (!result.buffer) {
+      result = await fetchHttpBuffer(pdfSafeUrl, { timeoutMs: 15000 });
     }
-    const localFallback = path.join(__dirname, '..', trimmed);
+    return result.buffer || null;
+  }
+
+  const localFallback = path.join(__dirname, '..', trimmed);
+  return await new Promise((resolve) => {
     fs.readFile(localFallback, (err, data) => {
       if (!err) resolve(data);
       else resolve(null);

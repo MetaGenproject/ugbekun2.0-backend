@@ -22,6 +22,7 @@ import {
   consolidateMarksByStudentAndSubject,
 } from '../../lib/markParser';
 import { resolveGradingScale, calculateGradeFromRanges } from '../../lib/gradingService';
+import { saveSignatureBase64 } from '../onboarding/onboardingController';
 import {
   resolveSchoolReportBranding,
   syncReportCardOnScoreSave,
@@ -33,6 +34,7 @@ import {
   resolveClassPositionPolicy,
   resolveAssignedClassSubjects,
   buildReportCardRowsForStudent,
+  selectBestTeacherAllocation,
 } from '../../lib/reportCardHelper';
 
 export function getRatingLabel(rating: number): string {
@@ -2137,12 +2139,71 @@ export async function saveReportCardCommentary(req: Request, res: Response): Pro
       },
     });
 
+    let resolvedPrincipalSigUrl: string | undefined;
+    if (typeof principalSignatureUrl === 'string' && principalSignatureUrl.trim().length > 0) {
+      const trimmed = principalSignatureUrl.trim();
+      resolvedPrincipalSigUrl = trimmed.startsWith('data:image/')
+        ? (await saveSignatureBase64(trimmed, `branch_${branchId}_principal_signature.png`)) || trimmed
+        : trimmed;
+    }
+
+    let resolvedTeacherSigUrl: string | undefined;
+    const isNewTeacherSigUpload =
+      typeof teacherSignatureUrl === 'string' && teacherSignatureUrl.trim().startsWith('data:image/');
+    if (typeof teacherSignatureUrl === 'string' && teacherSignatureUrl.trim().length > 0) {
+      const trimmed = teacherSignatureUrl.trim();
+      resolvedTeacherSigUrl = isNewTeacherSigUpload
+        ? (await saveSignatureBase64(trimmed, `class_${classId}_teacher_signature.png`)) || trimmed
+        : trimmed;
+    }
+
+    let serializedTeacherSigPayload: string | null | undefined;
+    if (resolvedTeacherSigUrl) {
+      const existingSetting = await prisma.systemSetting.findUnique({
+        where: { branchId: branchId! },
+        select: { defaultTeacherSignatureUrl: true },
+      });
+      const sigConfig = parseTeacherSignatureConfig(existingSetting?.defaultTeacherSignatureUrl);
+      const classKey = String(classId);
+      const existingClassSig = sigConfig.byClass?.[classKey];
+      const existingEffective =
+        existingClassSig && existingClassSig !== 'DISABLED' && existingClassSig !== 'UNAVAILABLE' && existingClassSig !== 'NONE'
+          ? existingClassSig
+          : sigConfig.general;
+
+      // Preserve existing JSON config (general, byClass for other classes, positionByClass)
+      if (isNewTeacherSigUpload || resolvedTeacherSigUrl !== existingEffective) {
+        if (!sigConfig.byClass) sigConfig.byClass = {};
+        sigConfig.byClass[classKey] = resolvedTeacherSigUrl;
+        serializedTeacherSigPayload = serializeTeacherSignatureConfig(sigConfig);
+
+        // Also sync onto the allocated class teacher's Teacher.signatureUrl so Teacher Portal matches
+        const allocs = await prisma.teacherAllocation.findMany({
+          where: { branchId: branchId!, classId: Number(classId) },
+          include: { teacher: { select: { id: true, name: true, signatureUrl: true } } },
+        });
+        const bestAlloc = selectBestTeacherAllocation(allocs, {
+          classId: Number(classId),
+          sectionId: Number(sectionId),
+          sessionId,
+        });
+        if (bestAlloc?.teacherId) {
+          await prisma.teacher
+            .update({
+              where: { id: bestAlloc.teacherId },
+              data: { signatureUrl: resolvedTeacherSigUrl },
+            })
+            .catch(() => {});
+        }
+      }
+    }
+
     if (
       resumptionDate !== undefined ||
       nextTermFees !== undefined ||
       principalName !== undefined ||
-      principalSignatureUrl !== undefined ||
-      teacherSignatureUrl !== undefined
+      resolvedPrincipalSigUrl !== undefined ||
+      serializedTeacherSigPayload !== undefined
     ) {
       await prisma.systemSetting.upsert({
         where: { branchId: branchId! },
@@ -2150,16 +2211,16 @@ export async function saveReportCardCommentary(req: Request, res: Response): Pro
           ...(resumptionDate !== undefined && { resumptionDate: String(resumptionDate) }),
           ...(nextTermFees !== undefined && { nextTermFees: String(nextTermFees) }),
           ...(principalName !== undefined && { principalName: String(principalName) }),
-          ...(principalSignatureUrl !== undefined && { principalSignatureUrl: String(principalSignatureUrl) }),
-          ...(teacherSignatureUrl !== undefined && { defaultTeacherSignatureUrl: String(teacherSignatureUrl) }),
+          ...(resolvedPrincipalSigUrl !== undefined && { principalSignatureUrl: resolvedPrincipalSigUrl }),
+          ...(serializedTeacherSigPayload !== undefined && { defaultTeacherSignatureUrl: serializedTeacherSigPayload }),
         },
         create: {
           branchId: branchId!,
           resumptionDate: resumptionDate ? String(resumptionDate) : null,
           nextTermFees: nextTermFees ? String(nextTermFees) : null,
           principalName: principalName ? String(principalName) : 'The Principal',
-          principalSignatureUrl: principalSignatureUrl ? String(principalSignatureUrl) : null,
-          defaultTeacherSignatureUrl: teacherSignatureUrl ? String(teacherSignatureUrl) : null,
+          principalSignatureUrl: resolvedPrincipalSigUrl || null,
+          defaultTeacherSignatureUrl: serializedTeacherSigPayload || null,
         },
       }).catch(() => {});
     }
